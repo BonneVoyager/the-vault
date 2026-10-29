@@ -517,9 +517,14 @@ impl AppState {
         }
     }
 
-    /// The row's Remove button: show the inline confirm.
+    /// Remove is an edit-mode action (owner decision): read mode only previews and saves.
+    fn can_remove_attachments(&self) -> bool {
+        self.main_active() && self.busy.is_none() && matches!(self.mode, Mode::Edit(_))
+    }
+
+    /// The row's Remove button (edit mode): show the inline confirm.
     pub fn request_remove_attachment(&mut self, id: Uuid, cx: &mut Context<Self>) {
-        if self.main_active() && self.busy.is_none() {
+        if self.can_remove_attachments() {
             self.attachments.remove_confirm = Some(id);
             cx.notify();
         }
@@ -535,7 +540,8 @@ impl AppState {
     /// cleanup) and autosaves.
     pub fn confirm_remove_attachment(&mut self, id: Uuid, cx: &mut Context<Self>) {
         self.attachments.remove_confirm = None;
-        if !self.main_active() {
+        if !self.can_remove_attachments() {
+            cx.notify();
             return;
         }
         let Some(item) = self.selected_item().map(|i| i.id) else {
@@ -842,6 +848,9 @@ impl AppState {
             self.attachments.save_confirm = None;
         }
         self.evict_images(cx);
+        if !matches!(self.mode, Mode::Edit(_)) {
+            self.attachments.remove_confirm = None;
+        }
         if let Some(id) = self.attachments.remove_confirm
             && !self
                 .selected_item()
@@ -1375,6 +1384,15 @@ mod tests {
 
         let gone = added[0].0;
         state.update(cx, |s, cx| {
+            // Read mode: Remove is refused.
+            s.request_remove_attachment(gone, cx);
+            assert!(s.attachments.remove_confirm.is_none());
+            s.confirm_remove_attachment(gone, cx);
+            assert!(
+                !s.vault.as_ref().unwrap().is_dirty(),
+                "nothing removed in read mode"
+            );
+            s.begin_edit(cx);
             s.request_remove_attachment(gone, cx);
             assert_eq!(s.attachments.remove_confirm, Some(gone));
             s.confirm_remove_attachment(gone, cx);
@@ -1382,6 +1400,13 @@ mod tests {
             assert!(s.vault.as_ref().unwrap().is_dirty(), "autosave pending");
         });
         assert_eq!(refs(&state, ids[0], cx), vec![added[1].clone()]);
+        // Leaving edit mode drops a pending confirm.
+        state.update(cx, |s, cx| {
+            s.request_remove_attachment(added[1].0, cx);
+            s.cancel_edit(cx);
+            s.follow_attachment_selection(cx);
+            assert!(s.attachments.remove_confirm.is_none());
+        });
     }
 
     #[gpui::test]
@@ -1595,7 +1620,9 @@ mod tests {
         let (gone, cloud) = (ids[0].0, ids[1].0);
         store.set_state(cloud, AttachmentState::NotDownloaded);
         state.update(cx, |s, cx| {
+            s.begin_edit(cx);
             s.confirm_remove_attachment(gone, cx);
+            s.cancel_edit(cx);
             assert!(s.vault.as_ref().unwrap().is_dirty());
         });
         [gone, cloud]

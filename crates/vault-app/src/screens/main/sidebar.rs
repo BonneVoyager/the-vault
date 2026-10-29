@@ -1,5 +1,5 @@
 //! Sidebar (specs/05-ui.md §2.3): sections with right-aligned muted counts, collapsible
-//! alphabetical tags, Settings at the bottom.
+//! alphabetical tags, Settings and a Lock button at the bottom.
 //!
 //! Hand-rolled rather than gpui-component's `Sidebar`: that widget paints from
 //! `theme.tokens` (which our theme overrides do not reach), has no dividers between
@@ -10,12 +10,13 @@ use gpui::{
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
-use gpui_component::{ActiveTheme as _, Icon};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use vault_core::ItemKind;
 
 use super::MainScreen;
-use crate::actions::OpenSettings;
+use crate::actions::{Lock, OpenSettings};
 use crate::state::Filter;
 use crate::ui;
 
@@ -42,6 +43,37 @@ pub fn kind_singular(kind: ItemKind) -> &'static str {
     }
 }
 
+/// Height of a sidebar row; the footer's Lock button is a square of this side.
+fn row_height(cx: &App) -> gpui::Pixels {
+    crate::theme::scaled(28., cx)
+}
+
+/// Square icon-only Lock button for the sidebar footer.
+///
+/// The glyph is a child rather than `.icon(..)`: Button sizes its icon at 3/4 of a
+/// pixel-sized button (21 px here), larger and heavier than the 16 px Settings gear.
+/// As a child it keeps `size_4` and the nav rows' muted colour; the explicit w/h keep
+/// the button square at the row height.
+fn lock_button(cx: &App) -> Button {
+    let side = row_height(cx);
+    Button::new("sidebar-lock")
+        .ghost()
+        .with_size(side)
+        .w(side)
+        .h(side)
+        .child(
+            div().debug_selector(|| "sidebar-lock-icon".into()).child(
+                Icon::new(IconName::Lock)
+                    .size_4()
+                    .text_color(cx.theme().muted_foreground),
+            ),
+        )
+        .tooltip("Lock  ⌘L")
+        .accessibility_label("Lock vault")
+        .debug_selector(|| "sidebar-lock".into())
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(Lock), cx))
+}
+
 /// One clickable, Tab-reachable sidebar row.
 fn nav_row(
     id: impl Into<ElementId>,
@@ -52,7 +84,7 @@ fn nav_row(
     on_click: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> impl IntoElement {
-    let height = crate::theme::scaled(28., cx);
+    let height = row_height(cx);
     let theme = cx.theme();
     let label = label.into();
     ui::h_flex()
@@ -211,20 +243,106 @@ impl MainScreen {
                 super::column_footer(theme.border, cx)
                     .debug_selector(|| "sidebar-footer".into())
                     .child(
-                        div()
+                        ui::h_flex()
                             .flex_1()
+                            .min_w_0()
+                            .gap(px(4.))
                             .debug_selector(|| "sidebar-footer-content".into())
-                            .child(nav_row(
-                                "nav-settings",
-                                IconName::Settings,
-                                "Settings",
-                                None,
-                                false,
-                                |window, cx| window.dispatch_action(Box::new(OpenSettings), cx),
-                                cx,
-                            )),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .debug_selector(|| "sidebar-settings".into())
+                                    .child(nav_row(
+                                        "nav-settings",
+                                        IconName::Settings,
+                                        "Settings",
+                                        None,
+                                        false,
+                                        |window, cx| {
+                                            window.dispatch_action(Box::new(OpenSettings), cx)
+                                        },
+                                        cx,
+                                    )),
+                            )
+                            .child(lock_button(cx)),
                     ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui::{AppContext as _, Modifiers, TestAppContext, VisualTestContext};
+    use gpui_component::Root;
+    use vault_core::{KdfParams, SecretString, Uuid};
+    use vault_sync::{NoopHooks, SyncedVault};
+
+    use crate::actions;
+    use crate::root::VaultRoot;
+    use crate::state::{AppState, Screen};
+
+    #[gpui::test]
+    fn footer_has_settings_and_a_lock_button_that_locks(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.vault");
+        drop(
+            SyncedVault::create(
+                &path,
+                &SecretString::new("pw".into()),
+                KdfParams::for_tests(),
+                Uuid::new_v4(),
+                Arc::new(NoopHooks),
+            )
+            .unwrap(),
+        );
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            actions::bind_keys(cx);
+            actions::register(&state, cx);
+        });
+        let window = cx.add_window(|window, cx| {
+            crate::theme::apply(window, cx);
+            let view = cx.new(|cx| VaultRoot::new(state.clone(), None, window, cx));
+            Root::new(view, window, cx)
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        state.update(&mut vcx, |s, cx| s.open_vault(path, cx));
+        vcx.run_until_parked();
+        state.update(&mut vcx, |s, cx| {
+            s.unlock(SecretString::new("pw".into()), cx)
+        });
+        vcx.run_until_parked();
+        assert_eq!(state.read_with(&vcx, |s, _| s.screen), Screen::Main);
+
+        let footer = vcx.debug_bounds("sidebar-footer").expect("footer");
+        let settings = vcx.debug_bounds("sidebar-settings").expect("settings");
+        let lock = vcx.debug_bounds("sidebar-lock").expect("lock button");
+        // Settings takes the room on the left; Lock is a square at the right edge.
+        assert!(settings.right() <= lock.left());
+        assert!(settings.size.width > lock.size.width * 3.);
+        assert_eq!(lock.size.width, lock.size.height);
+        assert!(footer.right() - lock.right() <= gpui::px(8.));
+        assert!(lock.top() >= footer.top() && lock.bottom() <= footer.bottom());
+        // The lock glyph matches the Settings gear: size_4 (1 rem), not 3/4 of the button.
+        let glyph = vcx.debug_bounds("sidebar-lock-icon").expect("lock glyph");
+        let rem = vcx.update(|window, _| window.rem_size());
+        assert_eq!(glyph.size.width, rem);
+        assert_eq!(glyph.size.height, rem);
+
+        vcx.simulate_click(lock.center(), Modifiers::none());
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| {
+            assert!(s.locked);
+            assert_eq!(s.screen, Screen::Unlock);
+        });
+        assert!(
+            vcx.debug_bounds("unlock-password").is_some(),
+            "unlock screen shown"
+        );
     }
 }

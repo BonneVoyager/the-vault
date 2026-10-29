@@ -24,7 +24,7 @@ use super::generator::GeneratorView;
 use super::prompts;
 use super::sidebar::kind_singular;
 use crate::actions::{CancelEdit, SaveItem};
-use crate::state::{AppState, EditBuffer, GeneratorTarget, Mode, kind_name};
+use crate::state::{ADDABLE_KINDS, AppState, EditBuffer, GeneratorTarget, Mode, kind_name};
 use crate::ui;
 
 enum ValueInput {
@@ -309,7 +309,7 @@ impl Editor {
         };
         let remove = {
             let state = self.state.clone();
-            ui::icon_button(("remove-field", key), IconName::Delete, "Remove field").on_click(
+            ui::icon_button(("remove-field", key), IconName::Trash, "Remove field").on_click(
                 move |_, _, cx| {
                     state.update(cx, |s, cx| s.edit(cx, |b| b.remove_field(key)));
                 },
@@ -346,51 +346,16 @@ impl Editor {
             }
             ValueInput::Area(area) => Textarea::new(area).into_any_element(),
         };
-        let scan = (field.kind == FieldKind::Totp).then(|| {
-            let state = self.state.clone();
-            ui::icon_button(
-                ("scan-qr", key),
-                IconName::ScanQrCode,
-                "Scan QR from screen",
-            )
-            .loading(s.qr_scanning)
-            .on_click(move |_, _, cx| state.update(cx, |s, cx| s.scan_totp_qr(key, cx)))
-        });
         let scan_file = (field.kind == FieldKind::Totp).then(|| {
             let state = self.state.clone();
             ui::icon_button(
                 ("scan-qr-file", key),
-                IconName::FolderOpen,
+                IconName::ScanQrCode,
                 "Scan QR from image\u{2026}",
             )
-            .disabled(s.qr_scanning)
+            .loading(s.qr_scanning)
             .on_click(move |_, _, cx| state.update(cx, |s, cx| s.scan_totp_qr_file(key, cx)))
         });
-        let recording_hint =
-            (field.kind == FieldKind::Totp && s.screen_recording_hint).then(|| {
-                let state = self.state.clone();
-                ui::h_flex()
-                    .pl(px(22.))
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(
-                                "Scanning the screen needs Screen Recording permission for \
-                                 vault, or scan a QR from an image file instead.",
-                            ),
-                    )
-                    .child(
-                        Button::new(("screen-recording", key))
-                            .small()
-                            .label("Open System Settings")
-                            .on_click(move |_, _, cx| {
-                                state.update(cx, |s, cx| s.open_screen_recording_settings(cx))
-                            }),
-                    )
-            });
         let generate = (field.kind == FieldKind::Password).then(|| {
             let open = s.generator_target == Some(GeneratorTarget::Field(key));
             let state = self.state.clone();
@@ -475,11 +440,9 @@ impl Editor {
                     .pl(px(22.))
                     .child(div().flex_1().min_w_0().child(value))
                     .children(generate)
-                    .children(scan)
                     .children(scan_file),
             )
             .children(totp_hint(key, buffer, cx))
-            .children(recording_hint)
             .when(field.kind == FieldKind::Password, |col| {
                 col.child(div().pl(px(22.)).child(ui::strength_meter(
                     strength_bits(field.value.expose_secret()),
@@ -617,7 +580,7 @@ impl Render for Editor {
                 .icon(Icon::new(IconName::Plus))
                 .label("Add field")
                 .dropdown_menu(move |menu, _, _| {
-                    FieldKind::ALL.into_iter().fold(menu, |menu, kind| {
+                    ADDABLE_KINDS.into_iter().fold(menu, |menu, kind| {
                         let state = state.clone();
                         menu.item(
                             PopupMenuItem::new(kind_name(kind)).on_click(move |_, _, cx| {

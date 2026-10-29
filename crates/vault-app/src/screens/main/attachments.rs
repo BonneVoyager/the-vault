@@ -70,7 +70,7 @@ pub fn section(
     let rows = item
         .attachments
         .iter()
-        .map(|a| row(s, state, item.id, a, cx));
+        .map(|a| row(s, state, item.id, a, editing, cx));
     let pending_rows = pending.into_iter().map(|p| {
         let name = p.name.clone();
         row_shell(IconName::File, p.name.clone(), p.size, None, cx)
@@ -140,6 +140,7 @@ fn row(
     state: &Entity<AppState>,
     item: Uuid,
     a: &AttachmentRef,
+    editing: bool,
     cx: &App,
 ) -> AnyElement {
     let id = a.id;
@@ -165,7 +166,8 @@ fn row(
         .as_ref()
         .filter(|p| p.id == id && p.item == item);
 
-    if s.attachments.remove_confirm == Some(id) {
+    // Remove and its confirm exist only in edit mode; read mode previews and saves.
+    if editing && s.attachments.remove_confirm == Some(id) {
         let (cancel, confirm) = (state.clone(), state.clone());
         let label = name.clone();
         el = el.child(
@@ -242,16 +244,25 @@ fn row(
                 .on_click(move |_, _, cx| st.update(cx, |s, cx| s.save_attachment_copy(id, cx))),
             );
         }
-        let st = state.clone();
-        el = el.child(
-            ui::icon_button(
-                ("attachment-remove", id.as_u128() as u64),
-                IconName::Delete,
-                "Remove attachment",
-            )
-            .disabled(busy)
-            .on_click(move |_, _, cx| st.update(cx, |s, cx| s.request_remove_attachment(id, cx))),
-        );
+        if editing {
+            let st = state.clone();
+            let remove_name = name.clone();
+            el = el.child(
+                div()
+                    .debug_selector(move || format!("attachment-remove {remove_name}"))
+                    .child(
+                        ui::icon_button(
+                            ("attachment-remove", id.as_u128() as u64),
+                            IconName::Trash,
+                            "Remove attachment",
+                        )
+                        .disabled(busy)
+                        .on_click(move |_, _, cx| {
+                            st.update(cx, |s, cx| s.request_remove_attachment(id, cx))
+                        }),
+                    ),
+            );
+        }
     }
 
     match previewing {
@@ -562,6 +573,11 @@ mod tests {
         assert!(shown("attachment-preview notes.txt", &mut vcx));
         assert!(!shown("attachment-preview scan.pdf", &mut vcx));
         assert!(!shown("attachment-preview photo.heic", &mut vcx));
+        // Read mode: Preview and Save only, no Remove (not even on a Missing row).
+        for name in ["notes.txt", "scan.pdf", "photo.heic"] {
+            let key: &'static str = Box::leak(format!("attachment-remove {name}").into_boxed_str());
+            assert!(!shown(key, &mut vcx), "{name}");
+        }
         // Rows sit between the fields and the footer.
         let section = vcx.debug_bounds("attachments-section").unwrap();
         let footer = vcx.debug_bounds("detail-footer").unwrap();
@@ -638,8 +654,29 @@ mod tests {
             "edit mode offers Add file"
         );
 
-        add(&state, vec![file(dir.path(), "k.txt", b"k")], &mut vcx);
+        add(
+            &state,
+            vec![
+                file(dir.path(), "k.txt", b"k"),
+                file(dir.path(), "x.txt", b"x"),
+            ],
+            &mut vcx,
+        );
         assert!(shown("attachment-row k.txt 1 B Present", &mut vcx));
+        assert!(
+            shown("attachment-remove x.txt", &mut vcx),
+            "edit mode offers Remove"
+        );
+        // Remove through the UI: trash, then the inline confirm.
+        let x = ids(&state, item, &vcx)[1];
+        let trash = vcx.debug_bounds("attachment-remove x.txt").unwrap();
+        vcx.simulate_click(trash.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        assert!(shown("attachment-remove-confirm x.txt", &mut vcx));
+        vcx.update(|_, cx| state.update(cx, |s, cx| s.confirm_remove_attachment(x, cx)));
+        vcx.run_until_parked();
+        assert!(!shown("attachment-row x.txt 1 B Present", &mut vcx));
+        assert_eq!(ids(&state, item, &vcx).len(), 1);
         let id = ids(&state, item, &vcx)[0];
         let out = dir.path().join("k-copy.txt");
         vcx.update(|_, cx| state.update(cx, |s, cx| s.save_attachment_to(id, out.clone(), cx)));

@@ -35,7 +35,8 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = ["
 # NSBitmapImageRep (+ its CGImage bridge) decodes PNG/JPEG/HEIC/TIFF files for qr.rs.
 # bitflags: NSPasteboardContentsOptions (currentHostOnly). NSWindow/NSResponder/NSApplication:
 # sharingType for window.rs; NSGraphics: NSBackingStoreType for the window test.
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "bitflags", "NSWorkspace", "NSPasteboard", "NSAccessibility", "NSImageRep", "NSBitmapImageRep", "objc2-core-graphics", "NSResponder", "NSWindow", "NSApplication", "NSGraphics"] }
+# NSColor/NSColorSpace (+ objc2-core-foundation for CGFloat): accent colour in appearance.rs.
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "bitflags", "NSWorkspace", "NSPasteboard", "NSAccessibility", "NSImageRep", "NSBitmapImageRep", "objc2-core-graphics", "NSResponder", "NSWindow", "NSApplication", "NSGraphics", "NSColor", "NSColorSpace", "objc2-core-foundation"] }
 # CGEventSourceSecondsSinceLastEventType for idle detection; CGDisplayCreateImage, bitmap
 # contexts and Screen Recording preflight/request for QR scanning (qr.rs).
 objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGEventSource", "CGEventTypes", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGImage", "CGColorSpace", "CGContext", "CGBitmapContext", "CGWindow"] }
@@ -72,4 +73,9 @@ harness = false
 # Creates an NSWindow, which AppKit only allows on the process main thread.
 [[test]]
 name = "window"
+harness = false
+
+# Reads NSColor.controlAccentColor, which system_accent_color only does on the main thread.
+[[test]]
+name = "appearance"
 harness = false

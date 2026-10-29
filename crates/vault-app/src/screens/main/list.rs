@@ -334,7 +334,7 @@ impl MainScreen {
             .px(px(ui::COLUMN_PAD_X))
             .gap(px(4.))
             .child(
-                div()
+                ui::no_window_drag(div())
                     .flex_1()
                     .debug_selector(|| "list-search".into())
                     .child(
@@ -358,8 +358,8 @@ impl MainScreen {
                         ),
                     ),
             )
-            .child(sort_button)
-            .child({
+            .child(ui::no_window_drag(div()).flex_none().child(sort_button))
+            .child(ui::no_window_drag(div()).flex_none().child({
                 let state = self.state.clone();
                 let generator = self.generator.clone();
                 ui::popover(
@@ -382,7 +382,7 @@ impl MainScreen {
                     },
                     move |_, _| generator.clone().into_any_element(),
                 )
-            });
+            }));
 
         let body: AnyElement = if placeholder == Some(EMPTY_VAULT) {
             empty_state(

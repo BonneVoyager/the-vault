@@ -15,6 +15,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::progress::ProgressCircle;
 use gpui_component::tag::Tag;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use vault_core::{ExposeSecret, Field, FieldKind, Item};
@@ -70,6 +71,43 @@ fn reveal_button(
     let name = name.to_owned();
     ui::icon_button(("reveal", ix), icon, &format!("{verb} {what}"))
         .on_click(move |_, _, cx| state.update(cx, |s, cx| s.toggle_reveal(&name, cx)))
+}
+
+/// Hint on a field's value area; clicking (or Enter/Space on it) copies the value.
+const CLICK_TO_COPY: &str = "Click to copy";
+
+/// A field's value area in read mode: clicking it does exactly what the row's Copy
+/// button does (`AppState::copy`), so a masked value is copied without being revealed.
+/// Focusable, so Enter or Space on it copies too (gpui clicks a focused div on key up).
+fn copy_on_click(
+    ix: usize,
+    what: &str,
+    shown: AnyElement,
+    state: &Entity<AppState>,
+    cx: &App,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    let hover = theme.accent.opacity(0.6);
+    let state = state.clone();
+    div()
+        .id(("field-value", ix))
+        .tab_index(0)
+        // Tests click the value by this key (no-op outside test builds).
+        .debug_selector(move || format!("field-value {ix}"))
+        .aria_label(SharedString::from(format!("{what}. {CLICK_TO_COPY}")))
+        .flex_1()
+        .min_w_0()
+        // Pad for the hover fill, then pull back so the text stays under the label.
+        .ml(px(-(4. + ui::FOCUS_RING_WIDTH)))
+        .px(px(4.))
+        .py(px(2.))
+        .rounded(theme.radius)
+        .map(|el| ui::focus_ring(el, cx))
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover))
+        .tooltip(|window, cx| Tooltip::new(CLICK_TO_COPY).build(window, cx))
+        .on_click(move |_, _, cx| state.update(cx, |s, cx| s.copy(CopyTarget::Field(ix), cx)))
+        .child(shown)
 }
 
 /// Value text in the monospace font (passwords, codes, card numbers).
@@ -202,10 +240,15 @@ impl MainScreen {
             s.selection.map_or(0, |id| id.as_u128() as usize) ^ usize::from(s.is_editing());
         let reduce_motion = s.reduce_motion || s.selection.is_none();
         let content: AnyElement = match s.shown_item() {
-            _ if s.is_editing() => self.render_editing(s, cx),
+            // Edit mode and onboarding are controls throughout, including in the band.
+            _ if s.is_editing() => ui::no_window_drag(div().size_full())
+                .child(self.render_editing(s, cx))
+                .into_any_element(),
             Some(item) => self.render_item(item, s, cx).into_any_element(),
             None if detail_placeholder(s) == Some(ONBOARDING_TITLE) => {
-                onboarding(&self.state, cx).into_any_element()
+                ui::no_window_drag(div().size_full())
+                    .child(onboarding(&self.state, cx))
+                    .into_any_element()
             }
             None if detail_placeholder(s) == Some(SELECT_AN_ITEM) => ui::v_flex()
                 .size_full()
@@ -249,7 +292,11 @@ impl MainScreen {
                         drop_state.update(cx, |s, cx| s.add_attachment_files(paths, cx));
                     })
             })
-            .children(banners)
+            .children(
+                banners
+                    .into_iter()
+                    .map(|b| ui::no_window_drag(div()).child(b)),
+            )
             .child(ui::panel_in(
                 div().flex_1().min_h_0().child(content),
                 ("detail-in", motion_key),
@@ -346,17 +393,27 @@ impl MainScreen {
                     )
                     .child(ui::muted(kind_singular(item.kind), cx)),
             )
-            .child(favorite)
+            // The buttons reach into the title-bar band: clicks there must not move the window.
             .child(
-                ui::icon_button("delete", IconName::Delete, "Delete  ⌘⌫")
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(DeleteItem), cx)),
-            )
-            .child(
-                Button::new("edit")
-                    .small()
-                    .label("Edit")
-                    .tooltip("Edit  ⌘E")
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(EditItem), cx)),
+                ui::no_window_drag(ui::h_flex())
+                    .debug_selector(|| "detail-header-buttons".into())
+                    .flex_none()
+                    .gap(px(14.))
+                    .child(favorite)
+                    .child(
+                        ui::icon_button("delete", IconName::Trash, "Delete  ⌘⌫").on_click(
+                            |_, window, cx| window.dispatch_action(Box::new(DeleteItem), cx),
+                        ),
+                    )
+                    .child(
+                        Button::new("edit")
+                            .small()
+                            .label("Edit")
+                            .tooltip("Edit  ⌘E")
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(EditItem), cx)
+                            }),
+                    ),
             );
 
         let mut fields: Vec<AnyElement> = Vec::with_capacity(item.fields.len() + 1);
@@ -376,7 +433,11 @@ impl MainScreen {
             .pb(px(64.))
             .gap(px(12.))
             .child(header)
-            .children(prompts::delete(s, &self.state, cx))
+            // Everything below the header holds controls and can scroll up into the
+            // title-bar band; mark it so clicks there never move the window.
+            .children(
+                prompts::delete(s, &self.state, cx).map(|p| ui::no_window_drag(div()).child(p)),
+            )
             .when(!item.tags.is_empty(), |col| {
                 col.child(
                     ui::h_flex().gap(px(6.)).flex_wrap().children(
@@ -390,7 +451,7 @@ impl MainScreen {
                 s.listing
                     .issues(item.id)
                     .iter()
-                    .map(|issue| issue_banner(issue, cx)),
+                    .map(|issue| ui::no_window_drag(div()).child(issue_banner(issue, cx))),
             )
             .child(ui::divider(cx))
             // Every field row (and the history disclosure) draws its own bottom border, so
@@ -400,8 +461,11 @@ impl MainScreen {
                 col.child(ui::muted("This item has no fields.", cx))
                     .child(ui::divider(cx))
             })
-            .child(ui::v_flex().children(fields))
-            .children(attachments::section(s, &self.state, item, false, cx))
+            .child(ui::no_window_drag(ui::v_flex()).children(fields))
+            .children(
+                attachments::section(s, &self.state, item, false, cx)
+                    .map(|a| ui::no_window_drag(div()).child(a)),
+            )
             .child(
                 ui::muted(
                     format!(
@@ -523,7 +587,7 @@ impl MainScreen {
                 ui::h_flex()
                     .gap(px(4.))
                     .min_h(px(28.))
-                    .child(div().flex_1().min_w_0().child(shown))
+                    .child(copy_on_click(ix, &field.name, shown, &self.state, cx))
                     .children(buttons),
             )
             .into_any_element()
@@ -670,8 +734,10 @@ mod tests {
     use super::super::MainScreen;
     use super::*;
     use crate::actions;
+    use crate::clipboard::fake::FakePasteboard;
 
     const STRONG: &str = "correct-Horse-battery-staple-42";
+    const TOTP_URI: &str = "otpauth://totp/GitHub:chris?secret=JBSWY3DPEHPK3PXP&issuer=GitHub";
 
     fn login(title: &str, password: &str, device: Uuid) -> Item {
         let mut item = Item::new(ItemKind::Login, title, device, 1);
@@ -696,6 +762,20 @@ mod tests {
         logins: &[(&str, &str)],
         cx: &mut TestAppContext,
     ) -> (Entity<AppState>, Vec<Uuid>, VisualTestContext) {
+        let logins = logins.to_vec();
+        open_items(
+            dir,
+            move |device| logins.iter().map(|(t, pw)| login(t, pw, device)).collect(),
+            cx,
+        )
+    }
+
+    /// The main screen over a vault holding the items `make(device_id)` builds.
+    fn open_items(
+        dir: &std::path::Path,
+        make: impl FnOnce(Uuid) -> Vec<Item>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<AppState>, Vec<Uuid>, VisualTestContext) {
         let mut vault = SyncedVault::create(
             &dir.join("t.vault"),
             &SecretString::new("pw".into()),
@@ -706,9 +786,9 @@ mod tests {
         .unwrap();
         let ids = vault
             .edit(|v| {
-                logins
-                    .iter()
-                    .map(|(title, pw)| v.insert(login(title, pw, v.device_id()), 1))
+                make(v.device_id())
+                    .into_iter()
+                    .map(|item| v.insert(item, 1))
                     .collect::<Vec<_>>()
             })
             .unwrap();
@@ -815,6 +895,107 @@ mod tests {
                 .values()
                 .all(|v| matches!(v.as_slice(), [Issue::Reused { count: 2 }]))
         );
+    }
+
+    /// Opens one login (username, password, totp) with a fake pasteboard installed.
+    fn open_with_board(
+        dir: &std::path::Path,
+        cx: &mut TestAppContext,
+    ) -> (Entity<AppState>, FakePasteboard, VisualTestContext) {
+        let (state, ids, mut vcx) = open_items(
+            dir,
+            |device| {
+                let mut item = login("GitHub", STRONG, device);
+                item.fields.push(Field::new(
+                    "totp",
+                    FieldKind::Totp,
+                    SecretString::new(TOTP_URI.into()),
+                    1,
+                ));
+                vec![item]
+            },
+            cx,
+        );
+        let board = FakePasteboard::default();
+        vcx.update(|_, cx| {
+            state.update(cx, |s, _| {
+                s.set_pasteboard(Box::new(board.clone()));
+                s.settings.clipboard_clear_secs = 30;
+            });
+        });
+        select(&state, ids[0], &mut vcx);
+        (state, board, vcx)
+    }
+
+    fn click(key: &'static str, vcx: &mut VisualTestContext) {
+        let at = vcx.debug_bounds(key).expect(key).center();
+        vcx.simulate_click(at, gpui::Modifiers::none());
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn clicking_the_password_copies_it_and_keeps_it_masked(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, board, mut vcx) = open_with_board(dir.path(), cx);
+        click("field-value 1", &mut vcx);
+        assert_eq!(board.contents().as_deref(), Some(STRONG));
+        state.read_with(&vcx, |s, _| {
+            let toast = s.toast.as_ref().expect("copied pill");
+            assert_eq!(toast.message.as_ref(), "Copied — clears in 30 s");
+            assert_eq!(toast.place, ToastPlace::Detail);
+            assert!(s.revealed.is_empty(), "the click revealed the password");
+        });
+        // Same auto-clear as the Copy button.
+        vcx.executor().advance_clock(Duration::from_secs(31));
+        vcx.run_until_parked();
+        assert_eq!(board.contents(), None);
+    }
+
+    #[gpui::test]
+    fn clicking_the_totp_copies_the_current_code(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, board, mut vcx) = open_with_board(dir.path(), cx);
+        let totp = parse_totp(&SecretString::new(TOTP_URI.into())).unwrap();
+        let before = totp.code(text::now_millis() / 1000);
+        click("field-value 2", &mut vcx);
+        let after = totp.code(text::now_millis() / 1000);
+        let copied = board.contents().expect("copied");
+        assert_eq!(copied.len(), 6);
+        assert!(copied.bytes().all(|b| b.is_ascii_digit()));
+        assert!(copied == before || copied == after, "not the current code");
+    }
+
+    #[gpui::test]
+    fn enter_on_a_focused_value_copies(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, board, mut vcx) = open_with_board(dir.path(), cx);
+        click("field-value 0", &mut vcx);
+        assert_eq!(board.contents().as_deref(), Some("chris"));
+        board.set("elsewhere");
+        // The click focused the value area; Enter clicks it again (on key up).
+        vcx.simulate_keystrokes("enter");
+        vcx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        vcx.run_until_parked();
+        assert_eq!(board.contents().as_deref(), Some("chris"));
+    }
+
+    #[gpui::test]
+    fn clicking_in_edit_mode_copies_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, board, mut vcx) = open_with_board(dir.path(), cx);
+        let at = vcx.debug_bounds("field-value 1").unwrap().center();
+        vcx.update(|_, cx| state.update(cx, |s, cx| s.begin_edit(cx)));
+        vcx.run_until_parked();
+        assert!(
+            !shown("field-value 1", &mut vcx),
+            "editor shows click-to-copy"
+        );
+        vcx.simulate_click(at, gpui::Modifiers::none());
+        vcx.run_until_parked();
+        assert_eq!(board.contents(), None);
+        state.read_with(&vcx, |s, _| assert!(s.toast.is_none()));
     }
 
     #[gpui::test]

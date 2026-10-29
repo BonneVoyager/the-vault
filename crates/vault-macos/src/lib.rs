@@ -41,3 +41,6 @@ pub use qr::{
     MAX_IMAGE_FILE_BYTES, MAX_IMAGE_PIXELS, decode_qr_from_gray, scan_qr_from_image_file,
     scan_qr_from_screen, screen_capture_permitted,
 };
+
+mod appearance;
+pub use appearance::{Rgba, on_system_colors_changed, system_accent_color};

@@ -4,6 +4,9 @@
 //! light/dark config and wipes any field edits. So we always go through [`apply`]:
 //! sync the mode with the window appearance first, then overwrite our tokens via
 //! `Theme::update`.
+//!
+//! The accent follows the macOS accent colour when [`AccentSource`] yields one; the
+//! spec blues are the fallback.
 
 use gpui::{App, Global, Hsla, Pixels, SharedString, Window, WindowAppearance, px, rgb};
 use gpui_component::{Colorize as _, Theme, ThemeMode};
@@ -103,12 +106,89 @@ fn hex(value: u32) -> Hsla {
     rgb(value).into()
 }
 
+/// Near-black label used on light accent fills (the light theme's `text`).
+const DARK_ACCENT_TEXT: u32 = 0x1D1D1F;
+/// White label, the default on accent fills.
+const LIGHT_ACCENT_TEXT: u32 = 0xFFFFFF;
+/// Below this white-on-accent contrast the label flips to near-black. Chosen to match
+/// native macOS, which keeps white labels on every accent but yellow: 4.5:1 or 3:1
+/// would also flip red, pink, graphite (4.5) and orange, green (3:1, about 2.4-2.6:1).
+const MIN_CONTRAST: f32 = 2.0;
+
+/// WCAG 2 relative luminance of an opaque sRGB colour.
+fn relative_luminance(color: Hsla) -> f32 {
+    let c = color.to_rgb();
+    let lin = |v: f32| {
+        if v <= 0.040_45 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+}
+
+/// WCAG 2 contrast ratio between two colours (1.0 to 21.0).
+fn contrast(a: Hsla, b: Hsla) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// Label colour for an accent fill: white, unless white falls below [`MIN_CONTRAST`]
+/// and near-black reaches it (05 §5). In practice only a yellow accent flips.
+pub fn text_on_accent(accent: Hsla) -> Hsla {
+    let light = hex(LIGHT_ACCENT_TEXT);
+    let dark = hex(DARK_ACCENT_TEXT);
+    if contrast(accent, light) < MIN_CONTRAST && contrast(accent, dark) >= MIN_CONTRAST {
+        dark
+    } else {
+        light
+    }
+}
+
+/// Where the accent colour comes from. The app installs [`AccentSource::system`];
+/// tests install a plain function so they never touch AppKit. Without a global, the
+/// accent falls back to the spec values (and in tests stays there).
+#[derive(Clone, Copy)]
+pub struct AccentSource(pub fn() -> Option<Hsla>);
+
+impl Global for AccentSource {}
+
+impl AccentSource {
+    /// `NSColor.controlAccentColor` via `vault-macos` (main thread only; `None` elsewhere).
+    /// Unused in test builds, which inject a fake.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn system() -> Self {
+        Self(system_accent)
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn system_accent() -> Option<Hsla> {
+    vault_macos::system_accent_color().map(|c| {
+        // Accent fills are opaque; ignore any alpha AppKit reports.
+        gpui::Rgba {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+            a: 1.0,
+        }
+        .into()
+    })
+}
+
+/// The current accent override, if any.
+fn current_accent(cx: &App) -> Option<Hsla> {
+    cx.try_global::<AccentSource>()
+        .and_then(|source| (source.0)())
+}
+
 impl VaultTheme {
     pub fn for_appearance(dark: bool) -> Self {
         let shared =
             |accent, bg, bg_sidebar, sidebar_vibrancy, bg_elevated, border, text, muted| Self {
                 accent: hex(accent),
-                accent_text: hex(0xFFFFFF),
+                accent_text: hex(LIGHT_ACCENT_TEXT),
                 bg: hex(bg),
                 bg_sidebar: hex(bg_sidebar),
                 sidebar_vibrancy,
@@ -132,6 +212,16 @@ impl VaultTheme {
                 0x3B6CF0, 0xFFFFFF, 0xF5F5F7, true, 0xF7F7F8, 0xE5E5EA, 0x1D1D1F, 0x6E6E73,
             )
         }
+    }
+
+    /// Replaces the spec accent with `accent` (the system accent) when given, and picks
+    /// a readable label colour for it.
+    pub fn with_accent(mut self, accent: Option<Hsla>) -> Self {
+        if let Some(accent) = accent {
+            self.accent = accent;
+            self.accent_text = text_on_accent(accent);
+        }
+        self
     }
 
     /// Writes these tokens into gpui-component's global theme.
@@ -212,7 +302,7 @@ fn apply_mode(system: WindowAppearance, cx: &mut App) {
     let prefs = prefs(cx);
     Theme::change(mode(prefs.appearance, system), None, cx);
     let dark = Theme::global(cx).is_dark();
-    let mut tokens = VaultTheme::for_appearance(dark);
+    let mut tokens = VaultTheme::for_appearance(dark).with_accent(current_accent(cx));
     tokens.font_size = px(tokens.font_size.as_f32() * prefs.scale);
     let mono = mono_family(cx);
     Theme::update(cx, |theme| tokens.write_into(theme, mono));
@@ -244,12 +334,24 @@ mod tests {
 
     /// The solid fill of the largest quad painted inside the primary button.
     fn primary_button_fill(appearance: Appearance, cx: &mut TestAppContext) -> Hsla {
+        primary_button_fill_with(appearance, None, cx)
+    }
+
+    /// Like [`primary_button_fill`] with `source` installed as the accent source.
+    fn primary_button_fill_with(
+        appearance: Appearance,
+        source: Option<AccentSource>,
+        cx: &mut TestAppContext,
+    ) -> Hsla {
         cx.update(gpui_component::init);
         cx.update(|cx| {
             cx.set_global(ThemePrefs {
                 appearance,
                 scale: 1.0,
-            })
+            });
+            if let Some(source) = source {
+                cx.set_global(source);
+            }
         });
         let window = cx.add_window(|window, cx| {
             apply(window, cx);
@@ -286,6 +388,98 @@ mod tests {
         let fill = primary_button_fill(Appearance::Dark, cx);
         assert_eq!(fill, VaultTheme::for_appearance(true).accent);
         assert_eq!(fill, hex(0x5B8CFF));
+    }
+
+    /// A saturated red like the macOS "Red" accent.
+    fn red() -> Option<Hsla> {
+        Some(hex(0xE0383E))
+    }
+
+    /// A yellow like the macOS "Yellow" accent.
+    fn yellow() -> Option<Hsla> {
+        Some(hex(0xFFC600))
+    }
+
+    fn no_accent() -> Option<Hsla> {
+        None
+    }
+
+    #[gpui::test]
+    fn primary_button_follows_system_accent_light(cx: &mut TestAppContext) {
+        let fill = primary_button_fill_with(Appearance::Light, Some(AccentSource(red)), cx);
+        assert_eq!(fill, hex(0xE0383E));
+    }
+
+    #[gpui::test]
+    fn primary_button_follows_system_accent_dark(cx: &mut TestAppContext) {
+        let fill = primary_button_fill_with(Appearance::Dark, Some(AccentSource(red)), cx);
+        assert_eq!(fill, hex(0xE0383E));
+    }
+
+    #[gpui::test]
+    fn no_system_accent_uses_spec_fallback(cx: &mut TestAppContext) {
+        let light = primary_button_fill_with(Appearance::Light, Some(AccentSource(no_accent)), cx);
+        assert_eq!(light, hex(0x3B6CF0));
+        cx.update(|cx| {
+            cx.set_global(ThemePrefs {
+                appearance: Appearance::Dark,
+                scale: 1.0,
+            });
+            reapply(cx);
+            assert_eq!(Theme::global(cx).button_primary, hex(0x5B8CFF));
+        });
+    }
+
+    #[gpui::test]
+    fn yellow_accent_gets_dark_label(cx: &mut TestAppContext) {
+        let fill = primary_button_fill_with(Appearance::Light, Some(AccentSource(yellow)), cx);
+        assert_eq!(fill, hex(0xFFC600));
+        cx.update(|cx| {
+            let theme = Theme::global(cx);
+            assert_eq!(theme.button_primary_foreground, hex(DARK_ACCENT_TEXT));
+            assert_eq!(theme.primary_foreground, hex(DARK_ACCENT_TEXT));
+        });
+    }
+
+    #[gpui::test]
+    fn accent_change_reapplies(cx: &mut TestAppContext) {
+        primary_button_fill_with(Appearance::Light, Some(AccentSource(red)), cx);
+        cx.update(|cx| {
+            cx.set_global(AccentSource(yellow));
+            reapply(cx);
+            assert_eq!(Theme::global(cx).button_primary, hex(0xFFC600));
+        });
+    }
+
+    #[test]
+    fn label_contrast_on_accents() {
+        let white = hex(LIGHT_ACCENT_TEXT);
+        let dark = hex(DARK_ACCENT_TEXT);
+        // Yellow: white is unreadable, near-black is fine.
+        assert_eq!(text_on_accent(hex(0xFFC600)), dark);
+        assert!(contrast(hex(0xFFC600), dark) >= MIN_CONTRAST);
+        // Red (macOS "Red" accent) keeps white, like native controls.
+        assert_eq!(text_on_accent(hex(0xE0383E)), white);
+        assert_eq!(text_on_accent(hex(0xFF5257)), white);
+        // Orange and green keep white too (native macOS labels).
+        assert_eq!(text_on_accent(hex(0xF7821B)), white);
+        assert_eq!(text_on_accent(hex(0x62BA46)), white);
+        // Spec light blue passes with white.
+        assert_eq!(text_on_accent(hex(0x3B6CF0)), white);
+        // A dark accent keeps white.
+        assert_eq!(text_on_accent(hex(0x1F3A93)), white);
+        // Reference points: black/white is 21:1, equal colours 1:1.
+        assert!((contrast(hex(0x000000), white) - 21.0).abs() < 0.01);
+        assert!((contrast(white, white) - 1.0).abs() < 0.001);
+        // Spec dark blue also clears 3:1 with white.
+        assert_eq!(text_on_accent(hex(0x5B8CFF)), white);
+        // Spec fallback tokens are unaffected by the label rule.
+        assert_eq!(
+            VaultTheme::for_appearance(true)
+                .with_accent(None)
+                .accent_text,
+            white
+        );
     }
 
     #[test]

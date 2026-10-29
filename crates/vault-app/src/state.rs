@@ -39,7 +39,7 @@ mod viewer;
 pub use attachments::{
     AttachmentStore, AttachmentsUi, PreviewContent, PreviewKind, preview_kind, state_label,
 };
-pub use edit::{EditBuffer, Navigation, kind_name};
+pub use edit::{ADDABLE_KINDS, EditBuffer, Navigation, kind_name};
 pub use generator::{
     CharClass, GenTab, Generator, GeneratorTarget, LENGTH_RANGE, SEPARATORS, WORDS_RANGE,
 };
@@ -369,8 +369,6 @@ pub struct AppState {
     qr: Arc<dyn QrScanner>,
     /// A screen scan is running.
     pub qr_scanning: bool,
-    /// The last scan lacked Screen Recording: the editor shows the settings button.
-    pub screen_recording_hint: bool,
     /// Open read-only backup viewer windows; `lock` closes them (they hold decrypted data).
     pub backup_windows: Vec<gpui::AnyWindowHandle>,
     /// Detail ▸ Attachments: pending adds, preview, confirms.
@@ -453,11 +451,10 @@ impl AppState {
             login_item: None,
             show_onboarding: false,
             #[cfg(not(test))]
-            qr: qr::screen_scanner(),
+            qr: qr::image_scanner(),
             #[cfg(test)]
             qr: qr::fake::FakeScanner::returning(Ok(Vec::new())),
             qr_scanning: false,
-            screen_recording_hint: false,
             backup_windows: Vec::new(),
             attachments: AttachmentsUi::default(),
             #[cfg(not(test))]
@@ -818,7 +815,6 @@ impl AppState {
         self.toast = None;
         self.toast_dismiss = None;
         self.settings_open = false;
-        self.screen_recording_hint = false;
         self.close_backup_windows(cx);
         self.clear_attachments(cx);
         let saved = match self.vault.as_mut() {

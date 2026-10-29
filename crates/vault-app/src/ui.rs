@@ -3,13 +3,15 @@
 //! gpui is pre-1.0. Keep every upstream call that more than two views need in here,
 //! so an upstream rename is a one-file fix.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use gpui::{
     Anchor, AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Div, Entity,
-    InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, Render, Result,
-    SharedString, Styled as _, Task, TitlebarOptions, Window, WindowBounds, WindowHandle,
-    WindowOptions, point, prelude::FluentBuilder as _, px, relative, size,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, PathPromptOptions,
+    Pixels, Point, Render, Result, SharedString, Styled as _, Task, TitlebarOptions, Window,
+    WindowBounds, WindowHandle, WindowOptions, point, prelude::FluentBuilder as _, px, relative,
+    size,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState, TextareaState};
@@ -81,8 +83,76 @@ pub fn main_window_options(restore: Option<WindowState>, cx: &App) -> WindowOpti
             appears_transparent: true,
             traffic_light_position: Some(point(px(TRAFFIC_LIGHTS.0), px(TRAFFIC_LIGHTS.1))),
         }),
+        // AppKit would otherwise move the window from anywhere in the titlebar band,
+        // including from the search field and buttons placed there. The window moves
+        // only from `window_drag_band` instead.
+        app_owns_titlebar_drag: true,
         ..Default::default()
     }
+}
+
+thread_local! {
+    /// The band saw a left mouse-down that may turn into a window drag.
+    static DRAG_ARMED: Cell<bool> = const { Cell::new(false) };
+    /// Position of the mouse-down a control in the band claimed (see `no_window_drag`).
+    static DRAG_CLAIM: Cell<Option<Point<Pixels>>> = const { Cell::new(None) };
+    #[cfg(test)]
+    static DRAG_MOVES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Transparent strip across the top of a window that claims its titlebar
+/// (`app_owns_titlebar_drag`): dragging it moves the window, double-clicking it applies
+/// the system titlebar double-click action. Put it before the content so it paints
+/// underneath, and wrap every control that reaches into the band in `no_window_drag`.
+pub fn window_drag_band() -> Div {
+    gpui::div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .h(px(TOP_BAND_HEIGHT))
+        .debug_selector(|| "window-drag-band".into())
+        .on_mouse_down(MouseButton::Left, |event, window, _| {
+            // Controls paint above the band, so their listeners ran first.
+            let claimed = DRAG_CLAIM.take() == Some(event.position);
+            DRAG_ARMED.set(false);
+            if claimed {
+                return;
+            }
+            if event.click_count == 2 {
+                window.titlebar_double_click();
+            } else {
+                DRAG_ARMED.set(true);
+            }
+        })
+        .on_mouse_up(MouseButton::Left, |_, _, _| DRAG_ARMED.set(false))
+        .on_mouse_move(|event, window, _| {
+            if DRAG_ARMED.replace(false) && event.pressed_button == Some(MouseButton::Left) {
+                // gpui's test window does not implement window moves; count them instead.
+                #[cfg(test)]
+                {
+                    let _ = window;
+                    DRAG_MOVES.set(DRAG_MOVES.get() + 1);
+                }
+                #[cfg(not(test))]
+                window.start_window_move();
+            }
+        })
+}
+
+/// Marks `el` as a control: a mouse-down on it never starts a window drag from a
+/// `window_drag_band` underneath. Does not stop propagation, so focus-on-click of the
+/// enclosing column keeps working.
+pub fn no_window_drag<E: gpui::InteractiveElement>(el: E) -> E {
+    el.on_mouse_down(MouseButton::Left, |event, _, _| {
+        DRAG_CLAIM.set(Some(event.position));
+    })
+}
+
+/// Window drags started by `window_drag_band` on this thread (tests only).
+#[cfg(test)]
+pub fn window_moves() -> usize {
+    DRAG_MOVES.get()
 }
 
 /// Opens the main window with `build` as content, wrapped in gpui-component's `Root`.

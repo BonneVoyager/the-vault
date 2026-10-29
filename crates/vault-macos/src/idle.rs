@@ -3,6 +3,10 @@
 use std::time::SystemTime;
 
 pub use imp::Subscription;
+#[cfg(not(target_os = "macos"))]
+pub(crate) use imp::noop_subscription;
+#[cfg(target_os = "macos")]
+pub(crate) use imp::on_center_notification;
 
 /// Calls `cb` when the distributed notification `name` is posted, even while
 /// the app is inactive. Building block for [`on_screen_locked`]; public so the
@@ -201,12 +205,13 @@ mod imp {
         on_distributed_notification(SCREEN_IS_LOCKED, cb)
     }
 
-    /// Observes `name` on NSWorkspace's own notification center.
-    fn on_workspace_notification(
+    /// Observes `name` (any sender) on an in-process notification `center`.
+    /// Shared with `appearance.rs`.
+    pub(crate) fn on_center_notification(
+        center: Retained<NSNotificationCenter>,
         name: &NSNotificationName,
         cb: impl Fn() + Send + 'static,
     ) -> Subscription {
-        let center = NSWorkspace::sharedWorkspace().notificationCenter();
         let observer = Observer::new(Box::new(cb));
         // SAFETY: as in `on_distributed_notification`: `observer` implements
         // `handle:` with the expected signature; nil object = any sender.
@@ -214,6 +219,18 @@ mod imp {
             center.addObserver_selector_name_object(&observer, sel!(handle:), Some(name), None);
         }
         Subscription { center, observer }
+    }
+
+    /// Observes `name` on NSWorkspace's own notification center.
+    fn on_workspace_notification(
+        name: &NSNotificationName,
+        cb: impl Fn() + Send + 'static,
+    ) -> Subscription {
+        on_center_notification(
+            NSWorkspace::sharedWorkspace().notificationCenter(),
+            name,
+            cb,
+        )
     }
 
     pub fn on_will_sleep(cb: impl Fn() + Send + 'static) -> Subscription {
@@ -273,6 +290,10 @@ mod imp {
     /// No-op guard on non-macOS hosts.
     #[derive(Debug)]
     pub struct Subscription(());
+
+    pub(crate) fn noop_subscription() -> Subscription {
+        Subscription(())
+    }
 
     pub fn on_screen_locked(_cb: impl Fn() + Send + 'static) -> Subscription {
         Subscription(())

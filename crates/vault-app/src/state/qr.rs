@@ -1,7 +1,6 @@
-//! Edit mode ▸ TOTP field ▸ "Scan QR from screen" and "Scan QR from image…"
-//! (specs/05-ui.md §2.3).
+//! Edit mode ▸ TOTP field ▸ "Scan QR from image…" (specs/05-ui.md §2.3).
 //!
-//! The capture or image decode runs on the background executor behind [`QrScanner`]
+//! The image decode runs on the background executor behind [`QrScanner`]
 //! (tests use a fake).
 //! Only `otpauth://totp` payloads that `Totp::parse_uri` accepts are used; the first one
 //! fills the field. Payloads are secrets and never reach a toast or a log.
@@ -16,35 +15,25 @@ use vault_macos::MacError;
 use super::{AppState, Mode};
 use crate::ui;
 
-/// System Settings ▸ Privacy & Security ▸ Screen Recording.
-const SCREEN_RECORDING_SETTINGS: &str =
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
-
-/// Decodes every QR code on the screen or in an image file.
+/// Decodes every QR code in an image file.
 pub trait QrScanner: Send + Sync {
-    /// Captures the screen (needs Screen Recording permission).
-    fn scan(&self) -> Result<Vec<SecretString>, MacError>;
     /// Reads the image at `path` (no permission needed).
     fn scan_file(&self, path: &Path) -> Result<Vec<SecretString>, MacError>;
 }
 
-/// The real scanner (Screen Recording permission required).
+/// The real scanner (Vision on the image file).
 #[cfg_attr(test, allow(dead_code))]
-pub struct ScreenScanner;
+pub struct ImageScanner;
 
-impl QrScanner for ScreenScanner {
-    fn scan(&self) -> Result<Vec<SecretString>, MacError> {
-        vault_macos::scan_qr_from_screen()
-    }
-
+impl QrScanner for ImageScanner {
     fn scan_file(&self, path: &Path) -> Result<Vec<SecretString>, MacError> {
         vault_macos::scan_qr_from_image_file(path)
     }
 }
 
 #[cfg_attr(test, allow(dead_code))]
-pub fn screen_scanner() -> Arc<dyn QrScanner> {
-    Arc::new(ScreenScanner)
+pub fn image_scanner() -> Arc<dyn QrScanner> {
+    Arc::new(ImageScanner)
 }
 
 /// The field a scan was started for.
@@ -59,13 +48,6 @@ struct ScanTarget {
     epoch: u64,
 }
 
-/// Where the QR codes come from: decides the toasts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScanSource {
-    Screen,
-    Image,
-}
-
 /// The first payload that is a valid `otpauth://totp` URI.
 pub fn totp_payload(payloads: Vec<SecretString>) -> Option<SecretString> {
     payloads.into_iter().find(|p| {
@@ -77,15 +59,6 @@ pub fn totp_payload(payloads: Vec<SecretString>) -> Option<SecretString> {
 }
 
 impl AppState {
-    /// "Scan QR from screen" on the TOTP field `key` of the edit buffer.
-    pub fn scan_totp_qr(&mut self, key: u64, cx: &mut Context<Self>) {
-        if !self.is_editing() || self.qr_scanning {
-            return;
-        }
-        let target = self.scan_target(key);
-        self.run_scan(target, None, cx);
-    }
-
     /// "Scan QR from image…" on the TOTP field `key`: the open panel, then the decode.
     pub fn scan_totp_qr_file(&mut self, key: u64, cx: &mut Context<Self>) {
         if !self.is_editing() || self.qr_scanning {
@@ -109,7 +82,7 @@ impl AppState {
             && !self.qr_scanning
             && !self.scan_outlived(&target)
         {
-            self.run_scan(target, Some(path), cx);
+            self.run_scan(target, path, cx);
         }
     }
 
@@ -121,7 +94,7 @@ impl AppState {
             return;
         }
         let target = self.scan_target(key);
-        self.run_scan(target, Some(path), cx);
+        self.run_scan(target, path, cx);
     }
 
     /// Row keys restart with every edit session: remember which session and item the
@@ -142,27 +115,19 @@ impl AppState {
         self.locked || self.lock_gen != target.lock_gen || self.epoch != target.epoch
     }
 
-    /// Scans the screen (`image` = `None`) or the image file off the main thread.
-    fn run_scan(&mut self, target: ScanTarget, image: Option<PathBuf>, cx: &mut Context<Self>) {
-        let source = if image.is_some() {
-            ScanSource::Image
-        } else {
-            ScanSource::Screen
-        };
+    /// Decodes the image file off the main thread.
+    fn run_scan(&mut self, target: ScanTarget, path: PathBuf, cx: &mut Context<Self>) {
         self.qr_scanning = true;
         cx.notify();
         let scanner = self.qr.clone();
-        let task = cx.background_executor().spawn(async move {
-            match image {
-                Some(path) => scanner.scan_file(&path),
-                None => scanner.scan(),
-            }
-        });
+        let task = cx
+            .background_executor()
+            .spawn(async move { scanner.scan_file(&path) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
                 this.qr_scanning = false;
-                this.qr_scanned(target, source, result, cx);
+                this.qr_scanned(target, result, cx);
             })
             .ok();
         })
@@ -172,7 +137,6 @@ impl AppState {
     fn qr_scanned(
         &mut self,
         target: ScanTarget,
-        source: ScanSource,
         result: Result<Vec<SecretString>, MacError>,
         cx: &mut Context<Self>,
     ) {
@@ -202,38 +166,16 @@ impl AppState {
                     if !filled {
                         // `uri` is dropped (zeroized) here; nothing was written.
                         self.show_toast("Scan result discarded: field changed", cx);
-                    } else if source == ScanSource::Image {
-                        self.show_toast("One-time code added from the image", cx);
                     } else {
-                        self.screen_recording_hint = false;
-                        self.show_toast("One-time code added from the screen", cx);
+                        self.show_toast("One-time code added from the image", cx);
                     }
                 }
-                None if source == ScanSource::Image => {
-                    self.show_toast("No TOTP QR code found in the image", cx)
-                }
-                None => self.show_toast("No TOTP QR code found on screen", cx),
+                None => self.show_toast("No TOTP QR code found in the image", cx),
             },
             // The error text names the file at most, never a payload; keep it out anyway.
-            Err(_) if source == ScanSource::Image => {
-                self.show_toast("Could not read the image", cx)
-            }
-            Err(MacError::NotAvailable) => {
-                self.screen_recording_hint = true;
-                self.show_toast(
-                    "Allow vault under Screen Recording in System Settings, then restart vault",
-                    cx,
-                );
-            }
-            Err(e) => self.show_toast(format!("Could not scan the screen: {e}"), cx),
+            Err(_) => self.show_toast("Could not read the image", cx),
         }
         cx.notify();
-    }
-
-    /// The hint's button. The only place a non-web URL is opened (not via
-    /// `text::browser_url`): a fixed System Settings deep link.
-    pub fn open_screen_recording_settings(&mut self, cx: &mut Context<Self>) {
-        cx.open_url(SCREEN_RECORDING_SETTINGS);
     }
 }
 
@@ -243,8 +185,8 @@ pub mod fake {
 
     use super::*;
 
-    /// Returns the queued result once (screen or file), then an empty scan. Records
-    /// the last file path it was asked to read.
+    /// Returns the queued result once, then an empty scan. Records the last file path
+    /// it was asked to read.
     pub struct FakeScanner {
         pub result: Mutex<Option<Result<Vec<SecretString>, MacError>>>,
         pub last_file: Mutex<Option<PathBuf>>,
@@ -260,17 +202,13 @@ pub mod fake {
     }
 
     impl QrScanner for FakeScanner {
-        fn scan(&self) -> Result<Vec<SecretString>, MacError> {
+        fn scan_file(&self, path: &Path) -> Result<Vec<SecretString>, MacError> {
+            *self.last_file.lock().unwrap() = Some(path.to_owned());
             self.result
                 .lock()
                 .unwrap()
                 .take()
                 .unwrap_or_else(|| Ok(Vec::new()))
-        }
-
-        fn scan_file(&self, path: &Path) -> Result<Vec<SecretString>, MacError> {
-            *self.last_file.lock().unwrap() = Some(path.to_owned());
-            self.scan()
         }
     }
 }
@@ -336,72 +274,12 @@ mod tests {
     }
 
     #[gpui::test]
-    fn scan_fills_the_totp_field(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let (state, key) = editing(dir.path(), cx);
-        state.update(cx, |st, cx| {
-            st.set_qr_scanner(FakeScanner::returning(Ok(vec![
-                s("https://not-a-code.example"),
-                s(VALID),
-            ])));
-            st.scan_totp_qr(key, cx);
-            assert!(st.qr_scanning);
-        });
-        cx.run_until_parked();
-        assert_eq!(field_value(&state, cx), VALID);
-        state.read_with(cx, |st, _| {
-            assert!(!st.qr_scanning);
-            assert_eq!(
-                st.edit_buffer().unwrap().pushed,
-                vec![key],
-                "editor input refreshed"
-            );
-            let toast = st.toast.as_ref().unwrap().message.to_string();
-            assert!(!toast.contains("JBSW"), "the secret never reaches a toast");
-        });
-    }
-
-    #[gpui::test]
-    fn no_code_and_no_permission(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let (state, key) = editing(dir.path(), cx);
-        state.update(cx, |st, cx| {
-            st.set_qr_scanner(FakeScanner::returning(Ok(vec![s("https://x.example")])));
-            st.scan_totp_qr(key, cx);
-        });
-        cx.run_until_parked();
-        state.read_with(cx, |st, _| {
-            assert_eq!(
-                st.toast.as_ref().unwrap().message.as_ref(),
-                "No TOTP QR code found on screen"
-            );
-        });
-        assert_eq!(field_value(&state, cx), "");
-
-        state.update(cx, |st, cx| {
-            st.set_qr_scanner(FakeScanner::returning(Err(MacError::NotAvailable)));
-            st.scan_totp_qr(key, cx);
-        });
-        cx.run_until_parked();
-        state.read_with(cx, |st, _| {
-            assert!(st.screen_recording_hint);
-            assert!(
-                st.toast
-                    .as_ref()
-                    .unwrap()
-                    .message
-                    .contains("Screen Recording")
-            );
-        });
-    }
-
-    #[gpui::test]
     fn late_result_never_lands_in_another_edit(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (state, key) = editing(dir.path(), cx);
         state.update(cx, |st, cx| {
             st.set_qr_scanner(FakeScanner::returning(Ok(vec![s(VALID)])));
-            st.scan_totp_qr(key, cx);
+            st.scan_totp_qr_image(key, PathBuf::from("/tmp/qr.png"), cx);
             // Cancel, then edit another item whose TOTP field has the same row key.
             st.mode = Mode::View;
             let mut other = Item::new(ItemKind::Login, "Other", st.device_id(), 1);
@@ -454,7 +332,9 @@ mod tests {
             assert_eq!(b.pushed, vec![key]);
             assert!(!st.qr_scanning);
         });
-        assert_eq!(toast(&state, cx), "One-time code added from the image");
+        let toast = toast(&state, cx);
+        assert_eq!(toast, "One-time code added from the image");
+        assert!(!toast.contains("JBSW"), "the secret never reaches a toast");
     }
 
     #[gpui::test]
@@ -478,10 +358,6 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(toast(&state, cx), "Could not read the image");
-        assert!(
-            state.read_with(cx, |st, _| !st.screen_recording_hint),
-            "a file needs no Screen Recording"
-        );
 
         // Stale: the edit is replaced while the image is decoded.
         state.update(cx, |st, cx| {
@@ -501,7 +377,7 @@ mod tests {
     #[gpui::test]
     fn scan_finishing_after_lock_is_dropped_silently(cx: &mut TestAppContext) {
         for found in [true, false] {
-            for image in [false, true] {
+            {
                 let dir = tempfile::tempdir().unwrap();
                 let (state, key) = editing(dir.path(), cx);
                 state.update(cx, |st, cx| {
@@ -510,11 +386,7 @@ mod tests {
                     } else {
                         Err(MacError::NotAvailable)
                     }));
-                    if image {
-                        st.scan_totp_qr_image(key, PathBuf::from("/tmp/qr.png"), cx);
-                    } else {
-                        st.scan_totp_qr(key, cx);
-                    }
+                    st.scan_totp_qr_image(key, PathBuf::from("/tmp/qr.png"), cx);
                     // Lock before the background scan delivers. Put a same-keyed edit
                     // back afterwards so a write would be observable.
                     st.lock(cx);
@@ -528,7 +400,6 @@ mod tests {
                 state.read_with(cx, |st, _| {
                     assert!(!st.qr_scanning, "spinner cleared");
                     assert!(st.toast.is_none(), "no toast over the unlock screen");
-                    assert!(!st.screen_recording_hint, "no hint");
                     assert!(st.edit_buffer().unwrap().pushed.is_empty());
                 });
                 assert_eq!(field_value(&state, cx), "", "nothing written");

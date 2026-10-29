@@ -103,8 +103,9 @@ impl EditBuffer {
 
     /// Appends a field of `kind` with a unique default name; returns its key.
     pub fn add_field(&mut self, kind: FieldKind) -> u64 {
-        let base = kind_name(kind);
-        let mut name = base.to_owned();
+        // Field names stay lower case, like the template names ("password", "url").
+        let base = kind_name(kind).to_lowercase();
+        let mut name = base.clone();
         let mut n = 2;
         while self.item.fields.iter().any(|f| f.name == name) {
             name = format!("{base} {n}");
@@ -305,21 +306,35 @@ pub(super) fn same_field(a: &Field, b: &Field) -> bool {
     a.name == b.name && a.kind == b.kind && a.value.expose_secret() == b.value.expose_secret()
 }
 
-/// User-facing name of a field kind (badge, "Add field" menu, default field name).
+/// User-facing label of a field kind ("Add field" menu and the chip next to a field).
 pub fn kind_name(kind: FieldKind) -> &'static str {
     match kind {
-        FieldKind::Text => "text",
-        FieldKind::Password => "password",
-        FieldKind::Totp => "one-time code",
-        FieldKind::Url => "url",
-        FieldKind::Notes => "notes",
-        FieldKind::Email => "email",
-        FieldKind::Date => "date",
-        FieldKind::MonthYear => "month/year",
-        FieldKind::Number => "number",
+        FieldKind::Text => "Text",
+        FieldKind::Password => "Password",
+        FieldKind::Totp => "One-time code",
+        FieldKind::Url => "URL",
+        FieldKind::Notes => "Notes",
+        FieldKind::Email => "Email",
+        FieldKind::Date => "Date",
+        FieldKind::MonthYear => "Month/year",
+        // Not offered any more; still labelled when an older item has one.
+        FieldKind::Number => "Number",
         FieldKind::Other => FieldKind::Other.as_str(),
     }
 }
+
+/// The kinds the "Add field" menu offers, in menu order. `Number` is left out: it
+/// stays supported for existing items but is no longer offered.
+pub const ADDABLE_KINDS: [FieldKind; 8] = [
+    FieldKind::Text,
+    FieldKind::Password,
+    FieldKind::Totp,
+    FieldKind::Url,
+    FieldKind::Notes,
+    FieldKind::Email,
+    FieldKind::Date,
+    FieldKind::MonthYear,
+];
 
 /// Template fields for a new item of `kind`.
 pub fn template(kind: ItemKind) -> &'static [(&'static str, FieldKind)] {
@@ -341,7 +356,7 @@ pub fn template(kind: ItemKind) -> &'static [(&'static str, FieldKind)] {
             ("first name", FieldKind::Text),
             ("last name", FieldKind::Text),
             ("email", FieldKind::Email),
-            ("phone", FieldKind::Number),
+            ("phone", FieldKind::Text),
             ("address", FieldKind::Notes),
         ],
         // Never offered for new items; title only.
@@ -1302,5 +1317,37 @@ mod tests {
             s.save_edit(cx);
             assert_eq!(stored(s, gh).tags, ["work"]);
         });
+    }
+
+    #[test]
+    fn kind_labels_are_capitalised_and_number_is_not_offered() {
+        let labels: Vec<_> = ADDABLE_KINDS.into_iter().map(kind_name).collect();
+        assert_eq!(
+            labels,
+            [
+                "Text",
+                "Password",
+                "One-time code",
+                "URL",
+                "Notes",
+                "Email",
+                "Date",
+                "Month/year"
+            ]
+        );
+        assert!(!ADDABLE_KINDS.contains(&FieldKind::Number));
+        assert_eq!(
+            kind_name(FieldKind::Number),
+            "Number",
+            "old items still label it"
+        );
+
+        let mut b = EditBuffer::new(Item::new(ItemKind::Login, "x", Uuid::new_v4(), 1));
+        let k1 = b.add_field(FieldKind::Totp);
+        let k2 = b.add_field(FieldKind::Totp);
+        let k3 = b.add_field(FieldKind::Url);
+        assert_eq!(b.field(k1).unwrap().name, "one-time code");
+        assert_eq!(b.field(k2).unwrap().name, "one-time code 2");
+        assert_eq!(b.field(k3).unwrap().name, "url");
     }
 }

@@ -263,10 +263,18 @@ impl Render for MainScreen {
         } else {
             h_resizable("main-columns-compact").with_state(&self.compact_columns)
         };
-        group
-            .on_resize(on_resize)
-            .child(list_panel)
-            .child(detail_panel)
+        // The window claims its titlebar, so it moves only by this band; it paints first
+        // (underneath), and the controls in it opt out with `ui::no_window_drag`.
+        gpui::div()
+            .size_full()
+            .relative()
+            .child(ui::window_drag_band())
+            .child(
+                group
+                    .on_resize(on_resize)
+                    .child(list_panel)
+                    .child(detail_panel),
+            )
     }
 }
 
@@ -466,6 +474,62 @@ mod tests {
                 })
                 .map(|q| px(q.bounds.origin.y.0 / sf))
         })
+    }
+
+    /// Window drags started by pressing at `at` and moving 6 px with the button held.
+    fn drags_from(at: gpui::Point<Pixels>, vcx: &mut VisualTestContext) -> usize {
+        use gpui::{Modifiers, MouseButton, point};
+        let before = ui::window_moves();
+        let to = at + point(px(6.), px(0.));
+        vcx.simulate_mouse_down(at, MouseButton::Left, Modifiers::default());
+        vcx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+        vcx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+        vcx.run_until_parked();
+        ui::window_moves() - before
+    }
+
+    #[gpui::test]
+    fn title_band_moves_the_window_only_from_empty_space(cx: &mut TestAppContext) {
+        use gpui::point;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut vcx) = open(true, dir.path(), cx);
+        assert!(state.read_with(&vcx, |s, _| s.selection.is_some()));
+        let bounds = |key: &'static str, vcx: &mut VisualTestContext| {
+            vcx.debug_bounds(key)
+                .unwrap_or_else(|| panic!("{key} not rendered"))
+        };
+        let band = bounds("window-drag-band", &mut vcx);
+        let search = bounds("list-search", &mut vcx);
+        let header = bounds("detail-header", &mut vcx);
+        let buttons = bounds("detail-header-buttons", &mut vcx);
+        // The controls really sit in the band; otherwise this test proves nothing.
+        assert!(band.contains(&search.center()));
+        assert!(band.contains(&buttons.center()));
+
+        // Controls in the band never move the window, and the search field still
+        // takes focus and text.
+        assert_eq!(drags_from(search.center(), &mut vcx), 0, "search field");
+        vcx.simulate_input("visa");
+        assert_eq!(state.read_with(&vcx, |s, _| s.query.clone()), "visa");
+        assert_eq!(drags_from(buttons.center(), &mut vcx), 0, "header buttons");
+
+        // Empty parts of the band do: above the sidebar, the list row's left padding,
+        // and the detail header's avatar.
+        assert_eq!(
+            drags_from(point(px(120.), px(20.)), &mut vcx),
+            1,
+            "sidebar band"
+        );
+        let pad = point(search.left() - px(ui::COLUMN_PAD_X / 2.), search.center().y);
+        assert_eq!(drags_from(pad, &mut vcx), 1, "list padding");
+        let avatar = point(header.left() + px(20.), header.top() + px(20.));
+        assert!(band.contains(&avatar));
+        assert_eq!(drags_from(avatar, &mut vcx), 1, "detail avatar");
+
+        // A press without movement is a plain click, not a drag.
+        let before = ui::window_moves();
+        vcx.simulate_click(pad, gpui::Modifiers::default());
+        assert_eq!(ui::window_moves(), before);
     }
 
     #[gpui::test]

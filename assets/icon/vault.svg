@@ -1,16 +1,162 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Vault app icon, 6-arm variant</title>
+  <desc id="desc">Polished cobalt-blue app icon with a brushed-steel circular safe door, a six-spoke vault wheel with top and bottom straight arms plus four diagonal arms, a keyhole, and a right-side hinge.</desc>
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#3B6CF0"/>
-      <stop offset="1" stop-color="#5B8CFF"/>
+    <linearGradient id="tile" x1=".13" y1="0" x2=".91" y2="1">
+      <stop offset="0" stop-color="#238cf5"/><stop offset=".18" stop-color="#0753ca"/><stop offset=".43" stop-color="#05317d"/><stop offset=".76" stop-color="#031d55"/><stop offset="1" stop-color="#09245b"/>
     </linearGradient>
+    <radialGradient id="tileLight" cx=".13" cy=".01" r=".95">
+      <stop offset="0" stop-color="#75d7ff" stop-opacity=".9"/>
+      <stop offset=".18" stop-color="#317cf8" stop-opacity=".47"/>
+      <stop offset=".42" stop-color="#0950c7" stop-opacity=".12"/>
+      <stop offset="1" stop-color="#011434" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="tileBottom" cx=".54" cy=".99" r=".65">
+      <stop offset="0" stop-color="#00215b" stop-opacity="0"/>
+      <stop offset=".65" stop-color="#02103b" stop-opacity=".26"/>
+      <stop offset="1" stop-color="#010a28" stop-opacity=".58"/>
+    </radialGradient>
+    <linearGradient id="rimMetal" x1="0" y1="0" x2=".99" y2="1">
+      <stop offset="0" stop-color="#f8fcff"/><stop offset=".12" stop-color="#dbe6f5"/><stop offset=".26" stop-color="#869ebc"/><stop offset=".38" stop-color="#f4f7ff"/><stop offset=".52" stop-color="#c1d1e5"/><stop offset=".69" stop-color="#849ab9"/><stop offset=".83" stop-color="#cfdeef"/><stop offset="1" stop-color="#7289a8"/>
+    </linearGradient>
+    <linearGradient id="rimGloss" x1=".16" y1=".03" x2=".89" y2=".98">
+      <stop offset="0" stop-color="#fff" stop-opacity=".75"/><stop offset=".26" stop-color="#fff" stop-opacity=".06"/><stop offset=".59" stop-color="#111f48" stop-opacity=".13"/><stop offset=".91" stop-color="#fff" stop-opacity=".32"/><stop offset="1" stop-color="#fff" stop-opacity=".03"/>
+    </linearGradient>
+    <linearGradient id="innerDoor" x1=".13" y1=".06" x2=".91" y2="1">
+      <stop offset="0" stop-color="#3768a8"/><stop offset=".22" stop-color="#20477d"/><stop offset=".49" stop-color="#092c65"/><stop offset=".7" stop-color="#061b48"/><stop offset="1" stop-color="#071c48"/>
+    </linearGradient>
+    <radialGradient id="innerSheen" cx=".27" cy=".18" r=".92">
+      <stop offset="0" stop-color="#c4dafa" stop-opacity=".24"/><stop offset=".38" stop-color="#1a58b2" stop-opacity=".09"/><stop offset="1" stop-color="#001341" stop-opacity=".34"/>
+    </radialGradient>
+    <linearGradient id="steelBar" x1="0" y1="0" x2=".93" y2="1">
+      <stop offset="0" stop-color="#fff"/><stop offset=".17" stop-color="#d4e0f1"/><stop offset=".45" stop-color="#9cadc6"/><stop offset=".69" stop-color="#f1f7ff"/><stop offset="1" stop-color="#697e9d"/>
+    </linearGradient>
+    <linearGradient id="hub" x1=".1" y1=".02" x2=".93" y2="1">
+      <stop offset="0" stop-color="#ffffff"/><stop offset=".23" stop-color="#e9f0fb"/><stop offset=".44" stop-color="#a8b9d2"/><stop offset=".62" stop-color="#e7effb"/><stop offset=".83" stop-color="#97acc7"/><stop offset="1" stop-color="#748cae"/>
+    </linearGradient>
+    <radialGradient id="hubShine" cx=".31" cy=".2" r=".95">
+      <stop offset="0" stop-color="#fff" stop-opacity=".53"/><stop offset=".44" stop-color="#fff" stop-opacity=".02"/><stop offset="1" stop-color="#263f69" stop-opacity=".2"/>
+    </radialGradient>
+    <linearGradient id="hingeMetal" x1="0" y1=".15" x2="1" y2=".91">
+      <stop offset="0" stop-color="#fbfdff"/><stop offset=".2" stop-color="#d7e2f1"/><stop offset=".42" stop-color="#8399b6"/><stop offset=".66" stop-color="#e6edf9"/><stop offset=".83" stop-color="#8fa5c1"/><stop offset="1" stop-color="#617999"/>
+    </linearGradient>
+    <linearGradient id="hingeCylinder" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f9fdff"/><stop offset=".14" stop-color="#d6e1f2"/><stop offset=".42" stop-color="#879dbb"/><stop offset=".66" stop-color="#dae5f2"/><stop offset=".83" stop-color="#9aadc6"/><stop offset="1" stop-color="#425b7c"/>
+    </linearGradient>
+    <linearGradient id="keyhole" x1="0" y1="0" x2=".8" y2="1">
+      <stop offset="0" stop-color="#000c29"/><stop offset=".6" stop-color="#001038"/><stop offset="1" stop-color="#00266b"/>
+    </linearGradient>
+    <linearGradient id="blueLight" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8be7ff"/><stop offset=".27" stop-color="#239eff"/><stop offset=".64" stop-color="#126aff"/><stop offset="1" stop-color="#0062f6"/>
+    </linearGradient>
+
+    <filter id="doorShadow" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="14" result="blur"/>
+      <feOffset in="blur" dx="7" dy="18" result="shadow"/>
+      <feComponentTransfer in="shadow" result="dark"><feFuncA type="linear" slope=".62"/></feComponentTransfer>
+      <feMerge><feMergeNode in="dark"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="hubShadow" x="-35%" y="-35%" width="170%" height="170%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="10" result="blur"/>
+      <feOffset in="blur" dx="0" dy="8" result="offset"/>
+      <feComponentTransfer in="offset"><feFuncA type="linear" slope=".55"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="barShadow" x="-35%" y="-35%" width="170%" height="170%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="8" result="blur"/>
+      <feOffset in="blur" dx="0" dy="10" result="offset"/>
+      <feComponentTransfer in="offset"><feFuncA type="linear" slope=".6"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feComponentTransfer><feFuncA type="linear" slope=".8"/></feComponentTransfer>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="4"/>
+    </filter>
+    <clipPath id="doorClip"><circle cx="486" cy="503" r="286"/></clipPath>
   </defs>
-  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="url(#bg)"/>
-  <!-- shackle -->
-  <path d="M392 490 V400 A120 120 0 0 1 632 400 V490" fill="none" stroke="#FFFFFF" stroke-width="64"/>
-  <!-- body -->
-  <rect x="312" y="470" width="400" height="320" rx="56" ry="56" fill="#FFFFFF"/>
-  <!-- keyhole -->
-  <circle cx="512" cy="598" r="40" fill="#4A7AF5"/>
-  <rect x="494" y="610" width="36" height="96" rx="14" ry="14" fill="#4A7AF5"/>
+
+  <g>
+    <rect x="20" y="20" width="984" height="984" rx="190" fill="url(#tile)"/>
+    <rect x="20" y="20" width="984" height="984" rx="190" fill="url(#tileLight)"/>
+    <rect x="20" y="20" width="984" height="984" rx="190" fill="url(#tileBottom)"/>
+    <path d="M112 188 Q134 95 242 75 H802 Q929 85 961 217" fill="none" stroke="#b8f2ff" stroke-opacity=".28" stroke-width="10" filter="url(#softGlow)"/>
+    <path d="M60 756 V824 Q60 960 202 964 H823 Q964 964 964 823 V785" fill="none" stroke="#075ff7" stroke-opacity=".38" stroke-width="8" filter="url(#softGlow)"/>
+
+    <g filter="url(#doorShadow)">
+      <circle cx="486" cy="503" r="359" fill="#00143b" stroke="#021334" stroke-width="6"/>
+      <circle cx="486" cy="500" r="351" fill="url(#rimMetal)" stroke="#b6c8e0" stroke-width="3"/>
+      <circle cx="486" cy="500" r="351" fill="url(#rimGloss)"/>
+      <circle cx="486" cy="502" r="342" fill="none" stroke="#ffffff" stroke-opacity=".41" stroke-width="2.6"/>
+      <circle cx="486" cy="503" r="307" fill="#061a40" stroke="#2e4774" stroke-width="7"/>
+      <circle cx="486" cy="503" r="300" fill="none" stroke="#00102c" stroke-width="6"/>
+      <circle cx="486" cy="503" r="286" fill="url(#innerDoor)" stroke="#b6d2fb" stroke-opacity=".9" stroke-width="2.8"/>
+      <circle cx="486" cy="503" r="283" fill="url(#innerSheen)"/>
+      <circle cx="486" cy="503" r="289" fill="none" stroke="#034dbf" stroke-opacity=".74" stroke-width="6" filter="url(#softGlow)"/>
+      <circle cx="486" cy="503" r="290" fill="none" stroke="#7bb8ff" stroke-opacity=".42" stroke-width="2"/>
+      <path d="M214 409 A286 286 0 0 1 718 337" fill="none" stroke="#c5e5ff" stroke-opacity=".17" stroke-width="15" clip-path="url(#doorClip)"/>
+    </g>
+
+    <!-- six-spoke vault wheel: top, bottom, and four diagonals -->
+    <g filter="url(#barShadow)">
+      <!-- vertical spokes -->
+      <g>
+        <rect x="461" y="255" width="50" height="140" rx="16" fill="url(#steelBar)" stroke="#051c4b" stroke-width="4"/>
+        <rect x="468" y="265" width="8" height="116" rx="4" fill="#fff" opacity=".50"/>
+      </g>
+      <g>
+        <rect x="461" y="612" width="50" height="141" rx="16" fill="url(#steelBar)" stroke="#051c4b" stroke-width="4"/>
+        <rect x="468" y="623" width="8" height="115" rx="4" fill="#fff" opacity=".42"/>
+      </g>
+      <!-- diagonal spokes -->
+      <g transform="rotate(-55 486 503)">
+        <rect x="461" y="252" width="50" height="158" rx="16" fill="url(#steelBar)" stroke="#051c4b" stroke-width="4"/>
+        <rect x="468" y="264" width="8" height="128" rx="4" fill="#fff" opacity=".50"/>
+      </g>
+      <g transform="rotate(55 486 503)">
+        <rect x="461" y="252" width="50" height="158" rx="16" fill="url(#steelBar)" stroke="#051c4b" stroke-width="4"/>
+        <rect x="468" y="264" width="8" height="128" rx="4" fill="#fff" opacity=".50"/>
+      </g>
+      <g transform="rotate(-125 486 503)">
+        <rect x="461" y="252" width="50" height="158" rx="16" fill="url(#steelBar)" stroke="#051c4b" stroke-width="4"/>
+        <rect x="468" y="264" width="8" height="128" rx="4" fill="#fff" opacity=".44"/>
+      </g>
+      <g transform="rotate(125 486 503)">
+        <rect x="461" y="252" width="50" height="158" rx="16" fill="url(#steelBar)" stroke="#051c4b" stroke-width="4"/>
+        <rect x="468" y="264" width="8" height="128" rx="4" fill="#fff" opacity=".44"/>
+      </g>
+    </g>
+
+    <circle cx="486" cy="503" r="140" fill="none" stroke="#0084ff" stroke-opacity=".7" stroke-width="11" filter="url(#glow)"/>
+    <circle cx="486" cy="503" r="140" fill="none" stroke="url(#blueLight)" stroke-width="4"/>
+    <g filter="url(#hubShadow)">
+      <circle cx="486" cy="503" r="140" fill="#081f51" stroke="#102b5d" stroke-width="4"/>
+      <circle cx="486" cy="500" r="132" fill="url(#hub)" stroke="#d8e4f1" stroke-width="2.6"/>
+      <circle cx="486" cy="500" r="129" fill="url(#hubShine)"/>
+      <circle cx="486" cy="500" r="121" fill="none" stroke="#ffffff" stroke-opacity=".18" stroke-width="1.5"/>
+      <path d="M403 416 A129 129 0 0 1 568 404" stroke="#fff" stroke-opacity=".3" stroke-width="3" fill="none"/>
+    </g>
+
+    <path d="M486 430 C451 430 425 458 425 491 C425 518 438 535 462 548 L454 600 Q454 604 460 604 H512 Q518 604 518 599 L509 548 C533 535 547 518 547 491 C547 457 521 430 486 430 Z" fill="#0056e8" opacity=".8" filter="url(#glow)"/>
+    <path d="M486 435 C454 435 430 460 430 491 C430 516 444 535 467 544 L459 597 Q459 599 463 599 H509 Q513 599 513 595 L505 544 C527 535 542 516 542 491 C542 460 518 435 486 435 Z" fill="url(#keyhole)" stroke="url(#blueLight)" stroke-width="3.2" stroke-linejoin="round"/>
+    <path d="M485 442 C456 442 437 464 437 491" stroke="#b9ebff" stroke-opacity=".33" fill="none" stroke-width="2.2" stroke-linecap="round"/>
+
+    <g filter="url(#barShadow)">
+      <rect x="761" y="333" width="119" height="344" rx="23" fill="#03193f" stroke="#02112d" stroke-width="6"/>
+      <path d="M766 351 Q766 338 781 338 H848 Q864 338 864 356 V654 Q864 674 844 674 H782 Q766 674 766 658 Z" fill="url(#hingeMetal)" stroke="#183761" stroke-width="4"/>
+      <path d="M773 357 V651" stroke="#fff" stroke-opacity=".58" stroke-width="4" stroke-linecap="round"/>
+      <path d="M851 355 V653" stroke="#183c76" stroke-opacity=".47" stroke-width="4"/>
+      <rect x="846" y="319" width="78" height="95" rx="14" fill="url(#hingeCylinder)" stroke="#0c2857" stroke-width="4"/>
+      <rect x="846" y="424" width="78" height="192" rx="12" fill="url(#hingeCylinder)" stroke="#0b2958" stroke-width="4"/>
+      <rect x="846" y="626" width="78" height="90" rx="13" fill="url(#hingeCylinder)" stroke="#0a2756" stroke-width="4"/>
+      <path d="M851 336 V400 M851 439 V601 M851 639 V700" stroke="#fff" stroke-opacity=".66" stroke-width="3.5" stroke-linecap="round"/>
+      <path d="M913 337 V398 M913 444 V599 M913 643 V700" stroke="#26436c" stroke-opacity=".63" stroke-width="3" stroke-linecap="round"/>
+      <path d="M851 416 H920 M851 624 H920" stroke="#061b3e" stroke-width="6"/>
+    </g>
+
+    <rect x="3" y="3" width="1018" height="1018" rx="199" fill="none" stroke="#76bdff" stroke-opacity=".2" stroke-width="4"/>
+  </g>
 </svg>

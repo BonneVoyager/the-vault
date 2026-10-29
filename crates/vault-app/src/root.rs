@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use futures::StreamExt as _;
+use futures::channel::mpsc;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, AppContext as _, Context, Entity,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Subscription,
@@ -74,6 +76,38 @@ fn exclude_windows_from_capture(cx: &gpui::App) {
     CAPTURE_EXCLUSIONS.with(|c| c.set(c.get() + 1));
 }
 
+/// Keeps the theme accent in step with the macOS accent colour (05 §5). The AppKit
+/// observer only pushes into a channel; a main-thread task rebuilds the theme. Drop on
+/// the main thread.
+struct SystemAccentWatch {
+    _observer: vault_macos::Subscription,
+    _task: Task<()>,
+}
+
+impl SystemAccentWatch {
+    fn install(cx: &mut Context<VaultRoot>) -> Self {
+        let (tx, mut rx) = mpsc::unbounded::<()>();
+        let observer = vault_macos::on_system_colors_changed(move || {
+            let _ = tx.unbounded_send(());
+        });
+        let task = cx.spawn(async move |this, cx| {
+            while rx.next().await.is_some() {
+                let alive = this.update(cx, |_, cx| {
+                    theme::reapply(cx);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            _observer: observer,
+            _task: task,
+        }
+    }
+}
+
 /// Locked → unlocked crossfade (§2.3).
 const CROSSFADE: Duration = Duration::from_millis(150);
 /// Window geometry is written this long after the last resize/move.
@@ -90,6 +124,7 @@ pub struct VaultRoot {
     save_geometry: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     _triggers: LockTriggers,
+    _system_accent: SystemAccentWatch,
 }
 
 impl VaultRoot {
@@ -101,6 +136,13 @@ impl VaultRoot {
     ) -> Self {
         if !cx.has_global::<CaptureExclusion>() {
             cx.set_global(CaptureExclusion::from_launch());
+        }
+        // Tests inject their own accent source; the app reads AppKit's. The window's
+        // theme was applied before this source existed, so apply it again.
+        #[cfg(not(test))]
+        if !cx.has_global::<theme::AccentSource>() {
+            cx.set_global(theme::AccentSource::system());
+            theme::apply(window, cx);
         }
         let columns = restore.and_then(|r| r.columns);
         let choose = cx.new(|cx| ChooseScreen::new(state.clone(), window, cx));
@@ -161,6 +203,7 @@ impl VaultRoot {
             this.appear(window, cx);
         });
         let triggers = autolock::install(&state, cx);
+        let system_accent = SystemAccentWatch::install(cx);
         Self {
             geometry: ui::window_geometry(window, columns),
             state,
@@ -172,6 +215,7 @@ impl VaultRoot {
             save_geometry: None,
             _subscriptions: subscriptions,
             _triggers: triggers,
+            _system_accent: system_accent,
         }
     }
 
@@ -259,6 +303,11 @@ impl Render for VaultRoot {
             .text_size(theme.font_size)
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.touch(cx)))
             .capture_key_down(cx.listener(|this, _, _, cx| this.touch(cx)))
+            // The window claims its titlebar (`app_owns_titlebar_drag`), so it moves only by
+            // a drag band painted under the content. The main screen draws its own.
+            .when(self.screen != Screen::Main, |root| {
+                root.child(ui::window_drag_band())
+            })
             .child(content)
             .when_some(toast, |root, message| {
                 root.child(
@@ -350,6 +399,30 @@ mod tests {
     }
 
     #[gpui::test]
+    fn choose_screen_moves_by_the_title_band(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseButton, point};
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let view = cx.new(|cx| VaultRoot::new(state.clone(), None, window, cx));
+            Root::new(view, window, cx)
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("window-drag-band").is_some());
+        let before = ui::window_moves();
+        let at = point(px(300.), px(20.));
+        vcx.simulate_mouse_down(at, MouseButton::Left, Modifiers::default());
+        vcx.simulate_mouse_move(
+            at + point(px(6.), px(0.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert_eq!(ui::window_moves(), before + 1);
+    }
+
+    #[gpui::test]
     fn settings_sheet_opens_applies_and_closes(cx: &mut TestAppContext) {
         let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
         cx.update(|cx| {
@@ -396,7 +469,7 @@ mod tests {
     }
 
     /// Locking (here the same `lock` every trigger calls) closes the Settings sheet and
-    /// drops the session's toast and Screen Recording hint, so nothing sits on top of the
+    /// drops the session's toast, so nothing sits on top of the
     /// unlock screen.
     #[gpui::test]
     fn lock_closes_settings_and_overlays(cx: &mut TestAppContext) {
@@ -431,7 +504,6 @@ mod tests {
         vcx.simulate_keystrokes("cmd-,");
         vcx.run_until_parked();
         state.update(&mut vcx, |s, cx| {
-            s.screen_recording_hint = true;
             s.show_toast("Copied", cx);
         });
         assert!(vcx.update(|window, cx| window.has_active_dialog(cx)));
@@ -441,7 +513,6 @@ mod tests {
         state.read_with(&vcx, |s, _| {
             assert_eq!(s.screen, Screen::Unlock);
             assert!(!s.settings_open);
-            assert!(!s.screen_recording_hint);
             assert!(s.toast.is_none());
         });
         assert!(
