@@ -2,7 +2,10 @@
 //!
 //! Unlock verification order (matters for which error wins):
 //!
-//! 1. Every `password` slot is tried; all fail -> `WrongPassword`.
+//! 1. Every `password` slot is tried; all fail -> `WrongPassword`. No `password` slot at all
+//!    (only `enclave`/`recovery`/opaque unknown-kind slots) -> `NoUsableSlot`, before any KDF
+//!    work. Opaque slots (unknown `kind`, 01 §9) are never tried and are carried through
+//!    `serialize` untouched in their original position.
 //! 2. Every item record is decrypted with its AAD, in file order; the first tag failure ->
 //!    `Tampered(Item(id))`. This runs *before* the manifest check so that a record moved in from
 //!    another vault is reported as `Item`, not `Manifest`.
@@ -28,7 +31,7 @@ use uuid::Uuid;
 use crate::crypto::{self, Keys};
 use crate::error::{TamperKind, VaultError};
 use crate::format::{
-    self, FORMAT_VERSION, Header, ItemRecord, KeySlot, ManifestRecord, SlotKind, VaultFile,
+    self, FORMAT_VERSION, Header, ItemRecord, KeySlot, ManifestRecord, Slot, SlotKind, VaultFile,
     item_aad, manifest_aad, slot_aad,
 };
 use crate::item::{Extras, FieldKind, HistoryEntry, Item, Millis};
@@ -40,8 +43,9 @@ pub use merge::MergeReport;
 /// Maximum number of `history` entries kept per item (01 §4, 02 "set_field").
 pub const HISTORY_CAP: usize = 10;
 
-/// The error for a mutation naming an id that is not in the vault. The error enum is frozen
-/// this round, so this reuses `Malformed` (interpretation; see package P4a notes).
+/// The error for a mutation naming an id that is not in the vault. 01 §7 has no dedicated
+/// variant for this, so it reuses `Malformed` (interpretation; see package P4a notes). The
+/// only extension to the §7 enum so far is `NoUsableSlot` (documented in `error.rs`).
 fn unknown_item(id: Uuid) -> VaultError {
     VaultError::Malformed(format!("unknown item {id}"))
 }
@@ -75,7 +79,7 @@ fn new_slot(
 ) -> KeySlot {
     let id = Uuid::new_v4();
     let nonce = crypto::random_nonce();
-    let aad = slot_aad(format_version, vault_id, id, kind);
+    let aad = slot_aad(format_version, vault_id, id, &kind);
     KeySlot {
         id,
         kind,
@@ -86,19 +90,40 @@ fn new_slot(
     }
 }
 
-/// Try `kek` against every `password` slot in `header` and return the first `vault_key` it
-/// unwraps. `None` means the password was wrong (or no password slot exists). Shared by
-/// `LockedVault::unlock` and `UnlockedVault::verify_password` so there is exactly one place
-/// that composes the slot AAD for password slots.
-fn unwrap_any_password_slot(header: &Header, kek: &crypto::Key32) -> Option<crypto::Key32> {
+/// The usable `password` slots of `header`, in header order (opaque slots are skipped).
+fn password_slots(header: &Header) -> impl Iterator<Item = &KeySlot> {
     header
         .slots
         .iter()
+        .filter_map(Slot::as_key)
         .filter(|s| s.kind == SlotKind::Password)
-        .find_map(|slot| {
-            let aad = slot_aad(header.format_version, header.vault_id, slot.id, slot.kind);
-            crypto::unwrap_key(kek, &slot.nonce, &aad, &slot.wrapped_key)
-        })
+}
+
+/// Try `kek` against every `password` slot in `header` and return the first `vault_key` it
+/// unwraps. `None` means the password was wrong. Callers check that at least one password
+/// slot exists first (`NoUsableSlot`). Shared by `LockedVault::unlock` and
+/// `UnlockedVault::verify_password` so there is exactly one place that composes the slot AAD
+/// for password slots.
+fn unwrap_any_password_slot(header: &Header, kek: &crypto::Key32) -> Option<crypto::Key32> {
+    password_slots(header).find_map(|slot| {
+        let aad = slot_aad(header.format_version, header.vault_id, slot.id, &slot.kind);
+        crypto::unwrap_key(kek, &slot.nonce, &aad, &slot.wrapped_key)
+    })
+}
+
+/// Derive the KEK for `password` and prove it unwraps a `password` slot. Returns the KEK and
+/// the unwrapped `vault_key`. `NoUsableSlot` if the header has no `password` slot (checked
+/// before the KDF runs); `WrongPassword` if none unwraps.
+fn verify_password_slots(
+    header: &Header,
+    password: &SecretString,
+) -> Result<(crypto::Key32, crypto::Key32), VaultError> {
+    if password_slots(header).next().is_none() {
+        return Err(VaultError::NoUsableSlot);
+    }
+    let kek = crypto::derive_kek(password, &header.kdf)?;
+    let vault_key = unwrap_any_password_slot(header, &kek).ok_or(VaultError::WrongPassword)?;
+    Ok((kek, vault_key))
 }
 
 /// The error for `set_field` naming a field the item does not have. Field names are not
@@ -139,10 +164,11 @@ impl LockedVault {
         self.file.items.iter().map(|r| (r.id, r.modified_at))
     }
 
-    /// Plaintext `(id, kind)` of every key slot, in header order. Lets the app decide whether
-    /// a Touch ID (`enclave`) unlock is available before asking for anything.
+    /// Plaintext `(id, kind)` of every key slot, in header order, opaque slots included (as
+    /// [`SlotKind::Other`]). Lets the app decide whether a Touch ID (`enclave`) unlock is
+    /// available before asking for anything.
     pub fn slots(&self) -> impl Iterator<Item = (Uuid, SlotKind)> + '_ {
-        self.file.header.slots.iter().map(|s| (s.id, s.kind))
+        self.file.header.slots.iter().map(|s| (s.id(), s.kind()))
     }
 
     /// Derive the KEK once and try it against every `password` slot. If none unwraps the vault
@@ -151,12 +177,16 @@ impl LockedVault {
     /// The KEK depends only on the password and the header-wide KDF params, so deriving it once
     /// is equivalent to the spec's "Argon2 runs once per slot" and strictly cheaper.
     ///
+    /// # Errors
+    ///
+    /// `NoUsableSlot` if the header holds no `password` slot at all (e.g. only slots of a
+    /// kind this build does not know, 01 §9); the KDF is not run in that case. `WrongPassword`
+    /// if at least one exists and none unwraps.
+    ///
     /// The returned vault has `device_id == Uuid::nil()`; call
     /// [`UnlockedVault::set_device_id`] before mutating.
     pub fn unlock(&self, password: &SecretString) -> Result<UnlockedVault, VaultError> {
-        let header = &self.file.header;
-        let kek = crypto::derive_kek(password, &header.kdf)?;
-        let vault_key = unwrap_any_password_slot(header, &kek).ok_or(VaultError::WrongPassword)?;
+        let (_kek, vault_key) = verify_password_slots(&self.file.header, password)?;
         self.unlock_with_vault_key(vault_key, false)
     }
 
@@ -168,6 +198,8 @@ impl LockedVault {
     ///
     /// - `Malformed` if no slot has `slot_id` or `kek` is not exactly 32 bytes long (neither
     ///   is a crypto failure, so neither is reported as `WrongPassword`).
+    /// - `NoUsableSlot` if the slot exists but its `kind` is unknown to this build (opaque,
+    ///   01 §9): its layout is unknown, so it cannot be unwrapped here.
     /// - `WrongPassword` if the slot's tag fails: per 01 §7 a slot tag failure on a cleanly
     ///   parsed header is always reported as the wrong credential, never as `Tampered`.
     pub fn unlock_with_kek(
@@ -176,13 +208,22 @@ impl LockedVault {
         kek: &SecretVec<u8>,
     ) -> Result<UnlockedVault, VaultError> {
         let header = &self.file.header;
-        let slot = header
+        // Look among usable slots first; ids are unique (enforced at parse), so an id that is
+        // only found on an opaque slot means "exists, but this build cannot use it".
+        let slot = match header
             .slots
             .iter()
+            .filter_map(Slot::as_key)
             .find(|s| s.id == slot_id)
-            .ok_or_else(|| no_such_slot(slot_id))?;
+        {
+            Some(slot) => slot,
+            None if header.slots.iter().any(|s| s.id() == slot_id) => {
+                return Err(VaultError::NoUsableSlot);
+            }
+            None => return Err(no_such_slot(slot_id)),
+        };
         let kek = crypto::kek_from_bytes(kek)?;
-        let aad = slot_aad(header.format_version, header.vault_id, slot.id, slot.kind);
+        let aad = slot_aad(header.format_version, header.vault_id, slot.id, &slot.kind);
         let vault_key = crypto::unwrap_key(&kek, &slot.nonce, &aad, &slot.wrapped_key)
             .ok_or(VaultError::WrongPassword)?;
         self.unlock_with_vault_key(vault_key, false)
@@ -358,16 +399,16 @@ impl UnlockedVault {
 
         let slot_id = Uuid::new_v4();
         let nonce = crypto::random_nonce();
-        let aad = slot_aad(FORMAT_VERSION, vault_id, slot_id, SlotKind::Password);
+        let aad = slot_aad(FORMAT_VERSION, vault_id, slot_id, &SlotKind::Password);
         let wrapped_key = crypto::wrap_key(&kek, &nonce, &aad, &vault_key);
-        let slot = KeySlot {
+        let slot = Slot::Key(KeySlot {
             id: slot_id,
             kind: SlotKind::Password,
             nonce,
             wrapped_key,
             created_at,
             extras: Vec::new(),
-        };
+        });
 
         Self {
             header: Header {
@@ -591,9 +632,10 @@ impl UnlockedVault {
         before - self.items.len()
     }
 
-    /// Plaintext `(id, kind)` of every key slot, in header order.
+    /// Plaintext `(id, kind)` of every key slot, in header order, opaque slots included (as
+    /// [`SlotKind::Other`]).
     pub fn slots(&self) -> impl Iterator<Item = (Uuid, SlotKind)> + '_ {
-        self.header.slots.iter().map(|s| (s.id, s.kind))
+        self.header.slots.iter().map(|s| (s.id(), s.kind()))
     }
 
     /// Derive the KEK for `password` under the header's current KDF params and prove it
@@ -602,15 +644,12 @@ impl UnlockedVault {
     ///
     /// # Errors
     ///
-    /// `WrongPassword` if no password slot unwraps; `Malformed` if the header's KDF params
-    /// are unusable (cannot happen for a vault this crate produced).
+    /// `NoUsableSlot` if there is no password slot; `WrongPassword` if none unwraps;
+    /// `Malformed` if the header's KDF params are unusable (cannot happen for a vault this
+    /// crate produced).
     fn verify_password(&self, password: &SecretString) -> Result<crypto::Key32, VaultError> {
-        let header = &self.header;
-        let kek = crypto::derive_kek(password, &header.kdf)?;
         // The unwrapped key is dropped (zeroized) unused; only the tag check matters here.
-        unwrap_any_password_slot(header, &kek)
-            .map(|_| kek)
-            .ok_or(VaultError::WrongPassword)
+        verify_password_slots(&self.header, password).map(|(kek, _)| kek)
     }
 
     /// Change the master password (01 §3): verify `old`, derive a new KEK from `new` under
@@ -622,14 +661,15 @@ impl UnlockedVault {
     /// under `new`, and any other password that previously opened the vault stops working. Each replacement keeps its predecessor's `created_at`
     /// and unknown extras (the core has no clock, and 01 §9 says writers preserve unknown
     /// keys). `enclave` and `recovery` slots are untouched: their KEKs are not
-    /// password-derived. Items are untouched in memory and re-encrypted with fresh nonces on
-    /// the next `serialize` (guarantee 8).
+    /// password-derived. Opaque slots of an unknown kind (01 §9) are likewise untouched and
+    /// keep their position. Items are untouched in memory and re-encrypted with fresh nonces
+    /// on the next `serialize` (guarantee 8).
     ///
     /// # Errors
     ///
-    /// `WrongPassword` if `old` unwraps no password slot; `Malformed` if `kdf` fails
-    /// [`KdfParams::validate`] or is rejected by Argon2. On either error the header is left
-    /// exactly as it was.
+    /// `WrongPassword` if `old` unwraps no password slot; `NoUsableSlot` if there is none;
+    /// `Malformed` if `kdf` fails [`KdfParams::validate`] or is rejected by Argon2. On any
+    /// error the header is left exactly as it was.
     pub fn change_password(
         &mut self,
         old: &SecretString,
@@ -640,7 +680,7 @@ impl UnlockedVault {
         let new_kek = crypto::derive_kek(new, &kdf)?;
         let version = self.header.format_version;
         let vault_id = self.header.vault_id;
-        for slot in &mut self.header.slots {
+        for slot in self.header.slots.iter_mut().filter_map(Slot::as_key_mut) {
             if slot.kind != SlotKind::Password {
                 continue;
             }
@@ -693,15 +733,16 @@ impl UnlockedVault {
             created_at,
         );
         let id = slot.id;
-        self.header.slots.push(slot);
+        self.header.slots.push(Slot::Key(slot));
         id
     }
 
-    /// Remove a key slot by id. Refuses to remove the only `password` slot, since the vault
-    /// would then be openable only through Keychain-held material, and refuses to remove the
-    /// last slot of any kind, since the parser requires at least one (01 §2). The second guard
-    /// is unreachable through this API today (the password-slot guard fires first) and exists
-    /// so a future constructor cannot produce an unparseable header.
+    /// Remove a key slot by id (opaque unknown-kind slots included). Refuses to remove the
+    /// only `password` slot, since the vault would then be openable only through
+    /// Keychain-held material, and refuses to remove the last slot of any kind, since the
+    /// parser requires at least one (01 §2). The second guard is unreachable through this API
+    /// today (the password-slot guard fires first) and exists so a future constructor cannot
+    /// produce an unparseable header.
     ///
     /// # Errors
     ///
@@ -712,13 +753,13 @@ impl UnlockedVault {
         let slots = &mut self.header.slots;
         let index = slots
             .iter()
-            .position(|s| s.id == id)
+            .position(|s| s.id() == id)
             .ok_or_else(|| no_such_slot(id))?;
         let password_slots = slots
             .iter()
-            .filter(|s| s.kind == SlotKind::Password)
+            .filter(|s| s.is_key_of(SlotKind::Password))
             .count();
-        if slots[index].kind == SlotKind::Password && password_slots == 1 {
+        if slots[index].is_key_of(SlotKind::Password) && password_slots == 1 {
             return Err(VaultError::Malformed(
                 "cannot remove last password slot".into(),
             ));
@@ -737,9 +778,11 @@ impl UnlockedVault {
     /// under the new key on the next `serialize`, since their keys derive from `vault_key`.
     /// The old key material is zeroized when dropped.
     ///
-    /// **`enclave` (and reserved `recovery`) slots are dropped.** Their KEKs are not derivable
-    /// from the password, so the core cannot re-wrap the new key into them; keeping them would
-    /// leave slots that silently fail to unlock. Callers must re-enroll Touch ID
+    /// **`enclave` (and reserved `recovery`) slots are dropped, and so are opaque slots of a
+    /// kind this build does not know (01 §9).** Their KEKs are not derivable from the
+    /// password, so the core cannot re-wrap the new key into them; keeping them would leave
+    /// slots that silently fail to unlock (or, for opaque ones, let a newer version unwrap
+    /// the *old* key and fail every item tag). Callers must re-enroll Touch ID
     /// ([`UnlockedVault::add_enclave_slot`]) after a rotation. Interpretation: the 02
     /// signature returns `()`, so the dropped ids are not reported; read
     /// [`UnlockedVault::slots`] before and after if you need them. Phase 4 must therefore
@@ -757,10 +800,12 @@ impl UnlockedVault {
         let new_key = crypto::random_key();
         let version = self.header.format_version;
         let vault_id = self.header.vault_id;
-        self.header.slots.retain(|s| s.kind == SlotKind::Password);
-        for slot in &mut self.header.slots {
+        self.header
+            .slots
+            .retain(|s| s.is_key_of(SlotKind::Password));
+        for slot in self.header.slots.iter_mut().filter_map(Slot::as_key_mut) {
             let nonce = crypto::random_nonce();
-            let aad = slot_aad(version, vault_id, slot.id, slot.kind);
+            let aad = slot_aad(version, vault_id, slot.id, &slot.kind);
             slot.wrapped_key = crypto::wrap_key(&kek, &nonce, &aad, &new_key);
             slot.nonce = nonce;
         }
@@ -770,7 +815,9 @@ impl UnlockedVault {
     }
 
     /// Encrypt every item (id order) and the manifest with fresh nonces and emit the file.
-    /// Slots are written as stored. Never fails.
+    /// Slots are written as stored, opaque ones verbatim in their original position. Items of
+    /// an unknown kind and fields of an unknown kind are written back with their original
+    /// kind string. Never fails.
     pub fn serialize(&self) -> Vec<u8> {
         let vault_id = self.header.vault_id;
         let version = self.header.format_version;

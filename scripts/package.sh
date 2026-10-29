@@ -115,11 +115,15 @@ fi
 
 if [[ $SKIP_SIGN -eq 1 ]]; then
   echo "==> Skipping codesign"
+  echo "SKIP: entitlements check (unsigned build)"
 else
   echo "==> Signing"
   run_guarded codesign --deep --options runtime --timestamp \
     --entitlements scripts/entitlements.plist \
     --sign "$VAULT_SIGN_IDENTITY" "$APP"
+  echo "==> Checking entitlements and hardened runtime"
+  # The spctl assessment only passes once notarized, so it is skipped before notarization.
+  run_guarded scripts/check-entitlements.sh --skip-notarize "$APP"
 fi
 
 if [[ $SKIP_NOTARIZE -eq 1 ]]; then

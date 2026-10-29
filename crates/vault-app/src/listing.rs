@@ -10,6 +10,7 @@ use gpui::SharedString;
 use vault_core::search::{Query, search};
 use vault_core::{ExposeSecret, Field, FieldKind, Item, ItemKind, UnlockedVault, Uuid};
 
+use crate::audit::{Issue, Issues};
 use crate::state::{Filter, Sort};
 use crate::text;
 
@@ -20,18 +21,27 @@ pub enum Row {
     Item(Uuid),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Listing {
     /// Visible items in display order. Selection moves through this.
     pub items: Vec<Uuid>,
     /// `items` plus group headers. Shared with the list element's render closure.
     pub rows: Rc<Vec<Row>>,
+    /// Weak / reused password warnings for every live item (not just the visible ones).
+    /// Computed once per vault change (`AppState::vault_changed`) and shared across the
+    /// query / filter / sort refreshes in between, so a search keystroke never re-audits.
+    pub issues: Rc<Issues>,
 }
 
 impl Listing {
     /// Index into `rows` of the item `id`.
     pub fn row_of(&self, id: Uuid) -> Option<usize> {
         self.rows.iter().position(|r| *r == Row::Item(id))
+    }
+
+    /// Password warnings for `id`; empty when it has none.
+    pub fn issues(&self, id: Uuid) -> &[Issue] {
+        self.issues.get(&id).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -91,12 +101,19 @@ pub fn group_label(title: &str) -> String {
     }
 }
 
-/// Filter, rank and sort the vault's live items.
+/// Filter, rank and sort the vault's live items. `issues` is the vault's current
+/// [`audit::audit`] result, carried into the listing unchanged.
 ///
 /// With a search query the order is the core's relevance ranking and there are no group
 /// headers. Without one, `sort` applies and A–Z adds a header row per first letter.
 /// Core items have no creation time, so "recently created" sorts by `modified_at` too.
-pub fn compute(vault: &UnlockedVault, query: &str, filter: &Filter, sort: Sort) -> Listing {
+pub fn compute(
+    vault: &UnlockedVault,
+    query: &str,
+    filter: &Filter,
+    sort: Sort,
+    issues: Rc<Issues>,
+) -> Listing {
     let q = Query {
         text: query,
         kind: match filter {
@@ -141,6 +158,7 @@ pub fn compute(vault: &UnlockedVault, query: &str, filter: &Filter, sort: Sort) 
     Listing {
         items: hits.iter().map(|i| i.id).collect(),
         rows: Rc::new(rows),
+        issues,
     }
 }
 
@@ -165,21 +183,25 @@ pub fn subtitle(item: &Item) -> String {
                     .map(|l| text::truncate(l, 80))
             })
             .unwrap_or_default(),
-        ItemKind::Login | ItemKind::Identity => username_field(item)
+        // An unknown kind from a newer app version: show a username if it has one.
+        ItemKind::Login | ItemKind::Identity | ItemKind::Other => username_field(item)
             .map(|f| f.value.expose_secret().to_string())
             .unwrap_or_default(),
     }
 }
 
-/// The field ⌘⇧U copies and the list subtitle shows: `username`, else the first email.
 /// A card's number field: masked as `•••• 4242` until revealed (main detail and the
 /// backup viewer share this rule).
 pub fn is_card_number(item: &Item, field: &Field) -> bool {
     item.kind == ItemKind::Card && field.name == "number"
 }
 
+/// The field ⌘⇧U copies and the list subtitle shows: `username`, else the first email.
+/// A sensitive field (password, TOTP, unknown kind) named "username" is never used, so
+/// its value cannot leak into the always-visible subtitle.
 pub fn username_field(item: &Item) -> Option<&Field> {
     item.field("username")
+        .filter(|f| !f.kind.is_sensitive())
         .or_else(|| item.fields.iter().find(|f| f.kind == FieldKind::Email))
 }
 
@@ -222,7 +244,7 @@ mod tests {
         add(&mut v, ItemKind::Login, "1Password import", 3);
         add(&mut v, ItemKind::Login, "_hidden", 4);
         add(&mut v, ItemKind::Login, "Apple", 5);
-        let l = compute(&v, "", &Filter::All, Sort::Alphabetical);
+        let l = compute(&v, "", &Filter::All, Sort::Alphabetical, Rc::default());
         let headers: Vec<_> = l
             .rows
             .iter()
@@ -241,10 +263,10 @@ mod tests {
         let mut v = vault();
         let old = add(&mut v, ItemKind::Login, "Old", 10);
         let new = add(&mut v, ItemKind::Login, "New", 20);
-        let l = compute(&v, "", &Filter::All, Sort::RecentlyModified);
+        let l = compute(&v, "", &Filter::All, Sort::RecentlyModified, Rc::default());
         assert_eq!(l.items, [new, old]);
         assert!(l.rows.iter().all(|r| matches!(r, Row::Item(_))));
-        let l = compute(&v, "ol", &Filter::All, Sort::Alphabetical);
+        let l = compute(&v, "ol", &Filter::All, Sort::Alphabetical, Rc::default());
         assert_eq!(l.items, [old]);
         assert_eq!(*l.rows, [Row::Item(old)]);
     }
@@ -263,11 +285,29 @@ mod tests {
         v.update(card, 5, |it| it.tags = vec!["infra".into()])
             .unwrap();
 
-        let fav = compute(&v, "", &Filter::Favorites, Sort::Alphabetical);
+        let fav = compute(
+            &v,
+            "",
+            &Filter::Favorites,
+            Sort::Alphabetical,
+            Rc::default(),
+        );
         assert_eq!(fav.items, [gh]);
-        let cards = compute(&v, "", &Filter::Kind(ItemKind::Card), Sort::Alphabetical);
+        let cards = compute(
+            &v,
+            "",
+            &Filter::Kind(ItemKind::Card),
+            Sort::Alphabetical,
+            Rc::default(),
+        );
         assert_eq!(cards.items, [card]);
-        let infra = compute(&v, "", &Filter::Tag("infra".into()), Sort::Alphabetical);
+        let infra = compute(
+            &v,
+            "",
+            &Filter::Tag("infra".into()),
+            Sort::Alphabetical,
+            Rc::default(),
+        );
         assert_eq!(infra.items.len(), 2);
 
         let c = counts(&v);
@@ -305,6 +345,42 @@ mod tests {
             1,
         ));
         assert_eq!(subtitle(&login), "chris");
+    }
+
+    #[test]
+    fn sensitive_username_field_never_reaches_the_subtitle() {
+        for kind in [FieldKind::Other, FieldKind::Password, FieldKind::Totp] {
+            for item_kind in [ItemKind::Login, ItemKind::Other] {
+                let mut item = Item::new(item_kind, "l", Uuid::new_v4(), 1);
+                let mut field = Field::new(
+                    "username",
+                    kind,
+                    SecretString::new("hunter2-secret".into()),
+                    1,
+                );
+                if kind == FieldKind::Other {
+                    field.kind_raw = Some("future-secret".into());
+                }
+                item.fields.push(field);
+                assert_eq!(subtitle(&item), "", "{kind:?} in {item_kind:?}");
+                assert!(username_field(&item).is_none());
+            }
+        }
+        // A sensitive "username" falls back to the first email field.
+        let mut item = Item::new(ItemKind::Login, "l", Uuid::new_v4(), 1);
+        item.fields.push(Field::new(
+            "username",
+            FieldKind::Other,
+            SecretString::new("hunter2-secret".into()),
+            1,
+        ));
+        item.fields.push(Field::new(
+            "email",
+            FieldKind::Email,
+            SecretString::new("a@b.c".into()),
+            1,
+        ));
+        assert_eq!(subtitle(&item), "a@b.c");
     }
 
     #[test]

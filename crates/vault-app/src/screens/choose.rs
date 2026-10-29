@@ -12,7 +12,6 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::spinner::Spinner;
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme as _, Disableable as _};
-use vault_core::{ExposeSecret as _, strength_bits};
 
 use crate::cloud;
 use crate::persist;
@@ -32,7 +31,8 @@ pub struct ChooseScreen {
     password: Entity<InputState>,
     confirm: Entity<InputState>,
     folder: Option<PathBuf>,
-    strength: f64,
+    /// Live strength and confirmation checks on the master password.
+    check: ui::MasterPasswordCheck,
     /// Local validation message; vault errors come from `AppState::error`.
     problem: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
@@ -46,12 +46,10 @@ impl ChooseScreen {
         let confirm = ui::password_input("Confirm master password", window, cx);
         let subscriptions = vec![
             cx.observe(&state, |_, _, cx| cx.notify()),
-            cx.subscribe_in(&password, window, |this, input, ev: &InputEvent, _, cx| {
+            cx.subscribe_in(&password, window, |this, _, ev: &InputEvent, window, cx| {
                 if matches!(ev, InputEvent::Change) {
-                    let secret = ui::input_secret(input, cx);
-                    this.strength = strength_bits(secret.expose_secret());
-                    this.problem = None;
-                    cx.notify();
+                    this.check.edited(&this.password, window, cx);
+                    this.recheck(cx);
                 }
             }),
             cx.subscribe_in(
@@ -59,10 +57,7 @@ impl ChooseScreen {
                 window,
                 |this, _, ev: &InputEvent, window, cx| match ev {
                     InputEvent::PressEnter { .. } => this.submit_create(window, cx),
-                    InputEvent::Change => {
-                        this.problem = None;
-                        cx.notify();
-                    }
+                    InputEvent::Change => this.recheck(cx),
                     _ => {}
                 },
             ),
@@ -74,7 +69,7 @@ impl ChooseScreen {
             password,
             confirm,
             folder: dirs::document_dir(),
-            strength: 0.,
+            check: ui::MasterPasswordCheck::default(),
             problem: None,
             _subscriptions: subscriptions,
         }
@@ -90,13 +85,31 @@ impl ChooseScreen {
         };
         self.problem = None;
         // Never leave a typed password behind in a hidden form.
-        ui::clear_input(&self.password, window, cx);
-        ui::clear_input(&self.confirm, window, cx);
-        self.strength = 0.;
+        self.clear_passwords(window, cx);
         if self.step == Step::Create {
             ui::focus_input(&self.name, window, cx);
         }
         cx.notify();
+    }
+
+    fn recheck(&mut self, cx: &mut Context<Self>) {
+        self.check.refresh(&self.password, &self.confirm, cx);
+        self.problem = None;
+        cx.notify();
+    }
+
+    fn suggest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.check
+            .suggest(&self.password, &self.confirm, window, cx);
+        self.problem = None;
+        cx.notify();
+    }
+
+    /// Never leave a typed password behind in a hidden form.
+    fn clear_passwords(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        ui::clear_input(&self.password, window, cx);
+        ui::clear_input(&self.confirm, window, cx);
+        self.check.reset(&self.password, window, cx);
     }
 
     fn start_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -110,9 +123,7 @@ impl ChooseScreen {
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.step = Step::Home;
         self.problem = None;
-        ui::clear_input(&self.password, window, cx);
-        ui::clear_input(&self.confirm, window, cx);
-        self.strength = 0.;
+        self.clear_passwords(window, cx);
         self.state.update(cx, |s, _| s.error = None);
         cx.notify();
     }
@@ -168,21 +179,20 @@ impl ChooseScreen {
                 return;
             }
         };
-        let password = ui::input_secret(&self.password, cx);
-        let confirm = ui::input_secret(&self.confirm, cx);
-        if password.expose_secret().is_empty() {
+        self.check.refresh(&self.password, &self.confirm, cx);
+        if self.check.is_empty() {
             self.problem = Some("Choose a master password.".into());
-        } else if password.expose_secret() != confirm.expose_secret() {
-            self.problem = Some("The passwords do not match.".into());
+        } else if !self.check.ready() && self.check.problem().is_none() {
+            // Weak or finished-but-different already shows under the meter; this is
+            // Enter on a confirmation that is still too short.
+            self.problem = Some(ui::PASSWORDS_DIFFER.into());
         }
-        drop(confirm);
-        if self.problem.is_some() {
+        if !self.check.ready() {
             cx.notify();
             return;
         }
-        ui::clear_input(&self.password, window, cx);
-        ui::clear_input(&self.confirm, window, cx);
-        self.strength = 0.;
+        let password = ui::input_secret(&self.password, cx);
+        self.clear_passwords(window, cx);
         self.state
             .update(cx, |s, cx| s.create_vault(path, password, cx));
     }
@@ -266,6 +276,7 @@ impl ChooseScreen {
         let state = self.state.read(cx);
         let busy = state.busy;
         let error = self.problem.clone().or_else(|| state.error.clone());
+        let ready = self.check.ready();
         let theme = cx.theme();
         let folder_text = self
             .folder
@@ -308,8 +319,13 @@ impl ChooseScreen {
                 ))
             })
             .child(field_label("Master password", cx))
-            .child(ui::input(&self.password))
-            .child(ui::strength_meter(self.strength, cx))
+            .child(ui::input(&self.password).mask_toggle())
+            .child(ui::master_password_feedback(
+                &self.check,
+                "create-suggest",
+                cx.listener(|this, _, window, cx| this.suggest(window, cx)),
+                cx,
+            ))
             .child(ui::input(&self.confirm));
         if busy == Some(Busy::Calibrating) {
             card = card.child(busy_row("Calibrating encryption for this Mac…", cx));
@@ -328,16 +344,18 @@ impl ChooseScreen {
                         .disabled(busy.is_some())
                         .on_click(cx.listener(|this, _, window, cx| this.back(window, cx))),
                 )
-                .child(
+                .child(ui::submit_gate(
+                    "create-submit",
+                    ready && busy.is_none(),
                     Button::new("do-create")
                         .primary()
                         .label("Create vault")
                         .loading(busy == Some(Busy::Calibrating))
-                        .disabled(busy.is_some())
+                        .disabled(busy.is_some() || !ready)
                         .on_click(
                             cx.listener(|this, _, window, cx| this.submit_create(window, cx)),
                         ),
-                ),
+                )),
         )
     }
 }
@@ -364,5 +382,125 @@ impl Render for ChooseScreen {
             Step::Create => self.render_create(cx),
         };
         ui::centered(cx).child(card)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{AppContext as _, Modifiers, TestAppContext, VisualTestContext};
+    use gpui_component::Root;
+    use vault_core::Uuid;
+
+    use super::*;
+    use crate::theme;
+
+    /// 8 chars from lower + digits: about 41 bits, below the minimum.
+    pub(crate) const WEAK: &str = "letmein1";
+    pub(crate) const STRONG: &str = "correct-horse-battery-staple";
+
+    fn window(
+        cx: &mut TestAppContext,
+    ) -> (Entity<AppState>, Entity<ChooseScreen>, VisualTestContext) {
+        cx.update(gpui_component::init);
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        let mut view = None;
+        let window = cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let v = cx.new(|cx| ChooseScreen::new(state.clone(), window, cx));
+            view = Some(v.clone());
+            Root::new(v, window, cx)
+        });
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        (state, view.unwrap(), vcx)
+    }
+
+    fn type_into(input: &Entity<InputState>, text: &str, vcx: &mut VisualTestContext) {
+        vcx.update(|window, cx| {
+            ui::clear_input(input, window, cx);
+            ui::focus_input(input, window, cx);
+        });
+        vcx.simulate_input(text);
+        vcx.run_until_parked();
+    }
+
+    fn shown(key: &'static str, vcx: &mut VisualTestContext) -> bool {
+        vcx.debug_bounds(key).is_some()
+    }
+
+    fn weak_message() -> &'static str {
+        Box::leak(format!("master-problem {}", ui::WEAK_MASTER_PASSWORD).into_boxed_str())
+    }
+
+    /// Weak blocks Create (button and Enter), strong + matching enables it, and
+    /// "Suggest passphrase" fills both fields, reveals the password once and enables it.
+    #[gpui::test]
+    fn create_requires_a_strong_master_password(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, view, mut vcx) = window(cx);
+        let (password, confirm) =
+            view.read_with(&vcx, |v, _| (v.password.clone(), v.confirm.clone()));
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.folder = Some(dir.path().to_owned());
+                v.start_create(window, cx);
+            })
+        });
+        vcx.run_until_parked();
+        assert!(shown("create-submit blocked", &mut vcx), "empty form");
+        assert!(!shown(weak_message(), &mut vcx), "no nagging before typing");
+
+        type_into(&password, WEAK, &mut vcx);
+        type_into(&confirm, WEAK, &mut vcx);
+        assert!(shown(weak_message(), &mut vcx));
+        assert!(shown("create-submit blocked", &mut vcx));
+        let button = vcx.debug_bounds("create-submit blocked").unwrap();
+        vcx.simulate_click(button.center(), Modifiers::none());
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| assert!(s.busy.is_none(), "weak never submits"));
+        assert!(!dir.path().join("Personal.vault").exists());
+
+        // Strong but not yet confirmed: still blocked, no strength message.
+        type_into(&password, STRONG, &mut vcx);
+        type_into(&confirm, "correct", &mut vcx);
+        assert!(!shown(weak_message(), &mut vcx));
+        assert!(shown("create-submit blocked", &mut vcx));
+        type_into(&confirm, STRONG, &mut vcx);
+        assert!(shown("create-submit ready", &mut vcx));
+        assert!(!shown("master-write-it-down", &mut vcx));
+
+        // Suggest: both fields hold the same phrase, readable, and Create is enabled.
+        vcx.update(|window, cx| {
+            ui::clear_input(&password, window, cx);
+            ui::clear_input(&confirm, window, cx);
+            view.update(cx, |v, cx| v.suggest(window, cx));
+        });
+        vcx.run_until_parked();
+        let (pw, again, masked) = vcx.update(|_, cx| {
+            (
+                ui::input_text(&password, cx),
+                ui::input_text(&confirm, cx),
+                ui::input_is_masked(&password, cx),
+            )
+        });
+        assert_eq!(pw.split('-').count(), 4, "a 4-word passphrase");
+        assert_eq!(pw, again);
+        assert!(!masked, "revealed once");
+        assert!(shown("master-write-it-down", &mut vcx));
+        assert!(shown("create-submit ready", &mut vcx));
+
+        // Editing the revealed phrase masks it again and drops the note.
+        vcx.update(|window, cx| ui::focus_input(&password, window, cx));
+        vcx.simulate_input("x");
+        vcx.run_until_parked();
+        assert!(vcx.update(|_, cx| ui::input_is_masked(&password, cx)));
+        assert!(!shown("master-write-it-down", &mut vcx));
+
+        // Back clears the passwords and re-masks.
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.back(window, cx)));
+        vcx.update(|_, cx| {
+            assert!(ui::input_is_empty(&password, cx));
+            assert!(ui::input_is_empty(&confirm, cx));
+        });
     }
 }

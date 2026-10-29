@@ -53,19 +53,19 @@ pub fn open_backup_window(
     state: Entity<AppState>,
     path: PathBuf,
     cx: &mut App,
-) -> gpui::Result<()> {
+) -> gpui::Result<gpui::AnyWindowHandle> {
     let title = format!("Backup \u{2014} {}", text::file_name(&path));
     let mut options = ui::main_window_options(None, cx);
     options.titlebar = Some(gpui::TitlebarOptions {
         title: Some(title.into()),
         ..Default::default()
     });
-    cx.open_window(options, |window, cx| {
+    let handle = cx.open_window(options, |window, cx| {
         theme::apply(window, cx);
         let view = cx.new(|cx| BackupWindow::new(state, path, window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     })?;
-    Ok(())
+    Ok(handle.into())
 }
 
 impl BackupWindow {
@@ -317,15 +317,18 @@ impl BackupWindow {
                 .into_any_element();
         };
         let fields = item.fields.iter().enumerate().map(|(ix, field)| {
-            let concealed =
-                field.kind == FieldKind::Password || listing::is_card_number(item, field);
+            // Passwords, unknown kinds from newer versions and card numbers start hidden.
+            // TOTP has its own rendering below (the code, never the secret).
+            let concealed = (field.kind.is_sensitive() && field.kind != FieldKind::Totp)
+                || listing::is_card_number(item, field);
+            let masked = concealed && !self.revealed.contains(&ix);
             let shown = if field.kind == FieldKind::Totp {
                 // The current code, like the main detail (the secret itself never shows).
                 parse_totp(&field.value).map_or_else(
                     || "Invalid one-time code setup".to_owned(),
                     |t| text::group_code(&t.code(text::now_millis() / 1000)),
                 )
-            } else if concealed && !self.revealed.contains(&ix) {
+            } else if masked {
                 "\u{2022}".repeat(10)
             } else {
                 field.value.expose_secret().clone()
@@ -358,6 +361,13 @@ impl BackupWindow {
                         .gap(px(4.))
                         .child(
                             div()
+                                // Records only whether the value is hidden, never the value.
+                                .debug_selector(move || {
+                                    format!(
+                                        "backup-value {ix} {}",
+                                        if masked { "masked" } else { "shown" }
+                                    )
+                                })
                                 .flex_1()
                                 .min_w_0()
                                 .font_family(theme.mono_font_family.clone())
@@ -528,6 +538,60 @@ mod tests {
         (view.unwrap(), vcx)
     }
 
+    /// A field kind from a newer app version is concealed like a password until revealed.
+    #[gpui::test]
+    fn unknown_field_kind_is_masked(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = SyncedVault::create(
+            &dir.path().join("t.vault"),
+            &SecretString::new(PW.into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let device = vault.device_id();
+        vault
+            .edit(|v| {
+                let mut item = Item::new(ItemKind::Login, "Gadget", device, 1);
+                let mut pin =
+                    Field::new("pin", FieldKind::Other, SecretString::new("4711".into()), 1);
+                pin.kind_raw = Some("x-future-pin".into());
+                item.fields = vec![
+                    Field::new("user", FieldKind::Text, SecretString::new("al".into()), 1),
+                    pin,
+                ];
+                v.insert(item, 1);
+            })
+            .unwrap();
+        vault.save().unwrap();
+        let backup = vault.backup_now().unwrap();
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        state.update(cx, |s, _| s.install_unlocked_for_tests(vault));
+        let (view, mut vcx) = window(&state, &backup, cx);
+        view.update(&mut vcx, |w, cx| w.unlock(SecretString::new(PW.into()), cx));
+        vcx.run_until_parked();
+        assert!(view.read_with(&vcx, |w, _| w.is_open()));
+        assert!(
+            vcx.debug_bounds("backup-value 0 shown").is_some(),
+            "text field"
+        );
+        assert!(
+            vcx.debug_bounds("backup-value 1 masked").is_some(),
+            "Other field"
+        );
+        assert!(vcx.debug_bounds("backup-value 1 shown").is_none());
+        view.update(&mut vcx, |w, cx| {
+            w.revealed.insert(1);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("backup-value 1 shown").is_some(),
+            "Reveal works"
+        );
+    }
+
     #[gpui::test]
     fn opens_read_only_and_copies_across(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -592,9 +656,26 @@ mod tests {
         state.update(cx, |s, cx| s.open_backup(backup.clone(), cx));
         cx.run_until_parked();
         assert_eq!(cx.update(|cx| cx.windows().len()), before + 1);
+        assert_eq!(state.read_with(cx, |s, _| s.backup_windows.len()), 1);
+
+        // Closed by the user (red button), then reopened: the dead handle is pruned.
+        let first = state.read_with(cx, |s, _| s.backup_windows[0]);
+        cx.update_window(first, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        state.update(cx, |s, cx| s.open_backup(backup.clone(), cx));
+        cx.run_until_parked();
+        state.read_with(cx, |s, _| {
+            assert_eq!(s.backup_windows.len(), 1);
+            assert_ne!(s.backup_windows[0], first);
+        });
 
         state.update(cx, |s, cx| s.lock(cx));
         cx.run_until_parked();
+        assert!(
+            state.read_with(cx, |s, _| s.backup_windows.is_empty()),
+            "lock forgets the viewer handle"
+        );
         assert_eq!(
             cx.update(|cx| cx.windows().len()),
             before,

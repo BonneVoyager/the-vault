@@ -39,7 +39,7 @@ Parsers reject: wrong magic, `format_version > SUPPORTED`, `header_len` beyond E
 ```
 {
   "id":          bytes(16)     UUIDv4
-  "kind":        "password" | "enclave" | "recovery"
+  "kind":        "password" | "enclave" | "passkey" | "recovery"
   "nonce":       bytes(24)
   "wrapped_key": bytes(48)     XChaCha20-Poly1305( vault_key ) → 32 ct + 16 tag
   "created_at":  u64
@@ -48,11 +48,14 @@ Parsers reject: wrong magic, `format_version > SUPPORTED`, `header_len` beyond E
 
 - `password` slot: KEK = `Argon2id(password_utf8_nfc, salt, m,t,p) → 32 bytes`. The password is NFC-normalised before hashing.
 - `enclave` slot (phase 4): KEK is a random 32-byte key held in the Keychain, access-controlled by Touch ID. The slot itself is identical in structure.
+- `passkey` slot (post-phase-5, macOS 15): extra keys `credential_id: bytes`, `prf_salt: bytes(32)` (random, static per slot), `rp_id: tstr`. KEK = `HKDF-SHA256(ikm = prf_output, salt = vault_id, info = "vault/slot/passkey/v1")` where `prf_output` is the 32-byte WebAuthn PRF result for `prf_salt` from the passkey assertion. The password slot stays; either factor unlocks. The PRF output must be identical on every device that holds the synced passkey; verify this before relying on cross-device unlock. Not yet implemented.
 - `recovery` slot (v2): reserved.
 
 AAD for unwrapping any slot: `magic || format_version || vault_id || slot.id || slot.kind`. Tampering with KDF params does not break unwrap (they're not in AAD by design — otherwise you can't rotate them); it just makes derivation produce the wrong KEK and the tag fails. Tampering with `vault_id` fails every slot.
 
 Multiple `password` slots are allowed in the format but v1 UI exposes one.
+
+Slot ids must be unique within a header; a duplicate is `Malformed`. A slot whose `kind` is unknown to the reader is kept as an **opaque slot**: `id` and `kind` are read, every other entry is preserved verbatim and re-emitted in the original position, the slot is skipped at unlock, may be removed by id, and is dropped by `rotate_vault_key` like an `enclave` slot. Kind strings match exactly (case and whitespace sensitive).
 
 ## 3. Keys
 
@@ -116,6 +119,8 @@ HistoryEntry = { "value": tstr, "replaced_at": u64 }
 AttachmentRef = { "id": bytes(16), "name": tstr, "size": u64, "key": bytes(32), "chunk_nonces": [bytes(24)] }
 ```
 
+Unknown `kind` strings on items and fields are not errors: the reader keeps the original string (`kind_raw`) and the writer re-emits it. Apps treat a field of unknown kind as sensitive (masked) because a newer version may have added a secret kind.
+
 Field `modified_at` is the merge unit (see `03-sync.md`). An item's top-level `modified_at` must equal `max(field.modified_at, deleted_at, metadata change)`; parsers do not enforce this but merge relies on it, so the writer must maintain it.
 
 ### ManifestRecord
@@ -149,12 +154,13 @@ pub enum VaultError {
     Truncated,
     Malformed(String),           // CBOR / structural
     WrongPassword,               // every password slot failed to unwrap
+    NoUsableSlot,                // no slot of a kind this version can unlock (decided from plaintext, before Argon2)
     Tampered(TamperKind),
 }
 pub enum TamperKind { Header, Item(Uuid), Manifest, ItemCount }
 ```
 
-`WrongPassword` and `Tampered(Header)` are indistinguishable at the crypto level (both are AEAD tag failures on slots). Report `WrongPassword` when all slots fail and the header parsed cleanly; report `Tampered(Header)` only on structural damage. Do not try to be cleverer than that.
+`WrongPassword` and `Tampered(Header)` are indistinguishable at the crypto level (both are AEAD tag failures on slots). Report `WrongPassword` when at least one password slot exists and all fail, and the header parsed cleanly; report `NoUsableSlot` when there is no password slot at all (for example a file written by a newer version whose slot kinds this version does not know); report `Tampered(Header)` only on structural damage. Do not try to be cleverer than that.
 
 ## 8. Test vectors
 
@@ -166,7 +172,9 @@ Phase 1 must commit:
 
 ## 9. Versioning
 
-`FORMAT_VERSION` bumps only on incompatible layout changes. Adding optional CBOR map keys is **not** a bump; readers ignore unknown keys, writers preserve unknown keys they read (store them as `Vec<(Value, Value)>` extras on each struct). This is how v1.1 adds attachments without a bump.
+`FORMAT_VERSION` bumps only on incompatible layout changes. Adding optional CBOR map keys is **not** a bump; readers ignore unknown keys, writers preserve unknown keys they read (store them as `Vec<(Value, Value)>` extras on each struct). This is how v1.1 adds attachments without a bump. New enum strings (slot kind, item kind, field kind) are also **not** a bump: readers preserve them as described in §2 and §4.
+
+Every `FORMAT_VERSION` keeps its fixtures under `tests/fixtures/` forever, and a test opens every fixture in that directory with the current reader. `v1-forward.vault` carries an opaque slot, an unknown item kind, an unknown field kind, and unknown keys at every level.
 
 ## 10. Non-goals of the format
 

@@ -2,6 +2,7 @@
 //! listing, selection, favourites with debounced autosave, copy with auto-clear,
 //! reveal, and focus requests. Views only render this state and call these methods.
 
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::Context;
@@ -102,6 +103,12 @@ impl AppState {
             .unlocked_vault()
             .map(listing::counts)
             .unwrap_or_default();
+        // Password warnings depend only on the contents, so audit here, not per refresh.
+        self.listing.issues = Rc::new(
+            self.unlocked_vault()
+                .map(crate::audit::audit)
+                .unwrap_or_default(),
+        );
         self.refresh();
     }
 
@@ -114,7 +121,8 @@ impl AppState {
             self.set_selection(None);
             return;
         };
-        let new_listing = listing::compute(vault, &self.query, &self.filter, self.sort);
+        let issues = self.listing.issues.clone();
+        let new_listing = listing::compute(vault, &self.query, &self.filter, self.sort, issues);
         self.listing = new_listing;
         self.listing_version = self.listing_version.wrapping_add(1);
         let keep = self

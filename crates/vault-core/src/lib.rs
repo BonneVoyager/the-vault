@@ -14,7 +14,7 @@ pub mod vault;
 mod crypto;
 
 pub use error::{TamperKind, VaultError};
-pub use format::{FORMAT_VERSION, Header, KeySlot, MAGIC, SlotKind};
+pub use format::{FORMAT_VERSION, Header, KeySlot, MAGIC, OpaqueSlot, Slot, SlotKind};
 pub use item::{Extras, Field, FieldKind, HistoryEntry, Item, ItemKind, Millis};
 pub use kdf::KdfParams;
 #[cfg(feature = "sync")]

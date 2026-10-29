@@ -7,7 +7,8 @@
 
 use gpui::{Context, SharedString};
 use vault_core::{
-    ExposeSecret, Field, FieldKind, Item, ItemKind, SecretString, UnlockedVault, Uuid, VaultError,
+    ExposeSecret, Field, FieldKind, Item, ItemKind, SecretString, Totp, UnlockedVault, Uuid,
+    VaultError,
 };
 
 use super::{AppState, ChooseIntent, Filter, FocusTarget, Mode};
@@ -32,6 +33,8 @@ pub struct EditBuffer {
     pub remote_fields: Vec<u64>,
     /// Same for the title.
     pub remote_title: bool,
+    /// Text in the tag input not yet committed with Enter or a comma; Save commits it.
+    pub tag_draft: String,
 }
 
 impl EditBuffer {
@@ -46,6 +49,7 @@ impl EditBuffer {
             pushed: Vec::new(),
             remote_fields: Vec::new(),
             remote_title: false,
+            tag_draft: String::new(),
         }
     }
 
@@ -83,9 +87,11 @@ impl EditBuffer {
         self.index(key).map(|i| &mut self.item.fields[i])
     }
 
-    /// True when title or fields differ from where editing started.
+    /// True when title, tags or fields differ from where editing started.
     pub fn has_changes(&self) -> bool {
         self.item.title != self.original.title
+            || self.item.tags != self.original.tags
+            || self.draft_adds_tag()
             || self.item.fields.len() != self.original.fields.len()
             || self
                 .item
@@ -133,12 +139,84 @@ impl EditBuffer {
         self.keys.insert(to, k);
     }
 
-    /// Validates and returns the item to write: trimmed title and names.
+    /// Adds a tag typed by the user: trimmed, leading `#` stripped. Blank tags and
+    /// case-insensitive duplicates are ignored. Returns true if the tag was added.
+    pub fn add_tag(&mut self, raw: &str) -> bool {
+        push_tag(&mut self.item.tags, raw)
+    }
+
+    pub fn remove_tag(&mut self, ix: usize) {
+        if ix < self.item.tags.len() {
+            self.item.tags.remove(ix);
+        }
+    }
+
+    /// Takes the tag input's text as the draft. Every comma-terminated part is committed
+    /// as a tag; returns the text after the last comma when there was one (the input
+    /// should then show just that).
+    pub fn type_tags(&mut self, text: &str) -> Option<String> {
+        let Some((done, rest)) = text.rsplit_once(',') else {
+            self.tag_draft = text.to_owned();
+            return None;
+        };
+        for part in done.split(',') {
+            self.add_tag(part);
+        }
+        self.tag_draft = rest.to_owned();
+        Some(rest.to_owned())
+    }
+
+    /// True when committing the draft would add a tag (not blank, not a duplicate).
+    fn draft_adds_tag(&self) -> bool {
+        normalize_tag(&self.tag_draft).is_some_and(|d| {
+            let d = d.to_lowercase();
+            !self.item.tags.iter().any(|t| t.to_lowercase() == d)
+        })
+    }
+
+    /// Enter in the tag input: commits the draft.
+    pub fn commit_tag_draft(&mut self) {
+        let draft = std::mem::take(&mut self.tag_draft);
+        self.add_tag(&draft);
+    }
+
+    /// Parse status shown under one-time-code row `key`: `(valid, message)`. `None` for
+    /// other rows and for an empty value.
+    pub fn totp_hint(&self, key: u64) -> Option<(bool, &'static str)> {
+        let field = self.field(key).filter(|f| f.kind == FieldKind::Totp)?;
+        let raw = field.value.expose_secret().trim();
+        if raw.is_empty() {
+            return None;
+        }
+        Some(if Totp::parse_uri(raw).is_ok() {
+            (true, TOTP_VALID)
+        } else if !looks_like_uri(raw) && Totp::from_secret_base32(raw).is_ok() {
+            (true, TOTP_VALID_SECRET)
+        } else {
+            (false, TOTP_INVALID)
+        })
+    }
+
+    /// Validates and returns the item to write: trimmed title, names and tags, a pending
+    /// tag committed, and one-time-code values stored as `otpauth://` URIs (01 §4).
     fn finished(&self) -> Result<Item, SharedString> {
         let mut item = self.item.clone();
         item.title = item.title.trim().to_owned();
         if item.title.is_empty() {
             return Err("Title required".into());
+        }
+        push_tag(&mut item.tags, &self.tag_draft);
+        // Only rows the user added or changed: an untouched field must stay byte-identical,
+        // or `apply_edit` would see a change and overwrite a value merged in meanwhile.
+        for (key, f) in self.keys.iter().zip(item.fields.iter_mut()) {
+            let untouched = usize::try_from(*key)
+                .ok()
+                .and_then(|k| self.original.fields.get(k))
+                .is_some_and(|of| same_field(f, of));
+            if f.kind != FieldKind::Totp || untouched {
+                continue;
+            }
+            f.value = normalize_totp(&f.value, &item.title);
         }
         for i in 0..item.fields.len() {
             let name = item.fields[i].name.trim().to_owned();
@@ -152,6 +230,75 @@ impl EditBuffer {
         }
         Ok(item)
     }
+}
+
+/// Status lines under a one-time-code field in the editor.
+const TOTP_VALID: &str = "Valid one-time code";
+const TOTP_VALID_SECRET: &str = "Valid one-time code secret (saved as an otpauth:// URI)";
+const TOTP_INVALID: &str = "Not a valid otpauth URI or base32 secret";
+
+/// A typed tag, trimmed and without leading `#`; `None` when nothing is left.
+fn normalize_tag(raw: &str) -> Option<String> {
+    let tag = raw.trim().trim_start_matches('#').trim();
+    (!tag.is_empty()).then(|| tag.to_owned())
+}
+
+/// Appends `raw` to `tags` unless it is blank or already there (case-insensitively).
+fn push_tag(tags: &mut Vec<String>, raw: &str) -> bool {
+    let Some(tag) = normalize_tag(raw) else {
+        return false;
+    };
+    if tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
+        return false;
+    }
+    tags.push(tag);
+    true
+}
+
+/// True when `s` starts like a URI (`scheme:`), so it is never taken for a bare secret.
+fn looks_like_uri(s: &str) -> bool {
+    s.split_once(':').is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    })
+}
+
+/// The value to store for a one-time-code field: trimmed; a bare base32 secret becomes
+/// `otpauth://totp/<title>?secret=…`. Anything else (a URI, or text that parses as
+/// neither) is stored trimmed as typed; the editor flags it.
+fn normalize_totp(value: &SecretString, title: &str) -> SecretString {
+    let raw = value.expose_secret().trim();
+    if looks_like_uri(raw) || raw.is_empty() {
+        return SecretString::new(raw.to_owned());
+    }
+    let Ok(totp) = Totp::from_secret_base32(raw) else {
+        return SecretString::new(raw.to_owned());
+    };
+    // `to_uri` has an empty label for a bare secret; put the item title there.
+    let uri = totp.to_uri();
+    let query = uri.expose_secret().split_once('?').map_or("", |(_, q)| q);
+    let label = percent_encode(title);
+    let mut out = String::with_capacity(16 + label.len() + query.len());
+    out.push_str("otpauth://totp/");
+    out.push_str(&label);
+    out.push('?');
+    out.push_str(query);
+    SecretString::new(out)
+}
+
+/// Percent-encodes everything but RFC 3986 unreserved characters (for the URI label).
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 pub(super) fn same_field(a: &Field, b: &Field) -> bool {
@@ -170,6 +317,7 @@ pub fn kind_name(kind: FieldKind) -> &'static str {
         FieldKind::Date => "date",
         FieldKind::MonthYear => "month/year",
         FieldKind::Number => "number",
+        FieldKind::Other => FieldKind::Other.as_str(),
     }
 }
 
@@ -196,6 +344,8 @@ pub fn template(kind: ItemKind) -> &'static [(&'static str, FieldKind)] {
             ("phone", FieldKind::Number),
             ("address", FieldKind::Notes),
         ],
+        // Never offered for new items; title only.
+        ItemKind::Other => &[],
     }
 }
 
@@ -253,9 +403,13 @@ fn apply_edit(
         }
     }
     let title_changed = item.title != original.title;
+    let tags_changed = item.tags != original.tags;
     v.update(id, now, |it| {
         if title_changed {
             it.title = item.title;
+        }
+        if tags_changed {
+            it.tags = item.tags;
         }
         let mut stored = std::mem::take(&mut it.fields);
         let mut fields = Vec::with_capacity(item.fields.len());
@@ -922,6 +1076,231 @@ mod tests {
             assert_eq!(s.selection, None);
             s.request_delete(cx);
             assert!(s.delete_confirm.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn tags_are_added_deduped_removed_and_saved(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, gh, _) = setup(dir.path(), cx);
+        state.update(cx, |s, cx| {
+            s.select(gh, cx);
+            s.begin_edit(cx);
+            s.edit(cx, |b| {
+                assert!(b.add_tag(" work "));
+                assert!(b.add_tag("#Infra"));
+                assert!(!b.add_tag("WORK"), "case-insensitive duplicate");
+                assert!(!b.add_tag("##infra"), "duplicate after # strip");
+                assert!(!b.add_tag("   "), "blank");
+                assert!(!b.add_tag("#"), "only a hash");
+                // Comma commits; the text after the last comma stays as the draft.
+                assert_eq!(b.type_tags("a, ,b,c").as_deref(), Some("c"));
+                assert_eq!(b.tag_draft, "c");
+                assert_eq!(b.type_tags("cd"), None);
+                assert_eq!(b.tag_draft, "cd");
+                b.remove_tag(2); // "a"
+                b.remove_tag(99); // out of range: no-op
+            });
+            assert!(s.edit_buffer().unwrap().has_changes());
+            // Save commits the pending draft too.
+            s.save_edit(cx);
+            assert!(!s.is_editing());
+            assert_eq!(stored(s, gh).tags, ["work", "Infra", "b", "cd"]);
+            let names: Vec<_> = s.counts.tags.iter().map(|t| t.0.as_str()).collect();
+            assert_eq!(names, ["b", "cd", "Infra", "work"], "sidebar counts follow");
+
+            // A second edit that only removes a tag writes just that.
+            s.begin_edit(cx);
+            s.edit(cx, |b| b.remove_tag(0));
+            s.save_edit(cx);
+            assert_eq!(stored(s, gh).tags, ["Infra", "b", "cd"]);
+        });
+    }
+
+    #[gpui::test]
+    fn tags_on_a_new_item_and_untouched_tags_keep_remote_changes(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, gh, _) = setup(dir.path(), cx);
+        state.update(cx, |s, cx| {
+            s.begin_new(ItemKind::Note, "Tagged".into(), cx);
+            s.edit(cx, |b| {
+                b.add_tag("home");
+            });
+            s.save_edit(cx);
+            assert_eq!(s.selected_item().unwrap().tags, ["home"]);
+
+            // Tags merged in while editing survive an edit that does not touch tags.
+            s.select(gh, cx);
+            s.begin_edit(cx);
+            s.vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| v.update(gh, 50, |it| it.tags = vec!["remote".into()]))
+                .unwrap()
+                .unwrap();
+            s.set_edit_title("GitHub 2".into(), cx);
+            s.save_edit(cx);
+            assert_eq!(stored(s, gh).tags, ["remote"]);
+        });
+    }
+
+    fn totp_buffer(value: &str) -> (EditBuffer, u64) {
+        let mut item = Item::new(ItemKind::Login, "My Bank: ü", Uuid::new_v4(), 1);
+        item.fields = vec![Field::new("one-time code", FieldKind::Totp, secret(""), 1)];
+        let mut b = EditBuffer::new(item);
+        let key = b.keys[0];
+        // Typed by the user, so the save normalises it.
+        b.field_mut(key).unwrap().value = secret(value);
+        (b, key)
+    }
+
+    #[test]
+    fn totp_values_are_trimmed_and_bare_secrets_become_uris() {
+        const URI: &str =
+            "otpauth://totp/Example:alice@google.com?secret=JBSWY3DPEHPK3PXP&issuer=Example";
+        let (b, key) = totp_buffer(&format!("  {URI}\n"));
+        assert_eq!(b.totp_hint(key), Some((true, TOTP_VALID)));
+        let saved = b.finished().unwrap();
+        assert_eq!(saved.fields[0].value.expose_secret(), URI);
+
+        let (b, key) = totp_buffer(" jbsw y3dp ehpk 3pxp ");
+        assert_eq!(b.totp_hint(key), Some((true, TOTP_VALID_SECRET)));
+        let saved = b.finished().unwrap();
+        let uri = saved.fields[0].value.expose_secret();
+        assert!(
+            uri.starts_with("otpauth://totp/My%20Bank%3A%20%C3%BC?secret=JBSWY3DPEHPK3PXP"),
+            "label is the title"
+        );
+        let a = Totp::parse_uri(uri).unwrap();
+        let b2 = Totp::from_secret_base32("JBSWY3DPEHPK3PXP").unwrap();
+        assert_eq!(a.code(59), b2.code(59), "same secret");
+
+        let (b, key) = totp_buffer("otpauth://totp/broken");
+        assert_eq!(b.totp_hint(key), Some((false, TOTP_INVALID)));
+        assert_eq!(
+            b.finished().unwrap().fields[0].value.expose_secret(),
+            "otpauth://totp/broken",
+            "kept as typed; the editor flags it"
+        );
+        let (b, key) = totp_buffer("not a secret!");
+        assert_eq!(b.totp_hint(key), Some((false, TOTP_INVALID)));
+        let (b, key) = totp_buffer("   ");
+        assert_eq!(b.totp_hint(key), None);
+        assert_eq!(b.finished().unwrap().fields[0].value.expose_secret(), "");
+    }
+
+    #[gpui::test]
+    fn untouched_raw_totp_is_not_rewritten_and_remote_update_survives(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, gh, _) = setup(dir.path(), cx);
+        state.update(cx, |s, cx| {
+            // As an import stores it: a bare, untrimmed secret.
+            s.vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| {
+                    v.update(gh, 20, |it| {
+                        it.fields.push(Field::new(
+                            "totp",
+                            FieldKind::Totp,
+                            secret(" jbswy3dpehpk3pxp "),
+                            20,
+                        ))
+                    })
+                })
+                .unwrap()
+                .unwrap();
+            s.select(gh, cx);
+            s.begin_edit(cx);
+            // Another device updates the TOTP while the user edits only the title.
+            let remote = "otpauth://totp/GitHub?secret=GEZDGNBVGY3TQOJQ";
+            s.vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| v.set_field(gh, "totp", secret(remote), 60))
+                .unwrap()
+                .unwrap();
+            let merged = stored(s, gh);
+            s.set_edit_title("GitHub 2".into(), cx);
+            s.save_edit(cx);
+            assert!(!s.is_editing());
+            let after = stored(s, gh);
+            let totp = after.field("totp").unwrap();
+            assert_eq!(totp.value.expose_secret(), remote, "remote update survives");
+            assert_eq!(totp.modified_at, merged.field("totp").unwrap().modified_at);
+            assert_eq!(after.title, "GitHub 2");
+
+            // Untouched raw value with no remote change: stays byte-identical.
+            s.vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| v.set_field(gh, "totp", secret(" jbswy3dpehpk3pxp "), 70))
+                .unwrap()
+                .unwrap();
+            let before = stored(s, gh);
+            s.begin_edit(cx);
+            s.set_edit_title("GitHub 3".into(), cx);
+            s.save_edit(cx);
+            let after = stored(s, gh);
+            let (a, b) = (after.field("totp").unwrap(), before.field("totp").unwrap());
+            assert_eq!(a.value.expose_secret(), " jbswy3dpehpk3pxp ");
+            assert_eq!(a.modified_at, b.modified_at, "stamp not bumped");
+
+            // Touched: now it is normalised.
+            s.begin_edit(cx);
+            let key = s.edit_buffer().unwrap().keys[2];
+            s.set_edit_value(key, secret(" jbswy3dpehpk3pxp\n"), cx);
+            s.save_edit(cx);
+            let v = stored(s, gh)
+                .field("totp")
+                .unwrap()
+                .value
+                .expose_secret()
+                .to_owned();
+            assert!(v.starts_with("otpauth://totp/GitHub%203?secret=JBSWY3DPEHPK3PXP"));
+        });
+    }
+
+    #[gpui::test]
+    fn duplicate_draft_is_no_change_and_cancel_discards_the_draft(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, gh, note) = setup(dir.path(), cx);
+        state.update(cx, |s, cx| {
+            s.select(gh, cx);
+            s.begin_edit(cx);
+            s.edit(cx, |b| {
+                b.add_tag("work");
+            });
+            s.save_edit(cx);
+
+            s.begin_edit(cx);
+            s.edit(cx, |b| {
+                b.type_tags(" #WORK ");
+            });
+            assert!(!s.edit_buffer().unwrap().has_changes(), "duplicate draft");
+            s.edit(cx, |b| {
+                b.type_tags("   ");
+            });
+            assert!(!s.edit_buffer().unwrap().has_changes(), "blank draft");
+            // So navigation just ends the edit, no prompt.
+            s.select(note, cx);
+            assert!(s.discard_prompt.is_none());
+            assert!(!s.is_editing());
+
+            // A real draft is a change; Cancel drops it.
+            s.select(gh, cx);
+            s.begin_edit(cx);
+            s.edit(cx, |b| {
+                b.type_tags("home");
+            });
+            assert!(s.edit_buffer().unwrap().has_changes());
+            s.cancel_edit(cx);
+            assert!(!s.is_editing());
+            assert_eq!(stored(s, gh).tags, ["work"]);
+            s.begin_edit(cx);
+            assert_eq!(s.edit_buffer().unwrap().tag_draft, "", "fresh buffer");
+            s.save_edit(cx);
+            assert_eq!(stored(s, gh).tags, ["work"]);
         });
     }
 }

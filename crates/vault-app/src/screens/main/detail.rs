@@ -20,11 +20,12 @@ use gpui_kit_assets::IconName;
 use vault_core::{ExposeSecret, Field, FieldKind, Item};
 
 use super::MainScreen;
-use super::list::avatar;
+use super::list::{alert_dot, avatar};
 use super::prompts;
 use super::sidebar::kind_singular;
 use super::sync_banners;
 use crate::actions::{DETAIL_CONTEXT, DeleteItem, EditItem, ToggleFavorite};
+use crate::audit::Issue;
 use crate::state::{AppState, CopyTarget, ToastPlace, parse_totp};
 use crate::{text, ui};
 
@@ -75,6 +76,38 @@ fn mono(text: impl Into<SharedString>, cx: &App) -> gpui::Div {
     div()
         .font_family(cx.theme().mono_font_family.clone())
         .child(text.into())
+}
+
+/// Apple-style warning card for one password issue: red "!" at left, bold title, body.
+/// Not dismissable; it disappears when a save fixes the password.
+fn issue_banner(issue: &Issue, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let title = issue.title();
+    ui::h_flex()
+        .items_start()
+        .gap(px(12.))
+        .p(px(12.))
+        .rounded(theme.radius_lg)
+        .bg(theme.secondary)
+        .border_1()
+        .border_color(theme.border)
+        // Tests find the banner by this key (no-op outside test builds).
+        .debug_selector(move || format!("issue-banner {title}"))
+        .child(alert_dot(20., cx))
+        .child(
+            ui::v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(2.))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .whitespace_normal()
+                        .child(issue.body()),
+                ),
+        )
 }
 
 pub const ONBOARDING_TITLE: &str = "Your vault is ready";
@@ -305,19 +338,31 @@ impl MainScreen {
                     ),
                 )
             })
+            .children(
+                s.listing
+                    .issues(item.id)
+                    .iter()
+                    .map(|issue| issue_banner(issue, cx)),
+            )
             .child(ui::divider(cx))
+            // Every field row (and the history disclosure) draws its own bottom border, so
+            // the last row's border already closes the group above the footer. Only the
+            // no-fields message needs a rule of its own.
             .when(item.fields.is_empty(), |col| {
                 col.child(ui::muted("This item has no fields.", cx))
+                    .child(ui::divider(cx))
             })
             .child(ui::v_flex().children(fields))
-            .child(ui::divider(cx))
-            .child(ui::muted(
-                format!(
-                    "modified {} · {device}",
-                    text::relative(now, item.modified_at)
-                ),
-                cx,
-            ))
+            .child(
+                ui::muted(
+                    format!(
+                        "modified {} · {device}",
+                        text::relative(now, item.modified_at)
+                    ),
+                    cx,
+                )
+                .debug_selector(|| "detail-footer".into()),
+            )
     }
 
     fn render_field(
@@ -357,10 +402,16 @@ impl MainScreen {
                     mono(text::mask_card(value), cx).into_any_element()
                 }
             }
-            FieldKind::Password => {
+            // A field kind from a newer app version may hold a secret: keep it concealed
+            // behind the same reveal toggle as a password.
+            FieldKind::Password | FieldKind::Other => {
+                let what = if field.kind == FieldKind::Password {
+                    "password  ⌘⇧R"
+                } else {
+                    "value"
+                };
                 buttons.push(
-                    reveal_button(ix, &field.name, revealed, "password  ⌘⇧R", &self.state)
-                        .into_any_element(),
+                    reveal_button(ix, &field.name, revealed, what, &self.state).into_any_element(),
                 );
                 if revealed {
                     mono(value.to_string(), cx).into_any_element()
@@ -408,6 +459,7 @@ impl MainScreen {
         );
 
         ui::v_flex()
+            .debug_selector(move || format!("field-row {ix}"))
             .py(px(8.))
             .gap(px(2.))
             .border_b_1()
@@ -431,7 +483,9 @@ impl MainScreen {
     fn render_totp(&self, ix: usize, field: &Field, now_ms: u64, cx: &App) -> AnyElement {
         let theme = cx.theme();
         let Some(totp) = parse_totp(&field.value) else {
-            return ui::muted("Invalid one-time code setup", cx).into_any_element();
+            return ui::muted("Invalid one-time code setup", cx)
+                .debug_selector(|| "totp-invalid".into())
+                .into_any_element();
         };
         let now = now_ms / 1000;
         let remaining = totp.seconds_remaining(now);
@@ -472,10 +526,13 @@ impl MainScreen {
             ring.into_any_element()
         };
 
+        let code = text::group_code(&totp.code(now));
         ui::h_flex()
             .gap(px(12.))
             .child(
-                mono(text::group_code(&totp.code(now)), cx)
+                mono(code.clone(), cx)
+                    // Tests find the shown code by this key (no-op outside test builds).
+                    .debug_selector(move || format!("totp-code {code}"))
                     .text_lg()
                     .font_weight(FontWeight::SEMIBOLD)
                     .when(urgent, |d| d.text_color(theme.warning)),
@@ -547,5 +604,179 @@ impl MainScreen {
             .child(toggle)
             .when(open, |col| col.children(entries))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Headless render tests for the password warnings and the field-group separator.
+
+    use std::sync::Arc;
+
+    use gpui::{AppContext as _, TestAppContext, VisualTestContext};
+    use gpui_component::Root;
+    use vault_core::{ItemKind, KdfParams, SecretString, Uuid};
+    use vault_sync::{NoopHooks, SyncedVault};
+
+    use super::super::MainScreen;
+    use super::*;
+    use crate::actions;
+
+    const STRONG: &str = "correct-Horse-battery-staple-42";
+
+    fn login(title: &str, password: &str, device: Uuid) -> Item {
+        let mut item = Item::new(ItemKind::Login, title, device, 1);
+        item.fields.push(Field::new(
+            "username",
+            FieldKind::Text,
+            SecretString::new("chris".into()),
+            1,
+        ));
+        item.fields.push(Field::new(
+            "password",
+            FieldKind::Password,
+            SecretString::new(password.into()),
+            1,
+        ));
+        item
+    }
+
+    /// The main screen over a vault holding one login per `(title, password)`.
+    fn open(
+        dir: &std::path::Path,
+        logins: &[(&str, &str)],
+        cx: &mut TestAppContext,
+    ) -> (Entity<AppState>, Vec<Uuid>, VisualTestContext) {
+        let mut vault = SyncedVault::create(
+            &dir.join("t.vault"),
+            &SecretString::new("pw".into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let ids = vault
+            .edit(|v| {
+                logins
+                    .iter()
+                    .map(|(title, pw)| v.insert(login(title, pw, v.device_id()), 1))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            actions::bind_keys(cx);
+            actions::register(&state, cx);
+        });
+        state.update(cx, |s, _| s.install_unlocked_for_tests(vault));
+        let mut main = None;
+        let window = cx.add_window(|window, cx| {
+            crate::theme::apply(window, cx);
+            let view = cx.new(|cx| MainScreen::new(state.clone(), None, window, cx));
+            main = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        let main = main.unwrap();
+        vcx.update(|window, cx| main.update(cx, |m, cx| m.appear(window, cx)));
+        vcx.run_until_parked();
+        (state, ids, vcx)
+    }
+
+    fn select(state: &Entity<AppState>, id: Uuid, vcx: &mut VisualTestContext) {
+        vcx.update(|_, cx| state.update(cx, |s, cx| s.select(id, cx)));
+        vcx.run_until_parked();
+    }
+
+    fn shown(key: &'static str, vcx: &mut VisualTestContext) -> bool {
+        vcx.debug_bounds(key).is_some()
+    }
+
+    /// Edits the selected item's password field to `password` and saves.
+    fn change_password(state: &Entity<AppState>, password: &str, vcx: &mut VisualTestContext) {
+        vcx.update(|_, cx| {
+            state.update(cx, |s, cx| {
+                s.begin_edit(cx);
+                let b = s.edit_buffer().unwrap();
+                let ix = b
+                    .item
+                    .fields
+                    .iter()
+                    .position(|f| f.kind == FieldKind::Password)
+                    .unwrap();
+                let key = b.keys[ix];
+                s.set_edit_value(key, SecretString::new(password.into()), cx);
+                s.save_edit(cx);
+                assert!(!s.is_editing());
+            });
+        });
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn weak_password_shows_badge_and_banner_until_fixed(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, ids, mut vcx) = open(dir.path(), &[("Bank", "123")], cx);
+        select(&state, ids[0], &mut vcx);
+        assert!(shown("issue-badge Weak password", &mut vcx));
+        assert!(shown("issue-banner Weak Password", &mut vcx));
+        assert!(!shown("issue-banner Reused Password", &mut vcx));
+
+        change_password(&state, STRONG, &mut vcx);
+        assert!(!shown("issue-badge Weak password", &mut vcx));
+        assert!(!shown("issue-banner Weak Password", &mut vcx));
+    }
+
+    #[gpui::test]
+    fn reused_password_flags_both_items(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, ids, mut vcx) = open(dir.path(), &[("Alpha", STRONG), ("Beta", STRONG)], cx);
+        select(&state, ids[0], &mut vcx);
+        // One badge per row, both rows flagged.
+        assert!(shown("issue-badge Reused password", &mut vcx));
+        let rows = state.read_with(&vcx, |s, _| s.listing.issues.len());
+        assert_eq!(rows, 2);
+        assert!(shown("issue-banner Reused Password", &mut vcx));
+        assert!(!shown("issue-banner Weak Password", &mut vcx));
+
+        change_password(&state, "an-entirely-Different-passphrase-7", &mut vcx);
+        assert!(!shown("issue-badge Reused password", &mut vcx));
+        assert!(!shown("issue-banner Reused Password", &mut vcx));
+    }
+
+    #[gpui::test]
+    fn search_reuses_the_audit_and_edits_redo_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, ids, mut vcx) = open(dir.path(), &[("Alpha", "123"), ("Beta", STRONG)], cx);
+        let before = state.read_with(&vcx, |s, _| s.listing.issues.clone());
+        vcx.update(|_, cx| state.update(cx, |s, cx| s.set_query("Al".into(), cx)));
+        let after = state.read_with(&vcx, |s, _| s.listing.issues.clone());
+        assert!(std::rc::Rc::ptr_eq(&before, &after), "search re-audited");
+        assert_eq!(after.len(), 1);
+
+        vcx.update(|_, cx| state.update(cx, |s, cx| s.set_query(String::new(), cx)));
+        select(&state, ids[0], &mut vcx);
+        change_password(&state, STRONG, &mut vcx);
+        let edited = state.read_with(&vcx, |s, _| s.listing.issues.clone());
+        assert!(!std::rc::Rc::ptr_eq(&before, &edited));
+        // Alpha now shares Beta's password.
+        assert!(
+            edited
+                .values()
+                .all(|v| matches!(v.as_slice(), [Issue::Reused { count: 2 }]))
+        );
+    }
+
+    #[gpui::test]
+    fn one_rule_between_last_field_and_footer(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, ids, mut vcx) = open(dir.path(), &[("Alpha", STRONG)], cx);
+        select(&state, ids[0], &mut vcx);
+        let last = vcx.debug_bounds("field-row 1").expect("last field row");
+        let footer = vcx.debug_bounds("detail-footer").expect("footer");
+        // The last row's own bottom border is the only rule: the footer follows after
+        // exactly one column gap, with no extra divider (1 px + another gap) between.
+        assert_eq!(footer.top() - last.bottom(), px(12.));
     }
 }

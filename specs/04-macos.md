@@ -2,9 +2,9 @@
 
 The only crate allowed `unsafe` and macOS-only dependencies. Everything here is behind a small trait or function so `vault-app` can be built with stub impls on CI machines without a Secure Enclave.
 
-Dependencies: `objc2`, `objc2-foundation`, `objc2-app-kit`, `objc2-local-authentication`, `security-framework` (Keychain), `core-foundation`. Pin all.
+Dependencies: `objc2`, `objc2-foundation`, `objc2-app-kit`, `objc2-local-authentication`, `security-framework` (Keychain), `core-foundation`. Pin all with `=` (this crate overrides the CLAUDE.md caret rule).
 
-Minimum target: macOS 14.
+Minimum target: macOS 15 (passkey PRF needs it; `LSMinimumSystemVersion 15.0`).
 
 ## 1. Device identity
 
@@ -43,8 +43,13 @@ Design (per vault, keyed by `vault_id`):
 ```
 
 Policy, enforced by `vault-app`, not here:
-- Master password required after reboot (detect via boot time), after 7 days, and after 5 failed Touch ID attempts.
+- Master password required after reboot (detect via boot time), after 7 days, and after 5 failed Touch ID attempts. The failure counter resets only on a password unlock; creating a vault counts as a password unlock. If boot time cannot be read, require the password (fail closed).
 - Touch ID can be enabled only after a successful master-password unlock in this session.
+- `rotate_vault_key` drops the enclave slot; Touch ID must be re-enrolled afterwards. Biometry change is detected by comparing the stored `evaluatedPolicyDomainState`; on mismatch the enrolment is stale and the user re-enrols.
+
+### 2b. Passkey unlock (post-phase-5, macOS 15)
+
+Uses `ASAuthorizationPlatformPublicKeyCredentialProvider` with the PRF extension. Enrol: register a passkey for `rp_id` with `prf_salt` → `(credential_id, prf_output)`; derive the KEK per `01` §2 and `vault.add_passkey_slot(...)`. Unlock: assertion with `prf_salt` → `prf_output` → KEK → `unlock_with_kek`. The passkey syncs through iCloud Keychain, so a second Mac needs no extra enrolment. Constraints: a native app may only use an `rp_id` it is associated with, which means an Associated Domains entitlement and an `apple-app-site-association` file hosted on that domain (owner to choose the domain); the PRF output must be verified identical across devices before cross-device unlock is advertised. API: `Passkey::register(vault_id, prf_salt) -> Result<(Vec<u8>, SecretVec<u8>), MacError>`, `Passkey::assert(credential_id, prf_salt, reason) -> Result<SecretVec<u8>, MacError>`, `Passkey::available() -> bool`.
 
 API:
 
@@ -65,14 +70,20 @@ pub enum MacError { NotAvailable, UserCancelled, BiometryChanged, Keychain(i32),
 ```rust
 pub struct Clipboard;
 impl Clipboard {
-    /// Writes with public.utf8-plain-text AND org.nspasteboard.ConcealedType so clipboard managers skip it.
-    pub fn write_concealed(text: &SecretString) -> ChangeCount;
+    /// Prepares the pasteboard with NSPasteboardContentsOptions.currentHostOnly (never reaches Universal Clipboard),
+    /// then writes org.nspasteboard.ConcealedType BEFORE public.utf8-plain-text so no poller sees the text unmarked.
+    /// On any write failure the pasteboard is cleared and None is returned.
+    pub fn write_concealed(text: &SecretString) -> Option<ChangeCount>;
     /// Clears only if the pasteboard changeCount is still ours.
     pub fn clear_if_unchanged(cc: ChangeCount);
 }
 ```
 
 `vault-app` schedules `clear_if_unchanged` after the configured delay (default 30 s). Also clear on lock.
+
+### 3b. Screen capture (best effort)
+
+`window::exclude_app_windows_from_capture() -> usize` sets `NSWindow.sharingType = .none` on every app window; `vault-app` calls it on the main thread whenever a window is created. Apple documents this constant as legacy and says it must not be relied on to hide content, so it is set as best effort only and never described to the user as protection.
 
 ## 4. iCloud eviction (`CloudHooks` impl for `vault-sync`)
 
@@ -90,16 +101,19 @@ impl CloudHooks for ICloudHooks {
 }
 ```
 
-Detecting "is this path inside iCloud Drive": `NSURL.isUbiquitousItemKey` resource value. Dropbox needs nothing special (it keeps a real file on disk; smart sync placeholders are handled by the file provider transparently on 14+).
+Detecting "is this path inside iCloud Drive": `NSURL.isUbiquitousItemKey` resource value. Dropbox needs nothing special (it keeps a real file on disk; smart sync placeholders are handled by the file provider transparently on 15+).
 
 ## 5. Idle and lock triggers
 
 ```rust
 pub fn seconds_since_user_input() -> f64;          // CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGAnyInputEventType)
-pub fn on_screen_locked(cb: impl Fn() + Send + 'static);   // NSDistributedNotificationCenter "com.apple.screenIsLocked"
-pub fn on_will_sleep(cb: impl Fn() + Send + 'static);      // NSWorkspace.willSleepNotification
-pub fn boot_time() -> SystemTime;                            // sysctl kern.boottime
+pub fn on_screen_locked(cb: impl Fn() + Send + 'static) -> Subscription;   // NSDistributedNotificationCenter "com.apple.screenIsLocked", DeliverImmediately
+pub fn on_will_sleep(cb: impl Fn() + Send + 'static) -> Subscription;      // NSWorkspace.willSleepNotification
+pub fn on_user_switched(cb: impl Fn() + Send + 'static) -> Subscription;   // NSWorkspace.sessionDidResignActiveNotification (fast user switch)
+pub fn boot_time() -> SystemTime;                                            // sysctl kern.boottime
 ```
+
+`Subscription` is a `#[must_use]` guard that removes the observer on drop; drop it on the main thread. Callbacks run on the main thread.
 
 ## 6. Security-scoped bookmarks
 
@@ -110,7 +124,8 @@ Only needed if the app is sandboxed. v1 ships outside the App Store, unsandboxed
 1. `cargo build --release -p vault-app`
 2. Assemble `Vault.app/Contents/{MacOS,Resources,Info.plist}`; Info.plist sets `LSMinimumSystemVersion 14.0`, `NSFaceIDUsageDescription` (required even for Touch ID), `CFBundleIdentifier`, `NSHighResolutionCapable`.
 3. `codesign --deep --options runtime --entitlements entitlements.plist --sign "Developer ID Application: …"`. Entitlements: `com.apple.security.cs.allow-jit` **not** needed; keep the list empty except what gpui requires (check at integration time).
-4. `xcrun notarytool submit … --wait`, `xcrun stapler staple`.
+3b. `scripts/check-entitlements.sh <app>` runs on the signed bundle and fails the build if the signature lacks the hardened-runtime flag or if any of these is set: `com.apple.security.get-task-allow`, `cs.disable-library-validation`, `cs.allow-dyld-environment-variables`, `cs.allow-unsigned-executable-memory`, `cs.allow-jit`, `cs.debugger`. `--skip-sign` skips it; `--dry-run` prints it.
+4. `xcrun notarytool submit … --wait`, `xcrun stapler staple`. Credentials: a notarytool keychain profile is preferred over env vars so no password appears on argv.
 5. Produce a `.dmg` with `create-dmg` or `hdiutil`.
 
 Signing identity and notarization credentials come from env vars; the script fails loudly if they're missing. Never commit them.

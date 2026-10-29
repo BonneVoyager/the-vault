@@ -45,11 +45,14 @@ On a debounced event for `<name>.vault`:
 4. If vault_id != ours → emit SyncEvent::ForeignVault, ignore.
 5. If app is locked: emit SyncEvent::ChangedWhileLocked; on next unlock, unlock the on-disk version (it's authoritative while we hold nothing dirty).
 6. If app is unlocked:
-   a. unlock on-disk copy with cached vault_key (UnlockedVault::unlock_with_key, core exposes this for sync only, behind a `sync` feature)
+   a. unlock on-disk copy with cached vault_key (LockedVault::unlock_with_key, core exposes this for sync only, behind a `sync` feature)
    b. report = ours.merge_from(&theirs)
    c. if report changed ours → save()   (which writes the merged result back; the other device will merge it idempotently)
    d. emit SyncEvent::Merged(report)
+   e. if ours has anything the on-disk copy lacks (an item, a newer field, a tombstone) → save() as well. Without this write-back two devices never converge when only one side changed. Side effect: unsaved edits can reach disk before the autosave timer.
 ```
+
+Before every `save`, re-read the primary and merge it in (pre-write merge), so a save can never clobber a change that landed between the last watcher event and now. If the on-disk file has a newer `FORMAT_VERSION` or a different `vault_id`, the save is refused with `SyncEvent::SaveBlocked{NewerVersion | ForeignVault}` and the in-memory state is kept.
 
 Merge is idempotent and commutative, so a ping-pong between two devices converges in one round trip each.
 
@@ -95,6 +98,8 @@ Field-level merge, keyed by `field.name`:
 `history` is merged by union on `(value, replaced_at)`, sorted, capped to 10 newest.
 
 Result item `modified_at = max(ours, theirs)`. Merged item takes `device_id` of whichever side supplied the winning metadata.
+
+Timestamps are monotone per item: every write stamps `max(now, previous + 1)`, so a clock that went backwards cannot resurrect a deleted item or let an older edit win. If a merge changes an item's content without changing its `modified_at` (possible when both sides carry the same timestamp), the merge bumps `modified_at` by one so the manifest check and the other device see the change. Two devices converge within two merge rounds.
 
 `merge_from` returns `MergeReport` and a bool-equivalent "anything changed" so `vault-sync` can skip the write when nothing moved.
 
@@ -144,12 +149,14 @@ pub struct SyncedVault { /* path, state, watcher handle, cached key, last_writte
 
 impl SyncedVault {
     pub fn create(path: &Path, password: &SecretString, kdf: KdfParams, device_id: Uuid, hooks: Arc<dyn CloudHooks>) -> Result<Self, SyncError>;
-    pub fn open(path: &Path, hooks: Arc<dyn CloudHooks>) -> Result<Self, SyncError>;        // locked
+    pub fn open(path: &Path, device_id: Uuid, hooks: Arc<dyn CloudHooks>) -> Result<Self, SyncError>;  // locked
     pub fn unlock(&mut self, password: &SecretString) -> Result<(), SyncError>;
     pub fn unlock_with_kek(&mut self, slot: Uuid, kek: &SecretVec<u8>) -> Result<(), SyncError>;
-    pub fn lock(&mut self);                                                                 // zeroizes key, drops items
+    pub fn lock(&mut self);                                                                 // zeroizes key, drops items; unsaved edits are snapshotted to a backup first
     pub fn vault(&self) -> Option<&UnlockedVault>;
-    pub fn edit<R>(&mut self, f: impl FnOnce(&mut UnlockedVault) -> R) -> R;               // marks dirty
+    pub fn edit<R>(&mut self, f: impl FnOnce(&mut UnlockedVault) -> R) -> Result<R, SyncError>; // marks dirty; Err when locked
+    pub fn start_watching(&mut self) -> Result<(), SyncError>;                              // explicit; watcher thread + debouncer
+    pub fn poll(&mut self);                                                                 // drains watcher events on the caller's thread
     pub fn save(&mut self) -> Result<(), SyncError>;
     pub fn is_dirty(&self) -> bool;
     pub fn subscribe(&self) -> crossbeam_channel::Receiver<SyncEvent>;
@@ -166,9 +173,16 @@ pub enum SyncEvent {
     ForeignVault,
     CloudUnavailable,
     BackupTaken(PathBuf),
+    KeyMismatch,                 // on-disk file no longer opens with our cached key (password changed elsewhere); edits are kept, next unlock re-verifies
+    KeyRotatedOnDisk,            // vault_key rotated elsewhere; must re-unlock with the password
+    SaveBlocked(SaveBlockReason), // NewerVersion | ForeignVault; in-memory state kept
     Error(String),
 }
+
+pub enum BackupKind { Snapshot, Unsaved, Conflict }
 ```
+
+Backups carry a kind: `Snapshot` (policy in §4), `Unsaved` (taken on lock or quit while edits could not be saved), `Conflict` (absorbed conflict copy, §6). Retention prunes `Snapshot` only; `Unsaved` and `Conflict` are never pruned. `restore_from` snapshots the current file first and works even when the primary no longer parses.
 
 Autosave: the app calls `save()` 2 s after the last edit (debounced) and immediately on lock, quit, and window close. `vault-sync` does not have its own timer.
 

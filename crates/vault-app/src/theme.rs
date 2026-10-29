@@ -6,7 +6,7 @@
 //! `Theme::update`.
 
 use gpui::{App, Global, Hsla, Pixels, SharedString, Window, WindowAppearance, px, rgb};
-use gpui_component::{Theme, ThemeMode};
+use gpui_component::{Colorize as _, Theme, ThemeMode};
 
 use crate::state::{Appearance, Settings};
 
@@ -76,6 +76,8 @@ const MONO_FALLBACK: &str = "Menlo";
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VaultTheme {
     pub accent: Hsla,
+    /// Text on an accent fill (primary buttons).
+    pub accent_text: Hsla,
     pub bg: Hsla,
     /// Opaque stand-in for the sidebar. See `sidebar_vibrancy`.
     pub bg_sidebar: Hsla,
@@ -106,6 +108,7 @@ impl VaultTheme {
         let shared =
             |accent, bg, bg_sidebar, sidebar_vibrancy, bg_elevated, border, text, muted| Self {
                 accent: hex(accent),
+                accent_text: hex(0xFFFFFF),
                 bg: hex(bg),
                 bg_sidebar: hex(bg_sidebar),
                 sidebar_vibrancy,
@@ -139,6 +142,20 @@ impl VaultTheme {
         theme.input = self.border;
         theme.ring = self.accent;
         theme.primary = self.accent;
+        // gpui-component's Button paints its primary fill from `tokens.button_primary*`,
+        // which the theme config derived from the stock (near-black) primary at load
+        // time. Editing `primary` alone reaches `tokens.primary` but not these, so set
+        // the button fields too. Hover/active use gpui-component's own fallback rules.
+        let dark = theme.mode.is_dark();
+        let hover = self.bg.blend(self.accent.opacity(0.9));
+        let active = self.accent.darken(if dark { 0.2 } else { 0.1 });
+        theme.primary_foreground = self.accent_text;
+        theme.primary_hover = hover;
+        theme.primary_active = active;
+        theme.button_primary = self.accent;
+        theme.button_primary_foreground = self.accent_text;
+        theme.button_primary_hover = hover;
+        theme.button_primary_active = active;
         theme.link = self.accent;
         theme.muted = self.bg_elevated;
         theme.muted_foreground = self.text_muted;
@@ -203,7 +220,73 @@ fn apply_mode(system: WindowAppearance, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use gpui::{
+        AppContext as _, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+        Styled as _, TestAppContext, VisualTestContext, div,
+    };
+    use gpui_component::Root;
+    use gpui_component::button::{Button, ButtonVariants as _};
+
     use super::*;
+
+    struct PrimaryButton;
+
+    impl Render for PrimaryButton {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().p_4().child(
+                div()
+                    .flex()
+                    .debug_selector(|| "primary-button".into())
+                    .child(Button::new("go").primary().label("Go")),
+            )
+        }
+    }
+
+    /// The solid fill of the largest quad painted inside the primary button.
+    fn primary_button_fill(appearance: Appearance, cx: &mut TestAppContext) -> Hsla {
+        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            cx.set_global(ThemePrefs {
+                appearance,
+                scale: 1.0,
+            })
+        });
+        let window = cx.add_window(|window, cx| {
+            apply(window, cx);
+            let view = cx.new(|_| PrimaryButton);
+            Root::new(view, window, cx)
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        let area = vcx.debug_bounds("primary-button").expect("button rendered");
+        vcx.update(|window, _| {
+            let area = area.scale(window.scale_factor());
+            window
+                .painted_quads()
+                .into_iter()
+                .filter(|q| area.intersect(&q.bounds) == q.bounds)
+                .max_by(|a, b| {
+                    let size = |q: &gpui::Quad| q.bounds.size.width.0 * q.bounds.size.height.0;
+                    size(a).total_cmp(&size(b))
+                })
+                .and_then(|q| q.background.as_solid())
+                .expect("button paints a solid fill")
+        })
+    }
+
+    #[gpui::test]
+    fn primary_button_uses_accent_light(cx: &mut TestAppContext) {
+        let fill = primary_button_fill(Appearance::Light, cx);
+        assert_eq!(fill, VaultTheme::for_appearance(false).accent);
+        assert_eq!(fill, hex(0x3B6CF0));
+    }
+
+    #[gpui::test]
+    fn primary_button_uses_accent_dark(cx: &mut TestAppContext) {
+        let fill = primary_button_fill(Appearance::Dark, cx);
+        assert_eq!(fill, VaultTheme::for_appearance(true).accent);
+        assert_eq!(fill, hex(0x5B8CFF));
+    }
 
     #[test]
     fn override_beats_system() {

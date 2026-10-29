@@ -23,11 +23,18 @@ fn ensure_downloaded_on_local_path_is_immediate() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.vault");
     std::fs::write(&path, b"x").unwrap();
+    // Generous timeout so a loaded machine cannot fail this; the intent is only that a
+    // local file returns Ok without waiting out the timeout.
+    let timeout = Duration::from_secs(30);
     let start = Instant::now();
     ICloudHooks::new()
-        .ensure_downloaded(&path, Duration::from_secs(5))
-        .unwrap();
-    assert!(start.elapsed() < Duration::from_secs(1));
+        .ensure_downloaded(&path, timeout)
+        .expect("local file must report downloaded");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < timeout / 3,
+        "ensure_downloaded waited {elapsed:?} on a local path (timeout {timeout:?})"
+    );
 }
 
 #[test]

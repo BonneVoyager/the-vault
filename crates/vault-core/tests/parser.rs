@@ -288,31 +288,87 @@ fn header_structure() {
         parse(&rebuild(e)).unwrap_err(),
         VaultError::Malformed(_)
     ));
-    // unknown slot kind is structural damage
-    let e: Vec<_> = entries
-        .iter()
-        .map(|(k, v)| {
-            if k == &Value::Text("slots".into()) {
-                let Value::Array(slots) = v else { panic!() };
-                let Value::Map(slot) = &slots[0] else {
-                    panic!()
-                };
-                let slot = slot
-                    .iter()
-                    .map(|(kk, vv)| {
-                        if kk == &Value::Text("kind".into()) {
-                            (kk.clone(), Value::Text("yubikey".into()))
-                        } else {
-                            (kk.clone(), vv.clone())
-                        }
-                    })
-                    .collect();
-                (k.clone(), Value::Array(vec![Value::Map(slot)]))
-            } else {
-                (k.clone(), v.clone())
+    // Rewrite the first slot's map through `edit`.
+    type Entries = Vec<(Value, Value)>;
+    let edit_slot0 = |edit: &dyn Fn(&mut Entries)| -> Entries {
+        entries
+            .iter()
+            .map(|(k, v)| {
+                if k == &Value::Text("slots".into()) {
+                    let Value::Array(slots) = v else { panic!() };
+                    let Value::Map(slot) = &slots[0] else {
+                        panic!()
+                    };
+                    let mut slot = slot.clone();
+                    edit(&mut slot);
+                    (k.clone(), Value::Array(vec![Value::Map(slot)]))
+                } else {
+                    (k.clone(), v.clone())
+                }
+            })
+            .collect()
+    };
+    // An unknown slot kind is NOT structural damage (01 §9 forward compatibility): the slot is
+    // kept opaque; unlocking is then `NoUsableSlot` because no password slot is left.
+    let e = edit_slot0(&|slot| {
+        for (kk, vv) in slot.iter_mut() {
+            if kk == &Value::Text("kind".into()) {
+                *vv = Value::Text("yubikey".into());
             }
-        })
-        .collect();
+        }
+    });
+    let locked = parse(&rebuild(e)).expect("unknown slot kind is tolerated");
+    assert_eq!(
+        locked.slots().map(|(_, k)| k).collect::<Vec<_>>(),
+        [vault_core::SlotKind::Other("yubikey".into())]
+    );
+    assert_eq!(locked.unlock(&pw()).unwrap_err(), VaultError::NoUsableSlot);
+    // ... but a slot whose `kind` is not text, or whose `id` is missing or mis-sized, still is,
+    // even when the kind is unknown.
+    let e = edit_slot0(&|slot| {
+        for (kk, vv) in slot.iter_mut() {
+            if kk == &Value::Text("kind".into()) {
+                *vv = Value::Integer(7.into());
+            }
+        }
+    });
+    assert!(matches!(
+        parse(&rebuild(e)).unwrap_err(),
+        VaultError::Malformed(_)
+    ));
+    let e = edit_slot0(&|slot| {
+        slot.retain(|(kk, _)| kk != &Value::Text("id".into()));
+        for (kk, vv) in slot.iter_mut() {
+            if kk == &Value::Text("kind".into()) {
+                *vv = Value::Text("yubikey".into());
+            }
+        }
+    });
+    assert!(matches!(
+        parse(&rebuild(e)).unwrap_err(),
+        VaultError::Malformed(_)
+    ));
+    let e = edit_slot0(&|slot| {
+        for (kk, vv) in slot.iter_mut() {
+            if kk == &Value::Text("id".into()) {
+                *vv = Value::Bytes(vec![0; 15]);
+            } else if kk == &Value::Text("kind".into()) {
+                *vv = Value::Text("yubikey".into());
+            }
+        }
+    });
+    assert!(matches!(
+        parse(&rebuild(e)).unwrap_err(),
+        VaultError::Malformed(_)
+    ));
+    // A known kind with a short wrapped_key is still structural damage.
+    let e = edit_slot0(&|slot| {
+        for (kk, vv) in slot.iter_mut() {
+            if kk == &Value::Text("wrapped_key".into()) {
+                *vv = Value::Bytes(vec![0; 47]);
+            }
+        }
+    });
     assert!(matches!(
         parse(&rebuild(e)).unwrap_err(),
         VaultError::Malformed(_)

@@ -73,6 +73,27 @@ Verified in P5.A (polish, second window), compiled + clippy + headless tests:
 - `vcx.simulate_input("..")` types into the focused gpui-component Input and `simulate_keystrokes("enter")` fires `InputEvent::PressEnter`.
 
 ## Runtime debugging without Screen Recording (verified 2026-10-29)
-- gpui logs through the `log` crate and vault installs no logger, so warnings are invisible. To see them in a probe, add `log = "0.4"` temporarily and `log::set_logger` a tiny stderr impl.
+- gpui logs through the `log` crate. Since 2026-10-29 vault-app initialises `env_logger` (^0.11.8, resolves 0.11.11) in main(): `env_logger::init_from_env(env_logger::Env::default().default_filter_or("warn"))`. Use `RUST_LOG=debug` to see gpui logs. Tests never call main, so no logger in tests.
+- Asserting painted colours headlessly: `window.painted_quads() -> Vec<gpui::Quad>` (test-support; `q.bounds: Bounds<ScaledPixels>`, `q.background.as_solid() -> Option<Hsla>`). Scale `vcx.debug_bounds(..)` with `.scale(window.scale_factor())` (test window sf = 2). `Bounds::contains` excludes the far edge, so test containment with `area.intersect(&q.bounds) == q.bounds`. Example: theme.rs primary button tests.
 - `Window::render_to_image()` returns `image::RgbaImage` (`.save(path)` writes PNG). It is gated on `test-support`: build with `cargo build -p vault-app --features gpui/test-support,gpui_macos/test-support`. Call it from `cx.spawn` after a timer via `WindowHandle::update`. `screencapture` fails here ("could not create image from display").
 - `window.text_system().shape_line(text, size, &[TextRun{len,font,color,background_color,underline,strikethrough}], None)` gives width and per-run `font_id`.
+
+Verified 2026-10-29 (lock closes overlays, menu rows), compiled + clippy + headless tests:
+- Closing another window from inside an entity update: keep `AnyWindowHandle`s (`cx.open_window(..)?.into()`), then `cx.defer(move |cx: &mut App| { handle.update(cx, |_, window, _| window.remove_window()).ok(); })`. `Context<T>` has no `defer(f(&mut App))` of its own; it derefs to `App::defer`. Deferring avoids failing when the caller runs inside that window's update. `AnyWindowHandle::update(cx, |AnyView, &mut Window, &mut App| R) -> Result<R>`.
+- gpui-component `window.close_dialog(cx)` closes the top non-closing dialog (with exit transition) and does NOT call the dialog's `on_close`. `has_active_dialog` ignores dialogs that are closing, so it reads false right after a close.
+- Left-aligned menu rows in a Popover: `h_flex().id(..).tab_index(0).justify_start().hover(..).active(|s| s.bg(..))` with a fixed `w(px(20.))` icon box; Button centres its icon+label, so avoid it for menu rows.
+
+Verified 2026-10-29 (tags editing, TOTP hint, QR from image), compiled + clippy + headless tests:
+- Asserting rendered content headlessly: `div().debug_selector(|| format!("totp-code {code}"))` (InteractiveElement; a no-op outside debug + `test-support` builds, so safe in app code), then `vcx.debug_bounds("totp-code 123 456").is_some()`. `debug_bounds` takes `&'static str`, so a computed key needs `Box::leak(s.into_boxed_str())`. Encoding the value in the selector lets a test check WHAT is shown, not just that something rendered.
+- Key dispatch order (window.rs `dispatch_key_event`): matched keybinding actions fire FIRST, key_down listeners after. So a parent `on_key_down` cannot tell "backspace in an empty input" (the char is already gone).
+- gpui-base Input's `Backspace` handler calls `cx.propagate()` when the cursor is at 0 with no selection. A parent `div().on_action(move |_: &gpui_component::input::Backspace, w, cx| ..)` therefore fires only for backspace-at-start; check the input is empty there.
+- Child modules of `screens::main` can read `MainScreen`'s private fields (`m.editor.read(cx).rows`) in tests: Rust privacy is module-tree based.
+- `vcx.app.borrow()` gives `&App` for helpers like `ui::input_is_empty(&state, &vcx.app.borrow())`.
+- Pasting via `cx.write_to_clipboard(..)` + `simulate_keystrokes("cmd-v")` into a single-line Input drops the trailing newline but keeps leading spaces.
+- Keyboard click on a focusable div fires on KEY UP (gpui div.rs: key down records focus generation, key up clicks). `vcx.simulate_keystrokes` sends only KeyDown, so tests must follow with `vcx.simulate_event(gpui::KeyUpEvent { keystroke: gpui::Keystroke::parse("enter").unwrap() })`. Popover content (tab_group) takes focus on open; Tab N times reaches row N in order.
+- Probing in tests: `.debug_selector(|| "name".into())` on an element + `vcx.debug_bounds("name") -> Option<Bounds>` + `vcx.simulate_click(b.center(), Modifiers::none())`. `VisualTestContext::run_until_parked` takes `&self`. Prune dead window handles with `cx.windows().contains(&h)`.
+
+Verified 2026-10-29 (capture exclusion):
+- `cx.observe_new::<T>(|this: &mut T, Option<&mut Window>, cx: &mut Context<T>| ..) -> Subscription` fires for every new entity of type T. `observe_new::<gpui_component::Root>` therefore fires once per window (main and backup viewers) without touching the code that opens them. It fires in `TestAppContext::add_window` too. vault defers `vault_macos::exclude_app_windows_from_capture()` from it in root.rs.
+- Thread-local counters (`thread_local!` + `Cell`) work for asserting calls in `#[gpui::test]`, because the test executor runs on the test thread.
+- Restoring a file with `mv backup file` keeps the backup's older mtime, so cargo reuses the stale (mutated) build. Use `cp` or `touch` after mutation checks.

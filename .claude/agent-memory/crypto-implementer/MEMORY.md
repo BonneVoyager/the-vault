@@ -2,3 +2,4 @@
 - [Mutation + merge decisions](mutation-merge-decisions.md) — P4a: error mapping for unknown id/field, restamp max rule, merge field order, history normalisation, MergeReport counting
 - [Slot management decisions](slot-management-decisions.md) — P4b: rotate drops enclave slots, created_at=0, KEK-length/missing-slot error mapping, change_password re-wraps all password slots
 - [Sync feature decisions](sync-feature-decisions.md) — P3.1: `sync` feature, VaultKeyHandle (no Clone/Debug, duplicate()), unlock_with_key first-tag-failure=WrongPassword, rotation invalidates handles
+- [Forward-compat decisions](forward-compat-decisions.md) — Slot/OpaqueSlot, unit *Kind::Other + kind_raw, NoUsableSlot, fixture policy, what stays Malformed

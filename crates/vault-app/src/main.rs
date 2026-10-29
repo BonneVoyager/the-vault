@@ -2,6 +2,7 @@
 
 mod actions;
 mod assets;
+mod audit;
 mod autolock;
 mod biometric;
 mod clipboard;
@@ -36,6 +37,10 @@ fn register_actions(state: &Entity<AppState>, cx: &mut App) {
 }
 
 fn main() {
+    // Log output goes to stderr only and must never include secrets (passwords, keys,
+    // TOTP secrets, item contents). Default level `warn`; RUST_LOG overrides.
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("warn"));
+
     gpui_platform::application()
         .with_quit_mode(QuitMode::LastWindowClosed)
         .with_assets(assets::AppAssets)

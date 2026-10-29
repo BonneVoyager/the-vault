@@ -17,7 +17,10 @@ pub struct Clipboard;
 impl Clipboard {
     /// Writes `text` as `public.utf8-plain-text` and marks the entry with
     /// `org.nspasteboard.ConcealedType` (empty value) so clipboard managers
-    /// skip it. Returns the pasteboard's change count after the write, or
+    /// skip it. The marker is written before the text, and if either write
+    /// fails the pasteboard is cleared before returning `None`. The write uses `NSPasteboardContentsCurrentHostOnly`, so the
+    /// entry stays on this Mac and is not offered to Universal Clipboard.
+    /// Returns the pasteboard's change count after the write, or
     /// `None` if AppKit refused to store a value (`setString:forType:` false).
     pub fn write_concealed(text: &SecretString) -> Option<ChangeCount> {
         imp::write_concealed(text.expose_secret()).map(ChangeCount)
@@ -46,6 +49,12 @@ impl Clipboard {
         imp::has_type(CONCEALED_TYPE)
     }
 
+    /// Pasteboard type identifiers in the order `types` reports them. Test helper only.
+    #[doc(hidden)]
+    pub fn types() -> Vec<String> {
+        imp::types()
+    }
+
     /// Writes `text` as plain text without the concealed marker, as another
     /// app would. Test helper only.
     #[doc(hidden)]
@@ -57,7 +66,7 @@ impl Clipboard {
 #[cfg(target_os = "macos")]
 mod imp {
     use objc2::rc::Retained;
-    use objc2_app_kit::{NSPasteboard, NSPasteboardType};
+    use objc2_app_kit::{NSPasteboard, NSPasteboardContentsOptions, NSPasteboardType};
     use objc2_foundation::{NSArray, NSString};
 
     use super::{CONCEALED_TYPE, PLAIN_TEXT_TYPE};
@@ -70,6 +79,7 @@ mod imp {
         NSString::from_str(s)
     }
 
+    /// Plain write as another app would do it (test helper path).
     fn declare_and_set(pb: &NSPasteboard, values: &[(&str, &str)]) -> Option<i64> {
         let types: Vec<Retained<NSString>> = values.iter().map(|(t, _)| pb_type(t)).collect();
         let types = NSArray::from_retained_slice(&types);
@@ -78,15 +88,30 @@ mod imp {
         unsafe { pb.declareTypes_owner(&types, None) };
         let mut ok = true;
         for (t, v) in values {
-            // The NSString copy of the secret is not zeroized; AppKit owns it
-            // from here and the pasteboard server holds its own copy anyway.
             ok &= pb.setString_forType(&NSString::from_str(v), &pb_type(t));
         }
         ok.then(|| pb.changeCount() as i64)
     }
 
     pub fn write_concealed(text: &str) -> Option<i64> {
-        declare_and_set(&general(), &[(PLAIN_TEXT_TYPE, text), (CONCEALED_TYPE, "")])
+        let pb = general();
+        // `currentHostOnly` keeps the entry off Universal Clipboard (macOS
+        // 10.12+). `prepareForNewContentsWithOptions:` clears the pasteboard
+        // like `clearContents`; `declareTypes:owner:` would clear it again
+        // and drop the option, so the types are added by `setString:forType:`.
+        pb.prepareForNewContentsWithOptions(NSPasteboardContentsOptions::CurrentHostOnly);
+        // Marker first: a clipboard manager polling `changeCount` between the
+        // two calls must never see the text without the concealed type. Stop
+        // at the first failure and clear, so nothing half-written stays.
+        for (t, v) in [(CONCEALED_TYPE, ""), (PLAIN_TEXT_TYPE, text)] {
+            // The NSString copy of the secret is not zeroized; AppKit owns it
+            // from here and the pasteboard server holds its own copy anyway.
+            if !pb.setString_forType(&NSString::from_str(v), &pb_type(t)) {
+                pb.clearContents();
+                return None;
+            }
+        }
+        Some(pb.changeCount() as i64)
     }
 
     pub fn write_plain(text: &str) -> Option<i64> {
@@ -108,6 +133,15 @@ mod imp {
         general()
             .stringForType(&pb_type(PLAIN_TEXT_TYPE))
             .map(|s| s.to_string())
+    }
+
+    pub fn types() -> Vec<String> {
+        let Some(types) = general().types() else {
+            return Vec::new();
+        };
+        (0..types.count())
+            .map(|i| types.objectAtIndex(i).to_string())
+            .collect()
     }
 
     pub fn has_type(t: &str) -> bool {
@@ -153,7 +187,7 @@ mod imp {
     }
 
     pub fn write_concealed(text: &str) -> Option<i64> {
-        Some(set(text, vec![PLAIN_TEXT_TYPE, CONCEALED_TYPE]))
+        Some(set(text, vec![CONCEALED_TYPE, PLAIN_TEXT_TYPE]))
     }
 
     pub fn write_plain(text: &str) -> Option<i64> {
@@ -176,6 +210,10 @@ mod imp {
 
     pub fn read_string() -> Option<String> {
         with(|p| p.text.as_ref().map(|s| s.to_string()))
+    }
+
+    pub fn types() -> Vec<String> {
+        with(|p| p.types.iter().map(|t| t.to_string()).collect())
     }
 
     pub fn has_type(t: &str) -> bool {

@@ -29,7 +29,8 @@ pub struct UnlockedVault { /* header, vault_key (Zeroizing), items: BTreeMap<Uui
 
 pub struct Item {
     pub id: Uuid,
-    pub kind: ItemKind,
+    pub kind: ItemKind,          // Copy; `Other` for a kind string this version does not know
+    pub kind_raw: Option<String>,// the on-disk string when kind == Other, else None; `kind_str()` returns the on-disk string
     pub title: String,
     pub deleted_at: Option<Millis>,
     pub device_id: Uuid,
@@ -42,7 +43,8 @@ pub struct Item {
 
 pub struct Field {
     pub name: String,
-    pub kind: FieldKind,
+    pub kind: FieldKind,         // Copy; `Other` for unknown; `is_sensitive()` = Password | Totp | Other
+    pub kind_raw: Option<String>,// as on Item
     pub value: SecretString,     // secrecy; Display is redacted
     pub modified_at: Millis,
     pub section: Option<String>,
@@ -62,7 +64,9 @@ impl LockedVault {
     pub fn kdf_params(&self) -> &KdfParams;
     pub fn item_summaries(&self) -> impl Iterator<Item = (Uuid, Millis)>;   // plaintext metadata only
     pub fn unlock(&self, password: &SecretString) -> Result<UnlockedVault, VaultError>;
-    pub fn unlock_with_kek(&self, slot_id: Uuid, kek: &SecretVec<u8>) -> Result<UnlockedVault, VaultError>; // enclave slot
+    pub fn unlock_with_kek(&self, slot_id: Uuid, kek: &SecretVec<u8>) -> Result<UnlockedVault, VaultError>; // enclave or passkey slot
+    #[cfg(feature = "sync")]
+    pub fn unlock_with_key(&self, key: &VaultKeyHandle) -> Result<UnlockedVault, VaultError>;             // vault-sync only; first tag failure → WrongPassword
 }
 ```
 
@@ -90,6 +94,7 @@ impl UnlockedVault {
     // keys
     pub fn change_password(&mut self, old: &SecretString, new: &SecretString, kdf: KdfParams) -> Result<(), VaultError>;
     pub fn add_enclave_slot(&mut self, kek: &SecretVec<u8>) -> Uuid;
+    pub fn add_passkey_slot(&mut self, kek: &SecretVec<u8>, credential_id: Vec<u8>, prf_salt: [u8; 32], rp_id: String) -> Uuid; // 01 §2; not yet implemented
     pub fn remove_slot(&mut self, id: Uuid) -> Result<(), VaultError>;   // refuses to remove last password slot
     pub fn rotate_vault_key(&mut self, password: &SecretString) -> Result<(), VaultError>;
 
@@ -126,7 +131,7 @@ impl KdfParams {
 ```rust
 pub struct Totp { /* parsed otpauth */ }
 impl Totp {
-    pub fn parse_uri(uri: &str) -> Result<Self, TotpError>;      // otpauth://totp/...  (hotp rejected)
+    pub fn parse_uri(uri: &str) -> Result<Self, TotpError>;      // otpauth://totp/...  (hotp rejected); scheme/host case-insensitive, secret normalised (case, padding, spaces, dashes), no minimum secret length
     pub fn from_secret_base32(secret: &str) -> Result<Self, TotpError>;  // defaults SHA1/6/30
     pub fn code(&self, unix_secs: u64) -> String;
     pub fn seconds_remaining(&self, unix_secs: u64) -> u32;
@@ -161,8 +166,8 @@ Ranking: title prefix match > title substring > url host match > username match 
 ## `import` / `export`
 
 ```rust
-pub fn import_csv(bytes: &[u8], mapping: &CsvMapping) -> Result<Vec<Item>, ImportError>;
-pub fn import_1pux(bytes: &[u8]) -> Result<Vec<Item>, ImportError>;        // zip + JSON
+pub fn import_csv(bytes: &[u8], mapping: &CsvMapping, device_id: Uuid, now: Millis) -> Result<Vec<Item>, ImportError>;
+pub fn import_1pux(bytes: &[u8], device_id: Uuid, now: Millis) -> Result<Vec<Item>, ImportError>;        // zip + JSON
 #[cfg(feature = "kdbx")] pub fn import_kdbx(bytes: &[u8], password: &SecretString) -> Result<Vec<Item>, ImportError>;
 
 pub struct PlaintextExport(pub Vec<u8>);   // newtype so callers can't confuse it with vault bytes

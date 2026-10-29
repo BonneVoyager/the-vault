@@ -146,6 +146,10 @@ fn guarantee_7_item_moved_between_vaults() {
     );
 }
 
+fn slot0(f: &mut vault_core::format::VaultFile) -> &mut vault_core::KeySlot {
+    f.header.slots[0].as_key_mut().unwrap()
+}
+
 #[test]
 fn header_tamper_reports_wrong_password() {
     let mut v = new_vault();
@@ -165,14 +169,14 @@ fn header_tamper_reports_wrong_password() {
     let t = rewrite(&bytes, |f| f.header.kdf.t_cost += 1);
     assert_eq!(unlock(&t).unwrap_err(), VaultError::WrongPassword);
 
-    let t = rewrite(&bytes, |f| f.header.slots[0].wrapped_key[40] ^= 1);
+    let t = rewrite(&bytes, |f| slot0(f).wrapped_key[40] ^= 1);
     assert_eq!(unlock(&t).unwrap_err(), VaultError::WrongPassword);
 
-    let t = rewrite(&bytes, |f| f.header.slots[0].nonce[0] ^= 1);
+    let t = rewrite(&bytes, |f| slot0(f).nonce[0] ^= 1);
     assert_eq!(unlock(&t).unwrap_err(), VaultError::WrongPassword);
 
     let t = rewrite(&bytes, |f| {
-        f.header.slots[0].id = vault_core::Uuid::from_u128(9);
+        slot0(f).id = vault_core::Uuid::from_u128(9);
     });
     assert_eq!(
         unlock(&t).unwrap_err(),
@@ -180,12 +184,12 @@ fn header_tamper_reports_wrong_password() {
         "slot id is in the AAD"
     );
 
-    let t = rewrite(&bytes, |f| {
-        f.header.slots[0].kind = vault_core::SlotKind::Enclave
-    });
+    // Relabelling the only password slot leaves no password slot at all: that is reported as
+    // `NoUsableSlot` (not `WrongPassword`) so the app can explain it; see forward_compat.rs.
+    let t = rewrite(&bytes, |f| slot0(f).kind = vault_core::SlotKind::Enclave);
     assert_eq!(
         unlock(&t).unwrap_err(),
-        VaultError::WrongPassword,
+        VaultError::NoUsableSlot,
         "no password slot left"
     );
 

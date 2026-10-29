@@ -39,7 +39,8 @@ Items before manifest so a foreign record reports `Item`, not `Manifest`.
 - `UnlockedVault::create` sets `created_at = 0` (core has no clock); `create_with_created_at(.., secs)` added.
 - `unlock` yields `device_id = Uuid::nil()`; `set_device_id` added (spec gives no source for it).
 - `get(id)` returns tombstones too; `insert` with an existing id replaces.
-- Unknown slot `kind`, unknown `kdf.alg`, unknown record `t` -> `Malformed` (not preserved).
+- Unknown `kdf.alg`, unknown record `t` -> `Malformed`. Unknown slot/item/field `kind` strings are
+  now TOLERATED (2026-10-29) — see [[forward-compat-decisions]].
 - Argon2 rejecting header params (e.g. m_cost < 8*p_cost) -> `Malformed`, not `WrongPassword`.
 - `attachments`: never parsed; `[]` dropped on read, non-empty array kept in `Item.extras` and
   re-emitted verbatim instead of `[]` (so v1 writers do not destroy v1.1 data).

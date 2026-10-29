@@ -195,3 +195,48 @@ fn unparsable_device_id_errors() {
     assert!(String::from_utf8_lossy(&o.stderr).contains("VAULT_DEVICE_ID"));
     assert!(!f.exists());
 }
+
+#[test]
+fn forward_fixture_shows_real_kinds_and_masks_unknown_fields() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../vault-core/tests/fixtures/v1-forward.vault");
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("fwd.vault");
+    std::fs::copy(&fixture, &f).unwrap();
+
+    let list = ok(&vault(&f, PW, &["list"]));
+    assert!(
+        list.lines()
+            .any(|l| l.contains("future-item-kind") && l.contains("Future thing")),
+        "list: {list}"
+    );
+
+    let get = ok(&vault(&f, PW, &["get", "Future thing"]));
+    assert!(get.contains("kind:  future-item-kind"), "get: {get}");
+    assert!(get.contains("future: ********"), "get: {get}");
+    assert!(!get.contains("future-value"), "get: {get}");
+}
+
+#[test]
+fn init_refuses_weak_master_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.vault");
+    let o = vault(&f, "123", &["init", "--kdf-test-params"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("master password too weak"), "{err}");
+    assert!(err.contains("--allow-weak"), "{err}");
+    assert!(!f.exists());
+}
+
+#[test]
+fn init_allow_weak_bypasses_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.vault");
+    ok(&vault(
+        &f,
+        "123",
+        &["init", "--kdf-test-params", "--allow-weak"],
+    ));
+    assert!(f.exists());
+}

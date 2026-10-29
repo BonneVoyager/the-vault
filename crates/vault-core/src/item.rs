@@ -17,6 +17,12 @@ pub type Millis = u64;
 pub type Extras = Vec<(Value, Value)>;
 
 /// `ItemPlain.kind`.
+///
+/// Forward compatibility (01 §9): a kind string this build does not know parses as
+/// [`ItemKind::Other`], with the original string kept in [`Item::kind_raw`] and written back
+/// unchanged, so an older app can open, edit and re-save a file written by a newer one without
+/// losing the item. `Other` is never produced for a known string and is not part of
+/// [`ItemKind::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemKind {
@@ -24,10 +30,13 @@ pub enum ItemKind {
     Note,
     Card,
     Identity,
+    /// A kind this build does not know; the on-disk string is in [`Item::kind_raw`]. Callers
+    /// should show such items generically (title, fields, tags) and must not reinterpret them.
+    Other,
 }
 
 impl ItemKind {
-    /// All variants, in declaration order.
+    /// Every *known* variant, in declaration order. [`ItemKind::Other`] is not listed.
     pub const ALL: [ItemKind; 4] = [
         ItemKind::Login,
         ItemKind::Note,
@@ -35,23 +44,40 @@ impl ItemKind {
         ItemKind::Identity,
     ];
 
-    /// The on-disk string.
+    /// The on-disk string of a known kind. For [`ItemKind::Other`] this is the placeholder
+    /// `"other"`; use [`Item::kind_str`] to get the real on-disk string.
     pub fn as_str(self) -> &'static str {
         match self {
             ItemKind::Login => "login",
             ItemKind::Note => "note",
             ItemKind::Card => "card",
             ItemKind::Identity => "identity",
+            ItemKind::Other => "other",
         }
     }
 
-    /// Inverse of [`ItemKind::as_str`].
+    /// Inverse of [`ItemKind::as_str`] for *known* kinds; `None` for anything else (including
+    /// `"other"`). Use this to validate user input; the parser maps `None` to
+    /// [`ItemKind::Other`] and keeps the string in [`Item::kind_raw`].
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+
+    /// True for [`ItemKind::Other`].
+    pub fn is_other(self) -> bool {
+        self == ItemKind::Other
     }
 }
 
 /// `Field.kind`.
+///
+/// Forward compatibility (01 §9): a kind string this build does not know parses as
+/// [`FieldKind::Other`], with the original string kept in [`Field::kind_raw`] and written back
+/// unchanged. **Display rule:** the value of an `Other` field must be treated as sensitive
+/// (masked by default, like a password) because this build cannot tell whether a newer kind
+/// is secret; see [`FieldKind::is_sensitive`]. Everything else (merge, search, timestamps)
+/// treats it as `text`. `Other` is never produced for a known string and is not part of
+/// [`FieldKind::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FieldKind {
@@ -64,10 +90,13 @@ pub enum FieldKind {
     Date,
     MonthYear,
     Number,
+    /// A kind this build does not know; the on-disk string is in [`Field::kind_raw`]. Its
+    /// value must be masked in any UI (`is_sensitive() == true`).
+    Other,
 }
 
 impl FieldKind {
-    /// All variants, in declaration order.
+    /// Every *known* variant, in declaration order. [`FieldKind::Other`] is not listed.
     pub const ALL: [FieldKind; 9] = [
         FieldKind::Text,
         FieldKind::Password,
@@ -80,7 +109,8 @@ impl FieldKind {
         FieldKind::Number,
     ];
 
-    /// The on-disk string.
+    /// The on-disk string of a known kind. For [`FieldKind::Other`] this is the placeholder
+    /// `"other"`; use [`Field::kind_str`] to get the real on-disk string.
     pub fn as_str(self) -> &'static str {
         match self {
             FieldKind::Text => "text",
@@ -92,12 +122,30 @@ impl FieldKind {
             FieldKind::Date => "date",
             FieldKind::MonthYear => "month_year",
             FieldKind::Number => "number",
+            FieldKind::Other => "other",
         }
     }
 
-    /// Inverse of [`FieldKind::as_str`].
+    /// Inverse of [`FieldKind::as_str`] for *known* kinds; `None` for anything else (including
+    /// `"other"`). Use this to validate user input; the parser maps `None` to
+    /// [`FieldKind::Other`] and keeps the string in [`Field::kind_raw`].
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+
+    /// True for [`FieldKind::Other`].
+    pub fn is_other(self) -> bool {
+        self == FieldKind::Other
+    }
+
+    /// Whether a UI must mask this field's value by default: `password`, `totp`, and every
+    /// unknown kind (a newer version may have added a secret kind; masking is the safe
+    /// default). Card numbers are an item-level rule, not a field kind, and are not covered.
+    pub fn is_sensitive(self) -> bool {
+        matches!(
+            self,
+            FieldKind::Password | FieldKind::Totp | FieldKind::Other
+        )
     }
 }
 
@@ -107,6 +155,9 @@ pub struct Field {
     /// Unique within the item, e.g. `"username"`, `"password"`, `"totp"`.
     pub name: String,
     pub kind: FieldKind,
+    /// The exact on-disk `kind` string when `kind == FieldKind::Other` (01 §9), else `None`.
+    /// Written back verbatim by `serialize`; ignored for known kinds.
+    pub kind_raw: Option<String>,
     /// For `Totp`, the full `otpauth://` URI.
     pub value: SecretString,
     pub modified_at: Millis,
@@ -121,12 +172,30 @@ impl Field {
         Self {
             name: name.into(),
             kind,
+            kind_raw: None,
             value,
             modified_at: now,
             section: None,
             extras: Vec::new(),
         }
     }
+
+    /// The on-disk kind string: `kind_raw` for an unknown kind, else the known kind's string.
+    pub fn kind_str(&self) -> &str {
+        kind_str(
+            self.kind == FieldKind::Other,
+            self.kind_raw.as_deref(),
+            self.kind.as_str(),
+        )
+    }
+}
+
+/// The string the writer emits for a kind: the preserved raw string for `Other` (falling back
+/// to the `"other"` placeholder if a caller built an `Other` without one), else the known
+/// string. `kind_raw` is deliberately ignored for known kinds so that changing an item's kind
+/// without clearing `kind_raw` cannot resurrect the old string.
+pub(crate) fn kind_str<'a>(other: bool, raw: Option<&'a str>, known: &'a str) -> &'a str {
+    if other { raw.unwrap_or(known) } else { known }
 }
 
 impl fmt::Debug for Field {
@@ -134,6 +203,7 @@ impl fmt::Debug for Field {
         f.debug_struct("Field")
             .field("name", &self.name)
             .field("kind", &self.kind)
+            .field("kind_raw", &self.kind_raw)
             .field("value", &"[REDACTED]")
             .field("modified_at", &self.modified_at)
             .field("section", &self.section)
@@ -167,6 +237,9 @@ impl fmt::Debug for HistoryEntry {
 pub struct Item {
     pub id: Uuid,
     pub kind: ItemKind,
+    /// The exact on-disk `kind` string when `kind == ItemKind::Other` (01 §9), else `None`.
+    /// Written back verbatim by `serialize`; ignored for known kinds.
+    pub kind_raw: Option<String>,
     pub title: String,
     /// Tombstone when `Some`.
     pub deleted_at: Option<Millis>,
@@ -189,6 +262,7 @@ impl Item {
         Self {
             id: Uuid::new_v4(),
             kind,
+            kind_raw: None,
             title: title.into(),
             deleted_at: None,
             device_id,
@@ -205,6 +279,15 @@ impl Item {
         self.deleted_at.is_some()
     }
 
+    /// The on-disk kind string: `kind_raw` for an unknown kind, else the known kind's string.
+    pub fn kind_str(&self) -> &str {
+        kind_str(
+            self.kind == ItemKind::Other,
+            self.kind_raw.as_deref(),
+            self.kind.as_str(),
+        )
+    }
+
     /// First field with this name, if any.
     pub fn field(&self, name: &str) -> Option<&Field> {
         self.fields.iter().find(|f| f.name == name)
@@ -216,6 +299,7 @@ impl fmt::Debug for Item {
         f.debug_struct("Item")
             .field("id", &self.id)
             .field("kind", &self.kind)
+            .field("kind_raw", &self.kind_raw)
             .field("title", &self.title)
             .field("deleted_at", &self.deleted_at)
             .field("device_id", &self.device_id)
@@ -256,6 +340,30 @@ mod tests {
             assert_eq!(FieldKind::parse(k.as_str()), Some(k));
         }
         assert_eq!(FieldKind::parse("nope"), None);
+        assert_eq!(ItemKind::parse("nope"), None);
+        assert_eq!(
+            ItemKind::parse("other"),
+            None,
+            "placeholder is not a known kind"
+        );
+        assert_eq!(FieldKind::parse("other"), None);
+        assert!(FieldKind::Other.is_sensitive() && FieldKind::Password.is_sensitive());
+        assert!(!FieldKind::Text.is_sensitive());
+    }
+
+    #[test]
+    fn kind_str_prefers_raw_only_for_other() {
+        let mut item = Item::new(ItemKind::Other, "t", Uuid::nil(), 1);
+        assert_eq!(item.kind_str(), "other", "fallback placeholder");
+        item.kind_raw = Some("future-item-kind".into());
+        assert_eq!(item.kind_str(), "future-item-kind");
+        item.kind = ItemKind::Login;
+        assert_eq!(item.kind_str(), "login", "raw ignored for known kinds");
+        let mut f = Field::new("f", FieldKind::Other, SecretString::new("v".into()), 1);
+        f.kind_raw = Some("future-field-kind".into());
+        assert_eq!(f.kind_str(), "future-field-kind");
+        f.kind = FieldKind::Text;
+        assert_eq!(f.kind_str(), "text");
     }
 
     #[test]

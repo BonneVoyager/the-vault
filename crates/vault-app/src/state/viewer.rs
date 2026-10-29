@@ -18,8 +18,27 @@ impl AppState {
             return self.show_toast("Unlock the vault to open a backup", cx);
         }
         let state = cx.entity();
-        if let Err(e) = crate::screens::open_backup_window(state, path, cx) {
-            self.show_toast(format!("Could not open the backup: {e}"), cx);
+        match crate::screens::open_backup_window(state, path, cx) {
+            Ok(handle) => {
+                // Forget viewers the user already closed, so the list cannot grow.
+                let live = cx.windows();
+                self.backup_windows.retain(|h| live.contains(h));
+                self.backup_windows.push(handle);
+            }
+            Err(e) => self.show_toast(format!("Could not open the backup: {e}"), cx),
+        }
+    }
+
+    /// Closes every backup viewer window and forgets the handles. Deferred, because
+    /// `lock` can run inside one of those windows' own updates.
+    pub(super) fn close_backup_windows(&mut self, cx: &mut Context<Self>) {
+        for handle in std::mem::take(&mut self.backup_windows) {
+            cx.defer(move |cx| {
+                // Already closed by the user: nothing to do.
+                handle
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
+            });
         }
     }
 

@@ -16,7 +16,7 @@ use gpui_component::spinner::Spinner;
 use gpui_component::switch::Switch;
 use gpui_component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
-use vault_core::{ExposeSecret as _, SecretString, strength_bits};
+use vault_core::SecretString;
 
 use crate::state::{AppState, Busy, SECURITY_TAB, SecurityForm};
 use crate::ui;
@@ -71,7 +71,8 @@ pub struct SecurityView {
     confirm: Entity<InputState>,
     /// The single master-password prompts: re-calibrate, rotate, turn Touch ID off.
     prompts: Vec<Prompt>,
-    strength: f64,
+    /// Live strength and confirmation checks on the new password.
+    check: ui::MasterPasswordCheck,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -90,11 +91,15 @@ impl SecurityView {
             .collect();
 
         let mut subscriptions = vec![
-            cx.subscribe_in(&new, window, |this, input, ev: &InputEvent, _, cx| {
+            cx.subscribe_in(&new, window, |this, _, ev: &InputEvent, window, cx| {
                 if matches!(ev, InputEvent::Change) {
-                    let secret = ui::input_secret(input, cx);
-                    this.strength = strength_bits(secret.expose_secret());
-                    cx.notify();
+                    this.check.edited(&this.new, window, cx);
+                    this.recheck(cx);
+                }
+            }),
+            cx.subscribe_in(&confirm, window, |this, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.recheck(cx);
                 }
             }),
             cx.observe_in(&state, window, |this, state, window, cx| {
@@ -138,7 +143,7 @@ impl SecurityView {
             new,
             confirm,
             prompts,
-            strength: 0.,
+            check: ui::MasterPasswordCheck::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -147,7 +152,17 @@ impl SecurityView {
         clear(&self.current, window, cx);
         clear(&self.new, window, cx);
         clear(&self.confirm, window, cx);
-        self.strength = 0.;
+        self.check.reset(&self.new, window, cx);
+    }
+
+    fn recheck(&mut self, cx: &mut Context<Self>) {
+        self.check.refresh(&self.new, &self.confirm, cx);
+        cx.notify();
+    }
+
+    fn suggest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.check.suggest(&self.new, &self.confirm, window, cx);
+        cx.notify();
     }
 
     fn open(&mut self, form: Option<SecurityForm>, window: &mut Window, cx: &mut Context<Self>) {
@@ -164,6 +179,14 @@ impl SecurityView {
 
     fn submit_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.read(cx).busy.is_some() || ui::input_is_empty(&self.current, cx) {
+            return;
+        }
+        // Below the minimum: the button is disabled and the reason shows under the meter,
+        // so Enter does nothing either. Empty and mismatched fields still reach the state's
+        // own checks, which explain themselves.
+        self.check.refresh(&self.new, &self.confirm, cx);
+        if self.check.too_weak() {
+            cx.notify();
             return;
         }
         let current = ui::input_secret(&self.current, cx);
@@ -343,10 +366,16 @@ impl SecurityView {
         error: Option<gpui::SharedString>,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let ready = self.check.ready() && !ui::input_is_empty(&self.current, cx);
         strip(false, cx)
             .child(ui::input(&self.current).small().mask_toggle())
             .child(ui::input(&self.new).small().mask_toggle())
-            .child(ui::strength_meter(self.strength, cx))
+            .child(ui::master_password_feedback(
+                &self.check,
+                "change-suggest",
+                cx.listener(|this, _, w, cx| this.suggest(w, cx)),
+                cx,
+            ))
             .child(ui::input(&self.confirm).small().mask_toggle())
             .children(error_line(error, cx))
             .child(
@@ -361,14 +390,17 @@ impl SecurityView {
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, w, cx| this.open(None, w, cx))),
                     )
-                    .child(
+                    .child(ui::submit_gate(
+                        "change-submit",
+                        ready && !busy,
                         Button::new("change-submit")
                             .primary()
                             .small()
                             .label("Change Password")
                             .loading(busy)
+                            .disabled(!ready)
                             .on_click(cx.listener(|this, _, w, cx| this.submit_change(w, cx))),
-                    ),
+                    )),
             )
     }
 
@@ -591,5 +623,166 @@ impl Render for SecurityView {
                 });
         }
         body.into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui::{AppContext as _, Modifiers, TestAppContext, VisualTestContext};
+    use gpui_component::Root;
+    use vault_core::{KdfParams, Uuid};
+    use vault_sync::{NoopHooks, SyncedVault};
+
+    use super::*;
+    use crate::theme;
+
+    const PW: &str = "pw";
+    const WEAK: &str = "letmein1";
+    const STRONG: &str = "correct-horse-battery-staple";
+
+    fn window(
+        dir: &std::path::Path,
+        cx: &mut TestAppContext,
+    ) -> (Entity<AppState>, Entity<SecurityView>, VisualTestContext) {
+        let vault = SyncedVault::create(
+            &dir.join("t.vault"),
+            &SecretString::new(PW.into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        cx.update(gpui_component::init);
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        let mut view = None;
+        let window = cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let v = cx.new(|cx| SecurityView::new(state.clone(), window, cx));
+            view = Some(v.clone());
+            Root::new(v, window, cx)
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        state.update(&mut vcx, |s, cx| {
+            s.install_unlocked_for_tests(vault);
+            s.settings_tab = SECURITY_TAB;
+            s.open_settings(true, cx);
+        });
+        vcx.run_until_parked();
+        (state, view.unwrap(), vcx)
+    }
+
+    fn open_form(view: &Entity<SecurityView>, vcx: &mut VisualTestContext) {
+        vcx.update(|w, cx| {
+            view.update(cx, |v, cx| {
+                v.open(Some(SecurityForm::ChangePassword), w, cx)
+            })
+        });
+        vcx.run_until_parked();
+    }
+
+    fn type_into(input: &Entity<InputState>, text: &str, vcx: &mut VisualTestContext) {
+        vcx.update(|window, cx| {
+            ui::clear_input(input, window, cx);
+            ui::focus_input(input, window, cx);
+        });
+        vcx.simulate_input(text);
+        vcx.run_until_parked();
+    }
+
+    fn shown(key: &'static str, vcx: &mut VisualTestContext) -> bool {
+        vcx.debug_bounds(key).is_some()
+    }
+
+    fn weak_message() -> &'static str {
+        Box::leak(format!("master-problem {}", ui::WEAK_MASTER_PASSWORD).into_boxed_str())
+    }
+
+    fn click(key: &'static str, vcx: &mut VisualTestContext) {
+        let b = vcx.debug_bounds(key).expect(key);
+        vcx.simulate_click(b.center(), Modifiers::none());
+        vcx.run_until_parked();
+    }
+
+    /// Same rules as Create: weak blocks the button and Enter, strong + matching changes
+    /// the password.
+    #[gpui::test]
+    fn change_requires_a_strong_master_password(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, view, mut vcx) = window(dir.path(), cx);
+        let (current, new, confirm) = view.read_with(&vcx, |v, _| {
+            (v.current.clone(), v.new.clone(), v.confirm.clone())
+        });
+        open_form(&view, &mut vcx);
+        assert!(shown("change-submit blocked", &mut vcx));
+
+        type_into(&current, PW, &mut vcx);
+        type_into(&new, WEAK, &mut vcx);
+        type_into(&confirm, WEAK, &mut vcx);
+        assert!(shown(weak_message(), &mut vcx));
+        assert!(shown("change-submit blocked", &mut vcx));
+        click("change-submit blocked", &mut vcx);
+        vcx.update(|w, cx| ui::focus_input(&confirm, w, cx));
+        vcx.simulate_keystrokes("enter");
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| {
+            assert!(s.busy.is_none(), "weak never submits");
+            assert!(s.toast.is_none());
+            assert_eq!(s.security.form, Some(SecurityForm::ChangePassword));
+        });
+
+        type_into(&new, STRONG, &mut vcx);
+        type_into(&confirm, STRONG, &mut vcx);
+        assert!(!shown(weak_message(), &mut vcx));
+        // The current password is still in its field after the blocked attempts.
+        assert!(shown("change-submit ready", &mut vcx));
+        click("change-submit ready", &mut vcx);
+        state.read_with(&vcx, |s, _| {
+            assert!(s.security.error.is_none(), "{:?}", s.security.error);
+            assert!(s.security.form.is_none(), "form closes on success");
+            assert!(s.toast.as_ref().unwrap().message.contains("changed"));
+        });
+    }
+
+    /// "Suggest passphrase" fills new + confirm, reveals the phrase once and enables
+    /// Change; closing the form clears and masks it again.
+    #[gpui::test]
+    fn change_suggest_fills_and_enables(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, view, mut vcx) = window(dir.path(), cx);
+        let (current, new, confirm) = view.read_with(&vcx, |v, _| {
+            (v.current.clone(), v.new.clone(), v.confirm.clone())
+        });
+        open_form(&view, &mut vcx);
+        type_into(&current, PW, &mut vcx);
+        type_into(&new, WEAK, &mut vcx);
+        assert!(shown(weak_message(), &mut vcx));
+
+        vcx.update(|w, cx| view.update(cx, |v, cx| v.suggest(w, cx)));
+        vcx.run_until_parked();
+        let (phrase, again, masked) = vcx.update(|_, cx| {
+            (
+                ui::input_text(&new, cx),
+                ui::input_text(&confirm, cx),
+                ui::input_is_masked(&new, cx),
+            )
+        });
+        assert_eq!(phrase.split('-').count(), 4);
+        assert_eq!(phrase, again);
+        assert!(!masked);
+        assert!(!shown(weak_message(), &mut vcx));
+        assert!(shown("master-write-it-down", &mut vcx));
+        assert!(shown("change-submit ready", &mut vcx));
+
+        // Cancel: fields cleared and masked again.
+        vcx.update(|w, cx| view.update(cx, |v, cx| v.open(None, w, cx)));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert!(ui::input_is_empty(&new, cx));
+            assert!(ui::input_is_empty(&confirm, cx));
+            assert!(ui::input_is_masked(&new, cx));
+        });
+        state.read_with(&vcx, |s, _| assert!(s.security.form.is_none()));
     }
 }

@@ -10,6 +10,7 @@ mod error;
 mod icloud;
 mod idle;
 mod pasteboard;
+mod window;
 
 pub use device::{BUNDLE_ID, DEVICE_ID_ENV, device_id, device_id_in, try_device_id};
 pub use error::MacError;
@@ -18,10 +19,13 @@ pub use icloud::{
     is_in_icloud,
 };
 pub use idle::{
-    Subscription, boot_time, on_distributed_notification, on_screen_locked, on_will_sleep,
-    reduce_motion_enabled, seconds_since_user_input,
+    Subscription, boot_time, on_distributed_notification, on_screen_locked, on_user_switched,
+    on_will_sleep, reduce_motion_enabled, seconds_since_user_input,
 };
 pub use pasteboard::{CONCEALED_TYPE, ChangeCount, Clipboard, PLAIN_TEXT_TYPE};
+pub use window::exclude_app_windows_from_capture;
+#[cfg(target_os = "macos")]
+pub use window::exclude_window_from_capture;
 
 mod biometric;
 pub use biometric::Biometric;
@@ -33,4 +37,7 @@ pub use login_item::{
 };
 
 mod qr;
-pub use qr::{decode_qr_from_gray, scan_qr_from_screen, screen_capture_permitted};
+pub use qr::{
+    MAX_IMAGE_FILE_BYTES, MAX_IMAGE_PIXELS, decode_qr_from_gray, scan_qr_from_image_file,
+    scan_qr_from_screen, screen_capture_permitted,
+};

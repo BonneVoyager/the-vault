@@ -26,6 +26,8 @@ pub fn kind_label(kind: ItemKind) -> (&'static str, IconName) {
         ItemKind::Note => ("Notes", IconName::StickyNote),
         ItemKind::Card => ("Cards", IconName::CreditCard),
         ItemKind::Identity => ("Identities", IconName::IdCard),
+        // A kind from a newer app version: no sidebar category, shown under All only.
+        ItemKind::Other => ("Other", IconName::Inbox),
     }
 }
 
@@ -36,6 +38,7 @@ pub fn kind_singular(kind: ItemKind) -> &'static str {
         ItemKind::Note => "Note",
         ItemKind::Card => "Card",
         ItemKind::Identity => "Identity",
+        ItemKind::Other => "Item",
     }
 }
 

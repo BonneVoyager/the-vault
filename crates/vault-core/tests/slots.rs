@@ -141,16 +141,14 @@ fn rotate_vault_key_reencrypts_items_drops_enclave_and_keeps_old_file_valid() {
     let header_after = v.header();
     assert_eq!(kinds(&v), [SlotKind::Password], "enclave slot dropped");
     assert_eq!(header_after.kdf, header_before.kdf, "kdf params unchanged");
-    assert_eq!(header_after.slots[0].id, header_before.slots[0].id);
-    assert_eq!(
-        header_after.slots[0].created_at,
-        header_before.slots[0].created_at
+    let (after0, before0) = (
+        header_after.slots[0].as_key().unwrap(),
+        header_before.slots[0].as_key().unwrap(),
     );
-    assert_ne!(header_after.slots[0].nonce, header_before.slots[0].nonce);
-    assert_ne!(
-        header_after.slots[0].wrapped_key,
-        header_before.slots[0].wrapped_key
-    );
+    assert_eq!(after0.id, before0.id);
+    assert_eq!(after0.created_at, before0.created_at);
+    assert_ne!(after0.nonce, before0.nonce);
+    assert_ne!(after0.wrapped_key, before0.wrapped_key);
 
     let new_bytes = v.serialize();
     let locked = LockedVault::parse(&new_bytes).unwrap();
@@ -205,7 +203,7 @@ fn change_password_with_wrong_old_leaves_header_unchanged() {
 fn change_password_replaces_slot_and_adopts_new_kdf_salt() {
     let (mut v, enclave, _) = vault_with_enclave();
     let before = v.header().clone();
-    let old_slot = &before.slots[0];
+    let old_slot = before.slots[0].as_key().unwrap();
     assert_eq!(old_slot.kind, SlotKind::Password);
 
     let mut params = KdfParams::for_tests();
@@ -217,6 +215,7 @@ fn change_password_replaces_slot_and_adopts_new_kdf_salt() {
     let password_slots: Vec<_> = after
         .slots
         .iter()
+        .filter_map(|s| s.as_key())
         .filter(|s| s.kind == SlotKind::Password)
         .collect();
     assert_eq!(password_slots.len(), 1);
@@ -228,7 +227,10 @@ fn change_password_replaces_slot_and_adopts_new_kdf_salt() {
     assert_eq!(after.kdf, params);
     assert_eq!(after.vault_id, before.vault_id);
     assert_eq!(after.created_at, before.created_at);
-    assert!(after.slots.iter().any(|s| s.id == enclave), "enclave kept");
+    assert!(
+        after.slots.iter().any(|s| s.id() == enclave),
+        "enclave kept"
+    );
 
     let locked = LockedVault::parse(&v.serialize()).unwrap();
     assert_eq!(locked.kdf_params().salt, params.salt);
@@ -245,8 +247,8 @@ fn add_enclave_slot_with_created_at_and_multiple_enclave_slots() {
     let s2 = v.add_enclave_slot(&k2);
     assert_ne!(s1, s2);
     let header = v.header();
-    assert_eq!(header.slots[1].created_at, 1_700_000_123);
-    assert_eq!(header.slots[2].created_at, 0);
+    assert_eq!(header.slots[1].as_key().unwrap().created_at, 1_700_000_123);
+    assert_eq!(header.slots[2].as_key().unwrap().created_at, 0);
 
     let locked = LockedVault::parse(&v.serialize()).unwrap();
     assert_vaults_eq(&v, &locked.unlock_with_kek(s1, &k1).unwrap());

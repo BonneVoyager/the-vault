@@ -6,16 +6,17 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, Bounds, Context, Div, Entity, IntoElement,
-    ParentElement as _, PathPromptOptions, Render, Result, SharedString, Styled as _, Task,
-    TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, point, px, relative, size,
+    Anchor, AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Div, Entity,
+    InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, Render, Result,
+    SharedString, Styled as _, Task, TitlebarOptions, Window, WindowBounds, WindowHandle,
+    WindowOptions, point, prelude::FluentBuilder as _, px, relative, size,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState, TextareaState};
 use gpui_component::popover::Popover;
 use gpui_component::{ActiveTheme as _, Icon, Root, Selectable, Sizable as _};
 use gpui_kit_assets::IconName;
-use vault_core::SecretString;
+use vault_core::{ExposeSecret as _, PassphraseSpec, SecretString, passphrase, strength_bits};
 
 pub use gpui_component::{h_flex, v_flex};
 
@@ -139,6 +140,11 @@ pub fn set_textarea(state: &Entity<TextareaState>, value: &str, window: &mut Win
 
 pub fn input_text(state: &Entity<InputState>, cx: &App) -> String {
     state.read(cx).text().to_string()
+}
+
+/// Whether a password input currently hides its text.
+pub fn input_is_masked(state: &Entity<InputState>, cx: &App) -> bool {
+    state.read(cx).presentation().is_masked()
 }
 
 pub fn input_is_empty(state: &Entity<InputState>, cx: &App) -> bool {
@@ -298,6 +304,162 @@ pub fn strength_meter(bits: f64, cx: &App) -> Div {
                 .text_color(theme.muted_foreground)
                 .child(format!("{label} · {bits:.0} bits")),
         )
+}
+
+/// Minimum estimated strength of a new master password (create vault, change password).
+/// `strength_bits` is the generator's naive length x log2(pool) estimate; 50 bits is our
+/// reading of "stronger than a short dictionary word", and a 4-word passphrase clears it.
+pub const MIN_MASTER_BITS: f64 = 50.;
+pub const WEAK_MASTER_PASSWORD: &str =
+    "Choose a stronger master password (at least 50 bits). Try a 4-word passphrase.";
+pub const WRITE_IT_DOWN: &str = "Write it down. There is no recovery without it.";
+pub const PASSWORDS_DIFFER: &str = "The passwords do not match.";
+
+/// Live checks on a new master password and its confirmation. Holds no secret text,
+/// only derived numbers and flags.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct MasterPasswordCheck {
+    pub bits: f64,
+    filled: bool,
+    matches: bool,
+    /// The confirmation is at least as long as the password and still differs, so the
+    /// user has finished typing it wrong (not merely not finished yet).
+    mismatch: bool,
+    /// The password field shows a suggested passphrase in clear text.
+    pub suggested: bool,
+}
+
+impl MasterPasswordCheck {
+    /// Recomputes everything from the two inputs.
+    pub fn refresh(
+        &mut self,
+        password: &Entity<InputState>,
+        confirm: &Entity<InputState>,
+        cx: &App,
+    ) {
+        let pw = input_secret(password, cx);
+        let again = input_secret(confirm, cx);
+        let (pw, again) = (pw.expose_secret(), again.expose_secret());
+        self.bits = strength_bits(pw);
+        self.filled = !pw.is_empty();
+        self.matches = pw == again;
+        self.mismatch =
+            !again.is_empty() && !self.matches && again.chars().count() >= pw.chars().count();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.filled
+    }
+
+    /// Filled in and below the minimum.
+    pub fn too_weak(&self) -> bool {
+        self.filled && self.bits < MIN_MASTER_BITS
+    }
+
+    /// Strong enough and confirmed: the primary button may be enabled.
+    pub fn ready(&self) -> bool {
+        self.filled && !self.too_weak() && self.matches
+    }
+
+    /// The inline message under the meter, if any.
+    pub fn problem(&self) -> Option<&'static str> {
+        if self.too_weak() {
+            Some(WEAK_MASTER_PASSWORD)
+        } else if self.mismatch {
+            Some(PASSWORDS_DIFFER)
+        } else {
+            None
+        }
+    }
+
+    /// Fills both fields with a fresh 4-word passphrase and shows it in the password field
+    /// so the user can read it once. The next edit of that field masks it again.
+    pub fn suggest(
+        &mut self,
+        password: &Entity<InputState>,
+        confirm: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let phrase = passphrase(&PassphraseSpec::default());
+        for input in [password, confirm] {
+            input.update(cx, |s, cx| s.set_value(phrase.expose_secret(), window, cx));
+        }
+        password.update(cx, |s, cx| s.set_masked(false, window, cx));
+        self.suggested = true;
+        self.refresh(password, confirm, cx);
+    }
+
+    /// The user typed in the password field: hide a revealed suggestion again.
+    pub fn edited(&mut self, password: &Entity<InputState>, window: &mut Window, cx: &mut App) {
+        if self.suggested {
+            self.suggested = false;
+            password.update(cx, |s, cx| s.set_masked(true, window, cx));
+        }
+    }
+
+    /// The form closed or was cleared: masked again, nothing measured.
+    pub fn reset(&mut self, password: &Entity<InputState>, window: &mut Window, cx: &mut App) {
+        if !input_is_masked(password, cx) {
+            password.update(cx, |s, cx| s.set_masked(true, window, cx));
+        }
+        *self = Self::default();
+    }
+}
+
+/// Meter, inline problem, "Suggest passphrase" link and the write-it-down note shown under
+/// a new master password field.
+pub fn master_password_feedback(
+    check: &MasterPasswordCheck,
+    suggest_id: &'static str,
+    on_suggest: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Div {
+    let theme = cx.theme();
+    let problem = check.problem();
+    v_flex()
+        .gap(px(6.))
+        .child(strength_meter(check.bits, cx))
+        .child(
+            h_flex()
+                .gap(px(8.))
+                .items_start()
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .when_some(problem, |d, p| {
+                            d.debug_selector(move || format!("master-problem {p}"))
+                                .child(p)
+                        }),
+                )
+                .child(
+                    Button::new(suggest_id)
+                        .link()
+                        .small()
+                        .label("Suggest passphrase")
+                        .on_click(on_suggest),
+                ),
+        )
+        .when(check.suggested, |col| {
+            col.child(
+                gpui::div()
+                    .debug_selector(|| "master-write-it-down".into())
+                    .text_xs()
+                    .text_color(theme.warning)
+                    .child(WRITE_IT_DOWN),
+            )
+        })
+}
+
+/// Wraps a form's primary button so headless tests can see whether it is enabled
+/// (`"<name> ready"` or `"<name> blocked"`).
+pub fn submit_gate(name: &'static str, ready: bool, button: impl IntoElement) -> Div {
+    gpui::div()
+        .debug_selector(move || format!("{name} {}", if ready { "ready" } else { "blocked" }))
+        .child(button)
 }
 
 /// A popover whose open state lives in `AppState`: drawn open while `open`. The trigger

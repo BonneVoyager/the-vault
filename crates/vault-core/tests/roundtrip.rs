@@ -247,6 +247,8 @@ fn unknown_keys_survive_roundtrip() {
             .kdf_extras
             .push((Value::Text("x_kdf".into()), Value::Integer(1.into())));
         f.header.slots[0]
+            .as_key_mut()
+            .unwrap()
             .extras
             .push((Value::Text("x_slot".into()), Value::Integer(2.into())));
         f.items[0]
@@ -283,7 +285,7 @@ fn unknown_keys_survive_roundtrip() {
     };
     assert!(has(&f.header.extras, "x_header_future"));
     assert!(has(&f.header.kdf_extras, "x_kdf"));
-    assert!(has(&f.header.slots[0].extras, "x_slot"));
+    assert!(has(&f.header.slots[0].as_key().unwrap().extras, "x_slot"));
     assert!(has(&f.items[0].extras, "x_rec"));
     assert!(has(&f.manifest.extras, "x_man"));
     let hv: Value = ciborium::from_reader(header_slice(&out)).unwrap();

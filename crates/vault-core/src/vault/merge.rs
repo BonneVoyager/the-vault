@@ -233,6 +233,7 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
     Item {
         id: ours.id,
         kind: winner.kind,
+        kind_raw: winner.kind_raw.clone(),
         title: winner.title.clone(),
         deleted_at: None,
         device_id: winner.device_id,
@@ -267,6 +268,7 @@ fn history_entry_eq(a: &HistoryEntry, b: &HistoryEntry) -> bool {
 pub(crate) fn field_content_eq(a: &Field, b: &Field) -> bool {
     a.name == b.name
         && a.kind == b.kind
+        && a.kind_raw == b.kind_raw
         && a.section == b.section
         && a.extras == b.extras
         && a.value.expose_secret() == b.value.expose_secret()
@@ -281,6 +283,7 @@ fn field_eq(a: &Field, b: &Field) -> bool {
 pub fn item_eq(a: &Item, b: &Item) -> bool {
     a.id == b.id
         && a.kind == b.kind
+        && a.kind_raw == b.kind_raw
         && a.title == b.title
         && a.deleted_at == b.deleted_at
         && a.device_id == b.device_id

@@ -9,6 +9,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::DropdownMenu as _;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 
@@ -17,6 +18,7 @@ use vault_core::ItemKind;
 
 use super::sidebar::{kind_label, kind_singular};
 use crate::actions::{LIST_CONTEXT, SortAlphabetical, SortRecentlyModified};
+use crate::audit::Issue;
 use crate::listing::{self, Row};
 use crate::state::{AppState, GeneratorTarget, Sort};
 use crate::ui;
@@ -48,6 +50,42 @@ pub fn avatar(id: vault_core::Uuid, title: &str, size: f32) -> gpui::Div {
         .child(listing::avatar_letter(title))
 }
 
+/// Apple-style red circle with a white "!" (password warnings).
+pub fn alert_dot(size: f32, cx: &App) -> gpui::Div {
+    div()
+        .flex_shrink_0()
+        .size(px(size))
+        .rounded_full()
+        .bg(cx.theme().danger)
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(gpui::white())
+        .font_weight(FontWeight::BOLD)
+        .text_size(px(size * 0.7))
+        .line_height(px(size))
+        .child("!")
+}
+
+/// Trailing badge for a list row whose item has password `issues`. The tooltip and
+/// VoiceOver label name every issue ("Weak password, Reused password").
+fn issue_badge(ix: usize, issues: &[Issue], cx: &App) -> AnyElement {
+    let label: SharedString = issues
+        .iter()
+        .map(Issue::short)
+        .collect::<Vec<_>>()
+        .join(", ")
+        .into();
+    let tip = label.clone();
+    alert_dot(16., cx)
+        .id(("issue-badge", ix))
+        .aria_label(label.clone())
+        // Tests find the badge by this key (no-op outside test builds).
+        .debug_selector(move || format!("issue-badge {label}"))
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .into_any_element()
+}
+
 fn render_row(
     rows: &[Row],
     ix: usize,
@@ -77,6 +115,8 @@ fn render_row(
             let selected = s.selection == Some(*id);
             let (title, subtitle, favorite) =
                 (item.title.clone(), listing::subtitle(item), item.favorite);
+            let issues = s.listing.issues(*id);
+            let badge = (!issues.is_empty()).then(|| issue_badge(ix, issues, cx));
             let (fg, muted) = if selected && list_focused {
                 (
                     theme.primary_foreground,
@@ -138,6 +178,7 @@ fn render_row(
                                 },
                             ))
                         })
+                        .children(badge)
                         .on_click(move |_, window, cx| {
                             state.update(cx, |s, cx| s.select(id, cx));
                             window.focus(&focus, cx);
@@ -149,17 +190,46 @@ fn render_row(
     }
 }
 
+/// Width of the icon slot in menu rows, so every label starts at the same x.
+const MENU_ICON_SLOT: f32 = 20.;
+
 /// The ⌘N kind picker: one row per item kind. Uses the title the picker was opened with.
-fn kind_picker(state: &Entity<AppState>) -> AnyElement {
+/// Rows are laid out like the sidebar's: fixed icon slot, left-aligned label.
+fn kind_picker(state: &Entity<AppState>, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let height = crate::theme::scaled(28., cx);
     let rows = ItemKind::ALL.into_iter().map(|kind| {
         let (_, icon) = kind_label(kind);
         let state = state.clone();
-        Button::new(SharedString::from(format!("new-{}", kind.as_str())))
-            .ghost()
-            .small()
+        ui::h_flex()
+            .id(SharedString::from(format!("new-{}", kind.as_str())))
+            .tab_index(0)
             .w_full()
-            .icon(Icon::new(icon))
-            .label(kind_singular(kind))
+            .h(height)
+            .px(px(8.))
+            .gap(px(8.))
+            .justify_start()
+            .rounded(theme.radius)
+            .text_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.accent))
+            .active(|style| style.bg(theme.primary.opacity(0.16)))
+            .map(|row| ui::focus_ring(row, cx))
+            .child(
+                ui::h_flex()
+                    .flex_none()
+                    .w(px(MENU_ICON_SLOT))
+                    .justify_center()
+                    .child(Icon::new(icon).size_4().text_color(theme.muted_foreground)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(kind_singular(kind)),
+            )
+            // Focusable divs also fire `on_click` on Enter / Space.
             .on_click(move |_, _, cx| {
                 state.update(cx, |s, cx| {
                     let title = s.kind_picker.clone().unwrap_or_default();
@@ -373,7 +443,7 @@ impl MainScreen {
                                 }
                             });
                         },
-                        move |_, _| kind_picker(&picker_state),
+                        move |_, cx| kind_picker(&picker_state, cx),
                     )
                 })
                 .child(div().text_xs().text_color(theme.muted_foreground).child(
@@ -403,5 +473,87 @@ impl MainScreen {
             )
             .child(footer)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui::{AppContext as _, TestAppContext, VisualTestContext};
+    use gpui_component::Root;
+    use vault_core::{KdfParams, SecretString, Uuid};
+    use vault_sync::{NoopHooks, SyncedVault};
+
+    use super::*;
+    use crate::actions;
+    use crate::state::Mode;
+
+    /// The main screen over an empty unlocked vault.
+    fn open(
+        dir: &std::path::Path,
+        cx: &mut TestAppContext,
+    ) -> (Entity<AppState>, VisualTestContext) {
+        let vault = SyncedVault::create(
+            &dir.join("t.vault"),
+            &SecretString::new("pw".into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            actions::bind_keys(cx);
+            actions::register(&state, cx);
+        });
+        state.update(cx, |s, _| s.install_unlocked_for_tests(vault));
+        let window = cx.add_window(|window, cx| {
+            crate::theme::apply(window, cx);
+            let view = cx.new(|cx| MainScreen::new(state.clone(), None, window, cx));
+            Root::new(view, window, cx)
+        });
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        (state, vcx)
+    }
+
+    /// Presses and releases `key`. gpui fires a focused element's keyboard click on key
+    /// up, and `simulate_keystrokes` sends only key down.
+    fn press(vcx: &mut VisualTestContext, key: &'static str) {
+        vcx.simulate_keystrokes(key);
+        vcx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse(key).unwrap(),
+        });
+    }
+
+    /// Opens the New popover with ⌘N, tabs `tabs` times, presses `key`, and returns the
+    /// kind of the item being created.
+    fn pick(tabs: usize, key: &'static str, cx: &mut TestAppContext) -> Option<ItemKind> {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut vcx) = open(dir.path(), cx);
+        vcx.simulate_keystrokes("cmd-n");
+        vcx.run_until_parked();
+        assert!(state.read_with(&vcx, |s, _| s.kind_picker.is_some()));
+        for _ in 0..tabs {
+            vcx.simulate_keystrokes("tab");
+        }
+        press(&mut vcx, key);
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| match &s.mode {
+            Mode::New(kind, _) => Some(*kind),
+            _ => None,
+        })
+    }
+
+    #[gpui::test]
+    fn kind_picker_row_activates_with_enter(cx: &mut TestAppContext) {
+        assert_eq!(pick(1, "enter", cx), Some(ItemKind::Login));
+    }
+
+    #[gpui::test]
+    fn kind_picker_row_activates_with_space(cx: &mut TestAppContext) {
+        assert_eq!(pick(2, "space", cx), Some(ItemKind::Note));
     }
 }

@@ -13,6 +13,9 @@ Visual target: 1Password 8 level of polish. Three-column layout, keyboard-first,
 - Multi-user sharing, organisations
 - Server-side sync, accounts, telemetry
 - Windows/Linux (keep `vault-core` and `vault-sync` portable anyway; only `vault-macos` and `vault-app` are allowed macOS-only deps)
+- macOS 14 or earlier. Minimum is macOS 15 (needed for passkey PRF).
+- Hardware keys (YubiKey HMAC-SHA1, FIDO2 hmac-secret) and key files. Dropped from the roadmap; see `docs/research/2026-10-29-hardware-key-and-unlocked-state.md`.
+- Network access of any kind, so no leaked-password ("compromised") checks.
 
 ## Threat model
 
@@ -22,13 +25,16 @@ Protects against:
 - Compromised cloud storage account (attacker gets the file)
 - Offline brute force of the master password (Argon2id, calibrated ≥ 500 ms on the user's machine)
 - Tampering with the vault file: modified items, swapped items between vaults, deleted/rolled-back items (per-item AEAD with AAD + encrypted manifest)
-- Casual clipboard snooping (concealed pasteboard type, auto-clear)
+- Casual clipboard snooping (concealed pasteboard type, current-host-only so nothing reaches Universal Clipboard, auto-clear)
+- Weak or reused item passwords (local audit: weak < 40 bits, reused across items; master password minimum 50 bits)
 
 Does **not** protect against:
 
 - Malware or a keylogger on an unlocked machine
 - A user with a weak master password
 - Someone with physical access to an unlocked session
+
+Unlock factors (master password, Touch ID, passkey) protect the file at rest and in transit only. While the vault is unlocked the vault key and decrypted items are in process memory; the controls for that window are auto-lock (idle, sleep, screen lock, user switch), zeroize on lock, hardened runtime without debugging entitlements, clipboard hygiene, and best-effort screen-capture exclusion.
 
 Explicitly accepted leaks in the file format: number of items, item UUIDs, per-item last-modified timestamps, vault creation time. Everything else — titles, URLs, usernames, notes, tags, field names — is encrypted.
 
@@ -64,7 +70,8 @@ Rules of dependency: `vault-core` depends on nothing in the workspace. `vault-sy
 | Sync model | File-based; cloud providers are just folders | iCloud / Dropbox / local folder are the same code path |
 | Merge | Field-level last-write-wins + tombstones | Good enough for one user on 2–3 devices; no CRDT library |
 | UI | gpui + gpui-component, pinned versions | GPU-rendered, own widgets, closest to 1Password look without a webview |
-| Unlock factors | Master password (required). Touch ID convenience unlock via Secure Enclave (phase 4). Secret key and hardware keys deferred to v2. | Scope |
+| Unlock factors | Master password (required). Touch ID convenience unlock via Secure Enclave (phase 4). Passkey unlock via the WebAuthn PRF extension (after phase 5, macOS 15). Hardware keys and key files: dropped. | Scope |
+| Forward compatibility | Readers preserve unknown slot kinds, item kinds, field kinds, and map keys; every `FORMAT_VERSION` keeps its fixtures forever (`01` §9) | A newer app always opens an older file, and an older app opens a newer file that only added things |
 
 ## Phases and acceptance criteria
 

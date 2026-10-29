@@ -1,4 +1,6 @@
-//! Error types, exactly as `specs/01-vault-format.md` §7.
+//! Error types per `specs/01-vault-format.md` §7, plus one documented extension:
+//! [`VaultError::NoUsableSlot`] (forward compatibility, 01 §9) is not in the §7 listing yet
+//! and is pending a spec amendment.
 
 use uuid::Uuid;
 
@@ -20,6 +22,13 @@ pub enum VaultError {
     /// Every `password` slot failed to unwrap and the header parsed cleanly.
     #[error("wrong password")]
     WrongPassword,
+    /// The header parsed cleanly but holds no slot this build can unlock with the credential
+    /// offered: `unlock` found no `password` slot at all, or `unlock_with_kek` was pointed at
+    /// a slot whose `kind` this build does not know (written by a newer version, 01 §9).
+    /// Distinct from [`VaultError::WrongPassword`] so the app can say "this vault uses an
+    /// unlock method this version does not support" instead of "wrong password".
+    #[error("no key slot this version can unlock (vault written by a newer version?)")]
+    NoUsableSlot,
     /// An AEAD tag or the manifest cross-check failed.
     #[error("vault file has been tampered with: {0:?}")]
     Tampered(TamperKind),

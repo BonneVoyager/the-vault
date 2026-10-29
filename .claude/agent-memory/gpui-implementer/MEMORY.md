@@ -1,4 +1,4 @@
 - [gpui version pins](gpui-version-pins.md) — gpui-pre 0.3.10 + gpui-component 0.8.1, Rust 1.99.1, runtime_shaders, font-kit required for text
-- [gpui API facts](gpui-api-facts.md) — app/window/actions/menus/list/clipboard/file panels/focus/animation/headless tests, observer self-update, reduce motion, window activation, rem scaling, 2nd window, drag, render_to_image + logger probe
-- [gpui-component theme](gpui-component-theme.md) — Theme::change wipes overrides; tokens.* not updated by field edits; primary=accent
-- [gpui-component widgets](gpui-component-widgets.md) — Input, Button, dropdown, Popover, Dialog, Slider, Switch, Tabs/segmented, Alert, drag-drop, why not Sidebar
+- [gpui API facts](gpui-api-facts.md) — app/window/actions/menus/list/clipboard/file panels/focus/animation/headless tests, observer self-update, reduce motion, window activation, rem scaling, 2nd window, drag, render_to_image + painted_quads colour asserts, env_logger in main, debug_selector asserts, Backspace propagation, defer-close windows, close_dialog semantics, observe_new per window
+- [gpui-component theme](gpui-component-theme.md) — Theme::change wipes overrides; Button reads tokens.button_primary*, set button_primary fields; primary=accent
+- [gpui-component widgets](gpui-component-widgets.md) — Input, Button, dropdown, Popover, Dialog, Slider, Switch, Tabs/segmented, Alert, drag-drop, tag chips, xsmall, set_value no Change, set_masked, link button, div tooltip + aria_label, why not Sidebar

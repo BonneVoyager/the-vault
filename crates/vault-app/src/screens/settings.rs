@@ -215,10 +215,10 @@ impl SettingsView {
                 cx,
             ))
             .child(row(
-                "Lock on sleep or screen lock",
+                "Lock on sleep, screen lock or user switch",
                 Switch::new("lock-on-sleep")
                     .checked(settings.lock_on_sleep)
-                    .accessibility_label("Lock on sleep or screen lock")
+                    .accessibility_label("Lock on sleep, screen lock or user switch")
                     .on_click(move |on, _, cx| {
                         let on = *on;
                         state.update(cx, |s, cx| {

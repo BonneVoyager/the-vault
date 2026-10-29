@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use vault_core::{
     CsvMapping, ExposeSecret, Field, FieldKind, Item, ItemKind, KdfParams, LockedVault,
     PassphraseSpec, PasswordSpec, Query, SecretString, Totp, UnlockedVault, Uuid, VaultError,
-    export_csv, import_csv, passphrase, password, search,
+    export_csv, import_csv, passphrase, password, search, strength_bits,
 };
 
 #[derive(Parser)]
@@ -35,6 +35,9 @@ enum Cmd {
         /// Use fast test KDF parameters instead of calibrating.
         #[arg(long)]
         kdf_test_params: bool,
+        /// Accept a master password under 50 bits of strength (for scripts and tests).
+        #[arg(long)]
+        allow_weak: bool,
     },
     /// Add an item.
     Add(AddArgs),
@@ -199,7 +202,7 @@ fn display_value(item: &Item, f: &Field, reveal: bool) -> String {
         return "********".to_owned();
     }
     match f.kind {
-        FieldKind::Password | FieldKind::Totp => "********".to_owned(),
+        _ if f.kind.is_sensitive() => "********".to_owned(),
         _ => raw.clone(),
     }
 }
@@ -282,9 +285,20 @@ fn run(cli: Cli) -> Result<()> {
             };
             println!("{}", secret.expose_secret());
         }
-        Cmd::Init { kdf_test_params } => {
+        Cmd::Init {
+            kdf_test_params,
+            allow_weak,
+        } => {
             let path = vault_path(&cli)?;
             let pw = master_password(&cli, true)?;
+            if !*allow_weak {
+                let bits = strength_bits(pw.expose_secret());
+                if bits < 50.0 {
+                    bail!(
+                        "master password too weak ({bits:.0} bits, minimum 50). Use a 4-word passphrase, or pass --allow-weak."
+                    );
+                }
+            }
             let kdf = if *kdf_test_params {
                 KdfParams::for_tests()
             } else {
@@ -367,7 +381,7 @@ fn run(cli: Cli) -> Result<()> {
                 .context("item vanished")?;
             println!("id:    {}", item.id);
             println!("title: {}", item.title);
-            println!("kind:  {}", item.kind.as_str());
+            println!("kind:  {}", item.kind_str());
             println!("tags:  {}", item.tags.join(", "));
             for f in &item.fields {
                 println!("{}: {}", f.name, display_value(item, f, *reveal));
@@ -392,12 +406,12 @@ fn run(cli: Cli) -> Result<()> {
                 let short = &item.id.simple().to_string()[..8];
                 let user = item
                     .field("username")
-                    .filter(|f| !matches!(f.kind, FieldKind::Password | FieldKind::Totp))
+                    .filter(|f| !f.kind.is_sensitive())
                     .map(|f| f.value.expose_secret().as_str())
                     .filter(|u| !u.is_empty());
                 match user {
-                    Some(u) => println!("{short}  {:<8}  {}  {u}", item.kind.as_str(), item.title),
-                    None => println!("{short}  {:<8}  {}", item.kind.as_str(), item.title),
+                    Some(u) => println!("{short}  {:<8}  {}  {u}", item.kind_str(), item.title),
+                    None => println!("{short}  {:<8}  {}", item.kind_str(), item.title),
                 }
             }
         }
@@ -498,6 +512,15 @@ fn main() -> ExitCode {
             ) {
                 eprintln!("wrong password");
                 return ExitCode::from(2);
+            }
+            if matches!(
+                e.downcast_ref::<VaultError>(),
+                Some(VaultError::NoUsableSlot)
+            ) {
+                eprintln!(
+                    "this vault was created by a newer version of vault with an unlock method this version does not support"
+                );
+                return ExitCode::FAILURE;
             }
             eprintln!("error: {e:#}");
             ExitCode::FAILURE

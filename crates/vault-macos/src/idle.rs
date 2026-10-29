@@ -38,6 +38,17 @@ pub fn on_will_sleep(cb: impl Fn() + Send + 'static) -> Subscription {
     imp::on_will_sleep(cb)
 }
 
+/// Calls `cb` when this login session stops being the active console
+/// session, e.g. on fast user switching to another account
+/// (`NSWorkspaceSessionDidResignActiveNotification`).
+///
+/// Delivered on the main thread's run loop. The observer stays registered
+/// until the returned [`Subscription`] is dropped.
+#[must_use = "dropping the Subscription unregisters the observer"]
+pub fn on_user_switched(cb: impl Fn() + Send + 'static) -> Subscription {
+    imp::on_user_switched(cb)
+}
+
 /// When the machine last booted (`sysctl kern.boottime`).
 ///
 /// Returns `UNIX_EPOCH` if the value cannot be read.
@@ -62,7 +73,10 @@ mod imp {
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, NSObject};
     use objc2::{AnyThread, DefinedClass, Message, define_class, msg_send, sel};
-    use objc2_app_kit::{NSWorkspace, NSWorkspaceWillSleepNotification};
+    use objc2_app_kit::{
+        NSWorkspace, NSWorkspaceSessionDidResignActiveNotification,
+        NSWorkspaceWillSleepNotification,
+    };
     use objc2_core_graphics::{CGEventSource, CGEventSourceStateID, CGEventType};
     use objc2_foundation::{
         NSDistributedNotificationCenter, NSNotification, NSNotificationCenter, NSNotificationName,
@@ -134,9 +148,10 @@ mod imp {
 
     /// Guard for a notification observer; removes it from its center on drop.
     ///
-    /// Drop does not wait for a callback that is already running. Both
-    /// notifications are delivered on the main thread, so drop the guard on
-    /// the main thread to be sure no callback is in flight.
+    /// Drop does not wait for a callback that is already running. All three
+    /// notifications (screen lock, will sleep, user switch) are delivered on
+    /// the main thread, so drop the guard on the main thread to be sure no
+    /// callback is in flight.
     pub struct Subscription {
         center: Retained<NSNotificationCenter>,
         observer: Retained<Observer>,
@@ -186,11 +201,12 @@ mod imp {
         on_distributed_notification(SCREEN_IS_LOCKED, cb)
     }
 
-    pub fn on_will_sleep(cb: impl Fn() + Send + 'static) -> Subscription {
+    /// Observes `name` on NSWorkspace's own notification center.
+    fn on_workspace_notification(
+        name: &NSNotificationName,
+        cb: impl Fn() + Send + 'static,
+    ) -> Subscription {
         let center = NSWorkspace::sharedWorkspace().notificationCenter();
-        // SAFETY: AppKit initialises this extern constant at load time; it is
-        // an immutable NSString that lives for the whole process.
-        let name: &NSNotificationName = unsafe { NSWorkspaceWillSleepNotification };
         let observer = Observer::new(Box::new(cb));
         // SAFETY: as in `on_distributed_notification`: `observer` implements
         // `handle:` with the expected signature; nil object = any sender.
@@ -198,6 +214,19 @@ mod imp {
             center.addObserver_selector_name_object(&observer, sel!(handle:), Some(name), None);
         }
         Subscription { center, observer }
+    }
+
+    pub fn on_will_sleep(cb: impl Fn() + Send + 'static) -> Subscription {
+        // SAFETY: AppKit initialises this extern constant at load time; it is
+        // an immutable NSString that lives for the whole process.
+        let name: &NSNotificationName = unsafe { NSWorkspaceWillSleepNotification };
+        on_workspace_notification(name, cb)
+    }
+
+    pub fn on_user_switched(cb: impl Fn() + Send + 'static) -> Subscription {
+        // SAFETY: as for `NSWorkspaceWillSleepNotification` above.
+        let name: &NSNotificationName = unsafe { NSWorkspaceSessionDidResignActiveNotification };
+        on_workspace_notification(name, cb)
     }
 
     pub fn boot_time() -> SystemTime {
@@ -250,6 +279,10 @@ mod imp {
     }
 
     pub fn on_will_sleep(_cb: impl Fn() + Send + 'static) -> Subscription {
+        Subscription(())
+    }
+
+    pub fn on_user_switched(_cb: impl Fn() + Send + 'static) -> Subscription {
         Subscription(())
     }
 

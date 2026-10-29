@@ -16,6 +16,21 @@ use crate::screens::{ChooseScreen, ColumnsResized, MainScreen, SettingsView, Unl
 use crate::state::{AppState, Screen, ToastPlace};
 use crate::{theme, ui};
 
+#[cfg(test)]
+thread_local! {
+    /// How often the capture exclusion ran on this (test) thread.
+    static CAPTURE_EXCLUSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Hides every app window from screenshots and screen recording (NSWindow
+/// `sharingType = none`). Apple documents this as legacy and best effort: ScreenCaptureKit
+/// on recent macOS may ignore it. A no-op off the main thread (e.g. in tests).
+fn exclude_windows_from_capture() {
+    vault_macos::exclude_app_windows_from_capture();
+    #[cfg(test)]
+    CAPTURE_EXCLUSIONS.with(|c| c.set(c.get() + 1));
+}
+
 /// Locked → unlocked crossfade (§2.3).
 const CROSSFADE: Duration = Duration::from_millis(150);
 /// Window geometry is written this long after the last resize/move.
@@ -74,6 +89,11 @@ impl VaultRoot {
                 this.geometry.columns = Some(ev.0);
                 this.schedule_save(cx);
             }),
+            // Every window (this one, backup viewers) is wrapped in a gpui-component
+            // `Root`; deferred so the NSWindow is registered with NSApp first.
+            cx.observe_new::<gpui_component::Root>(|_, _, cx| {
+                cx.defer(|_| exclude_windows_from_capture());
+            }),
         ];
 
         let weak = cx.entity().downgrade();
@@ -90,7 +110,10 @@ impl VaultRoot {
 
         cx.set_global(actions::MainWindow(window.window_handle().window_id()));
         let screen = state.read(cx).screen;
-        cx.defer_in(window, |this, window, cx| this.appear(window, cx));
+        cx.defer_in(window, |this, window, cx| {
+            exclude_windows_from_capture();
+            this.appear(window, cx);
+        });
         let triggers = autolock::install(&state, cx);
         Self {
             geometry: ui::window_geometry(window, columns),
@@ -215,6 +238,30 @@ mod tests {
     use crate::actions;
     use crate::state::Settings;
 
+    /// Capture exclusion runs (headless: a no-op, no panic) when the main window opens
+    /// and again for each later window, such as a backup viewer.
+    #[gpui::test]
+    fn windows_are_excluded_from_capture(cx: &mut TestAppContext) {
+        let calls = || CAPTURE_EXCLUSIONS.with(|c| c.get());
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        cx.update(gpui_component::init);
+        let before = calls();
+        cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let view = cx.new(|cx| VaultRoot::new(state.clone(), None, window, cx));
+            Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+        let after_main = calls();
+        assert!(after_main > before, "main window");
+        cx.add_window(|window, cx| {
+            let view = cx.new(|_| gpui::Empty);
+            Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(calls() > after_main, "second window");
+    }
+
     #[gpui::test]
     fn settings_sheet_opens_applies_and_closes(cx: &mut TestAppContext) {
         let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
@@ -259,6 +306,61 @@ mod tests {
         state.update(&mut vcx, |s, cx| s.open_settings(false, cx));
         vcx.run_until_parked();
         assert!(!vcx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+
+    /// Locking (here the same `lock` every trigger calls) closes the Settings sheet and
+    /// drops the session's toast and Screen Recording hint, so nothing sits on top of the
+    /// unlock screen.
+    #[gpui::test]
+    fn lock_closes_settings_and_overlays(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+        use vault_core::{KdfParams, SecretString};
+        use vault_sync::{NoopHooks, SyncedVault};
+
+        let dir = tempfile::tempdir().unwrap();
+        let vault = SyncedVault::create(
+            &dir.path().join("t.vault"),
+            &SecretString::new("pw".into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            actions::bind_keys(cx);
+            actions::register(&state, cx);
+        });
+        let window = cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let view = cx.new(|cx| VaultRoot::new(state.clone(), None, window, cx));
+            Root::new(view, window, cx)
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        state.update(&mut vcx, |s, _| s.install_unlocked_for_tests(vault));
+        vcx.run_until_parked();
+
+        vcx.simulate_keystrokes("cmd-,");
+        vcx.run_until_parked();
+        state.update(&mut vcx, |s, cx| {
+            s.screen_recording_hint = true;
+            s.show_toast("Copied", cx);
+        });
+        assert!(vcx.update(|window, cx| window.has_active_dialog(cx)));
+
+        vcx.simulate_keystrokes("cmd-l");
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| {
+            assert_eq!(s.screen, Screen::Unlock);
+            assert!(!s.settings_open);
+            assert!(!s.screen_recording_hint);
+            assert!(s.toast.is_none());
+        });
+        assert!(
+            !vcx.update(|window, cx| window.has_active_dialog(cx)),
+            "no Settings dialog over the unlock card"
+        );
     }
 
     /// Drives every settings tab, the restore and export confirms, and the detail-column

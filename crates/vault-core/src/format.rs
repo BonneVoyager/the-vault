@@ -10,6 +10,14 @@
 //! entry order, so sorting the `Value` tree before encoding is sufficient. Parsers reject maps
 //! with duplicate keys. Unknown keys are kept as `extras` and are re-emitted (sorted in with the
 //! known keys) on write.
+//!
+//! # Forward compatibility (01 §9)
+//!
+//! Besides unknown keys, unknown *enum strings* are tolerated so an older build can open a file
+//! a newer one wrote: an unknown `slot.kind` becomes an [`OpaqueSlot`] (preserved, never used),
+//! an unknown `item.kind` / `field.kind` becomes `ItemKind::Other` / `FieldKind::Other` with the
+//! original string in `kind_raw`. Wrong CBOR types, missing required keys and bad lengths
+//! remain `Malformed`.
 
 use std::collections::BTreeSet;
 
@@ -50,8 +58,9 @@ type Nonce = [u8; NONCE_LEN];
 /// `format_version` is the version read from (or about to be written to) the file prefix, as a
 /// `u16` big-endian — the spec writes it without a width, so the prefix width is used (the
 /// stricter, prefix-matching reading). KDF params are deliberately not bound (they must be
-/// rotatable).
-pub fn slot_aad(format_version: u16, vault_id: Uuid, slot_id: Uuid, kind: SlotKind) -> Vec<u8> {
+/// rotatable). `kind` is the exact on-disk string; this crate never wraps or unwraps under a
+/// [`SlotKind::Other`] kind (such slots are opaque, see [`OpaqueSlot`]).
+pub fn slot_aad(format_version: u16, vault_id: Uuid, slot_id: Uuid, kind: &SlotKind) -> Vec<u8> {
     let mut aad = Vec::with_capacity(4 + 2 + 16 + 16 + 8);
     aad.extend_from_slice(&MAGIC);
     aad.extend_from_slice(&format_version.to_be_bytes());
@@ -323,7 +332,11 @@ fn opt_text(v: Option<Value>, what: &str) -> Result<Option<String>, VaultError> 
 // ---------------------------------------------------------------------------------------------
 
 /// `KeySlot.kind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Forward compatibility (01 §9): a kind string this build does not know is reported as
+/// [`SlotKind::Other`] by [`Slot::kind`]; the slot itself is kept as an [`OpaqueSlot`] and
+/// never used to unlock.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SlotKind {
     /// KEK = Argon2id(password).
     Password,
@@ -331,17 +344,22 @@ pub enum SlotKind {
     Enclave,
     /// Reserved (v2).
     Recovery,
+    /// A kind this build does not know (written by a newer version). Holds the exact on-disk
+    /// string. Never produced for a known string.
+    Other(String),
 }
 
 impl SlotKind {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             SlotKind::Password => "password",
             SlotKind::Enclave => "enclave",
             SlotKind::Recovery => "recovery",
+            SlotKind::Other(s) => s,
         }
     }
 
+    /// Known kinds only; `None` for anything else.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "password" => Some(SlotKind::Password),
@@ -350,9 +368,16 @@ impl SlotKind {
             _ => None,
         }
     }
+
+    /// Total inverse of [`SlotKind::as_str`]: unknown strings become [`SlotKind::Other`].
+    pub fn from_raw(s: &str) -> Self {
+        Self::parse(s).unwrap_or_else(|| SlotKind::Other(s.to_owned()))
+    }
 }
 
-/// One wrapped copy of `vault_key` (01 §2). Contains only ciphertext, so `Debug` is fine.
+/// One wrapped copy of `vault_key` (01 §2) of a *known* kind. Contains only ciphertext, so
+/// `Debug` is fine. This crate only ever constructs these with a known [`SlotKind`]; a slot
+/// whose `kind` string is unknown is parsed as an [`OpaqueSlot`] instead.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeySlot {
     pub id: Uuid,
@@ -379,12 +404,8 @@ impl KeySlot {
         )
     }
 
-    fn from_value(value: Value) -> Result<Self, VaultError> {
-        let mut m = MapReader::new("slot", value)?;
-        let id = as_uuid(m.required("id")?, "slot.id")?;
-        let kind_str = as_text(m.required("kind")?, "slot.kind")?;
-        let kind = SlotKind::parse(&kind_str)
-            .ok_or_else(|| malformed(format!("slot.kind: unknown kind {kind_str:?}")))?;
+    /// `id` and `kind` have already been taken from `m` by [`Slot::from_value`].
+    fn from_reader(mut m: MapReader, id: Uuid, kind: SlotKind) -> Result<Self, VaultError> {
         let nonce = as_fixed::<NONCE_LEN>(m.required("nonce")?, "slot.nonce")?;
         let wrapped_key =
             as_fixed::<WRAPPED_KEY_LEN>(m.required("wrapped_key")?, "slot.wrapped_key")?;
@@ -400,6 +421,148 @@ impl KeySlot {
     }
 }
 
+/// A slot whose `kind` this build does not know (01 §9 forward compatibility: a newer version
+/// added an unlock method). Only `id` (16 bytes) and `kind` (text) are interpreted, so a
+/// future kind need not even carry `nonce`/`wrapped_key`; **every other entry of the map is
+/// kept verbatim** in `extras` and written back in the slot's original position, so the newer
+/// version still finds its slot intact after this build re-saves the file. Never used to
+/// unlock; [`UnlockedVault::remove_slot`](crate::UnlockedVault::remove_slot) may drop it by
+/// id, and [`UnlockedVault::rotate_vault_key`](crate::UnlockedVault::rotate_vault_key) drops
+/// it (its KEK cannot be re-wrapped here, same as an `enclave` slot).
+///
+/// Interpretation: `id` is required even for unknown kinds (the stricter reading of 01 §2,
+/// and the only handle the app has to remove the slot); a missing or mis-sized `id` is
+/// `Malformed`. Slot ids must be unique within a header (duplicates are `Malformed`).
+///
+/// The fields are private so that an `OpaqueSlot` can never carry a *known* kind: one with
+/// `kind == "password"` would serialise as a password slot without `nonce`/`wrapped_key`.
+/// [`OpaqueSlot::new`] enforces this.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpaqueSlot {
+    id: Uuid,
+    /// The exact on-disk `kind` string (never a known kind).
+    kind: String,
+    /// Every map entry except `id` and `kind`, verbatim.
+    extras: Extras,
+}
+
+impl OpaqueSlot {
+    /// Build an opaque slot (mainly for tests and fixture generators; the parser builds them
+    /// from files).
+    ///
+    /// # Errors
+    ///
+    /// `Malformed` if `kind` is a known [`SlotKind`] string (that must be a [`KeySlot`]) or
+    /// if `extras` contains an `id` or `kind` key (they would be silently dropped on write).
+    pub fn new(id: Uuid, kind: impl Into<String>, extras: Extras) -> Result<Self, VaultError> {
+        let kind = kind.into();
+        if SlotKind::parse(&kind).is_some() {
+            return Err(malformed(format!(
+                "opaque slot: {kind:?} is a known slot kind; use KeySlot"
+            )));
+        }
+        if extras
+            .iter()
+            .any(|(k, _)| matches!(k, Value::Text(s) if s == "id" || s == "kind"))
+        {
+            return Err(malformed("opaque slot: extras must not contain id or kind"));
+        }
+        Ok(Self { id, kind, extras })
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    /// The exact on-disk `kind` string.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Every map entry except `id` and `kind`, verbatim (canonical key order when parsed).
+    pub fn extras(&self) -> &Extras {
+        &self.extras
+    }
+
+    fn to_value(&self) -> Value {
+        debug_assert!(SlotKind::parse(&self.kind).is_none());
+        build_map(
+            vec![
+                ("id", bytes(self.id.as_bytes())),
+                ("kind", text(&self.kind)),
+            ],
+            &self.extras,
+        )
+    }
+}
+
+/// One entry of `header.slots`: a slot this build can use, or an opaque one it only preserves.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Slot {
+    Key(KeySlot),
+    Opaque(OpaqueSlot),
+}
+
+impl Slot {
+    pub fn id(&self) -> Uuid {
+        match self {
+            Slot::Key(k) => k.id,
+            Slot::Opaque(o) => o.id,
+        }
+    }
+
+    /// The slot's kind; [`SlotKind::Other`] for an opaque slot.
+    pub fn kind(&self) -> SlotKind {
+        match self {
+            Slot::Key(k) => k.kind.clone(),
+            Slot::Opaque(o) => SlotKind::Other(o.kind.clone()),
+        }
+    }
+
+    pub fn as_key(&self) -> Option<&KeySlot> {
+        match self {
+            Slot::Key(k) => Some(k),
+            Slot::Opaque(_) => None,
+        }
+    }
+
+    pub fn as_key_mut(&mut self) -> Option<&mut KeySlot> {
+        match self {
+            Slot::Key(k) => Some(k),
+            Slot::Opaque(_) => None,
+        }
+    }
+
+    /// True for a usable slot of the given known kind.
+    pub fn is_key_of(&self, kind: SlotKind) -> bool {
+        self.as_key().is_some_and(|k| k.kind == kind)
+    }
+
+    fn to_value(&self) -> Value {
+        match self {
+            Slot::Key(k) => k.to_value(),
+            Slot::Opaque(o) => o.to_value(),
+        }
+    }
+
+    /// Unknown `kind` strings are tolerated (opaque slot); everything else that is wrong with
+    /// the map (not a map, duplicate keys, missing or mis-typed `id`/`kind`, and for known
+    /// kinds a bad `nonce`/`wrapped_key`/`created_at`) is still `Malformed`.
+    fn from_value(value: Value) -> Result<Self, VaultError> {
+        let mut m = MapReader::new("slot", value)?;
+        let id = as_uuid(m.required("id")?, "slot.id")?;
+        let kind_str = as_text(m.required("kind")?, "slot.kind")?;
+        match SlotKind::parse(&kind_str) {
+            Some(kind) => KeySlot::from_reader(m, id, kind).map(Slot::Key),
+            None => Ok(Slot::Opaque(OpaqueSlot {
+                id,
+                kind: kind_str,
+                extras: m.finish(),
+            })),
+        }
+    }
+}
+
 /// The plaintext header map (01 §2). Contains no secrets.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Header {
@@ -411,8 +574,8 @@ pub struct Header {
     pub kdf: KdfParams,
     /// Unknown keys inside the `kdf` sub-map.
     pub kdf_extras: Extras,
-    /// At least one.
-    pub slots: Vec<KeySlot>,
+    /// At least one (opaque slots count). File order is preserved.
+    pub slots: Vec<Slot>,
     /// Unknown top-level header keys.
     pub extras: Extras,
 }
@@ -437,7 +600,7 @@ impl Header {
                 ("kdf", kdf),
                 (
                     "slots",
-                    Value::Array(self.slots.iter().map(KeySlot::to_value).collect()),
+                    Value::Array(self.slots.iter().map(Slot::to_value).collect()),
                 ),
             ],
             &self.extras,
@@ -472,10 +635,16 @@ impl Header {
 
         let slots = as_array(m.required("slots")?, "header.slots")?
             .into_iter()
-            .map(KeySlot::from_value)
+            .map(Slot::from_value)
             .collect::<Result<Vec<_>, _>>()?;
         if slots.is_empty() {
             return Err(malformed("header.slots: at least one slot required"));
+        }
+        // Ids are the only handle `unlock_with_kek` / `remove_slot` have; a duplicate (e.g. an
+        // opaque slot shadowing an enclave slot's id) would make lookups order-dependent.
+        let mut ids = BTreeSet::new();
+        if let Some(dup) = slots.iter().map(Slot::id).find(|id| !ids.insert(*id)) {
+            return Err(malformed(format!("header.slots: duplicate slot id {dup}")));
         }
         Ok(Self {
             format_version,
@@ -686,7 +855,7 @@ fn field_to_value(f: &Field) -> Value {
     build_map(
         vec![
             ("name", text(&f.name)),
-            ("kind", text(f.kind.as_str())),
+            ("kind", text(f.kind_str())),
             ("value", text(f.value.expose_secret())),
             ("modified_at", Value::from(f.modified_at)),
             ("section", f.section.as_deref().map_or(Value::Null, text)),
@@ -698,15 +867,18 @@ fn field_to_value(f: &Field) -> Value {
 fn field_from_value(value: Value) -> Result<Field, VaultError> {
     let mut m = MapReader::new("field", value)?;
     let name = as_text(m.required("name")?, "field.name")?;
+    // Unknown kind strings become `FieldKind::Other` + `kind_raw` (01 §9); only a non-text
+    // `kind` is structural damage.
     let kind_str = as_text(m.required("kind")?, "field.kind")?;
-    let kind = FieldKind::parse(&kind_str)
-        .ok_or_else(|| malformed(format!("field.kind: unknown kind {kind_str:?}")))?;
+    let kind = FieldKind::parse(&kind_str).unwrap_or(FieldKind::Other);
+    let kind_raw = (kind == FieldKind::Other).then_some(kind_str);
     let value = SecretString::new(as_text(m.required("value")?, "field.value")?);
     let modified_at = as_u64(m.required("modified_at")?, "field.modified_at")?;
     let section = opt_text(m.take("section"), "field.section")?;
     Ok(Field {
         name,
         kind,
+        kind_raw,
         value,
         modified_at,
         section,
@@ -740,7 +912,7 @@ pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
     // `String`s and cannot be zeroized; only the encoded output is. Known entries are moved,
     // not cloned, and `encode` allocates once, to keep the number of stray copies minimal.
     let mut known = vec![
-        ("kind", text(item.kind.as_str())),
+        ("kind", text(item.kind_str())),
         ("title", text(&item.title)),
         (
             "deleted_at",
@@ -775,9 +947,11 @@ pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
 pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<Item, VaultError> {
     // NOTE: same limitation as `encode_item_plain`: the decoded `Value` tree is not zeroized.
     let mut m = MapReader::new("item", decode_exact(plain, "item")?)?;
+    // Unknown kind strings become `ItemKind::Other` + `kind_raw` (01 §9); only a non-text
+    // `kind` is structural damage.
     let kind_str = as_text(m.required("kind")?, "item.kind")?;
-    let kind = ItemKind::parse(&kind_str)
-        .ok_or_else(|| malformed(format!("item.kind: unknown kind {kind_str:?}")))?;
+    let kind = ItemKind::parse(&kind_str).unwrap_or(ItemKind::Other);
+    let kind_raw = (kind == ItemKind::Other).then_some(kind_str);
     let title = as_text(m.required("title")?, "item.title")?;
     let deleted_at = opt_u64(Some(m.required("deleted_at")?), "item.deleted_at")?;
     let device_id = as_uuid(m.required("device_id")?, "item.device_id")?;
@@ -807,6 +981,7 @@ pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<
     Ok(Item {
         id,
         kind,
+        kind_raw,
         title,
         deleted_at,
         device_id,
@@ -899,7 +1074,7 @@ mod tests {
     fn aad_layouts() {
         let vid = Uuid::from_u128(0x11);
         let sid = Uuid::from_u128(0x22);
-        let aad = slot_aad(FORMAT_VERSION, vid, sid, SlotKind::Password);
+        let aad = slot_aad(FORMAT_VERSION, vid, sid, &SlotKind::Password);
         assert_eq!(aad.len(), 4 + 2 + 16 + 16 + 8);
         assert_eq!(&aad[..4], b"RVLT");
         assert_eq!(&aad[4..6], &[0, 1]);

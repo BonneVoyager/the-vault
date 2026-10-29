@@ -28,69 +28,148 @@ pub struct Totp {
     account_name: String,
 }
 
-/// ASCII case-insensitive prefix test that never copies `s` (the URI carries the secret, so
-/// it must not be lowercased into a plain `String`).
-fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+/// Percent-decode `s` (`+` becomes a space when `plus_space`). Invalid escapes are kept
+/// literally. Output is a byte buffer so secrets stay in zeroizable memory.
+fn percent_decode(s: &str, plus_space: bool) -> Zeroizing<Vec<u8>> {
+    let b = s.as_bytes();
+    let mut out = Zeroizing::new(Vec::with_capacity(b.len()));
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match b[i] {
+            b'%' if i + 2 < b.len() && hex(b[i + 1]).is_some() && hex(b[i + 2]).is_some() => {
+                out.push((hex(b[i + 1]).unwrap() * 16 + hex(b[i + 2]).unwrap()) as u8);
+                i += 3;
+                continue;
+            }
+            b'+' if plus_space => out.push(b' '),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Strip whitespace, dashes and `=` padding and uppercase, then decode base32.
+///
+/// No minimum length is enforced: real services issue 80-bit (16 char) or shorter secrets,
+/// which totp-rs's checked constructors would reject (they demand 128 bits).
+fn decode_secret(raw: &[u8]) -> Result<Zeroizing<Vec<u8>>, TotpError> {
+    let text = std::str::from_utf8(raw).map_err(|_| TotpError::InvalidSecret)?;
+    let mut cleaned: Zeroizing<String> = Zeroizing::new(String::with_capacity(text.len()));
+    cleaned.extend(
+        text.chars()
+            .filter(|c| !c.is_whitespace() && *c != '-' && *c != '=')
+            .map(|c| c.to_ascii_uppercase()),
+    );
+    // Moved (not cloned) into `Secret`, which zeroizes on drop via totp-rs's `zeroize` feature.
+    let encoded = Secret::Encoded(std::mem::take(&mut *cleaned));
+    let bytes = Zeroizing::new(encoded.to_bytes().map_err(|_| TotpError::InvalidSecret)?);
+    if bytes.is_empty() {
+        return Err(TotpError::InvalidSecret);
+    }
+    Ok(bytes)
 }
 
 impl Totp {
     /// Parse an `otpauth://totp/...` URI. `otpauth://hotp` yields [`TotpError::Unsupported`].
+    ///
+    /// Lenient about real-world shapes: scheme and type are case-insensitive, the label may be
+    /// empty, absent, percent-encoded or contain raw spaces, and the secret may be lowercase,
+    /// padded, or grouped with spaces/dashes.
     pub fn parse_uri(uri: &str) -> Result<Self, TotpError> {
         let uri = uri.trim();
-        if starts_with_ignore_ascii_case(uri, "otpauth://hotp") {
+        let rest = uri
+            .get(..10)
+            .filter(|p| p.eq_ignore_ascii_case("otpauth://"))
+            .map(|_| &uri[10..])
+            .ok_or(TotpError::InvalidUri)?;
+        let rest = rest.split('#').next().unwrap_or("");
+        let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let (kind, label) = path.split_once('/').unwrap_or((path, ""));
+        if kind.eq_ignore_ascii_case("hotp") {
             return Err(TotpError::Unsupported("hotp".to_owned()));
         }
-        if starts_with_ignore_ascii_case(uri, "otpauth://steam") {
+        if kind.eq_ignore_ascii_case("steam") {
             return Err(TotpError::Unsupported("steam".to_owned()));
         }
-        // The unchecked variant skips the 128-bit minimum secret length, which real-world
-        // (and RFC 6238 test) secrets do not always meet.
-        let mut parsed = TOTP::from_url_unchecked(uri).map_err(|_| TotpError::InvalidUri)?;
-        let secret = Zeroizing::new(std::mem::take(&mut parsed.secret));
-        if secret.is_empty() {
-            return Err(TotpError::InvalidSecret);
+        if !kind.eq_ignore_ascii_case("totp") {
+            return Err(TotpError::InvalidUri);
         }
-        if !matches!(
-            parsed.algorithm,
-            Algorithm::SHA1 | Algorithm::SHA256 | Algorithm::SHA512
-        ) {
-            return Err(TotpError::Unsupported("algorithm".to_owned()));
+
+        // Split on a raw `:` first: `to_uri` encodes a colon inside the issuer as `%3A`, so the
+        // separator is the only literal one. Labels that encode the separator itself
+        // (`Example%3Aalice`) have no raw colon and are split after decoding.
+        let dec = |s: &str| {
+            String::from_utf8_lossy(&percent_decode(s, false))
+                .trim()
+                .to_owned()
+        };
+        let (issuer, account_name) = match label.split_once(':') {
+            Some((i, a)) => (Some(dec(i)), dec(a)),
+            None => {
+                let full = dec(label);
+                match full.split_once(':') {
+                    Some((i, a)) => (Some(i.trim().to_owned()), a.trim().to_owned()),
+                    None => (None, full),
+                }
+            }
+        };
+        let mut issuer = issuer.filter(|i| !i.is_empty());
+
+        let mut algorithm = Algorithm::SHA1;
+        let mut digits = 6usize;
+        let mut period = 30u64;
+        let mut secret = None;
+        for pair in query.split('&').filter(|p| !p.is_empty()) {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let key = String::from_utf8_lossy(&percent_decode(key, true)).to_ascii_lowercase();
+            let value = percent_decode(value, true);
+            let text = || String::from_utf8_lossy(&value).trim().to_owned();
+            match key.as_str() {
+                "secret" => secret = Some(decode_secret(&value)?),
+                "issuer" => {
+                    let i = text();
+                    if !i.is_empty() {
+                        issuer = Some(i);
+                    }
+                }
+                "algorithm" => {
+                    algorithm = match text().to_ascii_uppercase().as_str() {
+                        "SHA1" => Algorithm::SHA1,
+                        "SHA256" => Algorithm::SHA256,
+                        "SHA512" => Algorithm::SHA512,
+                        _ => return Err(TotpError::Unsupported("algorithm".to_owned())),
+                    };
+                }
+                "digits" => digits = text().parse().map_err(|_| TotpError::InvalidUri)?,
+                "period" => period = text().parse().map_err(|_| TotpError::InvalidUri)?,
+                _ => {}
+            }
         }
-        if !(6..=8).contains(&parsed.digits) {
-            return Err(TotpError::Unsupported(format!("{} digits", parsed.digits)));
+        let secret = secret.ok_or(TotpError::InvalidSecret)?;
+        if !(6..=8).contains(&digits) {
+            return Err(TotpError::Unsupported(format!("{digits} digits")));
         }
-        let period = u32::try_from(parsed.step)
+        let period = u32::try_from(period)
             .ok()
             .filter(|p| *p >= 1)
             .ok_or(TotpError::InvalidUri)?;
         Ok(Self {
             secret,
-            algorithm: parsed.algorithm,
-            digits: parsed.digits,
+            algorithm,
+            digits,
             period,
-            issuer: parsed.issuer.take(),
-            account_name: std::mem::take(&mut parsed.account_name),
+            issuer,
+            account_name,
         })
     }
 
-    /// Base32 secret with defaults SHA1 / 6 digits / 30 s. Spaces, dashes and padding are ignored.
+    /// Base32 secret with defaults SHA1 / 6 / 30 s. Same normalisation and length policy as
+    /// [`Totp::parse_uri`]: spaces, dashes and padding are ignored, case is ignored.
     pub fn from_secret_base32(secret: &str) -> Result<Self, TotpError> {
-        let mut cleaned: Zeroizing<String> = Zeroizing::new(String::with_capacity(secret.len()));
-        cleaned.extend(
-            secret
-                .chars()
-                .filter(|c| !c.is_whitespace() && *c != '-' && *c != '=')
-                .map(|c| c.to_ascii_uppercase()),
-        );
-        // Moved (not cloned) into `Secret`, which zeroizes on drop via totp-rs's `zeroize` feature.
-        let encoded = Secret::Encoded(std::mem::take(&mut *cleaned));
-        let bytes = encoded.to_bytes().map_err(|_| TotpError::InvalidSecret)?;
-        if bytes.is_empty() {
-            return Err(TotpError::InvalidSecret);
-        }
         Ok(Self {
-            secret: Zeroizing::new(bytes),
+            secret: decode_secret(secret.as_bytes())?,
             algorithm: Algorithm::SHA1,
             digits: 6,
             period: 30,

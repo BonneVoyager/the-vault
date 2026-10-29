@@ -170,6 +170,7 @@ pub enum SyncStatus {
 pub struct Settings {
     /// `None` = never.
     pub auto_lock_minutes: Option<u32>,
+    /// Lock on sleep, screen lock or fast user switch (one setting, 05 §2.5).
     pub lock_on_sleep: bool,
     pub clipboard_clear_secs: u32,
     /// Automatic snapshots on save (03 §4).
@@ -360,6 +361,8 @@ pub struct AppState {
     pub qr_scanning: bool,
     /// The last scan lacked Screen Recording: the editor shows the settings button.
     pub screen_recording_hint: bool,
+    /// Open read-only backup viewer windows; `lock` closes them (they hold decrypted data).
+    pub backup_windows: Vec<gpui::AnyWindowHandle>,
 
     pub screen: Screen,
     pub busy: Option<Busy>,
@@ -442,6 +445,7 @@ impl AppState {
             qr: qr::fake::FakeScanner::returning(Ok(Vec::new())),
             qr_scanning: false,
             screen_recording_hint: false,
+            backup_windows: Vec::new(),
             // Tests never reach the real Keychain or Touch ID sheet.
             #[cfg(not(test))]
             biometrics: biometric::system(),
@@ -778,6 +782,13 @@ impl AppState {
     /// Safe to call at any time, including while locked or while an unlock is in flight.
     pub fn lock(&mut self, cx: &mut Context<Self>) {
         self.lock_gen = self.lock_gen.wrapping_add(1);
+        // Overlays of the unlocked session go first, so a "could not save" toast set
+        // below survives onto the unlock screen.
+        self.toast = None;
+        self.toast_dismiss = None;
+        self.settings_open = false;
+        self.screen_recording_hint = false;
+        self.close_backup_windows(cx);
         let saved = match self.vault.as_mut() {
             Some(vault) if vault.is_dirty() => Some(vault.save()),
             _ => None,

@@ -44,3 +44,17 @@ Verified in P3.4 (sync banners, Sync & Backup / Import-Export tabs), compiled + 
 - `Button::danger()` (needs `ButtonVariants`) for red confirms; `.loading(bool)` shows a spinner.
 
 Verified in P4.3b: `IconName::FingerprintPattern` exists (added to ExtraIcons in assets.rs). Verified in P4.3a: `Switch::new(id).disabled(true).tooltip("..").accessibility_label(..)` (placeholder toggle); `Spinner::new().small()`; disclosure = `Button::new(id).ghost().small().icon(Icon::new(IconName::ChevronRight|ChevronDown)).label("Advanced")`; `Button::danger()` + `.loading(busy)` for the red rotate confirm.
+
+Verified 2026-10-29: `Sizable::xsmall()` exists (Button). Default icon set includes Close, CircleCheck, CircleX, FolderOpen, Check (no Image/Upload icon by default). Tag chips: `Tag::secondary().small().child(h_flex().child(text).child(icon_button(..).xsmall()))` renders a removable chip. vault-macos exports `scan_qr_from_image_file(&Path)` at the crate root (not `vault_macos::qr::`).
+
+Verified 2026-10-29 (master password meter):
+- `InputState::set_value(..)` emits NO `InputEvent::Change` (and clears undo). After filling a field programmatically, recompute anything derived from it yourself.
+- Masking at runtime: `state.update(cx, |s, cx| s.set_masked(bool, window, cx))`. There is no `InputState::is_masked()`; read it as `state.read(cx).presentation().is_masked()` (wrapped as `ui::input_is_masked`). `toggle_masked(window, cx)` also exists.
+- `Button::new(id).link().small().label(..)` (ButtonVariants) renders a text link.
+- vault-app shared helpers: `ui::MasterPasswordCheck` (strength/confirm gate + suggest/reveal) and `ui::submit_gate(name, ready, button)`, which adds a `"<name> ready|blocked"` debug selector so headless tests can see whether a primary button is enabled.
+
+Verified 2026-10-29 (password warning badges), compiled:
+- Tooltip on a plain div: `div().id(..).tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(text.clone()).build(window, cx))` (`Tooltip::new(impl Into<Text>)`, `build(self, &mut Window, &mut App) -> AnyView`). gpui-base's `Tooltip::new(id)` is a different, unstyled popup; don't confuse them.
+- VoiceOver label on a div: `.aria_label(impl Into<SharedString>)` (InteractiveElement), `.role(accesskit::Role)`.
+- Red "!" badge without an icon asset: `div().size(px(16.)).rounded_full().bg(theme.danger).flex().items_center().justify_center().text_color(white()).font_weight(BOLD).text_size(px(11.)).child("!")` (vault: `list::alert_dot`). `theme.secondary` exists for a neutral card bg.
+- Layout assertions in headless tests: `vcx.debug_bounds(a).unwrap().bottom()` / `.top()` are `Pixels`; compare `footer.top() - row.bottom() == px(12.)` to prove nothing sits between two elements.

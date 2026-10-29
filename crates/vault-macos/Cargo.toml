@@ -28,10 +28,14 @@ rqrr = { version = "=0.11.0", default-features = false }
 [target.'cfg(target_os = "macos")'.dependencies]
 # Objective-C runtime bindings: message sending, retained pointers.
 objc2 = "=0.6.5"
-# NSString, NSNotification, NSNotificationCenter, NSDistributedNotificationCenter.
-objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString", "NSNotification", "NSDistributedNotificationCenter", "NSObject", "NSArray", "NSDictionary", "NSError", "NSURL", "NSFileManager", "NSValue", "NSBundle"] }
-# NSWorkspace + NSWorkspaceWillSleepNotification; NSPasteboard (§3); NSAccessibility (reduce motion).
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSPasteboard", "NSAccessibility"] }
+# NSString, NSNotification, NSNotificationCenter, NSDistributedNotificationCenter; NSData
+# (image file bytes for qr.rs).
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString", "NSNotification", "NSDistributedNotificationCenter", "NSObject", "NSArray", "NSDictionary", "NSError", "NSURL", "NSFileManager", "NSValue", "NSBundle", "NSData"] }
+# NSWorkspace + NSWorkspaceWillSleepNotification; NSPasteboard (§3); NSAccessibility (reduce motion);
+# NSBitmapImageRep (+ its CGImage bridge) decodes PNG/JPEG/HEIC/TIFF files for qr.rs.
+# bitflags: NSPasteboardContentsOptions (currentHostOnly). NSWindow/NSResponder/NSApplication:
+# sharingType for window.rs; NSGraphics: NSBackingStoreType for the window test.
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "bitflags", "NSWorkspace", "NSPasteboard", "NSAccessibility", "NSImageRep", "NSBitmapImageRep", "objc2-core-graphics", "NSResponder", "NSWindow", "NSApplication", "NSGraphics"] }
 # CGEventSourceSecondsSinceLastEventType for idle detection; CGDisplayCreateImage, bitmap
 # contexts and Screen Recording preflight/request for QR scanning (qr.rs).
 objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGEventSource", "CGEventTypes", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGImage", "CGColorSpace", "CGContext", "CGBitmapContext", "CGWindow"] }
@@ -53,13 +57,19 @@ objc2-service-management = { version = "=0.3.2", default-features = false, featu
 
 [dev-dependencies]
 tempfile = "=3.27.0"
-# Renders test QR codes for tests/qr.rs (pure Rust; image/svg/pic renderers off).
+# Renders test QR codes for tests/qr.rs, including the PNG fixtures written at test time for
+# scan_qr_from_image_file (pure Rust; image/svg/pic renderers off).
 qrcode = { version = "=0.14.1", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-# Delivery test: pumps the run loop.
-objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString", "NSNotification", "NSDistributedNotificationCenter", "NSObject", "NSRunLoop", "NSDate"] }
+# Delivery test: pumps the run loop. NSGeometry: NSRect for the window test.
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString", "NSNotification", "NSDistributedNotificationCenter", "NSObject", "NSRunLoop", "NSDate", "NSGeometry"] }
 
 [[test]]
 name = "delivery"
+harness = false
+
+# Creates an NSWindow, which AppKit only allows on the process main thread.
+[[test]]
+name = "window"
 harness = false

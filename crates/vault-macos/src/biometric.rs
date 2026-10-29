@@ -242,8 +242,10 @@ mod imp {
 
     /// `evaluatedPolicyDomainState`: opaque hash of the enrolled finger set, set after a
     /// successful biometric `canEvaluatePolicy`/evaluation. Deprecated in macOS 15 in favour
-    /// of `LADomainState`, which does not exist on our macOS 14 floor. Apple warns it may
-    /// change across major OS updates; that only forces a password unlock and re-enroll.
+    /// of `LADomainState` (`LAContext.domainState`), which is available on our macOS 15 floor
+    /// (objc2-local-authentication `LADomainState` feature); migrating is a possible follow-up.
+    /// Apple warns the value may change across major OS updates; that only forces a password
+    /// unlock and re-enroll.
     fn domain_state(ctx: &LAContext) -> Option<Vec<u8>> {
         // SAFETY: property getter on a context we own. (NSData::to_vec is enabled through
         // objc2-local-authentication's LAContext feature.)

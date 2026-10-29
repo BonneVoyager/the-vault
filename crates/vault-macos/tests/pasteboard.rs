@@ -4,7 +4,7 @@
 use std::sync::Mutex;
 
 use secrecy::SecretString;
-use vault_macos::Clipboard;
+use vault_macos::{CONCEALED_TYPE, Clipboard, PLAIN_TEXT_TYPE};
 
 /// Serializes tests that touch the shared pasteboard.
 static PASTEBOARD: Mutex<()> = Mutex::new(());
@@ -52,6 +52,14 @@ fn write_read_clear_round_trip() {
         Some("vault-test-secret-\u{1F511}")
     );
     assert!(Clipboard::has_concealed_type());
+
+    // Both types present, marker declared before the text (it is written
+    // first, so no observer can see the text without it).
+    let types = Clipboard::types();
+    let pos = |t: &str| types.iter().position(|x| x == t);
+    let (marker, plain) = (pos(CONCEALED_TYPE), pos(PLAIN_TEXT_TYPE));
+    assert!(marker.is_some() && plain.is_some(), "{types:?}");
+    assert!(marker < plain, "marker must precede text: {types:?}");
 
     Clipboard::clear_if_unchanged(cc);
     assert_eq!(Clipboard::read_string(), None);
