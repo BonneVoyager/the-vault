@@ -1,0 +1,25 @@
+[package]
+name = "vault-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "vault"
+path = "src/main.rs"
+
+[dependencies]
+vault-core = { path = "../vault-core" }
+vault-sync = { path = "../vault-sync" }
+vault-macos = { path = "../vault-macos" }
+# Argument parsing (derive API).
+clap = { version = "4", features = ["derive", "env"] }
+# Non-echoing password prompts.
+rpassword = "7"
+# Error plumbing in a binary.
+anyhow = "1"
+
+[dev-dependencies]
+# Temp directories for the CLI integration tests.
+tempfile = "3"

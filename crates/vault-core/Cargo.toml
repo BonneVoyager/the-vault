@@ -1,0 +1,48 @@
+[package]
+name = "vault-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Exposes `UnlockedVault::export_vault_key` / `LockedVault::unlock_with_key` so `vault-sync`
+# can unlock an on-disk copy with the cached vault key without re-running Argon2 (03 §3 6a).
+# Off by default. Feature unification may compile it into the app; the app and CLI must still
+# never obtain the raw bytes (the handle exposes none).
+sync = []
+
+[dependencies]
+# Argon2id KEK derivation (01 §2). `alloc` for hash_password_into; `zeroize` wipes memory blocks.
+argon2 = { version = "^0.5.3", default-features = false, features = ["alloc", "zeroize"] }
+# XChaCha20-Poly1305 AEAD for slots, items, manifest (01 §2, §4).
+chacha20poly1305 = { version = "^0.10.1", default-features = false, features = ["alloc"] }
+# HKDF-SHA256 subkey derivation (01 §3).
+hkdf = "^0.12.4"
+sha2 = { version = "^0.10.8", default-features = false }
+# OsRng only: nonces, vault_key, salts (01 §5). rand 0.8 shares rand_core 0.6 with chacha20poly1305 0.10.
+rand = { version = "^0.8.5", default-features = false, features = ["getrandom"] }
+zeroize = { version = "^1.8.1", features = ["zeroize_derive"] }
+secrecy = "^0.8.0"
+# Canonical CBOR encoding/decoding (01 §1-§4).
+ciborium = "^0.2.2"
+serde = { version = "^1.0.210", features = ["derive"] }
+uuid = { version = "^1.10.0", features = ["v4", "serde"] }
+# Password NFC normalisation before Argon2 (01 §2).
+unicode-normalization = "^0.1.24"
+thiserror = "^2.0.3"
+# otpauth:// parsing and RFC 6238 codes (02 "totp"); `otpauth` enables from_url/get_url.
+totp-rs = { version = "^5.6.0", features = ["otpauth", "zeroize"] }
+# RFC 4180 CSV quoting for import/export; hand-rolled quoting is error-prone.
+csv = "^1.3.0"
+# 1PUX is a zip archive; only the deflate backend is needed for reading (import).
+zip = { version = "^2.2.0", default-features = false, features = ["deflate"] }
+# Parses the `export.data` JSON inside a 1PUX archive.
+serde_json = "^1.0.128"
+
+[dev-dependencies]
+zip = { version = "^2.2.0", default-features = false, features = ["deflate"] }
+
+[[test]]
+name = "sync_feature"
+required-features = ["sync"]

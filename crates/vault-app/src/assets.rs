@@ -1,0 +1,42 @@
+//! Asset source: gpui-component's default icons plus the few extra Lucide icons we use.
+
+use std::borrow::Cow;
+
+use gpui::{AssetSource, Result, SharedString};
+
+gpui_kit_assets::icon_assets!(
+    ExtraIcons,
+    [
+        Lock,
+        KeyRound,
+        StickyNote,
+        CreditCard,
+        IdCard,
+        Tag,
+        LayoutList,
+        GripVertical,
+        WandSparkles,
+        FingerprintPattern,
+        ScanQrCode
+    ]
+);
+
+/// Our extras first, then gpui-kit's default component icons.
+pub struct AppAssets;
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(bytes) = ExtraIcons.load(path)? {
+            return Ok(Some(bytes));
+        }
+        gpui_kit_assets::Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut paths = gpui_kit_assets::Assets.list(path)?;
+        paths.extend(ExtraIcons.list(path)?);
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+}

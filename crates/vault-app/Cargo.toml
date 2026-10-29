@@ -1,0 +1,52 @@
+[package]
+name = "vault-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+# gpui-pre needs newer std APIs (e.g. slice::as_array); verified on 1.99.1.
+rust-version.workspace = true
+
+[dependencies]
+vault-core = { path = "../vault-core" }
+vault-sync = { path = "../vault-sync" }
+vault-macos = { path = "../vault-macos" }
+
+# UI framework. Pinned exactly (see specs/05-ui.md). gpui-component 0.8.x depends on
+# `gpui-pre`, the maintainer's crates.io snapshot of Zed's gpui (zed@08cbb88);
+# the crates.io `gpui` crate (0.2.x) is stale and incompatible.
+gpui = { package = "gpui-pre", version = "=0.3.10" }
+# `font-kit` selects the real CoreText text system on macOS. Without it gpui-pre-macos
+# falls back to a no-op text system: layout succeeds but no glyph is ever drawn.
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", features = ["font-kit"] }
+gpui-component = "=0.8.1"
+# Not used directly. gpui-component depends on these with a caret ("0.8.1"); pinning
+# them exactly here keeps cargo from floating them ahead of gpui-component itself.
+gpui-component-macros = "=0.8.1"
+gpui-base = "=0.8.1"
+gpui-kit-assets = "=0.8.1"
+
+# window.json and recent.json in Application Support.
+serde = { version = "^1.0.229", features = ["derive"] }
+serde_json = "^1.0.154"
+# Locates ~/Library/Application Support without hardcoding $HOME (same as vault-macos).
+dirs = "^6.0.0"
+# Names the receiver type of `SyncedVault::subscribe`.
+crossbeam-channel = "^0.5.17"
+# Async unbounded channel: wakes the main thread immediately when a screen-lock or
+# will-sleep notification arrives (crossbeam has no async receive).
+futures = "^0.3.31"
+# OsRng for the 32-byte Touch ID KEK (04 §2). Same 0.8 line as vault-core, so no second copy.
+rand = { version = "^0.8.5", default-features = false, features = ["getrandom"] }
+
+# Compile Metal shaders at launch instead of in build.rs. Building them ahead of time
+# needs Xcode's separate Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`),
+# which is not installed by default. Revisit for release builds.
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_macos = { package = "gpui-pre-macos", version = "=0.3.10", features = ["runtime_shaders"] }
+
+[dev-dependencies]
+# `TestAppContext` + `#[gpui::test]` for AppState tests.
+gpui = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"] }
+tempfile = "^3.13.0"
+# Builds a tiny .1pux archive in the import test. Same version and features as vault-core.
+zip = { version = "^2.2.0", default-features = false, features = ["deflate"] }

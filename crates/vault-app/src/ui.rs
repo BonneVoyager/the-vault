@@ -1,0 +1,395 @@
+//! Thin wrappers over gpui / gpui-component calls used across the app.
+//!
+//! gpui is pre-1.0. Keep every upstream call that more than two views need in here,
+//! so an upstream rename is a one-file fix.
+
+use std::path::{Path, PathBuf};
+
+use gpui::{
+    Anchor, AnyElement, App, AppContext as _, Bounds, Context, Div, Entity, IntoElement,
+    ParentElement as _, PathPromptOptions, Render, Result, SharedString, Styled as _, Task,
+    TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, point, px, relative, size,
+};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::{Input, InputState, TextareaState};
+use gpui_component::popover::Popover;
+use gpui_component::{ActiveTheme as _, Icon, Root, Selectable, Sizable as _};
+use gpui_kit_assets::IconName;
+use vault_core::SecretString;
+
+pub use gpui_component::{h_flex, v_flex};
+
+use crate::persist::WindowState;
+
+/// Default and minimum main window size (specs/05-ui.md §1).
+const MAIN_DEFAULT: (f32, f32) = (1100., 720.);
+const MAIN_MIN: (f32, f32) = (820., 520.);
+/// Traffic-light inset from the window's top-left corner.
+const TRAFFIC_LIGHTS: (f32, f32) = (16., 16.);
+/// Height of the transparent titlebar strip that content must keep clear of.
+pub const TITLEBAR_HEIGHT: f32 = 44.;
+
+/// Top padding of the detail column's content: below the title-bar band, or just below
+/// the sync banners when they occupy it.
+pub fn content_top(s: &crate::state::AppState) -> f32 {
+    if s.sync.has_banner() {
+        12.
+    } else {
+        TITLEBAR_HEIGHT
+    }
+}
+
+/// Window options for the main window: restored or centred, hidden title, transparent titlebar.
+pub fn main_window_options(restore: Option<WindowState>, cx: &App) -> WindowOptions {
+    let bounds = match restore {
+        Some(s) => Bounds::new(
+            point(px(s.x), px(s.y)),
+            size(px(s.width.max(MAIN_MIN.0)), px(s.height.max(MAIN_MIN.1))),
+        ),
+        None => Bounds::centered(None, size(px(MAIN_DEFAULT.0), px(MAIN_DEFAULT.1)), cx),
+    };
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_min_size: Some(size(px(MAIN_MIN.0), px(MAIN_MIN.1))),
+        titlebar: Some(TitlebarOptions {
+            title: None,
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(TRAFFIC_LIGHTS.0), px(TRAFFIC_LIGHTS.1))),
+        }),
+        ..Default::default()
+    }
+}
+
+/// Opens the main window with `build` as content, wrapped in gpui-component's `Root`.
+///
+/// `Root` hosts dialogs, sheets and notifications, so every window needs it on top.
+pub fn open_main_window<V: Render>(
+    restore: Option<WindowState>,
+    cx: &mut App,
+    build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+) -> Result<WindowHandle<Root>> {
+    let options = main_window_options(restore, cx);
+    cx.open_window(options, |window, cx| {
+        let view = build(window, cx);
+        cx.new(|cx| Root::new(view, window, cx))
+    })
+}
+
+/// Current restore bounds of `window` (also valid while fullscreen or zoomed).
+pub fn window_geometry(window: &Window, columns: Option<[f32; 2]>) -> WindowState {
+    let b = window.window_bounds().get_bounds();
+    WindowState {
+        x: b.origin.x.as_f32(),
+        y: b.origin.y.as_f32(),
+        width: b.size.width.as_f32(),
+        height: b.size.height.as_f32(),
+        columns,
+    }
+}
+
+/// A single-line text input state.
+pub fn text_input<T>(
+    placeholder: &str,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) -> Entity<InputState> {
+    let placeholder = SharedString::from(placeholder.to_owned());
+    cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
+}
+
+/// A masked password input state.
+pub fn password_input<T>(
+    placeholder: &str,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) -> Entity<InputState> {
+    let placeholder = SharedString::from(placeholder.to_owned());
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .masked(true)
+            .placeholder(placeholder)
+    })
+}
+
+/// The styled gpui-component input element for `state`.
+pub fn input(state: &Entity<InputState>) -> Input {
+    Input::new(state)
+}
+
+/// Copies an input's text straight into a `SecretString`.
+///
+/// The input's own rope (and undo history) still holds the text until [`clear_input`].
+pub fn input_secret(state: &Entity<InputState>, cx: &App) -> SecretString {
+    SecretString::new(state.read(cx).text().to_string())
+}
+
+/// A multi-line text area state that grows from 3 to 10 rows (notes fields).
+pub fn textarea<T>(window: &mut Window, cx: &mut Context<T>) -> Entity<TextareaState> {
+    cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 10))
+}
+
+pub fn textarea_secret(state: &Entity<TextareaState>, cx: &App) -> SecretString {
+    SecretString::new(state.read(cx).text().to_string())
+}
+
+pub fn set_textarea(state: &Entity<TextareaState>, value: &str, window: &mut Window, cx: &mut App) {
+    let value = value.to_owned();
+    state.update(cx, |s, cx| s.set_value(value, window, cx));
+}
+
+pub fn input_text(state: &Entity<InputState>, cx: &App) -> String {
+    state.read(cx).text().to_string()
+}
+
+pub fn input_is_empty(state: &Entity<InputState>, cx: &App) -> bool {
+    state.read(cx).text().len() == 0
+}
+
+pub fn clear_input(state: &Entity<InputState>, window: &mut Window, cx: &mut App) {
+    state.update(cx, |s, cx| s.set_value("", window, cx));
+}
+
+pub fn set_input(state: &Entity<InputState>, value: &str, window: &mut Window, cx: &mut App) {
+    let value = value.to_owned();
+    state.update(cx, |s, cx| s.set_value(value, window, cx));
+}
+
+pub fn focus_input(state: &Entity<InputState>, window: &mut Window, cx: &mut App) {
+    state.update(cx, |s, cx| s.focus(window, cx));
+}
+
+/// The centred card the choose-vault and unlock screens sit in.
+pub fn card(cx: &App) -> Div {
+    let theme = cx.theme();
+    v_flex()
+        .w(px(400.))
+        .p(px(28.))
+        .gap(px(14.))
+        .bg(theme.popover)
+        .border_1()
+        .border_color(theme.border)
+        .rounded(theme.radius_lg)
+        .shadow_lg()
+}
+
+/// Full-window centring wrapper.
+pub fn centered(cx: &App) -> Div {
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .bg(cx.theme().background)
+}
+
+/// Muted secondary text.
+pub fn muted(text: impl Into<SharedString>, cx: &App) -> Div {
+    gpui::div()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .child(text.into())
+}
+
+/// Shows the native open panel and resolves to the single chosen path, or `None`.
+pub fn pick_path(directories: bool, prompt: &str, cx: &App) -> Task<Option<PathBuf>> {
+    let rx = cx.prompt_for_paths(PathPromptOptions {
+        files: !directories,
+        directories,
+        multiple: false,
+        prompt: Some(SharedString::from(prompt.to_owned())),
+    });
+    cx.background_executor().spawn(async move {
+        match rx.await {
+            Ok(Ok(Some(mut paths))) => paths.pop(),
+            Ok(Err(e)) => {
+                eprintln!("vault: file panel failed: {e:#}");
+                None
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Shows the native save panel in `dir` with `name` suggested; resolves to the chosen
+/// path, or `None` if cancelled.
+pub fn pick_new_path(dir: &Path, name: &str, cx: &App) -> Task<Option<PathBuf>> {
+    let rx = cx.prompt_for_new_path(dir, Some(name));
+    cx.background_executor().spawn(async move {
+        match rx.await {
+            Ok(Ok(path)) => path,
+            Ok(Err(e)) => {
+                eprintln!("vault: save panel failed: {e:#}");
+                None
+            }
+            Err(_) => None,
+        }
+    })
+}
+
+/// An icon-only ghost button. `label` is both the tooltip and the VoiceOver label (§6).
+pub fn icon_button(id: impl Into<gpui::ElementId>, icon: IconName, label: &str) -> Button {
+    let label = SharedString::from(label.to_owned());
+    Button::new(id)
+        .ghost()
+        .small()
+        .icon(Icon::new(icon))
+        .tooltip(label.clone())
+        .accessibility_label(label)
+}
+
+/// A 1 px horizontal rule.
+pub fn divider(cx: &App) -> Div {
+    gpui::div().h(px(1.)).w_full().bg(cx.theme().border)
+}
+
+/// The rounded "toast" pill.
+pub fn pill(message: impl Into<SharedString>, cx: &App) -> Div {
+    let theme = cx.theme();
+    gpui::div()
+        .px(px(14.))
+        .py(px(6.))
+        .rounded_full()
+        .bg(theme.popover)
+        .border_1()
+        .border_color(theme.border)
+        .shadow_md()
+        .text_sm()
+        .child(message.into())
+}
+
+/// Label and level (0 weak, 1 fair, 2 good, 3 strong) for an entropy estimate.
+pub fn strength_label(bits: f64) -> (&'static str, u8) {
+    match bits {
+        b if b <= 0. => ("Empty", 0),
+        b if b < 40. => ("Weak", 0),
+        b if b < 60. => ("Fair", 1),
+        b if b < 80. => ("Good", 2),
+        _ => ("Strong", 3),
+    }
+}
+
+/// Strength bar plus a text label (§6: not colour alone).
+pub fn strength_meter(bits: f64, cx: &App) -> Div {
+    let theme = cx.theme();
+    let (label, level) = strength_label(bits);
+    let color = match level {
+        0 => theme.danger,
+        1 => theme.warning,
+        _ => theme.success,
+    };
+    h_flex()
+        .gap(px(8.))
+        .child(
+            gpui::div()
+                .flex_1()
+                .h(px(4.))
+                .rounded(px(2.))
+                .bg(theme.border)
+                .child(
+                    gpui::div()
+                        .h_full()
+                        .rounded(px(2.))
+                        .bg(color)
+                        .w(relative((bits / 100.).clamp(0., 1.) as f32)),
+                ),
+        )
+        .child(
+            gpui::div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(format!("{label} · {bits:.0} bits")),
+        )
+}
+
+/// A popover whose open state lives in `AppState`: drawn open while `open`. The trigger
+/// (click, Enter, Space), Esc and a click outside report the requested state through
+/// `on_toggle`, which must write it back to `AppState`.
+pub fn popover<T: Selectable + IntoElement + 'static>(
+    id: impl Into<gpui::ElementId>,
+    trigger: T,
+    anchor: Anchor,
+    open: bool,
+    on_toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
+    content: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+) -> Popover {
+    Popover::new(id)
+        .anchor(anchor)
+        .trigger(trigger)
+        .open(open)
+        .on_open_change(move |open, window, cx| on_toggle(*open, window, cx))
+        .content(move |_, window, cx| content(window, cx))
+}
+
+/// Keyboard focus ring (§6): a transparent 1 px border that takes the ring colour on
+/// `:focus-visible`, so layout does not shift. The element must be focusable.
+pub fn focus_ring<E: gpui::InteractiveElement + gpui::Styled>(el: E, cx: &App) -> E {
+    let ring = cx.theme().ring;
+    el.border_1()
+        .border_color(gpui::transparent_black())
+        .focus_visible(move |style| style.border_color(ring))
+}
+
+/// Empty-state art (05 §2.3): a tinted disc holding `icon`, with an optional `badge` icon
+/// in a small bubble at its lower right. Decorative only; the caption carries the meaning.
+pub fn illustration(icon: IconName, badge: Option<IconName>, cx: &App) -> Div {
+    let theme = cx.theme();
+    let disc = gpui::div()
+        .size_full()
+        .rounded_full()
+        .bg(theme.primary.opacity(0.10))
+        .border_1()
+        .border_color(theme.primary.opacity(0.25))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            Icon::new(icon)
+                .size(px(40.))
+                .text_color(theme.primary.opacity(0.85)),
+        );
+    let mut art = gpui::div().relative().size(px(88.)).child(disc);
+    if let Some(badge) = badge {
+        art = art.child(
+            gpui::div()
+                .absolute()
+                .right(px(-2.))
+                .bottom(px(-2.))
+                .size(px(32.))
+                .rounded_full()
+                .bg(theme.muted)
+                .border_2()
+                .border_color(theme.background)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(Icon::new(badge).size_4().text_color(theme.muted_foreground)),
+        );
+    }
+    art
+}
+
+/// Panel transitions (05 §5): 120-180 ms ease-out. Never used on list scrolling.
+pub const PANEL_MOTION: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Fades `el` in while sliding it `slide` px from the left, keyed by `id` (change the id
+/// to replay). With Reduce Motion the element appears at once.
+pub fn panel_in<E>(
+    el: E,
+    id: impl Into<gpui::ElementId>,
+    slide: f32,
+    reduce_motion: bool,
+) -> AnyElement
+where
+    E: IntoElement + gpui::Styled + 'static,
+{
+    use gpui::AnimationExt as _;
+    if reduce_motion {
+        return el.into_any_element();
+    }
+    el.relative()
+        .with_animation(
+            id,
+            gpui::Animation::new(PANEL_MOTION).with_easing(gpui::ease_out_quint()),
+            move |el, t| el.opacity(t).left(px(-slide * (1. - t))),
+        )
+        .into_any_element()
+}

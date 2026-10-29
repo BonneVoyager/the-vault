@@ -1,0 +1,608 @@
+//! Read-only backup viewer (specs/03-sync.md §4 "Restore"): a second window that opens a
+//! backup file with its master password and shows its items in a list and a detail pane.
+//!
+//! The backup is parsed and unlocked directly (`LockedVault::parse` + `unlock`) on the
+//! background executor: no `SyncedVault`, no watcher, nothing is ever written to the backup.
+//! The only ways out are copying a value (concealed clipboard, usual clear timer), "Copy to
+//! current vault" (a clone with a fresh id) and "Replace current vault with this backup"
+//! (the existing restore flow). MainScreen's renderers are bound to `AppState`'s listing,
+//! selection and edit buffer, so this window has its own minimal list and detail instead.
+//! It closes, dropping the decrypted backup, as soon as the live vault locks.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+use gpui::{
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
+};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::{InputEvent, InputState};
+use gpui_component::{ActiveTheme as _, Disableable as _, Root, Sizable as _};
+use gpui_kit_assets::IconName;
+use vault_core::{
+    ExposeSecret as _, FieldKind, Item, LockedVault, SecretString, UnlockedVault, Uuid,
+};
+
+use super::main::avatar;
+use crate::state::{AppState, parse_totp};
+use crate::{listing, text, theme, ui};
+
+pub struct BackupWindow {
+    state: Entity<AppState>,
+    path: PathBuf,
+    password: Entity<InputState>,
+    /// The decrypted backup. Dropped (zeroized) with the window.
+    vault: Option<UnlockedVault>,
+    /// Live items, by title.
+    items: Vec<Uuid>,
+    selection: Option<Uuid>,
+    /// Field indexes of the selected item whose values are revealed.
+    revealed: HashSet<usize>,
+    error: Option<SharedString>,
+    status: Option<SharedString>,
+    busy: bool,
+    /// Redraws once a second while open so a TOTP code stays current.
+    _ticker: gpui::Task<()>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// Opens the viewer for `path` in a new window.
+pub fn open_backup_window(
+    state: Entity<AppState>,
+    path: PathBuf,
+    cx: &mut App,
+) -> gpui::Result<()> {
+    let title = format!("Backup \u{2014} {}", text::file_name(&path));
+    let mut options = ui::main_window_options(None, cx);
+    options.titlebar = Some(gpui::TitlebarOptions {
+        title: Some(title.into()),
+        ..Default::default()
+    });
+    cx.open_window(options, |window, cx| {
+        theme::apply(window, cx);
+        let view = cx.new(|cx| BackupWindow::new(state, path, window, cx));
+        cx.new(|cx| Root::new(view, window, cx))
+    })?;
+    Ok(())
+}
+
+impl BackupWindow {
+    pub fn new(
+        state: Entity<AppState>,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let password = ui::password_input("Master password of this backup", window, cx);
+        ui::focus_input(&password, window, cx);
+        let subscriptions = vec![
+            cx.subscribe_in(&password, window, |this, _, ev: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = ev {
+                    this.submit(window, cx);
+                }
+            }),
+            // Never outlive the live session: close (and drop the keys) when it locks.
+            cx.observe_in(&state, window, |_, state, window, cx| {
+                if state.read(cx).locked {
+                    window.remove_window();
+                }
+            }),
+        ];
+        Self {
+            state,
+            path,
+            password,
+            vault: None,
+            items: Vec::new(),
+            selection: None,
+            revealed: HashSet::new(),
+            error: None,
+            status: None,
+            busy: false,
+            _ticker: cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(1))
+                        .await;
+                    let alive = this.update(cx, |this, cx| {
+                        if this.vault.is_some() {
+                            cx.notify();
+                        }
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            }),
+            _subscriptions: subscriptions,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_open(&self) -> bool {
+        self.vault.is_some()
+    }
+
+    #[cfg(test)]
+    pub fn item_ids(&self) -> &[Uuid] {
+        &self.items
+    }
+
+    fn item(&self, id: Uuid) -> Option<&Item> {
+        self.vault.as_ref()?.get(id)
+    }
+
+    /// Reads and unlocks the backup on the background executor.
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || ui::input_is_empty(&self.password, cx) {
+            return;
+        }
+        let password = ui::input_secret(&self.password, cx);
+        // The rope (and its undo history) must not keep the password.
+        ui::clear_input(&self.password, window, cx);
+        self.unlock(password, cx);
+    }
+
+    pub fn unlock(&mut self, password: SecretString, cx: &mut Context<Self>) {
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+        let path = self.path.clone();
+        let task = cx.background_executor().spawn(async move {
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let locked = LockedVault::parse(&bytes).map_err(|e| e.to_string())?;
+            locked.unlock(&password).map_err(|e| match e {
+                vault_core::VaultError::WrongPassword => "Wrong password. Try again.".to_owned(),
+                other => other.to_string(),
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.busy = false;
+                match result {
+                    Ok(vault) => this.opened(vault),
+                    Err(e) => this.error = Some(e.into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn opened(&mut self, vault: UnlockedVault) {
+        let mut items: Vec<&Item> = vault.items().collect();
+        items.sort_by_key(|i| i.title.to_lowercase());
+        self.items = items.iter().map(|i| i.id).collect();
+        self.selection = self.items.first().copied();
+        self.vault = Some(vault);
+    }
+
+    fn select(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        self.selection = Some(id);
+        self.revealed.clear();
+        self.status = None;
+        cx.notify();
+    }
+
+    /// Copies field `ix` of the selected item (a TOTP field copies the current code).
+    pub fn copy_field(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(field) = self
+            .selection
+            .and_then(|id| self.item(id))
+            .and_then(|i| i.fields.get(ix))
+        else {
+            return;
+        };
+        let value = if field.kind == FieldKind::Totp {
+            match parse_totp(&field.value) {
+                Some(totp) => SecretString::new(totp.code(text::now_millis() / 1000)),
+                None => return,
+            }
+        } else {
+            field.value.clone()
+        };
+        let secs = self.state.read(cx).settings.clipboard_clear_secs;
+        self.state.update(cx, |s, cx| s.copy_value(value, cx));
+        self.status = Some(format!("Copied \u{2014} clears in {secs} s").into());
+        cx.notify();
+    }
+
+    /// "Copy to current vault". Returns the new item's id in the live vault.
+    pub fn copy_to_current(&mut self, cx: &mut Context<Self>) -> Option<Uuid> {
+        let item = self.selection.and_then(|id| self.item(id))?.clone();
+        let id = self
+            .state
+            .update(cx, |s, cx| s.copy_item_into_vault(&item, cx));
+        self.status = Some(match id {
+            Some(_) => format!(
+                "Copied \u{2018}{}\u{2019} into the current vault",
+                item.title
+            )
+            .into(),
+            None => "Could not copy the item".into(),
+        });
+        cx.notify();
+        id
+    }
+
+    /// "Replace current vault with this backup": the restore confirm in Settings.
+    fn replace_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.path.clone();
+        self.state.update(cx, |s, cx| s.request_restore(path, cx));
+        window.remove_window();
+    }
+}
+
+impl BackupWindow {
+    fn render_prompt(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        ui::centered(cx)
+            .child(
+                ui::card(cx)
+                    .w(px(380.))
+                    .gap(px(10.))
+                    .child(ui::illustration(IconName::Inbox, Some(IconName::Eye), cx))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Open backup read-only"),
+                    )
+                    .child(ui::muted(text::file_name(&self.path), cx).text_xs())
+                    .child(ui::input(&self.password).mask_toggle().disabled(self.busy))
+                    .when_some(self.error.clone(), |col, e| {
+                        col.child(div().text_sm().text_color(theme.danger).child(e))
+                    })
+                    .child(
+                        Button::new("backup-open")
+                            .primary()
+                            .w_full()
+                            .label("Open")
+                            .loading(self.busy)
+                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_list(&self, vault: &UnlockedVault, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let rows = self
+            .items
+            .iter()
+            .filter_map(|id| vault.get(*id))
+            .map(|item| {
+                let id = item.id;
+                let selected = self.selection == Some(id);
+                ui::h_flex()
+                    .id(("backup-row", id.as_u128() as usize))
+                    .tab_index(0)
+                    .h(theme::scaled(48., cx))
+                    .px(px(12.))
+                    .gap(px(10.))
+                    .when(selected, |r| r.bg(theme.accent))
+                    .hover(|r| r.bg(theme.accent.opacity(0.6)))
+                    .child(avatar(id, &item.title, 28.))
+                    .child(
+                        ui::v_flex()
+                            .min_w_0()
+                            .child(div().text_sm().truncate().child(item.title.clone()))
+                            .child(ui::muted(listing::subtitle(item), cx).text_xs().truncate()),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
+            });
+        ui::v_flex()
+            .id("backup-list")
+            .w(px(280.))
+            .h_full()
+            .border_r_1()
+            .border_color(theme.border)
+            .overflow_y_scroll()
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn render_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let Some(item) = self.selection.and_then(|id| self.item(id)) else {
+            return ui::v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .child(ui::muted("This backup has no items", cx))
+                .into_any_element();
+        };
+        let fields = item.fields.iter().enumerate().map(|(ix, field)| {
+            let concealed =
+                field.kind == FieldKind::Password || listing::is_card_number(item, field);
+            let shown = if field.kind == FieldKind::Totp {
+                // The current code, like the main detail (the secret itself never shows).
+                parse_totp(&field.value).map_or_else(
+                    || "Invalid one-time code setup".to_owned(),
+                    |t| text::group_code(&t.code(text::now_millis() / 1000)),
+                )
+            } else if concealed && !self.revealed.contains(&ix) {
+                "\u{2022}".repeat(10)
+            } else {
+                field.value.expose_secret().clone()
+            };
+            let reveal = concealed.then(|| {
+                let revealed = self.revealed.contains(&ix);
+                ui::icon_button(
+                    ("backup-reveal", ix),
+                    if revealed {
+                        IconName::EyeOff
+                    } else {
+                        IconName::Eye
+                    },
+                    if revealed { "Hide" } else { "Reveal" },
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.revealed.remove(&ix) {
+                        this.revealed.insert(ix);
+                    }
+                    cx.notify();
+                }))
+            });
+            ui::v_flex()
+                .py(px(8.))
+                .border_b_1()
+                .border_color(theme.border)
+                .child(ui::muted(field.name.clone(), cx).text_xs())
+                .child(
+                    ui::h_flex()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_sm()
+                                .whitespace_normal()
+                                .child(shown),
+                        )
+                        .children(reveal)
+                        .child(
+                            ui::icon_button(("backup-copy", ix), IconName::Copy, "Copy").on_click(
+                                cx.listener(move |this, _, _, cx| this.copy_field(ix, cx)),
+                            ),
+                        ),
+                )
+        });
+        let live = self.state.read(cx).main_active();
+        ui::v_flex()
+            .id("backup-detail")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .p(px(20.))
+            .gap(px(8.))
+            .overflow_y_scroll()
+            .child(
+                ui::h_flex()
+                    .gap(px(12.))
+                    .child(avatar(item.id, &item.title, 40.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(item.title.clone()),
+                    )
+                    .child(
+                        Button::new("backup-copy-item")
+                            .small()
+                            .label("Copy to current vault")
+                            .disabled(!live)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.copy_to_current(cx);
+                            })),
+                    ),
+            )
+            .children(fields)
+            .when_some(self.status.clone(), |col, s| col.child(ui::muted(s, cx)))
+            .into_any_element()
+    }
+}
+
+impl Render for BackupWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let rem = theme::rem_size(cx);
+        if window.rem_size() != rem {
+            window.set_rem_size(rem);
+        }
+        let theme = cx.theme();
+        let (bg, fg, border, font) = (
+            theme.background,
+            theme.foreground,
+            theme.border,
+            theme.font_size,
+        );
+        let body = match self.vault.take() {
+            None => self.render_prompt(cx),
+            Some(vault) => {
+                let list = self.render_list(&vault, cx);
+                self.vault = Some(vault);
+                let detail = self.render_detail(cx);
+                ui::h_flex()
+                    .size_full()
+                    .child(list)
+                    .child(detail)
+                    .into_any_element()
+            }
+        };
+        let header = self.vault.is_some().then(|| {
+            ui::h_flex()
+                .px(px(16.))
+                .py(px(8.))
+                .gap(px(8.))
+                .border_b_1()
+                .border_color(border)
+                .child(gpui_component::tag::Tag::info().small().child("Read-only"))
+                .child(
+                    ui::muted(text::file_name(&self.path), cx)
+                        .flex_1()
+                        .truncate(),
+                )
+                .child(
+                    Button::new("backup-replace")
+                        .small()
+                        .danger()
+                        .label("Replace current vault with this backup\u{2026}")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.replace_current(window, cx)),
+                        ),
+                )
+        });
+        ui::v_flex()
+            .size_full()
+            .bg(bg)
+            .text_color(fg)
+            .text_size(font)
+            .children(header)
+            .child(div().flex_1().min_h_0().child(body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui::{TestAppContext, VisualTestContext};
+    use vault_core::{Field, ItemKind, KdfParams};
+    use vault_sync::{NoopHooks, SyncedVault};
+
+    use super::*;
+
+    const PW: &str = "correct horse";
+
+    /// A live vault with two items and a snapshot of it; returns the state and backup path.
+    fn setup(dir: &std::path::Path, cx: &mut TestAppContext) -> (Entity<AppState>, PathBuf) {
+        let mut vault = SyncedVault::create(
+            &dir.join("t.vault"),
+            &SecretString::new(PW.into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let device = vault.device_id();
+        vault
+            .edit(|v| {
+                let mut gh = Item::new(ItemKind::Login, "GitHub", device, 1);
+                gh.fields = vec![Field::new(
+                    "password",
+                    FieldKind::Password,
+                    SecretString::new("hunter2".into()),
+                    1,
+                )];
+                v.insert(gh, 1);
+                v.insert(Item::new(ItemKind::Note, "Alarm code", device, 1), 1);
+            })
+            .unwrap();
+        vault.save().unwrap();
+        let backup = vault.backup_now().unwrap();
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        state.update(cx, |s, _| s.install_unlocked_for_tests(vault));
+        (state, backup)
+    }
+
+    fn window(
+        state: &Entity<AppState>,
+        backup: &std::path::Path,
+        cx: &mut TestAppContext,
+    ) -> (Entity<BackupWindow>, VisualTestContext) {
+        cx.update(gpui_component::init);
+        let mut view = None;
+        let window = cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let v = cx.new(|cx| BackupWindow::new(state.clone(), backup.to_owned(), window, cx));
+            view = Some(v.clone());
+            Root::new(v, window, cx)
+        });
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        (view.unwrap(), vcx)
+    }
+
+    #[gpui::test]
+    fn opens_read_only_and_copies_across(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, backup) = setup(dir.path(), cx);
+        let backup_bytes = std::fs::read(&backup).unwrap();
+        let (view, mut vcx) = window(&state, &backup, cx);
+        vcx.run_until_parked();
+
+        view.update(&mut vcx, |w, cx| {
+            w.unlock(SecretString::new("nope".into()), cx)
+        });
+        vcx.run_until_parked();
+        view.read_with(&vcx, |w, _| {
+            assert!(!w.is_open());
+            assert_eq!(w.error.as_deref(), Some("Wrong password. Try again."));
+        });
+
+        // Typed and submitted like a user: the field is emptied as soon as it is read.
+        vcx.simulate_input(PW);
+        assert!(view.read_with(&vcx, |w, cx| !ui::input_is_empty(&w.password, cx)));
+        vcx.simulate_keystrokes("enter");
+        assert!(view.read_with(&vcx, |w, cx| ui::input_is_empty(&w.password, cx)));
+        vcx.run_until_parked();
+        let first = view.read_with(&vcx, |w, _| {
+            assert!(w.is_open());
+            assert_eq!(w.item_ids().len(), 2);
+            w.selection.unwrap()
+        });
+        // Sorted by title: "Alarm code" first. Select GitHub and copy its password.
+        let github = view.read_with(&vcx, |w, _| w.item_ids()[1]);
+        assert_ne!(first, github);
+        view.update(&mut vcx, |w, cx| {
+            w.select(github, cx);
+            w.revealed.insert(0);
+            w.copy_field(0, cx);
+            assert!(w.status.as_ref().unwrap().contains("clears in"));
+        });
+        vcx.run_until_parked();
+
+        // Copy to current vault: a clone under a fresh id.
+        let new_id = view
+            .update(&mut vcx, |w, cx| w.copy_to_current(cx))
+            .expect("copied");
+        state.read_with(&vcx, |s, _| {
+            assert_ne!(new_id, github, "fresh id");
+            assert_eq!(s.item_count(), 3);
+            let v = s.unlocked_vault().unwrap();
+            assert_eq!(v.get(new_id).unwrap().title, "GitHub");
+            assert_eq!(v.get(github).unwrap().title, "GitHub", "original untouched");
+        });
+
+        // Nothing was ever written to the backup.
+        assert_eq!(std::fs::read(&backup).unwrap(), backup_bytes);
+    }
+
+    #[gpui::test]
+    fn open_from_state_and_close_on_lock(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, backup) = setup(dir.path(), cx);
+        cx.update(gpui_component::init);
+        let before = cx.update(|cx| cx.windows().len());
+        state.update(cx, |s, cx| s.open_backup(backup.clone(), cx));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| cx.windows().len()), before + 1);
+
+        state.update(cx, |s, cx| s.lock(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            before,
+            "the viewer closes when the vault locks"
+        );
+        // Locked: opening is refused.
+        state.update(cx, |s, cx| s.open_backup(backup.clone(), cx));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| cx.windows().len()), before);
+    }
+}

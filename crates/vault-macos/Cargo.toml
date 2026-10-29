@@ -1,0 +1,65 @@
+[package]
+name = "vault-macos"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vault-core = { path = "../vault-core" }
+# Error enum for platform calls (spec §2 `MacError`).
+thiserror = "=2.0.21"
+# Device id type; v4 for first-run generation.
+uuid = { version = "=1.29.0", features = ["v4"] }
+# Locates ~/Library/Application Support without hardcoding $HOME.
+dirs = "=6.0.0"
+# Warning when device_id() falls back to an unpersisted id.
+tracing = "=0.1.44"
+# SecretString for Clipboard::write_concealed (same version as vault-core).
+secrecy = "=0.8.0"
+# CBOR payload of the Touch ID Keychain item (spec 04 §2.1d); same version as vault-core.
+ciborium = "=0.2.2"
+# QR decoding for "Scan QR from screen" (spec 05 §2.3): pure Rust, no network, no image crate
+# (default `img` feature off; we feed 8-bit gray via prepare_from_greyscale).
+# Transitive: g2p (Galois-field math for Reed-Solomon; its build pulls proc-macro g2gen,
+# g2poly, syn/quote/proc-macro2) and lru (+ hashbrown, foldhash).
+rqrr = { version = "=0.11.0", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Objective-C runtime bindings: message sending, retained pointers.
+objc2 = "=0.6.5"
+# NSString, NSNotification, NSNotificationCenter, NSDistributedNotificationCenter.
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString", "NSNotification", "NSDistributedNotificationCenter", "NSObject", "NSArray", "NSDictionary", "NSError", "NSURL", "NSFileManager", "NSValue", "NSBundle"] }
+# NSWorkspace + NSWorkspaceWillSleepNotification; NSPasteboard (§3); NSAccessibility (reduce motion).
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSPasteboard", "NSAccessibility"] }
+# CGEventSourceSecondsSinceLastEventType for idle detection; CGDisplayCreateImage, bitmap
+# contexts and Screen Recording preflight/request for QR scanning (qr.rs).
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGEventSource", "CGEventTypes", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGImage", "CGColorSpace", "CGContext", "CGBitmapContext", "CGWindow"] }
+# Wipes the grayscale screen buffers in qr.rs (same version as vault-core's lock).
+zeroize = "=1.9.1"
+# sysctl(kern.boottime) and timeval.
+libc = "=0.2.191"
+# Touch ID (§2): SecKeyCreateRandomKey, SecAccessControl, SecKeyCreate{En,De}cryptedData, SecItem*.
+# Chosen over security-framework 3.7: its GenerateKeyOptions cannot set kSecAttrApplicationTag
+# and it has no kSecUseAuthenticationContext/LAContext, so raw calls were needed anyway; the
+# objc2 family matches the rest of this crate and bridges LAContext without extra glue.
+objc2-security = { version = "=0.3.2", default-features = false, features = ["std", "SecBase", "SecItem", "SecKey", "SecAccessControl"] }
+# CFDictionary/CFData/CFString/CFNumber/CFError for the Security calls above.
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFBase", "CFData", "CFDictionary", "CFString", "CFNumber", "CFError", "CFCGTypes"] }
+# LAContext: canEvaluatePolicy (Biometric::available) and the Touch ID prompt reason.
+objc2-local-authentication = { version = "=0.3.2", default-features = false, features = ["std", "LAContext", "LAError"] }
+# Launch at login (spec 05 §2.5): SMAppService.mainAppService register/unregister/status.
+objc2-service-management = { version = "=0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+# Renders test QR codes for tests/qr.rs (pure Rust; image/svg/pic renderers off).
+qrcode = { version = "=0.14.1", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Delivery test: pumps the run loop.
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString", "NSNotification", "NSDistributedNotificationCenter", "NSObject", "NSRunLoop", "NSDate"] }
+
+[[test]]
+name = "delivery"
+harness = false

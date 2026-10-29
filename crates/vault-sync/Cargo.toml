@@ -1,0 +1,29 @@
+[package]
+name = "vault-sync"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# `sync` exposes export_vault_key / unlock_with_key for merging external changes (03 §3 step 6a).
+vault-core = { path = "../vault-core", features = ["sync"] }
+# Typed `SyncError` / `CloudError` (03 §8).
+thiserror = "^2.0.3"
+# Paths and sizes only; never secrets.
+tracing = "^0.1.40"
+# `SyncedVault::subscribe` event channel (03 §8).
+crossbeam-channel = "^0.5.13"
+# Hash of the bytes we last wrote, for echo suppression (03 §2 step 6, §3 step 2).
+blake3 = "^1.5.4"
+# OsRng for the tmp-file suffix (03 §1). 0.8 matches vault-core's rand_core.
+rand = { version = "^0.8.5", default-features = false, features = ["getrandom"] }
+
+# Filesystem watcher on the vault's directory (03 §3); runs on its own thread, no async runtime.
+notify = "^8.2.0"
+# 500 ms debounce of watcher events (03 §3); 0.7 is built on notify 8.2.
+notify-debouncer-full = "^0.7.0"
+
+[dev-dependencies]
+# Per-test temp directories.
+tempfile = "^3.13.0"

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Intentionally empty. gpui may require additions at integration time
+  (check when the app is first signed and run with the hardened runtime).
+  com.apple.security.cs.allow-jit is NOT needed and must not be added.
+-->
+<plist version="1.0">
+<dict/>
+</plist>

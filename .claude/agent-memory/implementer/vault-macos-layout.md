@@ -1,0 +1,10 @@
+---
+name: vault-macos-layout
+description: vault-macos module layout and conventions (cfg split, device id fallback rules)
+metadata:
+  type: project
+---
+vault-macos layout (as of 2026-10-29, P4.2): lib.rs re-exports; device.rs (BUNDLE_ID, device_id, device_id_in); pasteboard.rs (Clipboard, ChangeCount, hidden test helpers read_string/has_concealed_type/write_plain); icloud.rs (ICloudHooks with inherent methods, CloudError, CloudProvider, pin threads stop on Drop); idle.rs (also reduce_motion_enabled) with `mod imp` split (selector-based Observer class, delivery test is harness=false) by `cfg(target_os = "macos")`; error.rs (MacError per spec §2); bookmark.rs TODO stub; login_item.rs (P5.4a: SMAppService launch at login, guard on non-.app bundle); biometric.rs (P4.2: Biometric, a cross-platform `payload` CBOR module with ciborium::Value, and an `imp` pair); qr.rs (P5.7: scan_qr_from_screen -> Vec<SecretString>, pure decode_qr_from_gray via rqrr, screen_capture_permitted; cross-platform decode, `imp` pair for capture). Packaging (§7) is not done yet, and the app must ship the keychain-access-groups entitlement for Touch ID to work. vault-macos must NOT depend on vault-sync: vault-app adapts ICloudHooks to vault_sync::CloudHooks with a newtype. vault-macos pins deps with `=` (it overrides the CLAUDE.md caret rule).
+
+**Why:** the lead wanted one cfg split per module so Linux builds get stubs.
+**How to apply:** add new platform features as `mod imp` pairs in their own module. try_device_id() errors on a bad VAULT_DEVICE_ID or an unwritable dir. device_id() logs tracing::warn and falls back to a per-process random id. Temp files use a unique name with create_new. See [[objc2-patterns]].

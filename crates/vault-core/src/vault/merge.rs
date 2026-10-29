@@ -1,0 +1,298 @@
+//! Three-way-free last-writer-wins merge (`03-sync.md` §5).
+//!
+//! `ours.merge_from(&theirs)` folds every item of `theirs` into `ours`, item by item, with no
+//! common ancestor. The rules, in order:
+//!
+//! | ours | theirs | result |
+//! |---|---|---|
+//! | absent | present | take theirs (tombstones included) |
+//! | present | absent | keep ours |
+//! | one tombstone | — | tombstone wins iff `deleted_at >= other.modified_at`; else the live item (edit after delete resurrects) |
+//! | both tombstones | — | the side with greater `(modified_at, device_id)`; tie -> ours |
+//! | both live | — | field-level merge, see [`merge_items`] |
+//!
+//! The result's `modified_at` is always `max(ours, theirs)`.
+//!
+//! The merge is idempotent (folding the same `theirs` twice changes nothing the second time)
+//! and commutative in content. Field *order* follows the metadata winner, so it is also
+//! commutative whenever one side strictly wins on `(modified_at, device_id)`; an exact tie
+//! (same millisecond, same device) keeps "ours" order on each side.
+//!
+//! Only the identical-pair tie is not resolved by timestamps. `device_id` is compared as
+//! raw bytes (`Uuid`'s `Ord`), which is what the spec means by "greater `device_id` bytes".
+
+use std::cmp::Ordering;
+
+use secrecy::ExposeSecret;
+
+use super::{HISTORY_CAP, UnlockedVault};
+use crate::error::VaultError;
+use crate::item::{Field, FieldKind, HistoryEntry, Item};
+
+/// What `merge_from` did, per item id in `ours ∪ theirs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MergeReport {
+    /// Ids that were not in ours and were taken from theirs (live or tombstone).
+    pub added: usize,
+    /// Ids present on both sides whose merged result differs from ours and is live
+    /// (includes resurrections).
+    pub updated: usize,
+    /// Ids that were live in ours and are a tombstone after the merge.
+    pub deleted: usize,
+    /// Ids whose merged result equals ours, including ids absent from theirs.
+    pub unchanged: usize,
+}
+
+impl MergeReport {
+    /// `true` if the merge changed anything in ours (so a caller should save).
+    pub fn changed(&self) -> bool {
+        self.added + self.updated + self.deleted > 0
+    }
+}
+
+impl UnlockedVault {
+    /// Fold every item of `other` into `self` per `03-sync.md` §5. See the module docs for the
+    /// rules. Header, slots and keys of `self` are untouched; `other` is only read.
+    ///
+    /// **Record timestamp always moves with content.** If the merged item differs from ours but
+    /// the rule's `max(ours, theirs)` leaves `modified_at` equal to ours (e.g. ours
+    /// `{A@10, B@5, item@10}`, theirs `{A@3, B@8, item@8}` -> `{A@10, B@8}` at 10), the
+    /// merged item is stamped `ours.modified_at + 1` instead. Otherwise the new file would
+    /// carry the old `(id, modified_at)` pair with new content, and splicing the pre-merge
+    /// record back in would pass the manifest check (02 guarantee 6 is unconditional). The
+    /// peer takes the max on its next merge, so both sides still converge, at most one extra
+    /// round trip later. The bump behaves exactly like a local edit stamped `prev + 1` by the
+    /// merging device: it can win or lose an exact-millisecond tie with a genuine remote edit
+    /// under the normal `(modified_at, device_id)` tie-break, and both sides converge on the
+    /// same outcome either way.
+    ///
+    /// **Extras.** For an id present on both sides, ours' plaintext `record_extras` are kept
+    /// and theirs ignored. Inside the item, the metadata loser's `ItemPlain` extras (which is
+    /// where a v1.1 `attachments` array lands) are dropped; only the winner's survive.
+    ///
+    /// **Purged tombstones.** A peer that has been offline since before a delete still holds
+    /// the live item; if the tombstone was purged here in the meantime, merging that peer
+    /// resurrects the item (ours absent -> take theirs). See
+    /// [`UnlockedVault::purge_tombstones_older_than`].
+    ///
+    /// # Errors
+    ///
+    /// `Malformed("vault_id mismatch")` if the two vaults are not the same vault. (The spec
+    /// signature returns a bare `MergeReport` but says "same `vault_id` (else error)"; a
+    /// `Result` is the only way to report that.)
+    pub fn merge_from(&mut self, other: &UnlockedVault) -> Result<MergeReport, VaultError> {
+        if self.header.vault_id != other.header.vault_id {
+            return Err(VaultError::Malformed("vault_id mismatch".into()));
+        }
+        let mut report = MergeReport::default();
+        for (id, theirs) in &other.items {
+            match self.items.get(id) {
+                None => {
+                    self.items.insert(*id, theirs.clone());
+                    if let Some(extras) = other.record_extras.get(id) {
+                        self.record_extras.insert(*id, extras.clone());
+                    }
+                    report.added += 1;
+                }
+                Some(ours) => {
+                    let mut merged = merge_items(ours, theirs);
+                    if item_eq(ours, &merged) {
+                        report.unchanged += 1;
+                    } else {
+                        if merged.modified_at == ours.modified_at {
+                            merged.modified_at = ours.modified_at.saturating_add(1);
+                        }
+                        if merged.is_deleted() && !ours.is_deleted() {
+                            report.deleted += 1;
+                        } else {
+                            report.updated += 1;
+                        }
+                        self.items.insert(*id, merged);
+                    }
+                }
+            }
+        }
+        report.unchanged += self
+            .items
+            .keys()
+            .filter(|id| !other.items.contains_key(id))
+            .count();
+        Ok(report)
+    }
+}
+
+/// Merge two versions of the same item (same `id`). Pure; see the module docs for the rules.
+pub fn merge_items(ours: &Item, theirs: &Item) -> Item {
+    debug_assert_eq!(ours.id, theirs.id);
+    let modified_at = ours.modified_at.max(theirs.modified_at);
+    let mut result = match (ours.deleted_at, theirs.deleted_at) {
+        (Some(d), None) => {
+            if d >= theirs.modified_at {
+                ours.clone()
+            } else {
+                theirs.clone()
+            }
+        }
+        (None, Some(d)) => {
+            if d >= ours.modified_at {
+                theirs.clone()
+            } else {
+                ours.clone()
+            }
+        }
+        (Some(_), Some(_)) => {
+            if ours_wins_metadata(ours, theirs) {
+                ours.clone()
+            } else {
+                theirs.clone()
+            }
+        }
+        (None, None) => merge_live(ours, theirs),
+    };
+    result.modified_at = modified_at;
+    result
+}
+
+/// `true` if ours supplies the metadata: greater `modified_at`, tie -> greater `device_id`
+/// bytes, tie -> ours.
+fn ours_wins_metadata(ours: &Item, theirs: &Item) -> bool {
+    match ours.modified_at.cmp(&theirs.modified_at) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => ours.device_id >= theirs.device_id,
+    }
+}
+
+/// Both sides live. Metadata (`kind`, `title`, `favorite`, `tags`, `extras`, `device_id`)
+/// comes from the winner per [`ours_wins_metadata`]. Fields are keyed by `name`: a field on
+/// one side only is taken; a field on both sides is taken from the greater field
+/// `modified_at`, tie -> greater owning-item `device_id`, tie -> ours. Field order is the
+/// winner's, followed by the loser's extra fields in the loser's order. History is the union
+/// on `(value, replaced_at)` plus, for every [`FieldKind::Password`] field that lost a true
+/// conflict (both sides present, different values), the losing value as
+/// `(value, replaced_at = loser field modified_at)` so nothing is lost (03 §5). A losing
+/// value already present in the union by value (the common "only one side edited" case,
+/// where the winner recorded it when replacing it) is not pushed again, so merging an
+/// untouched copy never changes history. Then newest first, capped at [`HISTORY_CAP`].
+fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
+    let ours_wins = ours_wins_metadata(ours, theirs);
+    let (winner, loser) = if ours_wins {
+        (ours, theirs)
+    } else {
+        (theirs, ours)
+    };
+
+    // Returns (kept, dropped).
+    let pick = |o: &'a Field, t: &'a Field| -> (&'a Field, &'a Field) {
+        let take_ours = match o.modified_at.cmp(&t.modified_at) {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => ours.device_id >= theirs.device_id,
+        };
+        if take_ours { (o, t) } else { (t, o) }
+    };
+
+    let mut conflict_losers: Vec<&Field> = Vec::new();
+    let mut fields = Vec::with_capacity(winner.fields.len() + loser.fields.len());
+    for w in &winner.fields {
+        match loser.fields.iter().find(|l| l.name == w.name) {
+            None => fields.push(w.clone()),
+            Some(l) => {
+                let (o, t) = if ours_wins { (w, l) } else { (l, w) };
+                let (kept, dropped) = pick(o, t);
+                fields.push(kept.clone());
+                if dropped.kind == FieldKind::Password
+                    && dropped.value.expose_secret() != kept.value.expose_secret()
+                {
+                    conflict_losers.push(dropped);
+                }
+            }
+        }
+    }
+    for l in &loser.fields {
+        if !winner.fields.iter().any(|w| w.name == l.name) {
+            fields.push(l.clone());
+        }
+    }
+
+    let mut history = ours.history.clone();
+    history.extend(theirs.history.iter().cloned());
+    for lost in conflict_losers {
+        let present = history
+            .iter()
+            .any(|h| h.value.expose_secret() == lost.value.expose_secret());
+        if !present {
+            history.push(HistoryEntry {
+                value: lost.value.clone(),
+                replaced_at: lost.modified_at,
+            });
+        }
+    }
+    normalize_history(&mut history);
+
+    Item {
+        id: ours.id,
+        kind: winner.kind,
+        title: winner.title.clone(),
+        deleted_at: None,
+        device_id: winner.device_id,
+        favorite: winner.favorite,
+        tags: winner.tags.clone(),
+        fields,
+        history,
+        modified_at: ours.modified_at.max(theirs.modified_at),
+        extras: winner.extras.clone(),
+    }
+}
+
+/// Sort history newest first (ties broken by value so the order is deterministic on every
+/// device), drop exact `(value, replaced_at)` duplicates, and keep at most [`HISTORY_CAP`]
+/// entries. Shared with `set_field`.
+pub(crate) fn normalize_history(history: &mut Vec<HistoryEntry>) {
+    history.sort_by(|a, b| {
+        b.replaced_at
+            .cmp(&a.replaced_at)
+            .then_with(|| a.value.expose_secret().cmp(b.value.expose_secret()))
+    });
+    history.dedup_by(|a, b| history_entry_eq(a, b));
+    history.truncate(HISTORY_CAP);
+}
+
+fn history_entry_eq(a: &HistoryEntry, b: &HistoryEntry) -> bool {
+    a.replaced_at == b.replaced_at && a.value.expose_secret() == b.value.expose_secret()
+}
+
+/// Everything about a field except its timestamp. Used by `update` to detect edits that
+/// forgot to bump `modified_at`.
+pub(crate) fn field_content_eq(a: &Field, b: &Field) -> bool {
+    a.name == b.name
+        && a.kind == b.kind
+        && a.section == b.section
+        && a.extras == b.extras
+        && a.value.expose_secret() == b.value.expose_secret()
+}
+
+fn field_eq(a: &Field, b: &Field) -> bool {
+    a.modified_at == b.modified_at && field_content_eq(a, b)
+}
+
+/// Full structural equality including secrets and order. `Item` has no `PartialEq` (it holds
+/// secrets), so merge decides "unchanged" here.
+pub fn item_eq(a: &Item, b: &Item) -> bool {
+    a.id == b.id
+        && a.kind == b.kind
+        && a.title == b.title
+        && a.deleted_at == b.deleted_at
+        && a.device_id == b.device_id
+        && a.favorite == b.favorite
+        && a.tags == b.tags
+        && a.modified_at == b.modified_at
+        && a.extras == b.extras
+        && a.fields.len() == b.fields.len()
+        && a.fields.iter().zip(&b.fields).all(|(x, y)| field_eq(x, y))
+        && a.history.len() == b.history.len()
+        && a.history
+            .iter()
+            .zip(&b.history)
+            .all(|(x, y)| history_entry_eq(x, y))
+}
