@@ -23,7 +23,7 @@ use gpui_kit_assets::IconName;
 const APP_ICON_SIZE: f32 = 128.;
 
 use crate::state::{AppState, Busy, ChooseIntent, Screen, TouchDenied};
-use crate::ui;
+use crate::ui::{self, Clickable as _};
 
 const SHAKE: Duration = Duration::from_millis(400);
 /// Peak horizontal displacement of the shake.
@@ -175,6 +175,7 @@ impl Render for UnlockScreen {
                         .w_full()
                         .label("Unlock")
                         .disabled(unlocking)
+                        .clickable_when(!unlocking)
                         .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                 ),
             )
@@ -186,6 +187,7 @@ impl Render for UnlockScreen {
                             .icon(Icon::new(IconName::FingerprintPattern))
                             .label("Unlock with Touch ID")
                             .disabled(unlocking)
+                            .clickable_when(!unlocking)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.state.update(cx, |s, cx| s.touch_unlock(cx));
                             })),
@@ -198,6 +200,7 @@ impl Render for UnlockScreen {
                     .small()
                     .label("Open another vault…  ⌘O")
                     .disabled(unlocking)
+                    .clickable_when(!unlocking)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.state
                             .update(cx, |s, cx| s.switch_vault(ChooseIntent::Home, cx));

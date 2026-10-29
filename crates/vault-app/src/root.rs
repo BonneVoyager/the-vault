@@ -10,6 +10,7 @@ use gpui::{
     Task, Window, div, ease_out_quint, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{ActiveTheme as _, WindowExt as _};
+use gpui_kit_assets::IconName;
 
 use crate::actions;
 use crate::autolock::{self, LockTriggers};
@@ -235,9 +236,21 @@ impl VaultRoot {
         if want && !have {
             let (view, state) = (self.settings.clone(), self.state.clone());
             window.open_dialog(cx, move |dialog, _, _| {
-                let state = state.clone();
+                let (state, close) = (state.clone(), state.clone());
+                // Our own close button: gpui-component's built-in one keeps the arrow
+                // cursor and takes no style.
+                let title = ui::h_flex()
+                    .w_full()
+                    .justify_between()
+                    .child("Settings")
+                    .child(
+                        ui::icon_button("settings-close", IconName::Close, "Close  Esc").on_click(
+                            move |_, _, cx| close.update(cx, |s, cx| s.open_settings(false, cx)),
+                        ),
+                    );
                 dialog
-                    .title("Settings")
+                    .title(title)
+                    .close_button(false)
                     .w(px(560.))
                     .child(view.clone())
                     .on_close(move |_, _, cx| state.update(cx, |s, cx| s.open_settings(false, cx)))

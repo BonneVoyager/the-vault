@@ -18,7 +18,7 @@ use gpui_component::tag::Tag;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
-use vault_core::{ExposeSecret, Field, FieldKind, Item};
+use vault_core::{ExposeSecret, Field, FieldKind, HistoryEntry, Item};
 
 use super::MainScreen;
 use super::attachments;
@@ -29,6 +29,7 @@ use super::sync_banners;
 use crate::actions::{DETAIL_CONTEXT, DeleteItem, EditItem, ToggleFavorite};
 use crate::audit::Issue;
 use crate::state::{AppState, CopyTarget, Mode, ToastPlace, parse_totp};
+use crate::ui::Clickable as _;
 use crate::{text, ui};
 
 /// History entries shown in the disclosure (01 §4 caps history at 10 anyway).
@@ -103,7 +104,7 @@ fn copy_on_click(
         .py(px(2.))
         .rounded(theme.radius)
         .map(|el| ui::focus_ring(el, cx))
-        .cursor_pointer()
+        .clickable()
         .hover(move |style| style.bg(hover))
         .tooltip(|window, cx| Tooltip::new(CLICK_TO_COPY).build(window, cx))
         .on_click(move |_, _, cx| state.update(cx, |s, cx| s.copy(CopyTarget::Field(ix), cx)))
@@ -215,6 +216,7 @@ fn onboarding(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                             .primary()
                             .small()
                             .label("Got it")
+                            .clickable()
                             .on_click(move |_, _, cx| {
                                 state.update(cx, |s, cx| s.dismiss_onboarding(cx));
                             }),
@@ -410,6 +412,7 @@ impl MainScreen {
                             .small()
                             .label("Edit")
                             .tooltip("Edit  ⌘E")
+                            .clickable()
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(Box::new(EditItem), cx)
                             }),
@@ -655,18 +658,38 @@ impl MainScreen {
     }
 
     fn render_history(&self, item: &Item, s: &AppState, now: u64, cx: &App) -> AnyElement {
-        let theme = cx.theme();
-        let open = s.history_open;
-        let state = self.state.clone();
-        let count = item.history.len().min(HISTORY_SHOWN);
-        let toggle = ui::h_flex()
+        let entries: Vec<&HistoryEntry> = item.history.iter().collect();
+        history_disclosure(&entries, None, s, &self.state, now, cx)
+    }
+}
+
+/// Password history disclosure (§2.3): a toggle and, when open, the previous values
+/// masked with their timestamps, each copyable. `removed` is `Some(pending removals)` in
+/// edit mode, which adds a trash button per entry and a "Clear history" button; removing
+/// never reveals a value.
+pub(super) fn history_disclosure(
+    history: &[&HistoryEntry],
+    removed: Option<usize>,
+    s: &AppState,
+    state: &Entity<AppState>,
+    now: u64,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let open = s.history_open;
+    let editing = removed.is_some();
+    let count = history.len().min(HISTORY_SHOWN);
+    let pending = removed.unwrap_or(0);
+    let toggle = {
+        let state = state.clone();
+        ui::h_flex()
             .id("history-toggle")
             .tab_index(0)
             .gap(px(4.))
             .py(px(6.))
             .rounded(theme.radius)
             .map(|el| ui::focus_ring(el, cx))
-            .cursor_pointer()
+            .clickable()
             .text_xs()
             .text_color(theme.muted_foreground)
             .child(
@@ -678,46 +701,91 @@ impl MainScreen {
                 .size_3(),
             )
             .child(format!("Password history ({count})"))
-            .on_click(move |_, _, cx| state.update(cx, |s, cx| s.toggle_history(cx)));
+            .when(pending > 0, |row| {
+                row.child(format!("\u{b7} {pending} removed on save"))
+            })
+            .on_click(move |_, _, cx| state.update(cx, |s, cx| s.toggle_history(cx)))
+    };
 
-        let entries = item
-            .history
-            .iter()
-            .take(HISTORY_SHOWN)
-            .enumerate()
-            .map(|(j, h)| {
-                ui::h_flex()
-                    .pl(px(18.))
-                    .gap(px(8.))
-                    .child(
-                        mono(text::DOTS, cx)
-                            .text_color(theme.muted_foreground)
-                            .flex_1(),
-                    )
-                    .child(ui::muted(
-                        format!(
-                            "replaced {} ({})",
-                            text::date(h.replaced_at),
-                            text::relative(now, h.replaced_at)
-                        ),
-                        cx,
-                    ))
-                    .child(copy_button(
-                        ("history-copy", j),
-                        "Copy previous password",
-                        CopyTarget::History(j),
-                        &self.state,
-                    ))
+    let entries = history
+        .iter()
+        .take(HISTORY_SHOWN)
+        .enumerate()
+        .map(|(j, h)| {
+            let stamp = h.replaced_at;
+            let copy = {
+                let state = state.clone();
+                // By stamp in the stored item: in edit mode the shown list skips removals.
+                ui::icon_button(
+                    ("history-copy", j),
+                    IconName::Copy,
+                    "Copy previous password",
+                )
+                .on_click(move |_, _, cx| {
+                    state.update(cx, |s, cx| {
+                        let ix = s
+                            .selected_item()
+                            .and_then(|it| it.history.iter().position(|h| h.replaced_at == stamp));
+                        if let Some(ix) = ix {
+                            s.copy(CopyTarget::History(ix), cx);
+                        }
+                    })
+                })
+            };
+            let remove = editing.then(|| {
+                let state = state.clone();
+                ui::icon_button(
+                    ("history-remove", j),
+                    IconName::Trash,
+                    "Remove from history",
+                )
+                .debug_selector(move || format!("history-remove {j}"))
+                .on_click(move |_, _, cx| {
+                    state.update(cx, |s, cx| s.edit(cx, |b| b.remove_history(stamp)))
+                })
             });
+            ui::h_flex()
+                .pl(px(18.))
+                .gap(px(8.))
+                .child(
+                    mono(text::DOTS, cx)
+                        .text_color(theme.muted_foreground)
+                        .flex_1(),
+                )
+                .child(ui::muted(
+                    format!(
+                        "replaced {} ({})",
+                        text::date(stamp),
+                        text::relative(now, stamp)
+                    ),
+                    cx,
+                ))
+                .child(copy)
+                .children(remove)
+        });
 
-        ui::v_flex()
-            .pb(px(6.))
-            .border_b_1()
-            .border_color(theme.border)
-            .child(toggle)
-            .when(open, |col| col.children(entries))
-            .into_any_element()
-    }
+    let clear = (editing && count > 0).then(|| {
+        let state = state.clone();
+        ui::h_flex().pl(px(18.)).pt(px(2.)).child(
+            Button::new("history-clear")
+                .debug_selector(|| "history-clear".into())
+                .link()
+                .xsmall()
+                .label("Clear history")
+                .clickable()
+                .on_click(move |_, _, cx| {
+                    state.update(cx, |s, cx| s.edit(cx, |b| b.clear_history()))
+                }),
+        )
+    });
+
+    ui::v_flex()
+        .pb(px(6.))
+        .border_b_1()
+        .border_color(theme.border)
+        .child(toggle)
+        .when(open, |col| col.children(entries).children(clear))
+        .into_any_element()
 }
 
 #[cfg(test)]

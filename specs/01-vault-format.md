@@ -106,6 +106,7 @@ AAD = `vault_id || item.id || modified_at_be64 || format_version_be16`.
   "attachments": [AttachmentRef]   (v1.1, empty in v1)
   "removed_attachments": [{ "id": bytes(16), "removed_at": u64 }]   (v1.1, optional; tombstones so a removal survives merge, cap 64 newest, purged with item tombstones)
   "history":     [HistoryEntry]    last 10 password values, optional
+  "removed_history": [u64]         optional; `replaced_at` stamps of history entries the user deleted (never the value), cap 10 newest, purged with item tombstones
 }
 
 Field = {

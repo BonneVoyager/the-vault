@@ -513,6 +513,7 @@ impl UnlockedVault {
     pub fn try_insert(&mut self, mut item: Item, now: Millis) -> Result<Uuid, VaultError> {
         check_attachment_refs(&item)?;
         merge::normalize_attachment_tombstones(&mut item.removed_attachments);
+        merge::normalize_removed_history(&mut item.removed_history);
         let id = item.id;
         let mut floor = now;
         if let Some(existing) = self.items.get(&id) {
@@ -565,6 +566,7 @@ impl UnlockedVault {
             return Err(e);
         }
         merge::normalize_attachment_tombstones(&mut item.removed_attachments);
+        merge::normalize_removed_history(&mut item.removed_history);
         for field in &mut item.fields {
             match before.fields.iter().find(|b| b.name == field.name) {
                 Some(prev) => {
@@ -591,7 +593,12 @@ impl UnlockedVault {
     /// Replace the value of an existing field and stamp it `stamp(now, field.modified_at)`
     /// (strictly advancing, see [`stamp`]). For a [`FieldKind::Password`] field the previous value is
     /// pushed onto `history` as `(value, replaced_at = that stamp)`; history is kept
-    /// newest-first and capped at [`HISTORY_CAP`]. The item is restamped as in
+    /// newest-first and capped at [`HISTORY_CAP`]. If that stamp is in the item's
+    /// `removed_history` (a deleted entry's stamp, 03 §5) the stamp is advanced past it so
+    /// the new entry is not dropped by the next merge; under the monotone stamp rule this
+    /// never triggers (every removed stamp is an earlier password stamp of this item and
+    /// the field already sits at or past it), it only guards a field whose timestamp was
+    /// moved back by hand through `update`. The item is restamped as in
     /// [`UnlockedVault::update`].
     ///
     /// # Errors
@@ -614,7 +621,12 @@ impl UnlockedVault {
             .find(|f| f.name == name)
             .ok_or_else(|| unknown_field(id, name))?;
         let previous = std::mem::replace(&mut field.value, value);
-        let at = stamp(now, field.modified_at);
+        let mut at = stamp(now, field.modified_at);
+        if field.kind == FieldKind::Password {
+            while item.removed_history.contains(&at) {
+                at = at.saturating_add(1);
+            }
+        }
         field.modified_at = at;
         if field.kind == FieldKind::Password {
             item.history.push(HistoryEntry {
@@ -624,6 +636,65 @@ impl UnlockedVault {
             merge::normalize_history(&mut item.history);
         }
         restamp(item, item_floor, device_id);
+        Ok(())
+    }
+
+    /// Delete the history entry (or entries) of item `id` stamped `replaced_at` and record the
+    /// stamp in `removed_history` (01 §4) so the deletion survives a merge with a peer that
+    /// still holds the entry (03 §5). The value is never recorded, only the stamp. A merge
+    /// can leave two entries with the same stamp (different values); the marker is keyed by
+    /// stamp alone, so they are removed together here too. The stamp list is kept newest
+    /// first, deduplicated, capped at [`HISTORY_CAP`] and purged by
+    /// [`UnlockedVault::purge_tombstones_older_than`]. The item is restamped like every
+    /// other mutation (`modified_at = stamp(now, previous)`, `device_id = self.device_id`).
+    ///
+    /// # Errors
+    ///
+    /// `Malformed("unknown item ..")` / `Malformed("unknown history entry ..")` if no history
+    /// entry carries `replaced_at`.
+    pub fn remove_history_entry(
+        &mut self,
+        id: Uuid,
+        replaced_at: Millis,
+        now: Millis,
+    ) -> Result<(), VaultError> {
+        let device_id = self.device_id;
+        let item = self.items.get_mut(&id).ok_or_else(|| unknown_item(id))?;
+        if !item.history.iter().any(|h| h.replaced_at == replaced_at) {
+            return Err(VaultError::Malformed(format!(
+                "unknown history entry {replaced_at} on item {id}"
+            )));
+        }
+        item.history.retain(|h| h.replaced_at != replaced_at);
+        item.removed_history.push(replaced_at);
+        merge::normalize_removed_history(&mut item.removed_history);
+        restamp(item, stamp(now, item.modified_at), device_id);
+        Ok(())
+    }
+
+    /// Delete every history entry of item `id` and record all their stamps in
+    /// `removed_history` (see [`UnlockedVault::remove_history_entry`]); the item is restamped.
+    /// An item with no history is left untouched (no restamp), so the call is idempotent.
+    ///
+    /// The stamp list is capped at [`HISTORY_CAP`] (01 §4): the newest stamps win. When the
+    /// list already held stamps from earlier removals, the oldest ones fall off, and a peer
+    /// that still carries an entry with such a stamp can in theory bring it back at the next
+    /// merge. Accepted (lead decision 2026-10-29): history is itself capped at the same
+    /// number, so this only affects entries that were already deleted before.
+    ///
+    /// # Errors
+    ///
+    /// `Malformed("unknown item ..")`.
+    pub fn clear_history(&mut self, id: Uuid, now: Millis) -> Result<(), VaultError> {
+        let device_id = self.device_id;
+        let item = self.items.get_mut(&id).ok_or_else(|| unknown_item(id))?;
+        if item.history.is_empty() {
+            return Ok(());
+        }
+        item.removed_history
+            .extend(item.history.drain(..).map(|h| h.replaced_at));
+        merge::normalize_removed_history(&mut item.removed_history);
+        restamp(item, stamp(now, item.modified_at), device_id);
         Ok(())
     }
 
@@ -743,11 +814,11 @@ impl UnlockedVault {
     }
 
     /// Drop every item tombstone with `deleted_at < cutoff` (strictly older) and, on every
-    /// remaining item, every attachment removal marker with `removed_at < cutoff`. Returns
-    /// how many *items* were removed. Live items are otherwise never touched (dropping a
-    /// marker does not restamp the item: it changes nothing a peer could observe except that
-    /// a stale copy of the reference could come back, which is the same trade-off as for
-    /// item tombstones).
+    /// remaining item, every attachment removal marker with `removed_at < cutoff` and every
+    /// `removed_history` stamp `< cutoff`. Returns how many *items* were removed. Live items
+    /// are otherwise never touched (dropping a marker does not restamp the item: it changes
+    /// nothing a peer could observe except that a stale copy of the reference or history
+    /// entry could come back, which is the same trade-off as for item tombstones).
     ///
     /// **Choose `cutoff` conservatively.** A tombstone is the only thing that stops a peer's
     /// stale *live* copy from coming back: once it is purged, a merge from a device that has
@@ -763,6 +834,7 @@ impl UnlockedVault {
             .retain(|id, _| self.items.contains_key(id));
         for item in self.items.values_mut() {
             item.removed_attachments.retain(|t| t.removed_at >= cutoff);
+            item.removed_history.retain(|s| *s >= cutoff);
         }
         before - self.items.len()
     }

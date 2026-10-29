@@ -20,7 +20,7 @@ use vault_core::SecretString;
 
 use super::settings::{SectionRow, section};
 use crate::state::{AppState, Busy, SECURITY_TAB, SecurityForm};
-use crate::ui;
+use crate::ui::{self, Clickable as _};
 
 /// Text of the red rotate confirm.
 pub const ROTATE_WARNING: &str = "Rotating replaces the key that encrypts every item. \
@@ -300,6 +300,7 @@ impl SecurityView {
         let toggle = Switch::new("touch-id")
             .checked(enabled)
             .disabled(busy.is_some() || switch_off || disabling)
+            .clickable_when(!(busy.is_some() || switch_off || disabling))
             .accessibility_label("Unlock with Touch ID")
             .when_some(blocker.filter(|_| switch_off), |sw, why| sw.tooltip(why))
             .on_click(cx.listener(|this, on: &bool, w, cx| {
@@ -342,6 +343,7 @@ impl SecurityView {
                             .small()
                             .label("Cancel")
                             .disabled(working)
+                            .clickable_when(!working)
                             .on_click(cx.listener(|this, _, w, cx| this.open(None, w, cx))),
                     )
                     .child(
@@ -350,6 +352,7 @@ impl SecurityView {
                             .small()
                             .label("Turn Off")
                             .loading(working)
+                            .clickable_when(!working)
                             .on_click(cx.listener(|this, _, w, cx| {
                                 this.submit_prompt(SecurityForm::DisableTouchId, w, cx)
                             })),
@@ -386,6 +389,7 @@ impl SecurityView {
                             .small()
                             .label("Cancel")
                             .disabled(busy)
+                            .clickable_when(!busy)
                             .on_click(cx.listener(|this, _, w, cx| this.open(None, w, cx))),
                     )
                     .child(ui::submit_gate(
@@ -397,6 +401,7 @@ impl SecurityView {
                             .label("Change Password")
                             .loading(busy)
                             .disabled(!ready)
+                            .clickable_when(ready && !busy)
                             .on_click(cx.listener(|this, _, w, cx| this.submit_change(w, cx))),
                     )),
             )
@@ -434,6 +439,7 @@ impl SecurityView {
                             .small()
                             .label("Cancel")
                             .disabled(busy)
+                            .clickable_when(!busy)
                             .on_click(cx.listener(|this, _, w, cx| this.open(None, w, cx))),
                     )
                     .child(
@@ -442,6 +448,7 @@ impl SecurityView {
                             .small()
                             .label("Re-calibrate")
                             .loading(busy)
+                            .clickable_when(!busy)
                             .on_click(cx.listener(|this, _, w, cx| {
                                 this.submit_prompt(SecurityForm::Recalibrate, w, cx)
                             })),
@@ -472,6 +479,7 @@ impl SecurityView {
                             .small()
                             .label("Cancel")
                             .disabled(busy)
+                            .clickable_when(!busy)
                             .on_click(cx.listener(|this, _, w, cx| this.open(None, w, cx))),
                     )
                     .child(
@@ -480,6 +488,7 @@ impl SecurityView {
                             .small()
                             .label("Rotate Key")
                             .loading(busy)
+                            .clickable_when(!busy)
                             .on_click(cx.listener(|this, _, w, cx| {
                                 this.submit_prompt(SecurityForm::RotateKey, w, cx)
                             })),
@@ -528,6 +537,7 @@ impl Render for SecurityView {
             .small()
             .label("Change\u{2026}")
             .disabled(any_busy || form == Some(SecurityForm::ChangePassword))
+            .clickable_when(!(any_busy || form == Some(SecurityForm::ChangePassword)))
             .on_click(
                 cx.listener(|this, _, w, cx| this.open(Some(SecurityForm::ChangePassword), w, cx)),
             );
@@ -535,6 +545,7 @@ impl Render for SecurityView {
             .small()
             .label("Re-calibrate\u{2026}")
             .disabled(any_busy || form == Some(SecurityForm::Recalibrate))
+            .clickable_when(!(any_busy || form == Some(SecurityForm::Recalibrate)))
             .on_click(
                 cx.listener(|this, _, w, cx| this.open(Some(SecurityForm::Recalibrate), w, cx)),
             );
@@ -561,6 +572,7 @@ impl Render for SecurityView {
             } else {
                 "Advanced, collapsed"
             })
+            .clickable()
             .on_click(move |_, _, cx| state.update(cx, |s, cx| s.toggle_security_advanced(cx)));
 
         let error_for = |f: SecurityForm| if form == Some(f) { error.clone() } else { None };
@@ -613,6 +625,7 @@ impl Render for SecurityView {
                 .danger()
                 .label("Rotate\u{2026}")
                 .disabled(any_busy || form == Some(SecurityForm::RotateKey))
+                .clickable_when(!(any_busy || form == Some(SecurityForm::RotateKey)))
                 .on_click(
                     cx.listener(|this, _, w, cx| this.open(Some(SecurityForm::RotateKey), w, cx)),
                 );

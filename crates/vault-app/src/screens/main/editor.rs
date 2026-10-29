@@ -14,18 +14,20 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Backspace, InputEvent, InputState, Textarea, TextareaState};
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::DropdownMenu as _;
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use vault_core::{ExposeSecret as _, FieldKind, strength_bits};
 
+use super::detail::history_disclosure;
 use super::generator::GeneratorView;
 use super::prompts;
 use super::sidebar::kind_singular;
 use crate::actions::{CancelEdit, SaveItem};
 use crate::state::{ADDABLE_KINDS, AppState, EditBuffer, GeneratorTarget, Mode, kind_name};
-use crate::ui;
+use crate::text;
+use crate::ui::{self, Clickable as _};
 
 enum ValueInput {
     Line(Entity<InputState>),
@@ -301,6 +303,7 @@ impl Editor {
             let state = self.state.clone();
             ui::icon_button((id, key), icon, label)
                 .disabled(to.is_none())
+                .clickable_when(to.is_some())
                 .on_click(move |_, _, cx| {
                     if let Some(to) = to {
                         state.update(cx, |s, cx| s.edit(cx, |b| b.move_field(key, to)));
@@ -354,6 +357,7 @@ impl Editor {
                 "Scan QR from image\u{2026}",
             )
             .loading(s.qr_scanning)
+            .clickable_when(!s.qr_scanning)
             .on_click(move |_, _, cx| state.update(cx, |s, cx| s.scan_totp_qr_file(key, cx)))
         });
         let generate = (field.kind == FieldKind::Password).then(|| {
@@ -565,12 +569,33 @@ impl Render for Editor {
             Mode::New(kind, _) => Some(kind),
             _ => None,
         };
-        let rows: Vec<AnyElement> = self
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(ix, row)| self.render_row(ix, row, buffer, s, cx))
-            .collect();
+        // Password history sits under the first password row, as in read mode, with
+        // per-entry remove buttons (edit mode only; a new item has no history).
+        let history_after = (new_kind.is_none() && !buffer.item.history.is_empty())
+            .then(|| {
+                buffer
+                    .item
+                    .fields
+                    .iter()
+                    .position(|f| f.kind == FieldKind::Password)
+            })
+            .flatten()
+            .and_then(|i| buffer.keys.get(i).copied());
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(self.rows.len() + 1);
+        for (ix, row) in self.rows.iter().enumerate() {
+            rows.push(self.render_row(ix, row, buffer, s, cx));
+            if history_after == Some(row.key) {
+                let history: Vec<_> = buffer.history().collect();
+                rows.push(history_disclosure(
+                    &history,
+                    Some(buffer.removed_history.len()),
+                    s,
+                    &self.state,
+                    text::now_millis(),
+                    cx,
+                ));
+            }
+        }
 
         let add_field = {
             let state = self.state.clone();
@@ -579,18 +604,17 @@ impl Render for Editor {
                 .small()
                 .icon(Icon::new(IconName::Plus))
                 .label("Add field")
+                .clickable()
                 .dropdown_menu(move |menu, _, _| {
                     ADDABLE_KINDS.into_iter().fold(menu, |menu, kind| {
                         let state = state.clone();
-                        menu.item(
-                            PopupMenuItem::new(kind_name(kind)).on_click(move |_, _, cx| {
-                                state.update(cx, |s, cx| {
-                                    s.edit(cx, |b| {
-                                        b.add_field(kind);
-                                    });
+                        menu.item(ui::menu_item(kind_name(kind), false, move |_, _, cx| {
+                            state.update(cx, |s, cx| {
+                                s.edit(cx, |b| {
+                                    b.add_field(kind);
                                 });
-                            }),
-                        )
+                            });
+                        }))
                     })
                 })
         };
@@ -612,6 +636,7 @@ impl Render for Editor {
                     .small()
                     .label("Cancel")
                     .tooltip("Cancel  Esc")
+                    .clickable()
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(CancelEdit), cx)),
             )
             .child(
@@ -620,6 +645,7 @@ impl Render for Editor {
                     .small()
                     .label(if new_kind.is_some() { "Create" } else { "Save" })
                     .tooltip("Save  ⌘S")
+                    .clickable()
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(SaveItem), cx)),
             );
 
@@ -982,5 +1008,70 @@ mod tests {
         state.read_with(&vcx, |s, _| {
             assert_eq!(s.selected_item().unwrap().tags, ["infra"])
         });
+    }
+
+    /// Trash buttons appear on history entries in edit mode only; clicking one marks
+    /// just that entry, reveals nothing, and "Clear history" marks the rest.
+    #[gpui::test]
+    fn history_trash_buttons_only_in_edit_mode(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _main, mut vcx) = open(dir.path(), cx);
+        let stamps = state.update(&mut vcx, |s, cx| {
+            let device = s.device_id();
+            let id = s
+                .vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| {
+                    let mut it = vault_core::Item::new(ItemKind::Login, "GitHub", device, 10);
+                    it.fields = vec![vault_core::Field::new(
+                        "password",
+                        FieldKind::Password,
+                        SecretString::new("a".into()),
+                        10,
+                    )];
+                    let id = v.insert(it, 10);
+                    v.set_field(id, "password", SecretString::new("b".into()), 20)?;
+                    v.set_field(id, "password", SecretString::new("c".into()), 30)?;
+                    Ok::<_, vault_core::VaultError>(id)
+                })
+                .unwrap()
+                .unwrap();
+            s.vault_changed();
+            s.select(id, cx);
+            s.toggle_history(cx);
+            let item = s.selected_item().unwrap();
+            item.history
+                .iter()
+                .map(|h| h.replaced_at)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(stamps.len(), 2);
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("history-remove 0").is_none(), "read mode");
+        assert!(vcx.debug_bounds("history-clear").is_none(), "read mode");
+
+        state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("history-remove 1").is_some());
+        let trash = vcx.debug_bounds("history-remove 0").expect("trash button");
+        vcx.simulate_click(trash.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| {
+            let b = s.edit_buffer().unwrap();
+            assert_eq!(b.removed_history, vec![stamps[0]]);
+            assert!(s.revealed.is_empty(), "removing reveals nothing");
+            assert_eq!(s.selected_item().unwrap().history.len(), 2, "not saved yet");
+        });
+        assert!(vcx.debug_bounds("history-remove 1").is_none(), "one left");
+
+        let clear = vcx.debug_bounds("history-clear").expect("clear button");
+        vcx.simulate_click(clear.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| {
+            assert_eq!(s.edit_buffer().unwrap().history().count(), 0);
+        });
+        assert!(vcx.debug_bounds("history-remove 0").is_none());
+        assert!(vcx.debug_bounds("history-clear").is_none());
     }
 }

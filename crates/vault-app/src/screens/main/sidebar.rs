@@ -18,7 +18,7 @@ use vault_core::ItemKind;
 use super::MainScreen;
 use crate::actions::{Lock, OpenSettings};
 use crate::state::Filter;
-use crate::ui;
+use crate::ui::{self, Clickable as _};
 
 /// Sidebar label and icon for an item kind.
 pub fn kind_label(kind: ItemKind) -> (&'static str, IconName) {
@@ -70,6 +70,7 @@ fn lock_button(cx: &App) -> Button {
         )
         .tooltip("Lock  ⌘L")
         .accessibility_label("Lock vault")
+        .clickable()
         .debug_selector(|| "sidebar-lock".into())
         .on_click(|_, window, cx| window.dispatch_action(Box::new(Lock), cx))
 }
@@ -95,7 +96,7 @@ fn nav_row(
         .gap(px(8.))
         .rounded(theme.radius)
         .text_sm()
-        .cursor_pointer()
+        .clickable()
         .map(|row| {
             if selected {
                 row.bg(theme.primary.opacity(0.16))

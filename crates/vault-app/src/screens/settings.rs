@@ -12,7 +12,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{InputEvent, InputState};
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::DropdownMenu as _;
 use gpui_component::switch::Switch;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::tag::Tag;
@@ -25,6 +25,7 @@ use crate::state::{
     AppState, Appearance, Busy, LoginRow, RestorePrompt, SECURITY_TAB, SYNC_TAB, Settings,
     SyncStatus, TRANSFER_TAB, TextSize,
 };
+use crate::ui::Clickable as _;
 use crate::{cloud, text, ui};
 
 const TABS: [&str; 5] = [
@@ -167,16 +168,17 @@ fn choice<T: Copy + PartialEq + 'static>(
         .small()
         .label(label(current))
         .icon(Icon::new(IconName::ChevronsUpDown))
+        .clickable()
         .dropdown_menu(move |menu, _, _| {
             choices.iter().fold(menu, |menu, value| {
                 let (value, state) = (*value, state.clone());
-                menu.item(
-                    PopupMenuItem::new(label(value))
-                        .checked(value == current)
-                        .on_click(move |_, _, cx| {
-                            state.update(cx, |s, cx| s.update_settings(cx, |st| apply(st, value)));
-                        }),
-                )
+                menu.item(ui::menu_item(
+                    label(value),
+                    value == current,
+                    move |_, _, cx| {
+                        state.update(cx, |s, cx| s.update_settings(cx, |st| apply(st, value)));
+                    },
+                ))
             })
         })
 }
@@ -194,7 +196,7 @@ fn segmented(
         .segmented()
         .small()
         .selected_index(selected)
-        .children(labels.iter().map(|l| Tab::new().label(*l)))
+        .children(labels.iter().map(|l| Tab::new().label(*l).clickable()))
         .on_click(move |ix: &usize, _, cx| {
             let ix = *ix;
             state.update(cx, |s, cx| s.update_settings(cx, |st| apply(st, ix)));
@@ -212,6 +214,7 @@ fn state_button(
     Button::new(id)
         .small()
         .label(label)
+        .clickable()
         .on_click(move |_, _, cx| state.update(cx, |s, cx| f(s, cx)))
 }
 
@@ -236,6 +239,7 @@ impl SettingsView {
                 Switch::new("lock-on-sleep")
                     .checked(settings.lock_on_sleep)
                     .accessibility_label("Lock on sleep, screen lock or user switch")
+                    .clickable()
                     .on_click(move |on, _, cx| {
                         let on = *on;
                         state.update(cx, |s, cx| {
@@ -298,6 +302,7 @@ impl SettingsView {
                 Switch::new("launch-at-login")
                     .checked(on)
                     .accessibility_label("Launch at login")
+                    .clickable()
                     .on_click(move |on, _, cx| {
                         let on = *on;
                         state.update(cx, |s, cx| s.set_launch_at_login(on, cx));
@@ -307,6 +312,7 @@ impl SettingsView {
             LoginRow::NeedsApproval => Button::new("login-items")
                 .small()
                 .label("Allow in System Settings\u{2026}")
+                .clickable()
                 .on_click(|_, _, _| vault_macos::open_login_items_settings())
                 .into_any_element(),
         };
@@ -368,6 +374,7 @@ impl SettingsView {
                         Button::new("reveal-vault")
                             .small()
                             .label("Reveal in Finder")
+                            .clickable()
                             .on_click(move |_, _, cx| cx.reveal_path(&reveal_path)),
                     ),
             )
@@ -386,7 +393,10 @@ impl SettingsView {
             .segmented()
             .small()
             .selected_index(current)
-            .children(Settings::RETENTION_CHOICES.map(|m| Tab::new().label(retention_label(m))))
+            .children(
+                Settings::RETENTION_CHOICES
+                    .map(|m| Tab::new().label(retention_label(m)).clickable()),
+            )
             .on_click(move |ix: &usize, _, cx| {
                 if let Some(m) = Settings::RETENTION_CHOICES.get(*ix).copied() {
                     retention_state.update(cx, |s, cx| {
@@ -402,6 +412,7 @@ impl SettingsView {
                 Switch::new("backup-enabled")
                     .checked(settings.backup_enabled)
                     .accessibility_label("Automatic backups")
+                    .clickable()
                     .on_click(move |on, _, cx| {
                         let on = *on;
                         enabled_state.update(cx, |s, cx| {
@@ -477,6 +488,7 @@ impl SettingsView {
                     move |s, cx| s.request_restore(path.clone(), cx),
                 )
                 .disabled(s.locked || s.busy.is_some())
+                .clickable_when(!s.locked && s.busy.is_none())
                 .when(s.locked, |b| b.tooltip("Unlock the vault to restore")),
             );
         ui::v_flex()
@@ -527,6 +539,7 @@ impl SettingsView {
                         .small()
                         .label("Restore")
                         .loading(busy)
+                        .clickable_when(!busy)
                         .on_click({
                             let input = self.restore_input.clone();
                             let state = self.state.clone();
@@ -632,7 +645,7 @@ impl Render for SettingsView {
             .underline()
             .small()
             .selected_index(tab)
-            .children(TABS.map(|t| Tab::new().label(t)))
+            .children(TABS.map(|t| Tab::new().label(t).clickable()))
             .on_click(move |ix: &usize, _, cx| {
                 let ix = *ix;
                 state.update(cx, |s, cx| {

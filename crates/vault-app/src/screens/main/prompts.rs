@@ -9,7 +9,7 @@ use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 
 use crate::state::AppState;
-use crate::ui;
+use crate::ui::{self, Clickable as _};
 
 /// A tinted strip with a message and two buttons.
 fn banner(
@@ -43,11 +43,13 @@ pub fn discard(s: &AppState, state: &Entity<AppState>, cx: &App) -> Option<AnyEl
             .danger()
             .small()
             .label("Discard")
+            .clickable()
             .on_click(move |_, _, cx| drop.update(cx, |s, cx| s.discard_changes(cx))),
         Button::new("discard-keep")
             .ghost()
             .small()
             .label("Keep editing")
+            .clickable()
             .on_click(move |_, _, cx| keep.update(cx, |s, cx| s.keep_editing(cx))),
         cx,
     ))
@@ -69,11 +71,13 @@ pub fn delete(s: &AppState, state: &Entity<AppState>, cx: &App) -> Option<AnyEle
             .danger()
             .small()
             .label("Delete")
+            .clickable()
             .on_click(move |_, _, cx| yes.update(cx, |s, cx| s.confirm_delete(cx))),
         Button::new("delete-cancel")
             .ghost()
             .small()
             .label("Cancel")
+            .clickable()
             .on_click(move |_, _, cx| no.update(cx, |s, cx| s.cancel_delete(cx))),
         cx,
     ))

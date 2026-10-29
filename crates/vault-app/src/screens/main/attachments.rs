@@ -18,6 +18,7 @@ use vault_core::{AttachmentRef, Item, Uuid};
 use vault_sync::AttachmentState;
 
 use crate::state::{AppState, PreviewContent, PreviewKind, preview_kind, state_label};
+use crate::ui::Clickable as _;
 use crate::{text, ui};
 
 /// Height of one text-preview line and the most the preview box grows to.
@@ -53,6 +54,7 @@ pub fn section(
             .label("Add file\u{2026}")
             .tooltip("Add files, or drop them on this column")
             .disabled(!s.can_attach() || s.busy.is_some())
+            .clickable_when(s.can_attach() && s.busy.is_none())
             .on_click(move |_, _, cx| state.update(cx, |s, cx| s.pick_attachment_files(cx)))
     };
     let header = ui::h_flex()
@@ -180,6 +182,7 @@ fn row(
                         .ghost()
                         .xsmall()
                         .label("Cancel")
+                        .clickable()
                         .on_click(move |_, _, cx| {
                             cancel.update(cx, |s, cx| s.cancel_remove_attachment(cx))
                         }),
@@ -189,6 +192,7 @@ fn row(
                         .danger()
                         .xsmall()
                         .label("Remove")
+                        .clickable()
                         .on_click(move |_, _, cx| {
                             confirm.update(cx, |s, cx| s.confirm_remove_attachment(id, cx))
                         }),
@@ -227,6 +231,7 @@ fn row(
                                 label,
                             )
                             .disabled(busy)
+                            .clickable_when(!busy)
                             .on_click(move |_, _, cx| {
                                 st.update(cx, |s, cx| s.toggle_attachment_preview(id, cx))
                             }),
@@ -241,6 +246,7 @@ fn row(
                     "Save decrypted copy\u{2026}",
                 )
                 .disabled(busy)
+                .clickable_when(!busy)
                 .on_click(move |_, _, cx| st.update(cx, |s, cx| s.save_attachment_copy(id, cx))),
             );
         }
@@ -257,6 +263,7 @@ fn row(
                             "Remove attachment",
                         )
                         .disabled(busy)
+                        .clickable_when(!busy)
                         .on_click(move |_, _, cx| {
                             st.update(cx, |s, cx| s.request_remove_attachment(id, cx))
                         }),
@@ -337,6 +344,7 @@ fn preview(
                     .ghost()
                     .xsmall()
                     .label("Close preview")
+                    .clickable()
                     .on_click(move |_, _, cx| close.update(cx, |s, cx| s.close_preview(cx))),
             ),
         )
@@ -388,6 +396,7 @@ pub fn save_sheet(s: &AppState, state: &Entity<AppState>, cx: &App) -> Option<An
                                 Button::new("attachment-save-cancel")
                                     .small()
                                     .label("Cancel")
+                                    .clickable()
                                     .on_click(move |_, _, cx| {
                                         cancel.update(cx, |s, cx| s.cancel_save_copy(cx))
                                     }),
@@ -397,6 +406,7 @@ pub fn save_sheet(s: &AppState, state: &Entity<AppState>, cx: &App) -> Option<An
                                     .small()
                                     .danger()
                                     .label("Save Copy")
+                                    .clickable()
                                     .on_click(move |_, _, cx| {
                                         confirm.update(cx, |s, cx| s.confirm_save_copy(cx))
                                     }),

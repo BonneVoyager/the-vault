@@ -12,7 +12,7 @@ use gpui_component::input::InputState;
 use gpui_component::{ActiveTheme as _, Sizable as _};
 
 use crate::state::{AppState, Busy};
-use crate::ui;
+use crate::ui::{self, Clickable as _};
 
 pub const CORRUPT: &str =
     "The vault file on disk is unreadable; your in-memory copy will be re-saved.";
@@ -57,6 +57,7 @@ pub fn render(
                             .small()
                             .label("Continue")
                             .loading(busy)
+                            .clickable_when(!busy)
                             .on_click(move |_, window, cx| {
                                 submit_key(&submit_state, &submit_input, window, cx);
                             }),

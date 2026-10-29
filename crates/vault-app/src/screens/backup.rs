@@ -27,6 +27,7 @@ use vault_core::{
 
 use super::main::avatar;
 use crate::state::{AppState, parse_totp};
+use crate::ui::Clickable as _;
 use crate::{listing, text, theme, ui};
 
 pub struct BackupWindow {
@@ -263,6 +264,7 @@ impl BackupWindow {
                             .w_full()
                             .label("Open")
                             .loading(self.busy)
+                            .clickable_when(!self.busy)
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )
@@ -281,6 +283,7 @@ impl BackupWindow {
                 ui::h_flex()
                     .id(("backup-row", id.as_u128() as usize))
                     .tab_index(0)
+                    .clickable()
                     .h(theme::scaled(48., cx))
                     .px(px(12.))
                     .gap(px(10.))
@@ -408,6 +411,7 @@ impl BackupWindow {
                             .small()
                             .label("Copy to current vault")
                             .disabled(!live)
+                            .clickable_when(live)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.copy_to_current(cx);
                             })),
@@ -464,6 +468,7 @@ impl Render for BackupWindow {
                         .small()
                         .danger()
                         .label("Replace current vault with this backup\u{2026}")
+                        .clickable()
                         .on_click(
                             cx.listener(|this, _, window, cx| this.replace_current(window, cx)),
                         ),

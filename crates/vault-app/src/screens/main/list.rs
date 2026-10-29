@@ -21,7 +21,7 @@ use crate::actions::{LIST_CONTEXT, SortAlphabetical, SortRecentlyModified};
 use crate::audit::Issue;
 use crate::listing::{self, Row};
 use crate::state::{AppState, GeneratorTarget, Sort};
-use crate::ui;
+use crate::ui::{self, Clickable as _};
 
 /// Row height at the default text size; scaled by the text size step.
 const ROW_HEIGHT: f32 = 56.;
@@ -137,7 +137,7 @@ fn render_row(
                         .px(px(8.))
                         .gap(px(10.))
                         .rounded(theme.radius_lg)
-                        .cursor_pointer()
+                        .clickable()
                         .map(|row| match (selected, list_focused) {
                             (true, true) => row.bg(theme.primary),
                             (true, false) => row.bg(theme.primary.opacity(0.14)),
@@ -211,7 +211,7 @@ fn kind_picker(state: &Entity<AppState>, cx: &App) -> AnyElement {
             .justify_start()
             .rounded(theme.radius)
             .text_sm()
-            .cursor_pointer()
+            .clickable()
             .hover(|style| style.bg(theme.accent))
             .active(|style| style.bg(theme.primary.opacity(0.16)))
             .map(|row| ui::focus_ring(row, cx))
@@ -291,6 +291,7 @@ fn empty_state(
                     .primary()
                     .small()
                     .label(label)
+                    .clickable()
                     .on_click(move |_, _, cx| {
                         state.update(cx, |s, cx| s.open_kind_picker(title.clone(), cx));
                     }),
@@ -313,16 +314,16 @@ impl MainScreen {
 
         let sort_button = ui::icon_button("sort", IconName::SortAscending, "Sort items")
             .dropdown_menu(move |menu, _, _| {
-                menu.menu_with_check(
+                menu.item(ui::menu_item(
                     "Name",
                     sort == Sort::Alphabetical,
-                    Box::new(SortAlphabetical),
-                )
-                .menu_with_check(
+                    |_, window, cx| window.dispatch_action(Box::new(SortAlphabetical), cx),
+                ))
+                .item(ui::menu_item(
                     "Recently Modified",
                     sort == Sort::RecentlyModified,
-                    Box::new(SortRecentlyModified),
-                )
+                    |_, window, cx| window.dispatch_action(Box::new(SortRecentlyModified), cx),
+                ))
                 // "Recently Created" stays hidden until core items carry a created_at.
             });
 
@@ -437,7 +438,8 @@ impl MainScreen {
                         .small()
                         .icon(Icon::new(IconName::Plus))
                         .label("New")
-                        .tooltip("New item  ⌘N"),
+                        .tooltip("New item  ⌘N")
+                        .clickable(),
                     Anchor::BottomLeft,
                     picker_open,
                     move |open, _, cx| {

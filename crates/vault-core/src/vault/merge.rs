@@ -27,7 +27,9 @@ use secrecy::ExposeSecret;
 
 use super::{ATTACHMENT_TOMBSTONE_CAP, HISTORY_CAP, UnlockedVault};
 use crate::error::VaultError;
-use crate::item::{AttachmentRef, AttachmentTombstone, Field, FieldKind, HistoryEntry, Item};
+use crate::item::{
+    AttachmentRef, AttachmentTombstone, Field, FieldKind, HistoryEntry, Item, Millis,
+};
 
 /// What `merge_from` did, per item id in `ours ∪ theirs`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -178,7 +180,11 @@ fn ours_wins_metadata(ours: &Item, theirs: &Item) -> bool {
 /// `(value, replaced_at = loser field modified_at)` so nothing is lost (03 §5). A losing
 /// value already present in the union by value (the common "only one side edited" case,
 /// where the winner recorded it when replacing it) is not pushed again, so merging an
-/// untouched copy never changes history. Then newest first, capped at [`HISTORY_CAP`].
+/// untouched copy never changes history. `removed_history` is the union of both stamp
+/// lists (newest first, capped at [`HISTORY_CAP`]); every history entry whose `replaced_at`
+/// is in that set is then dropped (including a conflict loser that happens to carry such a
+/// stamp), so a deletion survives a merge with a peer that still holds the entry. The rest
+/// is kept newest first, capped at [`HISTORY_CAP`].
 ///
 /// Attachment removal markers are the union by `id` with the greater `removed_at`, newest
 /// first, capped at [`ATTACHMENT_TOMBSTONE_CAP`]. Attachment references are the union by `id`
@@ -241,6 +247,10 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
             });
         }
     }
+    let mut removed_history = ours.removed_history.clone();
+    removed_history.extend_from_slice(&theirs.removed_history);
+    normalize_removed_history(&mut removed_history);
+    history.retain(|h| !removed_history.contains(&h.replaced_at));
     normalize_history(&mut history);
 
     let mut removed_attachments = ours.removed_attachments.clone();
@@ -277,6 +287,7 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
         history,
         attachments,
         removed_attachments,
+        removed_history,
         modified_at: ours.modified_at.max(theirs.modified_at),
         extras: winner.extras.clone(),
     }
@@ -295,6 +306,14 @@ pub(crate) fn normalize_attachment_tombstones(tombstones: &mut Vec<AttachmentTom
     let mut seen = std::collections::BTreeSet::new();
     tombstones.retain(|t| seen.insert(t.id));
     tombstones.truncate(ATTACHMENT_TOMBSTONE_CAP);
+}
+
+/// Sort removed-history stamps newest first, drop duplicates, and cap at [`HISTORY_CAP`].
+/// Shared with `remove_history_entry`, `clear_history`, `insert` and `update`.
+pub(crate) fn normalize_removed_history(stamps: &mut Vec<Millis>) {
+    stamps.sort_unstable_by(|a, b| b.cmp(a));
+    stamps.dedup();
+    stamps.truncate(HISTORY_CAP);
 }
 
 /// Sort history newest first (ties broken by value so the order is deterministic on every
@@ -365,4 +384,5 @@ pub fn item_eq(a: &Item, b: &Item) -> bool {
             .zip(&b.attachments)
             .all(|(x, y)| attachment_eq(x, y))
         && a.removed_attachments == b.removed_attachments
+        && a.removed_history == b.removed_history
 }

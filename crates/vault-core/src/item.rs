@@ -324,6 +324,12 @@ pub struct Item {
     /// Removal markers for attachment references (v1.1), newest first, capped at
     /// [`crate::vault::ATTACHMENT_TOMBSTONE_CAP`]. Written only when non-empty.
     pub removed_attachments: Vec<AttachmentTombstone>,
+    /// `replaced_at` stamps of history entries the user deleted (01 §4 `removed_history`),
+    /// newest first, deduplicated, capped at [`crate::vault::HISTORY_CAP`]. Never holds the
+    /// value. Written only when non-empty. Edit through
+    /// [`crate::UnlockedVault::remove_history_entry`] / `clear_history` so the item is
+    /// restamped; a merge drops every history entry whose stamp is in this list.
+    pub removed_history: Vec<Millis>,
     /// Must equal `max(field.modified_at, deleted_at, metadata change)`; the writer maintains it.
     pub modified_at: Millis,
     /// Unknown `ItemPlain` keys preserved from the file (01 §9).
@@ -346,6 +352,7 @@ impl Item {
             history: Vec::new(),
             attachments: Vec::new(),
             removed_attachments: Vec::new(),
+            removed_history: Vec::new(),
             modified_at: now,
             extras: Vec::new(),
         }
@@ -396,6 +403,7 @@ impl fmt::Debug for Item {
             )
             .field("attachments", &self.attachments)
             .field("removed_attachments", &self.removed_attachments)
+            .field("removed_history", &self.removed_history)
             .field("modified_at", &self.modified_at)
             .field(
                 "extras",

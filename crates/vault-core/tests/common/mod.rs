@@ -128,6 +128,8 @@ pub fn assert_item_eq(a: &Item, b: &Item) {
         assert_eq!(x.value.expose_secret(), y.value.expose_secret());
         assert_eq!(x.replaced_at, y.replaced_at);
     }
+    assert_eq!(a.removed_attachments, b.removed_attachments);
+    assert_eq!(a.removed_history, b.removed_history);
 }
 
 pub fn assert_vaults_eq(a: &UnlockedVault, b: &UnlockedVault) {

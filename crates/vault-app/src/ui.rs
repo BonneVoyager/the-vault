@@ -325,7 +325,73 @@ pub fn pick_new_path(dir: &Path, name: &str, cx: &App) -> Task<Option<PathBuf>> 
     })
 }
 
+/// Pointer (hand) cursor for everything the user can click: buttons, rows, links,
+/// toggles, tabs and menu rows. The one place that decides how a clickable element looks
+/// under the mouse; text inputs keep the I-beam and plain content keeps the arrow.
+///
+/// gpui-component 0.8.1 sets the pointer only on link and text buttons; Button (it
+/// forces the arrow, then re-applies the caller's style, so this wins), Switch, Checkbox,
+/// Tab and menu rows keep the arrow. Apply it after the builder's other calls.
+pub trait Clickable: gpui::Styled + Sized {
+    fn clickable(self) -> Self {
+        self.cursor_pointer()
+    }
+
+    /// `clickable` while `enabled`; otherwise the arrow, also overriding an earlier
+    /// `clickable` (such as `icon_button`'s), so a disabled or busy control never shows
+    /// the hand.
+    fn clickable_when(self, enabled: bool) -> Self {
+        if enabled {
+            self.clickable()
+        } else {
+            self.cursor_default()
+        }
+    }
+}
+
+impl<T: gpui::Styled> Clickable for T {}
+
+/// Horizontal padding gpui-component 0.8.1 gives a dropdown-menu row (`INNER_PADDING` in
+/// `menu/popup_menu.rs`, private there).
+const MENU_ROW_PAD_X: f32 = 8.;
+
+/// A dropdown-menu row with the pointer over its whole area and an optional trailing
+/// check mark. gpui-component's menu rows keep the arrow and take no style, so the row's
+/// content stretches to the row height and carries a pointer overlay that also covers the
+/// row's side padding. Do not mix with `.checked()` / icon items in the same menu: those
+/// add a slot this overlay does not cover.
+pub fn menu_item(
+    label: impl Into<SharedString>,
+    checked: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui_component::menu::PopupMenuItem {
+    let label = label.into();
+    gpui_component::menu::PopupMenuItem::element(move |_, _| {
+        h_flex()
+            .relative()
+            .flex_1()
+            .self_stretch()
+            .gap(px(12.))
+            .justify_between()
+            .child(label.clone())
+            .when(checked, |row| {
+                row.child(Icon::new(IconName::Check).xsmall())
+            })
+            .child(
+                gpui::div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(-MENU_ROW_PAD_X))
+                    .right(px(-MENU_ROW_PAD_X))
+                    .clickable(),
+            )
+    })
+    .on_click(on_click)
+}
+
 /// An icon-only ghost button. `label` is both the tooltip and the VoiceOver label (§6).
+/// Shows the pointer; a call site that disables it adds `.clickable_when(enabled)`.
 pub fn icon_button(id: impl Into<gpui::ElementId>, icon: IconName, label: &str) -> Button {
     let label = SharedString::from(label.to_owned());
     Button::new(id)
@@ -334,6 +400,7 @@ pub fn icon_button(id: impl Into<gpui::ElementId>, icon: IconName, label: &str) 
         .icon(Icon::new(icon))
         .tooltip(label.clone())
         .accessibility_label(label)
+        .clickable()
 }
 
 /// A 1 px horizontal rule.

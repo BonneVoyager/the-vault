@@ -4,3 +4,4 @@
 - [Sync feature decisions](sync-feature-decisions.md) — P3.1: `sync` feature, VaultKeyHandle (no Clone/Debug, duplicate()), unlock_with_key first-tag-failure=WrongPassword, rotation invalidates handles
 - [Forward-compat decisions](forward-compat-decisions.md) — Slot/OpaqueSlot, unit *Kind::Other + kind_raw, NoUsableSlot, fixture policy, what stays Malformed
 - [Attachment decisions](attachment-decisions.md) — v1.1: AttachmentRef, 42-byte chunk AAD bound to ATTACHMENT_VERSION=1 (not file version), seal by value, validate_ref everywhere, removal tombstones (cap 64) + merge rule, v1-attach fixture
+- [History tombstone decisions](history-tombstone-decisions.md) — removed_history [u64] optional key, cap 10 (HISTORY_CAP), remove-all-with-stamp, clear_history no-op when empty, merge drop after loser push, set_field stamp guard

@@ -20,7 +20,7 @@ use vault_core::{ExposeSecret as _, strength_bits};
 use crate::state::{
     AppState, CharClass, GenTab, GeneratorTarget, LENGTH_RANGE, SEPARATORS, WORDS_RANGE,
 };
-use crate::ui;
+use crate::ui::{self, Clickable as _};
 
 pub struct GeneratorView {
     state: Entity<AppState>,
@@ -81,6 +81,7 @@ impl GeneratorView {
         Checkbox::new(id)
             .label(label)
             .checked(checked)
+            .clickable()
             .on_click(move |_, _, cx| state.update(cx, |s, cx| s.update_generator(cx, f)))
     }
 }
@@ -126,8 +127,8 @@ impl Render for GeneratorView {
                 GenTab::Password => 0,
                 GenTab::Passphrase => 1,
             })
-            .child(Tab::new().label("Password"))
-            .child(Tab::new().label("Passphrase"))
+            .child(Tab::new().label("Password").clickable())
+            .child(Tab::new().label("Passphrase").clickable())
             .on_click({
                 let state = state.clone();
                 move |ix, _, cx| {
@@ -156,7 +157,11 @@ impl Render for GeneratorView {
                 ui::v_flex()
                     .gap(px(8.))
                     .child(ui::muted(format!("Length  {}", p.length), cx))
-                    .child(Slider::new(&self.length).accessibility_label("Password length"))
+                    .child(
+                        Slider::new(&self.length)
+                            .accessibility_label("Password length")
+                            .clickable(),
+                    )
                     .child(
                         ui::h_flex()
                             .gap(px(12.))
@@ -196,6 +201,7 @@ impl Render for GeneratorView {
                         .label(label)
                         .selected(p.separator == sep)
                         .when(p.separator == sep, |b| b.primary())
+                        .clickable()
                         .on_click(move |_, _, cx| {
                             state.update(cx, |s, cx| {
                                 s.update_generator(cx, |g| g.set_separator(sep))
@@ -205,7 +211,11 @@ impl Render for GeneratorView {
                 ui::v_flex()
                     .gap(px(8.))
                     .child(ui::muted(format!("Words  {}", p.words), cx))
-                    .child(Slider::new(&self.words).accessibility_label("Number of words"))
+                    .child(
+                        Slider::new(&self.words)
+                            .accessibility_label("Number of words")
+                            .clickable(),
+                    )
                     .child(
                         ui::h_flex()
                             .gap(px(4.))
@@ -235,6 +245,7 @@ impl Render for GeneratorView {
                     .small()
                     .icon(Icon::new(IconName::RefreshCw))
                     .label("Regenerate")
+                    .clickable()
                     .on_click({
                         let state = state.clone();
                         move |_, _, cx| {
@@ -248,6 +259,7 @@ impl Render for GeneratorView {
                     .small()
                     .icon(Icon::new(IconName::Copy))
                     .label("Copy")
+                    .clickable()
                     .on_click({
                         let state = state.clone();
                         move |_, _, cx| state.update(cx, |s, cx| s.copy_generated(cx))
@@ -259,6 +271,7 @@ impl Render for GeneratorView {
                         .primary()
                         .small()
                         .label("Use")
+                        .clickable()
                         .on_click(move |_, _, cx| state.update(cx, |s, cx| s.use_generated(cx))),
                 )
             });

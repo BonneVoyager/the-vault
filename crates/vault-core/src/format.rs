@@ -1014,8 +1014,9 @@ fn history_from_value(value: Value) -> Result<HistoryEntry, VaultError> {
 /// limitation of using a generic CBOR model.
 ///
 /// `attachments` is always written (as `[]` when the item has none); `removed_attachments`
-/// (`[{ "id": bytes(16), "removed_at": u64 }]`) is an optional key written only when
-/// non-empty, so files without removals keep their v1 byte layout.
+/// (`[{ "id": bytes(16), "removed_at": u64 }]`) and `removed_history` (`[u64]`, stamps
+/// newest first) are optional keys written only when non-empty, so files without removals
+/// keep their v1 byte layout.
 pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
     // NOTE: the `ciborium::Value` tree built here holds plaintext field values and attachment
     // keys as ordinary `String`s / `Vec<u8>`s and cannot be zeroized; only the encoded output
@@ -1054,6 +1055,17 @@ pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
                 item.removed_attachments
                     .iter()
                     .map(attachment_tombstone_to_value)
+                    .collect(),
+            ),
+        ));
+    }
+    if !item.removed_history.is_empty() {
+        known.push((
+            "removed_history",
+            Value::Array(
+                item.removed_history
+                    .iter()
+                    .map(|s| Value::from(*s))
                     .collect(),
             ),
         ));
@@ -1104,6 +1116,13 @@ pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<
             .map(attachment_tombstone_from_value)
             .collect::<Result<Vec<_>, _>>()?,
     };
+    let removed_history = match m.take("removed_history") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => as_array(v, "item.removed_history")?
+            .into_iter()
+            .map(|s| as_u64(s, "item.removed_history[]"))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     Ok(Item {
         id,
         kind,
@@ -1117,6 +1136,7 @@ pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<
         history,
         attachments,
         removed_attachments,
+        removed_history,
         modified_at,
         extras: m.finish(),
     })

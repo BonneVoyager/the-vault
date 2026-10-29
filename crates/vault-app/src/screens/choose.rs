@@ -16,7 +16,7 @@ use gpui_component::{ActiveTheme as _, Disableable as _};
 use crate::cloud;
 use crate::persist;
 use crate::state::{AppState, Busy, ChooseIntent};
-use crate::ui;
+use crate::ui::{self, Clickable as _};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -219,12 +219,14 @@ impl ChooseScreen {
                     .primary()
                     .label("Create new vault")
                     .disabled(busy.is_some())
+                    .clickable_when(busy.is_none())
                     .on_click(cx.listener(|this, _, window, cx| this.start_create(window, cx))),
             )
             .child(
                 Button::new("open")
                     .label("Open existing vault…")
                     .disabled(busy.is_some())
+                    .clickable_when(busy.is_none())
                     .on_click(cx.listener(|this, _, _, cx| this.open_existing(cx))),
             );
         if busy == Some(Busy::Opening) {
@@ -246,7 +248,7 @@ impl ChooseScreen {
                     .px(px(10.))
                     .py(px(6.))
                     .rounded(cx.theme().radius)
-                    .cursor_pointer()
+                    .clickable_when(busy.is_none())
                     .hover(|s| s.bg(cx.theme().accent))
                     .when(busy.is_none(), |row| {
                         row.on_click(move |_, _, cx| {
@@ -310,6 +312,7 @@ impl ChooseScreen {
                     .child(
                         Button::new("folder")
                             .label("Choose…")
+                            .clickable()
                             .on_click(cx.listener(|this, _, _, cx| this.choose_folder(cx))),
                     ),
             )
@@ -342,6 +345,7 @@ impl ChooseScreen {
                         .ghost()
                         .label("Back")
                         .disabled(busy.is_some())
+                        .clickable_when(busy.is_none())
                         .on_click(cx.listener(|this, _, window, cx| this.back(window, cx))),
                 )
                 .child(ui::submit_gate(
@@ -352,6 +356,7 @@ impl ChooseScreen {
                         .label("Create vault")
                         .loading(busy == Some(Busy::Calibrating))
                         .disabled(busy.is_some() || !ready)
+                        .clickable_when(busy.is_none() && ready)
                         .on_click(
                             cx.listener(|this, _, window, cx| this.submit_create(window, cx)),
                         ),

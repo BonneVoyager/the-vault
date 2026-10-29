@@ -7,8 +7,8 @@
 
 use gpui::{Context, SharedString};
 use vault_core::{
-    ExposeSecret, Field, FieldKind, Item, ItemKind, SecretString, Totp, UnlockedVault, Uuid,
-    VaultError,
+    ExposeSecret, Field, FieldKind, HistoryEntry, Item, ItemKind, Millis, SecretString, Totp,
+    UnlockedVault, Uuid, VaultError,
 };
 
 use super::{AppState, ChooseIntent, Filter, FocusTarget, Mode};
@@ -35,6 +35,9 @@ pub struct EditBuffer {
     pub remote_title: bool,
     /// Text in the tag input not yet committed with Enter or a comma; Save commits it.
     pub tag_draft: String,
+    /// `replaced_at` stamps of password-history entries the user removed in this edit.
+    /// Applied on Save (core `remove_history_entry`), dropped on Cancel.
+    pub removed_history: Vec<Millis>,
 }
 
 impl EditBuffer {
@@ -50,7 +53,38 @@ impl EditBuffer {
             remote_fields: Vec::new(),
             remote_title: false,
             tag_draft: String::new(),
+            removed_history: Vec::new(),
         }
+    }
+
+    /// Password-history entries still shown: the item's history minus pending removals.
+    pub fn history(&self) -> impl Iterator<Item = &HistoryEntry> {
+        self.item
+            .history
+            .iter()
+            .filter(|h| !self.removed_history.contains(&h.replaced_at))
+    }
+
+    /// Trash button on a history entry: marks the entry with `replaced_at` for removal.
+    pub fn remove_history(&mut self, replaced_at: Millis) {
+        let known = self
+            .item
+            .history
+            .iter()
+            .any(|h| h.replaced_at == replaced_at);
+        if known && !self.removed_history.contains(&replaced_at) {
+            self.removed_history.push(replaced_at);
+        }
+    }
+
+    /// "Clear history": marks every entry shown when editing began for removal. Entries
+    /// another device adds meanwhile are not touched.
+    pub fn clear_history(&mut self) {
+        let mut stamps: Vec<Millis> = self.history().map(|h| h.replaced_at).collect();
+        // Two merged entries can share a stamp; core removes them together.
+        stamps.sort_unstable();
+        stamps.dedup();
+        self.removed_history.extend(stamps);
     }
 
     /// Recomputes the "changed remotely" marks against `stored`, the item as it is in the
@@ -92,6 +126,7 @@ impl EditBuffer {
         self.item.title != self.original.title
             || self.item.tags != self.original.tags
             || self.draft_adds_tag()
+            || !self.removed_history.is_empty()
             || self.item.fields.len() != self.original.fields.len()
             || self
                 .item
@@ -475,6 +510,26 @@ fn apply_edit(
     Ok(id)
 }
 
+/// Removes the history entries stamped `removed` from item `id`, one core call each.
+/// A stamp no longer in the stored history (removed by a merge meanwhile) is skipped:
+/// core rejects it, and the entry is already gone.
+fn remove_history(
+    v: &mut UnlockedVault,
+    id: Uuid,
+    removed: &[Millis],
+    now: u64,
+) -> Result<(), VaultError> {
+    for stamp in removed {
+        let present = v
+            .get(id)
+            .is_some_and(|it| it.history.iter().any(|h| h.replaced_at == *stamp));
+        if present {
+            v.remove_history_entry(id, *stamp, now)?;
+        }
+    }
+    Ok(())
+}
+
 /// Flattens `SyncedVault::edit(|v| core_call)` into one error message.
 pub(super) fn edit_result<T>(
     r: Result<Result<T, VaultError>, vault_sync::SyncError>,
@@ -667,6 +722,7 @@ impl AppState {
             return;
         };
         let (keys, original) = (buffer.keys.clone(), buffer.original.clone());
+        let removed = buffer.removed_history.clone();
         let mut item = match buffer.finished() {
             Ok(item) => item,
             Err(e) => {
@@ -685,7 +741,12 @@ impl AppState {
             }
             vault.edit(|v| Ok(v.insert(item, now)))
         } else {
-            vault.edit(|v| apply_edit(v, item, &keys, &original, now))
+            vault.edit(|v| {
+                // History removals first, so `apply_edit`'s field diff (and a changed
+                // password's new history entry) runs on the trimmed history.
+                remove_history(v, item.id, &removed, now)?;
+                apply_edit(v, item, &keys, &original, now)
+            })
         };
         let id = match edit_result(result) {
             Ok(id) => id,
@@ -1349,5 +1410,116 @@ mod tests {
         assert_eq!(b.field(k1).unwrap().name, "one-time code");
         assert_eq!(b.field(k2).unwrap().name, "one-time code 2");
         assert_eq!(b.field(k3).unwrap().name, "url");
+    }
+
+    /// Gives GitHub's password two history entries ("old" at 20, "mid" at 30).
+    fn with_history(state: &Entity<AppState>, gh: Uuid, cx: &mut TestAppContext) {
+        state.update(cx, |s, cx| {
+            s.vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| {
+                    v.set_field(gh, "password", secret("mid"), 20)?;
+                    v.set_field(gh, "password", secret("new"), 30)
+                })
+                .unwrap()
+                .unwrap();
+            s.vault_changed();
+            s.select(gh, cx);
+        });
+    }
+
+    fn stamps(item: &Item) -> Vec<Millis> {
+        item.history.iter().map(|h| h.replaced_at).collect()
+    }
+
+    #[gpui::test]
+    fn removed_history_entry_is_gone_after_save(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, gh, _) = setup(dir.path(), cx);
+        with_history(&state, gh, cx);
+        state.update(cx, |s, cx| {
+            let before = stored(s, gh);
+            assert_eq!(before.history.len(), 2);
+            let gone = before.history[0].replaced_at;
+            let kept = before.history[1].replaced_at;
+            s.begin_edit(cx);
+            s.edit(cx, |b| b.remove_history(gone));
+            let b = s.edit_buffer().unwrap();
+            assert!(b.has_changes(), "a pending removal is a change");
+            assert_eq!(b.history().count(), 1);
+            assert_eq!(b.item.history.len(), 2, "nothing removed before Save");
+            assert_eq!(stored(s, gh).history.len(), 2);
+            s.save_edit(cx);
+            assert!(!s.is_editing());
+            let after = stored(s, gh);
+            assert_eq!(stamps(&after), vec![kept]);
+            assert!(after.removed_history.contains(&gone));
+            assert_eq!(
+                after.field("password").unwrap().value.expose_secret(),
+                "new"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn cancel_discards_history_removals(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, gh, _) = setup(dir.path(), cx);
+        with_history(&state, gh, cx);
+        state.update(cx, |s, cx| {
+            let before = stamps(&stored(s, gh));
+            s.begin_edit(cx);
+            s.edit(cx, |b| b.clear_history());
+            s.cancel_edit(cx);
+            assert!(!s.is_editing());
+            let after = stored(s, gh);
+            assert_eq!(stamps(&after), before);
+            assert!(after.removed_history.is_empty());
+            // A fresh edit starts with nothing pending.
+            s.begin_edit(cx);
+            let b = s.edit_buffer().unwrap();
+            assert!(b.removed_history.is_empty());
+            assert!(!b.has_changes());
+        });
+    }
+
+    #[gpui::test]
+    fn clear_history_empties_it_on_save(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, gh, _) = setup(dir.path(), cx);
+        with_history(&state, gh, cx);
+        state.update(cx, |s, cx| {
+            let before = stamps(&stored(s, gh));
+            s.begin_edit(cx);
+            s.edit(cx, |b| b.clear_history());
+            assert_eq!(s.edit_buffer().unwrap().history().count(), 0);
+            s.save_edit(cx);
+            let after = stored(s, gh);
+            assert!(after.history.is_empty());
+            for stamp in before {
+                assert!(after.removed_history.contains(&stamp));
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn guard_prompts_when_only_a_history_removal_is_pending(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, gh, note) = setup(dir.path(), cx);
+        with_history(&state, gh, cx);
+        state.update(cx, |s, cx| {
+            let stamp = stored(s, gh).history[0].replaced_at;
+            s.begin_edit(cx);
+            s.edit(cx, |b| b.remove_history(stamp));
+            s.select(note, cx);
+            assert_eq!(s.discard_prompt, Some(Navigation::Select(note)));
+            assert!(s.is_editing());
+            assert_eq!(s.selection, Some(gh));
+            // Discard drops the removal.
+            s.discard_changes(cx);
+            assert_eq!(s.selection, Some(note));
+            assert_eq!(stored(s, gh).history.len(), 2);
+        });
     }
 }

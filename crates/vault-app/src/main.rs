@@ -7,6 +7,7 @@ mod autolock;
 mod biometric;
 mod clipboard;
 mod cloud;
+mod cursor_audit;
 mod listing;
 mod persist;
 mod root;

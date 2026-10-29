@@ -103,7 +103,7 @@ Field-level merge, keyed by `field.name`:
 | present | absent | keep ours (field deletion is not tracked in v1; a removed field reappears if the other side still has it — accepted) |
 | both | — | greater `modified_at` wins; tie → greater `device_id` of the owning item; tie → ours |
 
-`history` is merged by union on `(value, replaced_at)`, sorted, capped to 10 newest.
+`history` is merged by union on `(value, replaced_at)`, sorted, capped to 10 newest; `removed_history` stamps are unioned (cap 10 newest) and any history entry whose `replaced_at` is in the set is dropped, so a user's deletion of a history entry survives merge. A later `set_field` producing an entry with a stamp already in the set gets `max(now, stamp+1)`, which the monotone stamp rule guarantees anyway. Markers are keyed by stamp alone: if two devices change the same password in the same millisecond from the same base and one side deletes that history stamp before merging, the conflict-loser value is dropped with it. Accepted.
 
 `attachments` are merged by union on `id` (sorted by `added_at`, then `id`); `removed_attachments` tombstones are unioned with the greatest `removed_at` per id, and a ref is dropped when a tombstone for its id has `removed_at ≥ added_at`. Unlike fields, an attachment removal therefore survives a merge with a device that still holds the ref.
 
