@@ -25,9 +25,9 @@ use std::cmp::Ordering;
 
 use secrecy::ExposeSecret;
 
-use super::{HISTORY_CAP, UnlockedVault};
+use super::{ATTACHMENT_TOMBSTONE_CAP, HISTORY_CAP, UnlockedVault};
 use crate::error::VaultError;
-use crate::item::{Field, FieldKind, HistoryEntry, Item};
+use crate::item::{AttachmentRef, AttachmentTombstone, Field, FieldKind, HistoryEntry, Item};
 
 /// What `merge_from` did, per item id in `ours ∪ theirs`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,8 +67,13 @@ impl UnlockedVault {
     /// same outcome either way.
     ///
     /// **Extras.** For an id present on both sides, ours' plaintext `record_extras` are kept
-    /// and theirs ignored. Inside the item, the metadata loser's `ItemPlain` extras (which is
-    /// where a v1.1 `attachments` array lands) are dropped; only the winner's survive.
+    /// and theirs ignored. Inside the item, the metadata loser's `ItemPlain` extras are
+    /// dropped; only the winner's survive.
+    ///
+    /// **Attachments** (v1.1) of two live items are merged by union on `id`, sorted by
+    /// `(added_at, id)`, after applying the union of both sides' removal markers: a
+    /// reference whose id has a marker with `removed_at >= added_at` is dropped. A removal
+    /// on one side therefore wins over the other side's untouched copy; see [`merge_live`].
     ///
     /// **Purged tombstones.** A peer that has been offline since before a delete still holds
     /// the live item; if the tombstone was purged here in the meantime, merging that peer
@@ -174,6 +179,14 @@ fn ours_wins_metadata(ours: &Item, theirs: &Item) -> bool {
 /// value already present in the union by value (the common "only one side edited" case,
 /// where the winner recorded it when replacing it) is not pushed again, so merging an
 /// untouched copy never changes history. Then newest first, capped at [`HISTORY_CAP`].
+///
+/// Attachment removal markers are the union by `id` with the greater `removed_at`, newest
+/// first, capped at [`ATTACHMENT_TOMBSTONE_CAP`]. Attachment references are the union by `id`
+/// (ours' copy kept when both carry an id; the blob and reference are immutable so the copies
+/// can only differ if something is wrong) minus every reference whose id has a marker with
+/// `removed_at >= added_at`, sorted by `(added_at, id)` so both sides produce the same order.
+/// Ids are random and never reused, so a marker can only ever match the reference it was
+/// written for.
 fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
     let ours_wins = ours_wins_metadata(ours, theirs);
     let (winner, loser) = if ours_wins {
@@ -230,6 +243,27 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
     }
     normalize_history(&mut history);
 
+    let mut removed_attachments = ours.removed_attachments.clone();
+    removed_attachments.extend_from_slice(&theirs.removed_attachments);
+    normalize_attachment_tombstones(&mut removed_attachments);
+    let removed = |a: &AttachmentRef| {
+        removed_attachments
+            .iter()
+            .any(|t| t.id == a.id && t.removed_at >= a.added_at)
+    };
+    let mut attachments: Vec<AttachmentRef> = ours
+        .attachments
+        .iter()
+        .filter(|a| !removed(a))
+        .cloned()
+        .collect();
+    for a in &theirs.attachments {
+        if ours.attachment(a.id).is_none() && !removed(a) {
+            attachments.push(a.clone());
+        }
+    }
+    attachments.sort_by(|a, b| a.added_at.cmp(&b.added_at).then_with(|| a.id.cmp(&b.id)));
+
     Item {
         id: ours.id,
         kind: winner.kind,
@@ -241,9 +275,26 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
         tags: winner.tags.clone(),
         fields,
         history,
+        attachments,
+        removed_attachments,
         modified_at: ours.modified_at.max(theirs.modified_at),
         extras: winner.extras.clone(),
     }
+}
+
+/// Sort attachment removal markers newest first (ties by id), keep one marker per id (the
+/// greatest `removed_at`), and cap at [`ATTACHMENT_TOMBSTONE_CAP`]. Shared with
+/// `remove_attachment_ref`, `insert` and `update`.
+pub(crate) fn normalize_attachment_tombstones(tombstones: &mut Vec<AttachmentTombstone>) {
+    tombstones.sort_by(|a, b| {
+        b.removed_at
+            .cmp(&a.removed_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    // After the sort the first occurrence of an id is its greatest removed_at.
+    let mut seen = std::collections::BTreeSet::new();
+    tombstones.retain(|t| seen.insert(t.id));
+    tombstones.truncate(ATTACHMENT_TOMBSTONE_CAP);
 }
 
 /// Sort history newest first (ties broken by value so the order is deterministic on every
@@ -278,6 +329,16 @@ fn field_eq(a: &Field, b: &Field) -> bool {
     a.modified_at == b.modified_at && field_content_eq(a, b)
 }
 
+fn attachment_eq(a: &AttachmentRef, b: &AttachmentRef) -> bool {
+    a.id == b.id
+        && a.name == b.name
+        && a.size == b.size
+        && a.added_at == b.added_at
+        && a.chunk_nonces == b.chunk_nonces
+        && a.extras == b.extras
+        && a.key.as_ref() == b.key.as_ref()
+}
+
 /// Full structural equality including secrets and order. `Item` has no `PartialEq` (it holds
 /// secrets), so merge decides "unchanged" here.
 pub fn item_eq(a: &Item, b: &Item) -> bool {
@@ -298,4 +359,10 @@ pub fn item_eq(a: &Item, b: &Item) -> bool {
             .iter()
             .zip(&b.history)
             .all(|(x, y)| history_entry_eq(x, y))
+        && a.attachments.len() == b.attachments.len()
+        && a.attachments
+            .iter()
+            .zip(&b.attachments)
+            .all(|(x, y)| attachment_eq(x, y))
+        && a.removed_attachments == b.removed_attachments
 }

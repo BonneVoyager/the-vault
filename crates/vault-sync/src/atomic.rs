@@ -1,4 +1,4 @@
-//! Atomic replace of the primary file (03 §2 steps 2-5).
+//! Atomic replace of the primary file (03 §2 steps 2-5) and of attachment blobs (03 §1.1).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -67,12 +67,37 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), 
     write_atomic_with(path, bytes, mode, |src, dst| fs::hard_link(src, dst))
 }
 
+/// [`write_atomic`] with the content streamed by `fill` instead of passed as a slice. `fill`
+/// gets the open tmp file and its path (for error reporting); if it fails, the tmp is removed
+/// and its error returned with `path` untouched.
+pub(crate) fn write_atomic_stream(
+    path: &Path,
+    mode: Mode,
+    fill: impl FnOnce(&mut File, &Path) -> Result<(), SyncError>,
+) -> Result<(), SyncError> {
+    write_atomic_inner(path, mode, fill, |src, dst| fs::hard_link(src, dst))
+}
+
 /// [`write_atomic`] with the hard-link call injectable, so tests can simulate filesystems
 /// without hard links.
 fn write_atomic_with(
     path: &Path,
     bytes: &[u8],
     mode: Mode,
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), SyncError> {
+    write_atomic_inner(
+        path,
+        mode,
+        |file, tmp| file.write_all(bytes).map_err(|e| SyncError::io(tmp, e)),
+        link,
+    )
+}
+
+fn write_atomic_inner(
+    path: &Path,
+    mode: Mode,
+    fill: impl FnOnce(&mut File, &Path) -> Result<(), SyncError>,
     link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<(), SyncError> {
     let tmp = tmp_path(path);
@@ -82,7 +107,7 @@ fn write_atomic_with(
         armed: true,
     };
 
-    file.write_all(bytes).map_err(|e| SyncError::io(&tmp, e))?;
+    fill(&mut file, &tmp)?;
     file.sync_all().map_err(|e| SyncError::io(&tmp, e))?;
     drop(file);
 
@@ -196,6 +221,27 @@ mod tests {
         let target = dir.path().join("a.vault");
         write_atomic(&target, b"ours", Mode::NoReplace).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"ours");
+        assert!(leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn stream_fill_failure_removes_tmp_and_keeps_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.bin");
+        let err = write_atomic_stream(&target, Mode::Replace, |file, tmp| {
+            file.write_all(b"partial").unwrap();
+            Err(SyncError::io(tmp, ErrorKind::InvalidData.into()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, SyncError::Io { .. }), "{err:?}");
+        assert!(!target.exists());
+        assert!(leftovers(dir.path()).is_empty());
+
+        write_atomic_stream(&target, Mode::Replace, |file, tmp| {
+            file.write_all(b"whole").map_err(|e| SyncError::io(tmp, e))
+        })
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"whole");
         assert!(leftovers(dir.path()).is_empty());
     }
 

@@ -30,4 +30,8 @@ pub enum SyncEvent {
     /// with the same password, so a rollback is indistinguishable from a rotation by design.
     /// Worth telling the user.
     KeyRotatedOnDisk,
+    /// Orphan cleanup after a save (03 §1.1) deleted this many attachment blobs that no item
+    /// references any more and that were older than the 24 h grace period. Stale tmp files
+    /// are not counted.
+    AttachmentsPruned(usize),
 }

@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Context, Entity, FontWeight,
+    Animation, AnimationExt as _, AnyElement, App, Context, Entity, ExternalPaths, FontWeight,
     InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, ease_in_out,
     prelude::FluentBuilder as _, px,
@@ -20,13 +20,14 @@ use gpui_kit_assets::IconName;
 use vault_core::{ExposeSecret, Field, FieldKind, Item};
 
 use super::MainScreen;
+use super::attachments;
 use super::list::{alert_dot, avatar};
 use super::prompts;
 use super::sidebar::kind_singular;
 use super::sync_banners;
 use crate::actions::{DETAIL_CONTEXT, DeleteItem, EditItem, ToggleFavorite};
 use crate::audit::Issue;
-use crate::state::{AppState, CopyTarget, ToastPlace, parse_totp};
+use crate::state::{AppState, CopyTarget, Mode, ToastPlace, parse_totp};
 use crate::{text, ui};
 
 /// History entries shown in the disclosure (01 §4 caps history at 10 anyway).
@@ -186,6 +187,9 @@ fn onboarding(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
 
 impl MainScreen {
     pub(super) fn render_detail(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // A selection change wipes the decrypted attachment preview before anything draws.
+        self.state
+            .update(cx, |s, cx| s.follow_attachment_selection(cx));
         let s = self.state.read(cx);
         let toast = s
             .toast
@@ -197,8 +201,8 @@ impl MainScreen {
         let motion_key =
             s.selection.map_or(0, |id| id.as_u128() as usize) ^ usize::from(s.is_editing());
         let reduce_motion = s.reduce_motion || s.selection.is_none();
-        let content: AnyElement = match s.selected_item() {
-            _ if s.is_editing() => self.editor.clone().into_any_element(),
+        let content: AnyElement = match s.shown_item() {
+            _ if s.is_editing() => self.render_editing(s, cx),
             Some(item) => self.render_item(item, s, cx).into_any_element(),
             None if detail_placeholder(s) == Some(ONBOARDING_TITLE) => {
                 onboarding(&self.state, cx).into_any_element()
@@ -224,6 +228,10 @@ impl MainScreen {
         };
 
         let banners = sync_banners::render(s, &self.state, &self.key_input, cx);
+        let save_sheet = attachments::save_sheet(s, &self.state, cx);
+        let droppable = s.can_attach();
+        let drop_state = self.state.clone();
+        let drop_tint = cx.theme().primary.opacity(0.08);
 
         ui::v_flex()
             .id("detail")
@@ -233,6 +241,14 @@ impl MainScreen {
             .size_full()
             .relative()
             .map(|el| ui::focus_ring(el, cx))
+            // Files dropped from Finder become attachments of the shown item.
+            .when(droppable, |col| {
+                col.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_tint))
+                    .on_drop(move |paths: &ExternalPaths, _, cx| {
+                        let paths = paths.paths().to_vec();
+                        drop_state.update(cx, |s, cx| s.add_attachment_files(paths, cx));
+                    })
+            })
             .children(banners)
             .child(ui::panel_in(
                 div().flex_1().min_h_0().child(content),
@@ -251,6 +267,36 @@ impl MainScreen {
                         .child(ui::pill(message, cx)),
                 )
             })
+            .children(save_sheet)
+            .into_any_element()
+    }
+
+    /// Edit mode: the editor, with the attachments strip pinned below it (existing items
+    /// only; a new item is not in the vault yet).
+    fn render_editing(&self, s: &AppState, cx: &App) -> AnyElement {
+        let editor = self.editor.clone().into_any_element();
+        let strip = match (&s.mode, s.shown_item()) {
+            (Mode::Edit(_), Some(item)) => attachments::section(s, &self.state, item, true, cx),
+            _ => None,
+        };
+        let Some(strip) = strip else {
+            return editor;
+        };
+        ui::v_flex()
+            .size_full()
+            .child(div().flex_1().min_h_0().child(editor))
+            .child(
+                div()
+                    .id("attachments-edit")
+                    .flex_none()
+                    .max_h(px(220.))
+                    .overflow_y_scroll()
+                    .px(px(ui::COLUMN_PAD_X - ui::FOCUS_RING_WIDTH))
+                    .py(px(8.))
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(strip),
+            )
             .into_any_element()
     }
 
@@ -355,6 +401,7 @@ impl MainScreen {
                     .child(ui::divider(cx))
             })
             .child(ui::v_flex().children(fields))
+            .children(attachments::section(s, &self.state, item, false, cx))
             .child(
                 ui::muted(
                     format!(

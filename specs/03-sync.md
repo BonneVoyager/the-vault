@@ -18,6 +18,14 @@ Dependencies: `vault-core`, `notify` (+ `notify-debouncer-full`), `tempfile`, `f
 
 Everything in `.backups/` is a complete, independently-openable vault file. Backups are encrypted; the directory is safe to sync.
 
+### 1.1 Attachments directory
+
+`<name>.vault.attachments/<id hex>.bin`, one immutable blob per attachment (`01` §4). Writes are atomic (tmp + fsync + rename, mode 0600) like the vault. Reads call `ensure_downloaded` first; an evicted or absent blob is reported as `AttachmentState::NotDownloaded` / `Missing`, never as an error that blocks the item. Blobs are immutable, so there is nothing to merge.
+
+**Orphan cleanup**: after each `save` that wrote the file, a blob whose id is referenced by no item (live or tombstoned) is deleted once it has been present locally for more than 24 h. "Present locally" is measured from `max(mtime, ctime)`: cloud providers preserve the source device's mtime, but ctime is set by the local kernel on create or rename and cannot be forged, so a peer's blob that arrives before its vault file always gets the full grace period. The same rule applies to stale tmp files (1 h). Cleanup never runs while locked. References are judged by this device's state after the pre-save merge; a reference a peer holds only in memory does not protect its blob once the grace period has passed (the app's 2 s autosave keeps that window theoretical). Deleting an item keeps its refs on the tombstone until `purge_tombstones_older_than`, so the other device learns about the deletion before the blob can go.
+
+**Limitation (owner decision 2026-10-29): attachments are not backed up.** Snapshots copy only the vault file. Restoring a backup may yield references whose blobs are gone; those show as `Missing`. Attachment size cap 100 MB per file.
+
 ## 2. Writing — `SyncedVault::save`
 
 ```
@@ -97,6 +105,8 @@ Field-level merge, keyed by `field.name`:
 
 `history` is merged by union on `(value, replaced_at)`, sorted, capped to 10 newest.
 
+`attachments` are merged by union on `id` (sorted by `added_at`, then `id`); `removed_attachments` tombstones are unioned with the greatest `removed_at` per id, and a ref is dropped when a tombstone for its id has `removed_at ≥ added_at`. Unlike fields, an attachment removal therefore survives a merge with a device that still holds the ref.
+
 Result item `modified_at = max(ours, theirs)`. Merged item takes `device_id` of whichever side supplied the winning metadata.
 
 Timestamps are monotone per item: every write stamps `max(now, previous + 1)`, so a clock that went backwards cannot resurrect a deleted item or let an older edit win. If a merge changes an item's content without changing its `modified_at` (possible when both sides carry the same timestamp), the merge bumps `modified_at` by one so the manifest check and the other device see the change. Two devices converge within two merge rounds.
@@ -163,6 +173,12 @@ impl SyncedVault {
     pub fn backups(&self) -> Result<Vec<BackupInfo>, SyncError>;
     pub fn backup_now(&mut self) -> Result<PathBuf, SyncError>;
     pub fn restore_from(&mut self, backup: &Path, password: &SecretString) -> Result<(), SyncError>;
+
+    // attachments (v1.1) — streaming; the ref is added to / removed from the item by the caller via `edit`
+    pub fn add_attachment(&mut self, item: Uuid, name: &str, data: impl Read, size: u64, now: Millis) -> Result<Uuid, SyncError>; // seals + writes blob, appends ref, marks dirty
+    pub fn open_attachment(&self, item: Uuid, id: Uuid) -> Result<AttachmentReader, SyncError>;  // streaming decrypt; NotDownloaded / Missing
+    pub fn attachment_state(&self, id: Uuid) -> AttachmentState;                                  // Present | NotDownloaded | Missing
+    pub fn remove_attachment(&mut self, item: Uuid, id: Uuid, now: Millis) -> Result<(), SyncError>; // drops the ref; blob goes via orphan cleanup
 }
 
 pub enum SyncEvent {

@@ -7203,6 +7203,7 @@ dependencies = [
  "vault-core",
  "vault-macos",
  "vault-sync",
+ "zeroize",
  "zip",
 ]
 
@@ -7280,6 +7281,8 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "vault-core",
+ "vault-sync",
+ "zeroize",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@ use ciborium::Value;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// Unix milliseconds. Always passed in by the caller; the core never reads a clock.
 pub type Millis = u64;
@@ -231,6 +232,73 @@ impl fmt::Debug for HistoryEntry {
     }
 }
 
+/// A reference to one encrypted attachment blob (01 §4 "Attachments (v1.1)"). Lives inside
+/// the item's ciphertext, so the name, size and key are encrypted and the reference is
+/// authenticated together with the item. The blob itself is immutable and stored next to the
+/// vault as `<name>.vault.attachments/<id hex>.bin` (see [`crate::attachment`]).
+///
+/// Build one with [`crate::attachment::new_ref`]; `key` and `chunk_nonces` are then random
+/// and consistent with `size`. No `Debug` derive: the manual impl redacts `key`.
+#[derive(Clone)]
+pub struct AttachmentRef {
+    /// Random v4 id; also the blob file name (`attachment::blob_file_name`).
+    pub id: Uuid,
+    /// Original file name, for display only (not used to locate the blob).
+    pub name: String,
+    /// Plaintext length in bytes, at most [`crate::attachment::MAX_ATTACHMENT_SIZE`].
+    pub size: u64,
+    /// Per-attachment random 32-byte XChaCha20-Poly1305 key, wiped on drop.
+    pub key: Zeroizing<[u8; 32]>,
+    /// One random 24-byte nonce per chunk; `len()` is the chunk count
+    /// (`max(1, ceil(size / CHUNK_SIZE))`).
+    pub chunk_nonces: Vec<[u8; 24]>,
+    /// When the reference was added (unix millis). Merge order key.
+    pub added_at: Millis,
+    /// Unknown keys preserved from the file (01 §9).
+    pub extras: Extras,
+}
+
+impl AttachmentRef {
+    /// Number of chunks in the blob (`chunk_nonces.len()`).
+    pub fn chunk_count(&self) -> usize {
+        self.chunk_nonces.len()
+    }
+}
+
+impl fmt::Debug for AttachmentRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AttachmentRef")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("size", &self.size)
+            .field("key", &"[REDACTED]")
+            .field(
+                "chunk_nonces",
+                &format_args!("[{} nonces]", self.chunk_nonces.len()),
+            )
+            .field("added_at", &self.added_at)
+            .field(
+                "extras",
+                &format_args!("[{} extras redacted]", self.extras.len()),
+            )
+            .finish()
+    }
+}
+
+/// Removal marker for an attachment reference (01 §4, v1.1 `removed_attachments`). Written
+/// by [`crate::UnlockedVault::remove_attachment_ref`] so that a merge with a peer that still
+/// carries the reference drops it instead of resurrecting it (the blob may already be
+/// pruned). Holds no secret. Capped per item at [`crate::vault::ATTACHMENT_TOMBSTONE_CAP`]
+/// and purged with the item tombstones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttachmentTombstone {
+    /// The removed reference's id.
+    pub id: Uuid,
+    /// The item stamp of the removal (unix millis). A reference whose `added_at` is at or
+    /// before this is considered removed.
+    pub removed_at: Millis,
+}
+
 /// A decrypted item. `id` and `modified_at` are stored in plaintext on the record; everything
 /// else is inside the ciphertext.
 #[derive(Clone)]
@@ -249,10 +317,16 @@ pub struct Item {
     pub tags: Vec<String>,
     pub fields: Vec<Field>,
     pub history: Vec<HistoryEntry>,
+    /// Attachment references (01 §4, v1.1). Empty for every v1 file. Add and remove through
+    /// [`crate::UnlockedVault::add_attachment_ref`] / `remove_attachment_ref` so the item is
+    /// restamped; the blobs themselves are managed by `vault-sync`.
+    pub attachments: Vec<AttachmentRef>,
+    /// Removal markers for attachment references (v1.1), newest first, capped at
+    /// [`crate::vault::ATTACHMENT_TOMBSTONE_CAP`]. Written only when non-empty.
+    pub removed_attachments: Vec<AttachmentTombstone>,
     /// Must equal `max(field.modified_at, deleted_at, metadata change)`; the writer maintains it.
     pub modified_at: Millis,
-    /// Unknown `ItemPlain` keys preserved from the file (01 §9). A v1.1 `attachments` array
-    /// also lands here so that a v1 writer does not drop it.
+    /// Unknown `ItemPlain` keys preserved from the file (01 §9).
     pub extras: Extras,
 }
 
@@ -270,6 +344,8 @@ impl Item {
             tags: Vec::new(),
             fields: Vec::new(),
             history: Vec::new(),
+            attachments: Vec::new(),
+            removed_attachments: Vec::new(),
             modified_at: now,
             extras: Vec::new(),
         }
@@ -292,6 +368,11 @@ impl Item {
     pub fn field(&self, name: &str) -> Option<&Field> {
         self.fields.iter().find(|f| f.name == name)
     }
+
+    /// The attachment reference with this id, if any.
+    pub fn attachment(&self, id: Uuid) -> Option<&AttachmentRef> {
+        self.attachments.iter().find(|a| a.id == id)
+    }
 }
 
 impl fmt::Debug for Item {
@@ -313,6 +394,8 @@ impl fmt::Debug for Item {
                 "history",
                 &format_args!("[{} entries redacted]", self.history.len()),
             )
+            .field("attachments", &self.attachments)
+            .field("removed_attachments", &self.removed_attachments)
             .field("modified_at", &self.modified_at)
             .field(
                 "extras",
@@ -386,9 +469,30 @@ mod tests {
         item.fields[0]
             .extras
             .push((Value::Text("x".into()), Value::Text("secret-ext".into())));
-        let s = format!("{item:?} {:?} {:?}", item.fields[0], item.history[0]);
+        item.attachments.push(AttachmentRef {
+            id: Uuid::nil(),
+            name: "doc.pdf".into(),
+            size: 3,
+            key: Zeroizing::new([0xA7; 32]),
+            chunk_nonces: vec![[0xB8; 24]],
+            added_at: 2,
+            extras: vec![(
+                Value::Text("y".into()),
+                Value::Text("secret-att-ext".into()),
+            )],
+        });
+        let s = format!(
+            "{item:?} {:?} {:?} {:?}",
+            item.fields[0], item.history[0], item.attachments[0]
+        );
         assert!(!s.contains("hunter"));
         assert!(!s.contains("secret-"));
+        assert!(!s.contains("167"), "key byte 0xA7 = 167 must not appear");
+        assert!(
+            !s.contains("184"),
+            "nonce byte 0xB8 = 184 is not printed either"
+        );
+        assert!(s.contains("doc.pdf"));
         assert!(s.contains("REDACTED"));
         assert!(s.contains("1 extras redacted"));
     }

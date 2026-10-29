@@ -28,13 +28,16 @@ use std::fmt;
 use secrecy::{SecretString, SecretVec};
 use uuid::Uuid;
 
+use crate::attachment;
 use crate::crypto::{self, Keys};
 use crate::error::{TamperKind, VaultError};
 use crate::format::{
     self, FORMAT_VERSION, Header, ItemRecord, KeySlot, ManifestRecord, Slot, SlotKind, VaultFile,
     item_aad, manifest_aad, slot_aad,
 };
-use crate::item::{Extras, FieldKind, HistoryEntry, Item, Millis};
+use crate::item::{
+    AttachmentRef, AttachmentTombstone, Extras, FieldKind, HistoryEntry, Item, Millis,
+};
 use crate::kdf::KdfParams;
 
 pub mod merge;
@@ -42,6 +45,8 @@ pub use merge::MergeReport;
 
 /// Maximum number of `history` entries kept per item (01 §4, 02 "set_field").
 pub const HISTORY_CAP: usize = 10;
+/// Maximum number of attachment removal markers kept per item (newest first).
+pub const ATTACHMENT_TOMBSTONE_CAP: usize = 64;
 
 /// The error for a mutation naming an id that is not in the vault. 01 §7 has no dedicated
 /// variant for this, so it reuses `Malformed` (interpretation; see package P4a notes). The
@@ -487,7 +492,27 @@ impl UnlockedVault {
     /// Field names are expected to be unique within an item (01 §4) but this is not enforced:
     /// duplicates are tolerated and written as-is; `Item::field`, `set_field`, `update`'s
     /// diffing and the merge all use the first field with a given name.
-    pub fn insert(&mut self, mut item: Item, now: Millis) -> Uuid {
+    ///
+    /// # Panics
+    ///
+    /// If `item.attachments` holds a reference that fails
+    /// [`crate::attachment::validate_ref`] (size over the cap or a nonce count that does not
+    /// match the size). Such a reference can never match a blob, and writing it would make
+    /// the vault fail to parse on the next unlock. References from
+    /// [`crate::attachment::new_ref`] or a parsed vault always pass; use
+    /// [`UnlockedVault::try_insert`] to get the error instead.
+    pub fn insert(&mut self, item: Item, now: Millis) -> Uuid {
+        match self.try_insert(item, now) {
+            Ok(id) => id,
+            Err(e) => panic!("UnlockedVault::insert: {e}"),
+        }
+    }
+
+    /// [`UnlockedVault::insert`] that reports an invalid attachment reference as
+    /// `Malformed` instead of panicking. Nothing is inserted on error.
+    pub fn try_insert(&mut self, mut item: Item, now: Millis) -> Result<Uuid, VaultError> {
+        check_attachment_refs(&item)?;
+        merge::normalize_attachment_tombstones(&mut item.removed_attachments);
         let id = item.id;
         let mut floor = now;
         if let Some(existing) = self.items.get(&id) {
@@ -496,7 +521,7 @@ impl UnlockedVault {
         }
         restamp(&mut item, floor, self.device_id);
         self.items.insert(id, item);
-        id
+        Ok(id)
     }
 
     /// Edit an item in place through `f`, then restamp it (02 "update"):
@@ -521,7 +546,9 @@ impl UnlockedVault {
     /// # Errors
     ///
     /// `Malformed("unknown item ..")` if `id` is not in the vault (the error enum has no
-    /// dedicated variant yet).
+    /// dedicated variant yet). `Malformed("attachment ..")` if `f` left an attachment
+    /// reference that fails [`crate::attachment::validate_ref`]; the item is then restored
+    /// to its pre-call state.
     pub fn update<F: FnOnce(&mut Item)>(
         &mut self,
         id: Uuid,
@@ -533,6 +560,11 @@ impl UnlockedVault {
         let before = item.clone();
         f(item);
         item.id = id;
+        if let Err(e) = check_attachment_refs(item) {
+            *item = before;
+            return Err(e);
+        }
+        merge::normalize_attachment_tombstones(&mut item.removed_attachments);
         for field in &mut item.fields {
             match before.fields.iter().find(|b| b.name == field.name) {
                 Some(prev) => {
@@ -614,8 +646,108 @@ impl UnlockedVault {
         Ok(())
     }
 
-    /// Drop every tombstone with `deleted_at < cutoff` (strictly older). Returns how many were
-    /// removed. Live items are never touched.
+    /// Append an attachment reference to an item (01 §4, v1.1) and restamp the item like any
+    /// other mutation (`modified_at = stamp(now, previous)`, `device_id = self.device_id`).
+    /// The caller seals the blob with [`crate::attachment::seal`] using the same reference;
+    /// this only records it. Tombstones accept references too (a resurrected item keeps them).
+    ///
+    /// `r.added_at` is clamped to at most the item's new stamp, so a reference can never sit
+    /// in the future relative to the item that carries it (a later removal marker, which is
+    /// stamped from the item, must be able to cover it: `removed_at >= added_at`).
+    ///
+    /// # Errors
+    ///
+    /// `Malformed("unknown item ..")` if `id` is not in the vault; `Malformed("duplicate
+    /// attachment ..")` if the item already references `r.id` or carries a removal marker
+    /// for it (blobs are immutable and ids are never reused, so a second reference can only
+    /// be a caller bug, and a re-added removed id would be dropped again by the next merge);
+    /// `Malformed("attachment ..")` if `r` fails [`crate::attachment::validate_ref`] (it
+    /// could never match a blob and the parser would reject the file on the next unlock).
+    pub fn add_attachment_ref(
+        &mut self,
+        id: Uuid,
+        r: AttachmentRef,
+        now: Millis,
+    ) -> Result<(), VaultError> {
+        attachment::validate_ref(&r)
+            .map_err(|e| VaultError::Malformed(format!("attachment {}: {e}", r.id)))?;
+        let device_id = self.device_id;
+        let item = self.items.get_mut(&id).ok_or_else(|| unknown_item(id))?;
+        if item.attachment(r.id).is_some() || item.removed_attachments.iter().any(|t| t.id == r.id)
+        {
+            return Err(VaultError::Malformed(format!(
+                "duplicate attachment {} on item {id}",
+                r.id
+            )));
+        }
+        let floor = stamp(now, item.modified_at);
+        let mut r = r;
+        r.added_at = r.added_at.min(floor);
+        item.attachments.push(r);
+        restamp(item, floor, device_id);
+        Ok(())
+    }
+
+    /// Remove the attachment reference `attachment` from item `id`, leave an
+    /// [`AttachmentTombstone`] with `removed_at` = the item's new stamp, and restamp the item
+    /// as in [`UnlockedVault::add_attachment_ref`]. The new stamp is at least the removed
+    /// reference's `added_at` (a reference added under a clock that was ahead, or carried in
+    /// by `insert`/`update`, could otherwise outrun its marker and come back at the next
+    /// merge), so the item's `modified_at` may jump forward to it. The blob is not touched here; `vault-sync`
+    /// garbage-collects blobs no live reference points at (see
+    /// [`UnlockedVault::attachment_ids`]).
+    ///
+    /// The marker is what keeps the removal across a merge: a peer that still carries the
+    /// reference drops it because `removed_at >= added_at` (see `merge`). Markers are kept
+    /// newest first, capped at [`ATTACHMENT_TOMBSTONE_CAP`], and purged by
+    /// [`UnlockedVault::purge_tombstones_older_than`].
+    ///
+    /// # Errors
+    ///
+    /// `Malformed("unknown item ..")` / `Malformed("unknown attachment ..")`.
+    pub fn remove_attachment_ref(
+        &mut self,
+        id: Uuid,
+        attachment: Uuid,
+        now: Millis,
+    ) -> Result<(), VaultError> {
+        let device_id = self.device_id;
+        let item = self.items.get_mut(&id).ok_or_else(|| unknown_item(id))?;
+        let idx = item
+            .attachments
+            .iter()
+            .position(|a| a.id == attachment)
+            .ok_or_else(|| {
+                VaultError::Malformed(format!("unknown attachment {attachment} on item {id}"))
+            })?;
+        let removed = item.attachments.remove(idx);
+        let floor = stamp(now, item.modified_at).max(removed.added_at);
+        item.removed_attachments.push(AttachmentTombstone {
+            id: attachment,
+            removed_at: floor,
+        });
+        merge::normalize_attachment_tombstones(&mut item.removed_attachments);
+        restamp(item, floor, device_id);
+        Ok(())
+    }
+
+    /// Every attachment id referenced by a *live* reference on any item, item tombstones
+    /// included, in item-id order. Removed references (those with an [`AttachmentTombstone`])
+    /// are not listed, so their blobs are prunable. A blob whose id is not in this set is an
+    /// orphan (03 §1.1); item tombstones keep their references until purged so a peer learns
+    /// about the deletion before the blob can go.
+    pub fn attachment_ids(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.items
+            .values()
+            .flat_map(|item| item.attachments.iter().map(|a| a.id))
+    }
+
+    /// Drop every item tombstone with `deleted_at < cutoff` (strictly older) and, on every
+    /// remaining item, every attachment removal marker with `removed_at < cutoff`. Returns
+    /// how many *items* were removed. Live items are otherwise never touched (dropping a
+    /// marker does not restamp the item: it changes nothing a peer could observe except that
+    /// a stale copy of the reference could come back, which is the same trade-off as for
+    /// item tombstones).
     ///
     /// **Choose `cutoff` conservatively.** A tombstone is the only thing that stops a peer's
     /// stale *live* copy from coming back: once it is purged, a merge from a device that has
@@ -629,6 +761,9 @@ impl UnlockedVault {
             .retain(|_, item| !matches!(item.deleted_at, Some(d) if d < cutoff));
         self.record_extras
             .retain(|id, _| self.items.contains_key(id));
+        for item in self.items.values_mut() {
+            item.removed_attachments.retain(|t| t.removed_at >= cutoff);
+        }
         before - self.items.len()
     }
 
@@ -861,6 +996,24 @@ impl UnlockedVault {
         }
         .to_bytes()
     }
+}
+
+/// Every reference on `item` must pass [`attachment::validate_ref`] (the parser enforces the
+/// same rule, so an invalid one written now would brick the vault on the next unlock) and
+/// must not share its id with a removal marker on the same item (the next merge would drop
+/// it again; same rule as `add_attachment_ref`).
+fn check_attachment_refs(item: &Item) -> Result<(), VaultError> {
+    for r in &item.attachments {
+        attachment::validate_ref(r)
+            .map_err(|e| VaultError::Malformed(format!("attachment {}: {e}", r.id)))?;
+        if item.removed_attachments.iter().any(|t| t.id == r.id) {
+            return Err(VaultError::Malformed(format!(
+                "attachment {}: a removal marker for this id exists on item {}",
+                r.id, item.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The timestamp a local mutation gets: `max(now, previous + 1)`. Every mutation therefore

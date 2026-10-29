@@ -4,6 +4,7 @@
 //! focus requests they leave behind and keeps the virtual list in step with the
 //! cached listing.
 
+pub(crate) mod attachments;
 mod detail;
 mod editor;
 mod generator;

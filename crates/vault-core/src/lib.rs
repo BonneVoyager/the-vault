@@ -2,9 +2,11 @@
 //! `vault-core`: file format, cryptography and item model for the vault password manager.
 //!
 //! Pure library: no I/O, no clock (except `KdfParams::calibrate`, which times itself with a
-//! monotonic `Instant`), no async, no logging. Bytes in, bytes out. See `specs/01-vault-format.md`
-//! and `specs/02-core-api.md`.
+//! monotonic `Instant`), no async, no logging. Bytes in, bytes out; the [`attachment`] module
+//! streams through caller-supplied `std::io::Read` / `Write` but never opens anything itself.
+//! See `specs/01-vault-format.md` and `specs/02-core-api.md`.
 
+pub mod attachment;
 pub mod error;
 pub mod format;
 pub mod item;
@@ -13,9 +15,13 @@ pub mod vault;
 
 mod crypto;
 
+pub use attachment::AttachmentError;
 pub use error::{TamperKind, VaultError};
 pub use format::{FORMAT_VERSION, Header, KeySlot, MAGIC, OpaqueSlot, Slot, SlotKind};
-pub use item::{Extras, Field, FieldKind, HistoryEntry, Item, ItemKind, Millis};
+pub use item::{
+    AttachmentRef, AttachmentTombstone, Extras, Field, FieldKind, HistoryEntry, Item, ItemKind,
+    Millis,
+};
 pub use kdf::KdfParams;
 #[cfg(feature = "sync")]
 pub use vault::VaultKeyHandle;

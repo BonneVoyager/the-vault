@@ -98,6 +98,11 @@ impl UnlockedVault {
     pub fn remove_slot(&mut self, id: Uuid) -> Result<(), VaultError>;   // refuses to remove last password slot
     pub fn rotate_vault_key(&mut self, password: &SecretString) -> Result<(), VaultError>;
 
+    // attachments (01 §4 "Attachments"); refs only — blobs are sealed/opened by `attachment::{seal, open}` and stored by vault-sync
+    pub fn add_attachment_ref(&mut self, item: Uuid, r: AttachmentRef, now: Millis) -> Result<(), VaultError>;
+    pub fn remove_attachment_ref(&mut self, item: Uuid, id: Uuid, now: Millis) -> Result<(), VaultError>;
+    pub fn attachment_ids(&self) -> impl Iterator<Item = Uuid>;     // all items incl. tombstones, for orphan cleanup
+
     // merge (03-sync.md)
     pub fn merge_from(&mut self, other: &UnlockedVault) -> MergeReport;
 

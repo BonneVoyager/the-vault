@@ -176,7 +176,7 @@ pub(crate) fn backups_dir(vault_path: &Path) -> PathBuf {
     parent_dir(vault_path).join(format!("{}.backups", file_name(vault_path)))
 }
 
-fn file_name(vault_path: &Path) -> String {
+pub(crate) fn file_name(vault_path: &Path) -> String {
     vault_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -351,7 +351,7 @@ pub(crate) fn list_backups(vault_path: &Path) -> Result<Vec<BackupInfo>, SyncErr
 }
 
 /// Create the backups directory (0700) if needed.
-fn ensure_dir(dir: &Path) -> Result<(), SyncError> {
+pub(crate) fn ensure_dir(dir: &Path) -> Result<(), SyncError> {
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {

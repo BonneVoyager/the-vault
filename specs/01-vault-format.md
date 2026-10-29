@@ -104,6 +104,7 @@ AAD = `vault_id || item.id || modified_at_be64 || format_version_be16`.
   "tags":        [tstr]
   "fields":      [Field]
   "attachments": [AttachmentRef]   (v1.1, empty in v1)
+  "removed_attachments": [{ "id": bytes(16), "removed_at": u64 }]   (v1.1, optional; tombstones so a removal survives merge, cap 64 newest, purged with item tombstones)
   "history":     [HistoryEntry]    last 10 password values, optional
 }
 
@@ -116,8 +117,25 @@ Field = {
 }
 
 HistoryEntry = { "value": tstr, "replaced_at": u64 }
-AttachmentRef = { "id": bytes(16), "name": tstr, "size": u64, "key": bytes(32), "chunk_nonces": [bytes(24)] }
+AttachmentRef = { "id": bytes(16), "name": tstr, "size": u64, "key": bytes(32), "chunk_nonces": [bytes(24)], "added_at": u64 }
 ```
+
+### Attachments (v1.1, no version bump)
+
+One immutable encrypted blob per attachment at `<name>.vault.attachments/<id as 32 lowercase hex>.bin`. The item keeps only the `AttachmentRef` inside `ct`, so names, sizes and keys are encrypted and the reference is authenticated with the item. Replacing a file is a new id; blobs are never rewritten.
+
+```
+chunk_size   = 1 MiB (1_048_576 bytes); the last chunk may be shorter; a 0-byte file has one empty chunk
+chunk_count  = len(chunk_nonces) = ceil(size / chunk_size), at least 1
+blob         = ct_0 || ct_1 || ... || ct_{n-1}          (each ct_i = plaintext chunk + 16-byte tag)
+ct_i         = XChaCha20-Poly1305(key = ref.key, nonce = ref.chunk_nonces[i], plaintext = chunk_i,
+                 AAD = vault_id || ref.id || i_be32 || chunk_count_be32 || attachment_version_be16)
+attachment_version = 1   (constant, independent of the file's format_version, so a future FORMAT_VERSION bump never invalidates existing blobs)
+```
+
+`ref.key` is 32 random bytes from `OsRng` per attachment. The derived `attach_key` in §3 is reserved and unused in v1.1. The AAD binds every chunk to its vault, attachment, position and total count, so chunks cannot be swapped, reordered, truncated or moved between vaults; a short or long blob fails on the chunk count. Maximum `size` is 100 MB (100_000_000 bytes); larger files are refused before encryption. Readers and writers stream chunk by chunk and never hold a whole blob in memory.
+
+`vault-core` exposes `attachment::seal(vault_id, ref, reader, writer) -> (ref, bytes_written)` (consumes the ref: one ref, one seal; a retry needs a new ref so nonces are never reused) and `attachment::open(vault_id, &ref, reader, writer)` streaming helpers (bytes in, bytes out; no I/O). Every write path validates a ref (size ≤ cap, nonce count = chunk count) so an unreadable ref can never be written. Phase: `v1-attach.vault` fixture with one item carrying two attachments (empty file, 3-chunk file) plus their blobs under `tests/fixtures/v1-attach.vault.attachments/`.
 
 Unknown `kind` strings on items and fields are not errors: the reader keeps the original string (`kind_raw`) and the writer re-emits it. Apps treat a field of unknown kind as sensitive (masked) because a newer version may have added a secret kind.
 

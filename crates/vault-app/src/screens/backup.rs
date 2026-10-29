@@ -414,6 +414,7 @@ impl BackupWindow {
                     ),
             )
             .children(fields)
+            .children(super::main::attachments::backup_section(item, cx))
             .when_some(self.status.clone(), |col, s| col.child(ui::muted(s, cx)))
             .into_any_element()
     }
@@ -645,6 +646,41 @@ mod tests {
 
         // Nothing was ever written to the backup.
         assert_eq!(std::fs::read(&backup).unwrap(), backup_bytes);
+    }
+
+    /// Attachments are not backed up: the viewer lists them as Missing, with no actions.
+    #[gpui::test]
+    fn attachments_show_as_missing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = SyncedVault::create(
+            &dir.path().join("t.vault"),
+            &SecretString::new(PW.into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let device = vault.device_id();
+        vault
+            .edit(|v| {
+                let mut item = Item::new(ItemKind::Note, "Passport", device, 1);
+                item.attachments
+                    .push(vault_core::attachment::new_ref("scan.pdf", 2_500_000, 1).unwrap());
+                v.insert(item, 1);
+            })
+            .unwrap();
+        vault.save().unwrap();
+        let backup = vault.backup_now().unwrap();
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        state.update(cx, |s, _| s.install_unlocked_for_tests(vault));
+        let (view, mut vcx) = window(&state, &backup, cx);
+        view.update(&mut vcx, |w, cx| w.unlock(SecretString::new(PW.into()), cx));
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("backup-attachment scan.pdf Missing")
+                .is_some()
+        );
+        assert!(vcx.debug_bounds("attachment-preview scan.pdf").is_none());
     }
 
     #[gpui::test]

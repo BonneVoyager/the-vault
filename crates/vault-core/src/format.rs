@@ -24,11 +24,15 @@ use std::collections::BTreeSet;
 use ciborium::Value;
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::crypto::{NONCE_LEN, WRAPPED_KEY_LEN};
+use crate::attachment::validate_ref;
+use crate::crypto::{KEY_LEN, NONCE_LEN, WRAPPED_KEY_LEN};
 use crate::error::VaultError;
-use crate::item::{Extras, Field, FieldKind, HistoryEntry, Item, ItemKind, Millis};
+use crate::item::{
+    AttachmentRef, AttachmentTombstone, Extras, Field, FieldKind, HistoryEntry, Item, ItemKind,
+    Millis,
+};
 use crate::kdf::KdfParams;
 
 /// Lowest format version this build reads. Version 0 never existed and is rejected.
@@ -104,6 +108,34 @@ pub fn manifest_aad(format_version: u16, vault_id: Uuid, item_count: u32) -> Vec
     aad.extend_from_slice(vault_id.as_bytes());
     aad.extend_from_slice(&item_count.to_be_bytes());
     aad.extend_from_slice(&format_version.to_be_bytes());
+    aad
+}
+
+/// AAD for chunk `index` of an attachment blob (01 §4 "Attachments (v1.1)"):
+///
+/// ```text
+/// vault_id(16) || ref.id(16) || index_be32(4) || chunk_count_be32(4) || attachment_version_be16(2)
+/// ```
+///
+/// 42 bytes. `attachment_version` is [`crate::attachment::ATTACHMENT_VERSION`] (the blob
+/// layout version), deliberately **not** the vault file's `format_version`: blobs are
+/// immutable and must keep opening after a file format bump. `seal`/`open` always pass the
+/// constant; the parameter exists so tests can build a foreign-version AAD. `chunk_count` is
+/// `ref.chunk_nonces.len()`. Binding both the position and the total count is what makes
+/// swapped, reordered, truncated and extended blobs fail their tag.
+pub fn attachment_chunk_aad(
+    attachment_version: u16,
+    vault_id: Uuid,
+    attachment_id: Uuid,
+    index: u32,
+    chunk_count: u32,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(16 + 16 + 4 + 4 + 2);
+    aad.extend_from_slice(vault_id.as_bytes());
+    aad.extend_from_slice(attachment_id.as_bytes());
+    aad.extend_from_slice(&index.to_be_bytes());
+    aad.extend_from_slice(&chunk_count.to_be_bytes());
+    aad.extend_from_slice(&attachment_version.to_be_bytes());
     aad
 }
 
@@ -311,6 +343,24 @@ fn as_fixed<const N: usize>(v: Value, what: &str) -> Result<[u8; N], VaultError>
 
 fn as_uuid(v: Value, what: &str) -> Result<Uuid, VaultError> {
     Ok(Uuid::from_bytes(as_fixed::<16>(v, what)?))
+}
+
+/// Like `as_fixed::<32>` for key material: the intermediate `Vec` is wiped and the result
+/// lands straight in a `Zeroizing` array (the decoded `Value` it came from is not wiped; same
+/// accepted limitation as the rest of the `ciborium::Value` path).
+fn as_key(v: Value, what: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    let mut b = as_bytes(v, what)?;
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    if b.len() != KEY_LEN {
+        b.zeroize();
+        return Err(malformed(format!(
+            "{what}: expected {KEY_LEN} bytes, got {}",
+            b.len()
+        )));
+    }
+    key.copy_from_slice(&b);
+    b.zeroize();
+    Ok(key)
 }
 
 fn opt_u64(v: Option<Value>, what: &str) -> Result<Option<u64>, VaultError> {
@@ -849,7 +899,65 @@ impl VaultFile {
 // ItemPlain and manifest payloads
 // ---------------------------------------------------------------------------------------------
 
-const ATTACHMENTS_KEY: &str = "attachments";
+fn attachment_to_value(a: &AttachmentRef) -> Value {
+    build_map(
+        vec![
+            ("id", bytes(a.id.as_bytes())),
+            ("name", text(&a.name)),
+            ("size", Value::from(a.size)),
+            ("key", bytes(a.key.as_ref())),
+            (
+                "chunk_nonces",
+                Value::Array(a.chunk_nonces.iter().map(|n| bytes(n)).collect()),
+            ),
+            ("added_at", Value::from(a.added_at)),
+        ],
+        &a.extras,
+    )
+}
+
+/// Decode one `AttachmentRef`. Besides types and lengths, the two invariants of 01 §4 that a
+/// blob can never satisfy if broken are enforced here (stricter reading) via
+/// [`validate_ref`]: `size` is at most `MAX_ATTACHMENT_SIZE` and
+/// `len(chunk_nonces) == max(1, ceil(size / chunk_size))`.
+fn attachment_from_value(value: Value) -> Result<AttachmentRef, VaultError> {
+    let mut m = MapReader::new("attachment", value)?;
+    let id = as_uuid(m.required("id")?, "attachment.id")?;
+    let name = as_text(m.required("name")?, "attachment.name")?;
+    let size = as_u64(m.required("size")?, "attachment.size")?;
+    let key = as_key(m.required("key")?, "attachment.key")?;
+    let chunk_nonces = as_array(m.required("chunk_nonces")?, "attachment.chunk_nonces")?
+        .into_iter()
+        .map(|n| as_fixed::<NONCE_LEN>(n, "attachment.chunk_nonces[]"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let added_at = as_u64(m.required("added_at")?, "attachment.added_at")?;
+    let r = AttachmentRef {
+        id,
+        name,
+        size,
+        key,
+        chunk_nonces,
+        added_at,
+        extras: m.finish(),
+    };
+    validate_ref(&r).map_err(|e| malformed(format!("attachment {id}: {e}")))?;
+    Ok(r)
+}
+
+fn attachment_tombstone_to_value(t: &AttachmentTombstone) -> Value {
+    Value::Map(vec![
+        (text("id"), bytes(t.id.as_bytes())),
+        (text("removed_at"), Value::from(t.removed_at)),
+    ])
+}
+
+fn attachment_tombstone_from_value(value: Value) -> Result<AttachmentTombstone, VaultError> {
+    let mut m = MapReader::new("removed_attachment", value)?;
+    let id = as_uuid(m.required("id")?, "removed_attachment.id")?;
+    let removed_at = as_u64(m.required("removed_at")?, "removed_attachment.removed_at")?;
+    // No extras slot (like HistoryEntry); unknown keys here are dropped.
+    Ok(AttachmentTombstone { id, removed_at })
+}
 
 fn field_to_value(f: &Field) -> Value {
     build_map(
@@ -905,12 +1013,14 @@ fn history_from_value(value: Value) -> Result<HistoryEntry, VaultError> {
 /// the intermediate `ciborium::Value` tree is not (it cannot be), which is an accepted
 /// limitation of using a generic CBOR model.
 ///
-/// `attachments` is always written (as `[]`) unless the item's extras already carry a
-/// non-empty `attachments` entry read from a newer file, which is then preserved verbatim.
+/// `attachments` is always written (as `[]` when the item has none); `removed_attachments`
+/// (`[{ "id": bytes(16), "removed_at": u64 }]`) is an optional key written only when
+/// non-empty, so files without removals keep their v1 byte layout.
 pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
-    // NOTE: the `ciborium::Value` tree built here holds plaintext field values as ordinary
-    // `String`s and cannot be zeroized; only the encoded output is. Known entries are moved,
-    // not cloned, and `encode` allocates once, to keep the number of stray copies minimal.
+    // NOTE: the `ciborium::Value` tree built here holds plaintext field values and attachment
+    // keys as ordinary `String`s / `Vec<u8>`s and cannot be zeroized; only the encoded output
+    // is. Known entries are moved, not cloned, and `encode` allocates once, to keep the number
+    // of stray copies minimal.
     let mut known = vec![
         ("kind", text(item.kind_str())),
         ("title", text(&item.title)),
@@ -932,13 +1042,21 @@ pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
             "history",
             Value::Array(item.history.iter().map(history_to_value).collect()),
         ),
+        (
+            "attachments",
+            Value::Array(item.attachments.iter().map(attachment_to_value).collect()),
+        ),
     ];
-    let has_attachments = item
-        .extras
-        .iter()
-        .any(|(k, _)| matches!(k, Value::Text(s) if s == ATTACHMENTS_KEY));
-    if !has_attachments {
-        known.push((ATTACHMENTS_KEY, Value::Array(Vec::new())));
+    if !item.removed_attachments.is_empty() {
+        known.push((
+            "removed_attachments",
+            Value::Array(
+                item.removed_attachments
+                    .iter()
+                    .map(attachment_tombstone_to_value)
+                    .collect(),
+            ),
+        ));
     }
     Zeroizing::new(encode(&canonicalize(build_map(known, &item.extras))))
 }
@@ -971,13 +1089,21 @@ pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<
             .map(history_from_value)
             .collect::<Result<Vec<_>, _>>()?,
     };
-    // An empty "attachments" array is exactly what a v1 writer emits, so drop it to keep
-    // round-trips extras-free; a non-empty one (v1.1) is left in extras and preserved verbatim.
-    let mut extras = m.finish();
-    extras.retain(|(k, v)| {
-        !(matches!(k, Value::Text(s) if s == ATTACHMENTS_KEY)
-            && matches!(v, Value::Array(a) if a.is_empty()))
-    });
+    // Optional on read: a v1 writer always emits `[]`, but tolerate a missing or null key.
+    let attachments = match m.take("attachments") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => as_array(v, "item.attachments")?
+            .into_iter()
+            .map(attachment_from_value)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let removed_attachments = match m.take("removed_attachments") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => as_array(v, "item.removed_attachments")?
+            .into_iter()
+            .map(attachment_tombstone_from_value)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     Ok(Item {
         id,
         kind,
@@ -989,8 +1115,10 @@ pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<
         tags,
         fields,
         history,
+        attachments,
+        removed_attachments,
         modified_at,
-        extras,
+        extras: m.finish(),
     })
 }
 
@@ -1024,6 +1152,7 @@ pub fn decode_manifest(plain: &[u8]) -> Result<Vec<(Uuid, Millis)>, VaultError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attachment::ATTACHMENT_VERSION;
 
     #[test]
     fn canonicalize_sorts_by_encoded_key_bytes() {
@@ -1091,5 +1220,30 @@ mod tests {
         assert_eq!(aad.len(), 16 + 4 + 2);
         assert_eq!(&aad[16..20], &[0, 0, 0, 3]);
         assert_eq!(&aad[20..], &[0, 1]);
+
+        // vault_id || ref.id || index_be32 || chunk_count_be32 || attachment_version_be16
+        assert_eq!(ATTACHMENT_VERSION, 1);
+        let aad = attachment_chunk_aad(ATTACHMENT_VERSION, vid, sid, 0x0102_0304, 0x0506_0708);
+        assert_eq!(aad.len(), 16 + 16 + 4 + 4 + 2);
+        assert_eq!(&aad[..16], vid.as_bytes());
+        assert_eq!(&aad[16..32], sid.as_bytes());
+        assert_eq!(&aad[32..36], &[1, 2, 3, 4]);
+        assert_eq!(&aad[36..40], &[5, 6, 7, 8]);
+        assert_eq!(&aad[40..], &[0, 1]);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(vid.as_bytes());
+        expected.extend_from_slice(sid.as_bytes());
+        expected.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 0, 1]);
+        assert_eq!(aad, expected);
+        assert_ne!(
+            aad,
+            attachment_chunk_aad(ATTACHMENT_VERSION, vid, sid, 0x0506_0708, 0x0102_0304),
+            "index and count are not interchangeable"
+        );
+        assert_eq!(
+            &attachment_chunk_aad(2, vid, sid, 0, 1)[40..],
+            &[0, 2],
+            "a different attachment version changes the AAD"
+        );
     }
 }

@@ -5,6 +5,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -12,8 +13,10 @@ use clap::{Args, Parser, Subcommand};
 use vault_core::{
     CsvMapping, ExposeSecret, Field, FieldKind, Item, ItemKind, KdfParams, LockedVault,
     PassphraseSpec, PasswordSpec, Query, SecretString, Totp, UnlockedVault, Uuid, VaultError,
-    export_csv, import_csv, passphrase, password, search, strength_bits,
+    attachment::MAX_ATTACHMENT_SIZE, export_csv, import_csv, passphrase, password, search,
+    strength_bits,
 };
+use vault_sync::{AttachmentState, NoopHooks, SyncError, SyncedVault};
 
 #[derive(Parser)]
 #[command(name = "vault", about = "Dev/debug CLI for the vault password manager")]
@@ -73,6 +76,11 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Manage item attachments.
+    Attach {
+        #[command(subcommand)]
+        cmd: AttachCmd,
+    },
     /// Import items.
     Import {
         #[arg(long)]
@@ -80,6 +88,22 @@ enum Cmd {
         #[arg(long = "in")]
         input: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum AttachCmd {
+    /// Encrypt a file and attach it to an item.
+    Add { item: String, path: PathBuf },
+    /// List an item's attachments.
+    List { item: String },
+    /// Decrypt an attachment into a new file (mode 0600).
+    Get {
+        item: String,
+        attachment_id: Uuid,
+        out: PathBuf,
+    },
+    /// Remove an attachment from an item.
+    Rm { item: String, attachment_id: Uuid },
 }
 
 #[derive(Args)]
@@ -266,8 +290,117 @@ fn parse_kind(s: &str) -> Result<ItemKind> {
     ItemKind::parse(s).with_context(|| format!("unknown kind {s:?} (login|note|card|identity)"))
 }
 
+/// Keep `VaultError` reachable for the exit-code mapping in `main`.
+fn sync_err(e: SyncError) -> anyhow::Error {
+    match e {
+        SyncError::Vault(v) => v.into(),
+        other => other.into(),
+    }
+}
+
+fn open_synced(path: &Path, password: &SecretString) -> Result<SyncedVault> {
+    let mut sv = SyncedVault::open(path, device_id()?, Arc::new(NoopHooks)).map_err(sync_err)?;
+    sv.unlock(password).map_err(sync_err)?;
+    Ok(sv)
+}
+
+fn synced_item(sv: &SyncedVault, key: &str) -> Result<Uuid> {
+    find_item(sv.vault().context("vault is locked")?, key)
+}
+
+fn state_str(s: AttachmentState) -> &'static str {
+    match s {
+        AttachmentState::Present => "present",
+        AttachmentState::NotDownloaded => "not-downloaded",
+        AttachmentState::Missing => "missing",
+    }
+}
+
+fn attach_get(sv: &SyncedVault, item: Uuid, id: Uuid, out: &Path) -> Result<()> {
+    let mut reader = sv.open_attachment(item, id).map_err(sync_err)?;
+    let mut f = create_private(out)?;
+    let result = std::io::copy(&mut reader, &mut f)
+        .map(drop)
+        .and_then(|()| f.sync_all())
+        .with_context(|| format!("writing {}", out.display()));
+    if result.is_err() {
+        drop(f);
+        let _ = fs::remove_file(out);
+    }
+    result
+}
+
+fn run_attach(cli: &Cli, cmd: &AttachCmd) -> Result<()> {
+    let path = vault_path(cli)?;
+    let pw = master_password(cli, false)?;
+    match cmd {
+        AttachCmd::Add { item, path: src } => {
+            let meta = fs::metadata(src).with_context(|| format!("reading {}", src.display()))?;
+            if !meta.is_file() {
+                bail!("{} is not a regular file", src.display());
+            }
+            if meta.len() > MAX_ATTACHMENT_SIZE {
+                bail!("file is larger than 100 MB");
+            }
+            let name = src
+                .file_name()
+                .with_context(|| format!("{} has no file name", src.display()))?
+                .to_string_lossy()
+                .into_owned();
+            let mut sv = open_synced(&path, &pw)?;
+            let item = synced_item(&sv, item)?;
+            let file = fs::File::open(src).with_context(|| format!("opening {}", src.display()))?;
+            let id = sv
+                .add_attachment(item, &name, file, meta.len(), now_millis())
+                .map_err(sync_err)?;
+            sv.save().map_err(sync_err)?;
+            println!("{id}");
+        }
+        AttachCmd::List { item } => {
+            let sv = open_synced(&path, &pw)?;
+            let item = synced_item(&sv, item)?;
+            let it = sv
+                .vault()
+                .and_then(|v| v.get(item))
+                .context("item vanished")?;
+            for a in &it.attachments {
+                println!(
+                    "{}  {}  {}  {}",
+                    a.id,
+                    a.name,
+                    a.size,
+                    state_str(sv.attachment_state(a.id))
+                );
+            }
+        }
+        AttachCmd::Get {
+            item,
+            attachment_id,
+            out,
+        } => {
+            let sv = open_synced(&path, &pw)?;
+            let item = synced_item(&sv, item)?;
+            attach_get(&sv, item, *attachment_id, out)?;
+            println!("wrote {}", out.display());
+        }
+        AttachCmd::Rm {
+            item,
+            attachment_id,
+        } => {
+            let mut sv = open_synced(&path, &pw)?;
+            let item = synced_item(&sv, item)?;
+            sv.remove_attachment(item, *attachment_id, now_millis())
+                .map_err(sync_err)?;
+            sv.save().map_err(sync_err)?;
+            println!("removed {attachment_id}");
+        }
+    }
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<()> {
     match &cli.command {
+        Cmd::Attach { cmd } => run_attach(&cli, cmd)?,
         Cmd::Gen(a) => {
             let secret = if a.passphrase {
                 passphrase(&PassphraseSpec {

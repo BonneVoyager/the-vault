@@ -21,9 +21,17 @@ rand = { version = "^0.8.5", default-features = false, features = ["getrandom"] 
 
 # Filesystem watcher on the vault's directory (03 §3); runs on its own thread, no async runtime.
 notify = "^8.2.0"
+# Wipes decrypted attachment chunks in `AttachmentReader` (same version as vault-core's).
+zeroize = "^1.8.1"
 # 500 ms debounce of watcher events (03 §3); 0.7 is built on notify 8.2.
 notify-debouncer-full = "^0.7.0"
 
+[features]
+# Test-only hooks (`set_prune_clock_offset_for_tests`). Never enable outside tests.
+test-support = []
+
 [dev-dependencies]
+# Self dependency so the integration tests get the `test-support` hooks.
+vault-sync = { path = ".", features = ["test-support"] }
 # Per-test temp directories.
 tempfile = "^3.13.0"

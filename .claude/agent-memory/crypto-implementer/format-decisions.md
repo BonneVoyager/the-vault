@@ -42,8 +42,8 @@ Items before manifest so a foreign record reports `Item`, not `Manifest`.
 - Unknown `kdf.alg`, unknown record `t` -> `Malformed`. Unknown slot/item/field `kind` strings are
   now TOLERATED (2026-10-29) — see [[forward-compat-decisions]].
 - Argon2 rejecting header params (e.g. m_cost < 8*p_cost) -> `Malformed`, not `WrongPassword`.
-- `attachments`: never parsed; `[]` dropped on read, non-empty array kept in `Item.extras` and
-  re-emitted verbatim instead of `[]` (so v1 writers do not destroy v1.1 data).
+- `attachments`: parsed into `Item.attachments` since 2026-10-29 — see [[attachment-decisions]]
+  (the earlier "kept in extras" behaviour is gone; a colliding extra is dropped on write).
 - `history` optional on read (missing/null = empty); always written. `HistoryEntry` has no extras.
 - Record-level unknown keys (plaintext, unauthenticated) kept in `UnlockedVault.record_extras`
   / `manifest_extras` keyed by item id and re-emitted.

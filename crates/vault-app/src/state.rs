@@ -24,6 +24,7 @@ use crate::clipboard::SystemPasteboard;
 use crate::listing::{Counts, Listing};
 use crate::{cloud, persist};
 
+mod attachments;
 mod edit;
 mod generator;
 mod prefs;
@@ -35,6 +36,9 @@ mod touch_id;
 mod transfer;
 mod viewer;
 
+pub use attachments::{
+    AttachmentStore, AttachmentsUi, PreviewContent, PreviewKind, preview_kind, state_label,
+};
 pub use edit::{EditBuffer, Navigation, kind_name};
 pub use generator::{
     CharClass, GenTab, Generator, GeneratorTarget, LENGTH_RANGE, SEPARATORS, WORDS_RANGE,
@@ -90,6 +94,10 @@ pub enum Busy {
     TouchUnlocking,
     EnablingTouchId,
     DisablingTouchId,
+    /// Sealing dropped or picked files into the selected item.
+    Attaching,
+    /// Decrypting an attachment whose blob first has to download.
+    ReadingAttachment,
 }
 
 impl Busy {
@@ -104,6 +112,8 @@ impl Busy {
                 | Self::RotatingKey
                 | Self::EnablingTouchId
                 | Self::DisablingTouchId
+                | Self::Attaching
+                | Self::ReadingAttachment
         )
     }
 }
@@ -363,6 +373,9 @@ pub struct AppState {
     pub screen_recording_hint: bool,
     /// Open read-only backup viewer windows; `lock` closes them (they hold decrypted data).
     pub backup_windows: Vec<gpui::AnyWindowHandle>,
+    /// Detail ▸ Attachments: pending adds, preview, confirms.
+    pub attachments: AttachmentsUi,
+    attach_store: Arc<dyn AttachmentStore>,
 
     pub screen: Screen,
     pub busy: Option<Busy>,
@@ -446,6 +459,11 @@ impl AppState {
             qr_scanning: false,
             screen_recording_hint: false,
             backup_windows: Vec::new(),
+            attachments: AttachmentsUi::default(),
+            #[cfg(not(test))]
+            attach_store: attachments::sync_store(),
+            #[cfg(test)]
+            attach_store: attachments::fake::FakeStore::new(),
             // Tests never reach the real Keychain or Touch ID sheet.
             #[cfg(not(test))]
             biometrics: biometric::system(),
@@ -730,6 +748,19 @@ impl AppState {
         work: impl FnOnce() -> R + Send + 'static,
         finish: impl FnOnce(&mut Self, R, Outcome) + 'static,
     ) {
+        self.run_bg_cx(busy, cx, work, move |this, result, outcome, _| {
+            finish(this, result, outcome)
+        });
+    }
+
+    /// [`Self::run_bg`] whose `finish` also gets the `Context` (to reschedule autosave).
+    fn run_bg_cx<R: Send + 'static>(
+        &mut self,
+        busy: Busy,
+        cx: &mut Context<Self>,
+        work: impl FnOnce() -> R + Send + 'static,
+        finish: impl FnOnce(&mut Self, R, Outcome, &mut Context<Self>) + 'static,
+    ) {
         self.busy = Some(busy);
         self.error = None;
         cx.notify();
@@ -759,7 +790,7 @@ impl AppState {
                 if outcome != Outcome::Closed {
                     this.busy = None;
                 }
-                finish(this, result, outcome);
+                finish(this, result, outcome, cx);
                 cx.notify();
             })
             .ok();
@@ -789,6 +820,7 @@ impl AppState {
         self.settings_open = false;
         self.screen_recording_hint = false;
         self.close_backup_windows(cx);
+        self.clear_attachments(cx);
         let saved = match self.vault.as_mut() {
             Some(vault) if vault.is_dirty() => Some(vault.save()),
             _ => None,
@@ -947,6 +979,12 @@ impl AppState {
             persist::save_recent(&self.recent_vaults);
         }
     }
+}
+
+/// A fresh in-memory attachment store for render tests.
+#[cfg(test)]
+pub fn attachments_fake() -> Arc<attachments::fake::FakeStore> {
+    attachments::fake::FakeStore::new()
 }
 
 /// User-facing text for a failed vault operation. Never contains secrets.

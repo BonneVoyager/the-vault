@@ -106,3 +106,14 @@ Verified 2026-10-29 (three-column grid alignment), compiled + clippy + headless 
 - Painted borders: gpui paints a bordered quad once PER EDGE (4 identical quads, each with a thin `content_mask` strip). Find the top divider by `q.border_widths.top > 0` and `content_mask.bounds` being a strip at the quad's top. Example: main.rs `top_divider_y`.
 - A `focus_ring` (transparent border_1) insets the column's content by 1 px in x and y; account for it when aligning with a sibling column.
 - macOS titlebar: gpui sizes AppKit's titlebar container to `2 * traffic_light_position.y + button height` (14), full window width. With `app_owns_titlebar_drag: false`, `_opaqueRectForWindowMoveWhenInTitlebar` returns an empty rect, so AppKit treats the whole band as a window-move region, including under gpui controls placed there.
+
+Verified 2026-10-29 (attachments UI), compiled + clippy + headless tests:
+- In-memory image: `gpui::Image::from_bytes(ImageFormat::Png|Jpeg|Gif.., Vec<u8>).to_image_data(cx.svg_renderer()) -> anyhow::Result<Arc<RenderImage>>`; runs fine on the background executor (`SvgRenderer` is Send + Clone). `img(Arc<RenderImage>)` (ImageSource::Render) skips gpui's asset cache; evict from the sprite atlas with `cx.defer(move |cx| cx.drop_image(image, None))`. ImageFormat has no HEIC (image crate cannot decode it). gpui owns the bytes: they cannot be zeroized.
+- File drop from Finder: `div().drag_over::<gpui::ExternalPaths>(|style, _, _, _| style.bg(..)).on_drop(|paths: &ExternalPaths, window, cx| paths.paths().to_vec())`. Compiled; real Finder drop not runtime-verified.
+- Multi-select open panel: `cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Add".into()) })`.
+- vault-app root.rs `sync_settings` closes ANY active dialog whenever AppState notifies and settings is closed, so `window.open_dialog` cannot host another sheet. Use an absolute overlay card in the column instead (attachments save confirm).
+- Updating `AppState` from inside `MainScreen::render` (`self.state.update(cx, ..)` without `cx.notify()`) is fine; used to drop stale previews on selection change.
+- To assert in-flight UI (spinner rows) before background tasks run: `vcx.update(|w, _| w.refresh()); vcx.update(|w, cx| w.draw(cx));` then `debug_bounds`, then `run_until_parked`.
+- `uniform_list(id, count, move |range, _, _| Vec<Div>)` + `.h(px(..))` works nested inside an `overflow_y_scroll` column (text preview).
+- An element keeps only ONE `debug_selector`: a second call replaces the first. For a second marker, add a child `div().debug_selector(..)` (a zero-size child still registers bounds).
+- `cargo clippy -p vault-app -- -D warnings` also denies warnings in path-dependency workspace crates (vault-sync); while another agent has a warning there, use `--no-deps` to lint vault-app alone.

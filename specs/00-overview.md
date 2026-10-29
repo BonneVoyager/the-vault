@@ -16,6 +16,7 @@ Visual target: 1Password 8 level of polish. Three-column layout, keyboard-first,
 - macOS 14 or earlier. Minimum is macOS 15 (needed for passkey PRF).
 - Hardware keys (YubiKey HMAC-SHA1, FIDO2 hmac-secret) and key files. Dropped from the roadmap; see `docs/research/2026-10-29-hardware-key-and-unlocked-state.md`.
 - Network access of any kind, so no leaked-password ("compromised") checks.
+- Backups of attachments. Snapshots cover the vault file only (`03` §1.1); attachments are capped at 100 MB each.
 
 ## Threat model
 

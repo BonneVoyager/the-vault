@@ -13,8 +13,16 @@
 //! `v1-forward.vault` exercises 01 §9 forward compatibility: it carries an opaque key slot
 //! of an unknown kind, an item and a field of unknown kinds, and unknown keys at header,
 //! item and field level, as a newer build would write them.
+//!
+//! `v1-attach.vault` (01 §4 "Attachments (v1.1)") holds one item with two attachment
+//! references, an empty file and a 3-chunk file (2 MiB + 7 bytes), whose sealed blobs live
+//! under `v1-attach.vault.attachments/<id hex>.bin`. The blob contents are deterministic
+//! (`attach_pattern`) so the test can verify the decrypted bytes.
+
+use std::io::Cursor;
 
 use ciborium::Value;
+use vault_core::attachment::{CHUNK_SIZE, blob_file_name, new_ref, open, seal};
 use vault_core::format::VaultFile;
 use vault_core::{
     ExposeSecret, Field, FieldKind, Item, ItemKind, KdfParams, LockedVault, OpaqueSlot,
@@ -34,6 +42,20 @@ const FUTURE_ITEM_KIND: &str = "future-item-kind";
 const FUTURE_FIELD_KIND: &str = "future-field-kind";
 const FUTURE_SLOT_ID: [u8; 16] = [0x05; 16];
 const FUTURE_ITEM_ID: [u8; 16] = [0x04; 16];
+
+/// `v1-attach.vault`: the item and its two attachments.
+const ATTACH_ITEM_ID: [u8; 16] = [0x06; 16];
+const ATTACH_EMPTY_ID: [u8; 16] = [0x0A; 16];
+const ATTACH_BIG_ID: [u8; 16] = [0x0B; 16];
+const ATTACH_BIG_LEN: usize = 2 * CHUNK_SIZE + 7;
+const ATTACH_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/v1-attach.vault.attachments"
+);
+
+fn attach_pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
 
 fn t(s: &str) -> Value {
     Value::Text(s.to_owned())
@@ -167,6 +189,82 @@ fn regenerate_forward_fixture() {
     let mut file = VaultFile::parse(&vault.serialize()).unwrap();
     file.header.slots.insert(0, Slot::Opaque(future_slot()));
     std::fs::write(format!("{FIXTURE_DIR}/v1-forward.vault"), file.to_bytes()).unwrap();
+}
+
+/// Builds `v1-attach.vault` and its two blobs (see the module docs). Separate from the other
+/// regenerators so their bytes are not churned.
+#[test]
+#[ignore]
+fn regenerate_attach_fixture() {
+    std::fs::create_dir_all(ATTACH_DIR).unwrap();
+    let mut vault = new_vault();
+
+    let mut item = Item::new(ItemKind::Note, "With attachments", device(), T0 + 40);
+    item.id = Uuid::from_bytes(ATTACH_ITEM_ID);
+    item.fields = vec![field("notes", FieldKind::Notes, "see attached", T0 + 40)];
+    let id = vault.insert(item, T0 + 40);
+
+    let mut empty = new_ref("empty.txt", 0, T0 + 41).unwrap();
+    empty.id = Uuid::from_bytes(ATTACH_EMPTY_ID);
+    let mut big = new_ref("three-chunks.bin", ATTACH_BIG_LEN as u64, T0 + 42).unwrap();
+    big.id = Uuid::from_bytes(ATTACH_BIG_ID);
+
+    for (r, plain) in [(empty, Vec::new()), (big, attach_pattern(ATTACH_BIG_LEN))] {
+        let mut blob = Vec::new();
+        let (r, _) = seal(vault.vault_id(), r, Cursor::new(plain), &mut blob).unwrap();
+        std::fs::write(format!("{ATTACH_DIR}/{}", blob_file_name(r.id)), blob).unwrap();
+        let added_at = r.added_at;
+        vault.add_attachment_ref(id, r, added_at).unwrap();
+    }
+    std::fs::write(format!("{FIXTURE_DIR}/v1-attach.vault"), vault.serialize()).unwrap();
+}
+
+#[test]
+fn v1_attach_refs_and_blobs_open() {
+    let bytes = std::fs::read(format!("{FIXTURE_DIR}/v1-attach.vault")).unwrap();
+    let locked = LockedVault::parse(&bytes).unwrap();
+    check_kdf(&locked);
+    let vault = locked.unlock(&pw()).unwrap();
+    let item = vault.get(Uuid::from_bytes(ATTACH_ITEM_ID)).unwrap();
+    assert_eq!(item.title, "With attachments");
+    assert_eq!(item.attachments.len(), 2);
+    let mut ids: Vec<_> = vault.attachment_ids().collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        [
+            Uuid::from_bytes(ATTACH_EMPTY_ID),
+            Uuid::from_bytes(ATTACH_BIG_ID)
+        ]
+    );
+
+    let expected = [
+        (ATTACH_EMPTY_ID, "empty.txt", 0usize, 1usize, T0 + 41),
+        (
+            ATTACH_BIG_ID,
+            "three-chunks.bin",
+            ATTACH_BIG_LEN,
+            3,
+            T0 + 42,
+        ),
+    ];
+    for (id, name, len, chunks, added_at) in expected {
+        let r = item.attachment(Uuid::from_bytes(id)).unwrap();
+        assert_eq!(r.name, name);
+        assert_eq!(r.size, len as u64);
+        assert_eq!(r.chunk_count(), chunks);
+        assert_eq!(r.added_at, added_at);
+        let blob = std::fs::read(format!("{ATTACH_DIR}/{}", blob_file_name(r.id))).unwrap();
+        assert_eq!(blob.len(), len + 16 * chunks);
+        let mut out = Vec::new();
+        open(vault.vault_id(), r, Cursor::new(&blob), &mut out)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(out, attach_pattern(len), "{name}: contents");
+
+        // The blob is bound to this vault: another vault id rejects it.
+        let mut out = Vec::new();
+        assert!(open(Uuid::nil(), r, Cursor::new(&blob), &mut out).is_err());
+    }
 }
 
 fn check_kdf(locked: &LockedVault) {
@@ -376,8 +474,8 @@ fn every_fixture_in_the_directory_opens() {
         .collect();
     names.sort();
     assert!(
-        names.len() >= 3,
-        "expected at least v1-basic, v1-empty, v1-forward; found {names:?}"
+        names.len() >= 4,
+        "expected at least v1-attach, v1-basic, v1-empty, v1-forward; found {names:?}"
     );
     for name in &names {
         let bytes = std::fs::read(format!("{FIXTURE_DIR}/{name}")).unwrap();

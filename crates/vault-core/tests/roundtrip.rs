@@ -224,6 +224,7 @@ fn unknown_keys_survive_roundtrip() {
     let mut item = sample_item(1, 10);
     item.extras
         .push((Value::Text("x_future".into()), Value::Integer(7.into())));
+    // A known key in extras collides with the real field and is dropped, never duplicated.
     item.extras.push((
         Value::Text("attachments".into()),
         Value::Array(vec![Value::Map(vec![(
@@ -231,6 +232,11 @@ fn unknown_keys_survive_roundtrip() {
             Value::Bytes(vec![1; 16]),
         )])]),
     ));
+    let mut att = vault_core::attachment::new_ref("note.txt", 5, 10).unwrap();
+    att.extras
+        .push((Value::Text("x_att_future".into()), Value::Integer(9.into())));
+    let att_id = att.id;
+    item.attachments.push(att);
     item.fields[0]
         .extras
         .push((Value::Text("x_field_future".into()), Value::Bool(true)));
@@ -267,9 +273,17 @@ fn unknown_keys_survive_roundtrip() {
             .any(|(k, _)| k == &Value::Text("x_future".into()))
     );
     assert!(
-        got.extras
+        !got.extras
             .iter()
-            .any(|(k, _)| k == &Value::Text("attachments".into()))
+            .any(|(k, _)| k == &Value::Text("attachments".into())),
+        "a colliding extra never shadows the parsed attachments"
+    );
+    let att = got.attachment(att_id).unwrap();
+    assert_eq!(att.name, "note.txt");
+    assert!(
+        att.extras
+            .iter()
+            .any(|(k, _)| k == &Value::Text("x_att_future".into()))
     );
     assert!(
         got.fields[0]
@@ -296,7 +310,8 @@ fn unknown_keys_survive_roundtrip() {
 
     let u2 = unlock(&out).unwrap();
     assert_vaults_eq(&u, &u2);
-    // The v1.1 attachments array is preserved verbatim, not replaced with [].
+    // Exactly one attachments array, holding the real reference (with its extra), not the
+    // colliding junk.
     let plain = format::encode_item_plain(u2.get(id).unwrap());
     let pv: Value = ciborium::from_reader(plain.as_slice()).unwrap();
     let Value::Map(entries) = pv else { panic!() };
@@ -305,5 +320,14 @@ fn unknown_keys_survive_roundtrip() {
         .filter(|(k, _)| k == &Value::Text("attachments".into()))
         .collect();
     assert_eq!(att.len(), 1);
-    assert!(matches!(&att[0].1, Value::Array(a) if a.len() == 1));
+    let Value::Array(refs) = &att[0].1 else {
+        panic!()
+    };
+    assert_eq!(refs.len(), 1);
+    let Value::Map(m) = &refs[0] else { panic!() };
+    assert!(
+        m.iter()
+            .any(|(k, _)| k == &Value::Text("x_att_future".into()))
+    );
+    assert!(m.iter().any(|(k, _)| k == &Value::Text("key".into())));
 }

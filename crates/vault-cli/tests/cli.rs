@@ -240,3 +240,115 @@ fn init_allow_weak_bypasses_check() {
     ));
     assert!(f.exists());
 }
+
+fn attach_setup() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    ok(&vault(
+        &f,
+        PW,
+        &["add", "--kind", "login", "--title", "Docs"],
+    ));
+    (dir, f)
+}
+
+#[test]
+fn attach_round_trip() {
+    let (dir, f) = attach_setup();
+    let empty = dir.path().join("empty.bin");
+    let big = dir.path().join("big.bin");
+    std::fs::write(&empty, b"").unwrap();
+    let bytes: Vec<u8> = (0..1_500_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&big, &bytes).unwrap();
+
+    let empty_id = ok(&vault(
+        &f,
+        PW,
+        &["attach", "add", "Docs", empty.to_str().unwrap()],
+    ))
+    .trim()
+    .to_owned();
+    let big_id = ok(&vault(
+        &f,
+        PW,
+        &["attach", "add", "Docs", big.to_str().unwrap()],
+    ))
+    .trim()
+    .to_owned();
+
+    let list = ok(&vault(&f, PW, &["attach", "list", "Docs"]));
+    assert_eq!(list.lines().count(), 2, "{list}");
+    assert!(
+        list.contains(&empty_id) && list.contains("empty.bin"),
+        "{list}"
+    );
+    assert!(list.contains(&big_id) && list.contains("big.bin"), "{list}");
+    assert!(list.contains("1500000"), "{list}");
+    assert!(list.contains("present"), "{list}");
+
+    let out = dir.path().join("out.bin");
+    ok(&vault(
+        &f,
+        PW,
+        &["attach", "get", "Docs", &big_id, out.to_str().unwrap()],
+    ));
+    assert_eq!(std::fs::read(&out).unwrap(), bytes);
+    assert_eq!(
+        std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // Refuses to overwrite and leaves the existing file alone.
+    assert!(
+        !vault(
+            &f,
+            PW,
+            &["attach", "get", "Docs", &big_id, out.to_str().unwrap()]
+        )
+        .status
+        .success()
+    );
+    assert_eq!(std::fs::read(&out).unwrap(), bytes);
+
+    let out0 = dir.path().join("out0.bin");
+    ok(&vault(
+        &f,
+        PW,
+        &["attach", "get", "Docs", &empty_id, out0.to_str().unwrap()],
+    ));
+    assert_eq!(std::fs::read(&out0).unwrap(), b"");
+
+    ok(&vault(&f, PW, &["attach", "rm", "Docs", &big_id]));
+    let list = ok(&vault(&f, PW, &["attach", "list", "Docs"]));
+    assert!(
+        !list.contains(&big_id) && list.contains(&empty_id),
+        "{list}"
+    );
+
+    let out2 = dir.path().join("out2.bin");
+    let o = vault(
+        &f,
+        PW,
+        &["attach", "get", "Docs", &big_id, out2.to_str().unwrap()],
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert!(!out2.exists());
+}
+
+#[test]
+fn attach_refuses_oversize_file() {
+    let (dir, f) = attach_setup();
+    let huge = dir.path().join("huge.bin");
+    std::fs::File::create(&huge)
+        .unwrap()
+        .set_len(101_000_000)
+        .unwrap();
+    let o = vault(&f, PW, &["attach", "add", "Docs", huge.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.starts_with("error: ") && err.contains("file is larger than 100 MB"),
+        "{err}"
+    );
+    assert_eq!(ok(&vault(&f, PW, &["attach", "list", "Docs"])), "");
+}

@@ -201,6 +201,8 @@ impl AppState {
                 self.show_toast("Ignored a different vault in this folder", cx);
             }
             SyncEvent::CloudUnavailable => self.sync.waiting_for_cloud = true,
+            // Orphan blobs deleted after a save: nothing the user needs to see.
+            SyncEvent::AttachmentsPruned(_) => {}
             SyncEvent::BackupTaken(path) => {
                 eprintln!("vault: backup taken: {}", path.display());
                 self.refresh_backups();

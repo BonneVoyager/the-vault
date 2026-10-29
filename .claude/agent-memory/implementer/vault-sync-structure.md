@@ -1,6 +1,6 @@
 ---
 name: vault-sync-structure
-description: vault-sync crate layout after P2.1 + P3.2 backups, state model, and gotchas (rand 0.8 pin, chmod test caveat, save-when-clean no-op, same-second snapshot suffix)
+description: vault-sync crate layout after P2.1 + P3.2 backups + v1.1 attachments, state model, and gotchas (rand 0.8 pin, chmod test caveat, save-when-clean no-op, same-second snapshot suffix)
 metadata:
   type: project
 ---
@@ -23,6 +23,8 @@ Gotchas:
 - clippy (1.99) flags `sort_by(|a,b| b.cmp(a))` -> use `sort_by_key(|x| Reverse(..))`.
 - vault-core/src/vault.rs is edited concurrently by other agents; rely on public API only.
 - Deliberate deviations from 03 §8: `open` takes device_id; `edit` returns Result; save on a clean vault is a no-op.
+
+Attachments (v1.1, 2026-10-29): src/attachments.rs (dir/blob paths, `prune`, `AttachmentReader`, `AttachmentState`) + src/synced/attachments.rs (SyncedVault methods). `atomic::write_atomic_stream(path, mode, fill)` streams into the tmp. Reader runs core `attachment::open` on a helper thread feeding a bounded(1) channel of Zeroizing chunks (core only offers push-style open). Orphan prune runs only after a save that WROTE (clean save skips: memory may lag disk). Age = now - max(mtime, ctime) (cloud providers keep the peer's mtime). Setting mtime refreshes ctime, so tests cannot age files; they use hidden `set_prune_clock_offset_for_tests`. With an offset, a peer's blob whose ref is not yet saved is legitimately pruned, so apply offsets only after all refs are saved. Gotchas: core `seal(vault_id, ref, plain, out)` takes the ref by value and returns it on success (one ref, one seal); seal/open have no format_version arg (blob AAD version is a core constant); removals propagate via `Item.removed_attachments` tombstones; vault-app matches `SyncEvent` exhaustively (new variants break it).
 
 **Why:** future phase-3 work (watcher, backups, conflicts) builds on these seams.
 **How to apply:** extend synced.rs rather than restructure; keep `locked` in sync with disk when adding watcher reloads.

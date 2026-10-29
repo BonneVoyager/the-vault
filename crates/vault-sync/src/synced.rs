@@ -1,6 +1,7 @@
 //! [`SyncedVault`]: a vault bound to a file path (03 §8): open, unlock, edit, atomic save,
 //! snapshots and restore. Watching and reconciling external changes live in [`reconcile`].
 
+mod attachments;
 mod reconcile;
 
 use std::collections::HashMap;
@@ -90,6 +91,9 @@ pub struct SyncedVault {
     /// Last `ForeignVault` / `Error` reported per sibling, with the bytes' hash, so a file
     /// that keeps firing watcher events is reported once until it changes or disappears.
     sibling_reports: HashMap<PathBuf, ([u8; 32], reconcile::SiblingReport)>,
+    /// Added to the clock by orphan cleanup. Always zero unless the `test-support` feature is
+    /// on (file ages count from ctime, which tests cannot set back).
+    prune_clock_offset: Duration,
 }
 
 impl fmt::Debug for SyncedVault {
@@ -144,6 +148,7 @@ impl SyncedVault {
             save_blocked: None,
             locked_fallback: None,
             sibling_reports: HashMap::new(),
+            prune_clock_offset: Duration::ZERO,
         };
         this.write(&bytes, Mode::NoReplace)?;
         this.hooks.pin(&this.path);
@@ -192,6 +197,7 @@ impl SyncedVault {
             save_blocked: None,
             locked_fallback: None,
             sibling_reports: HashMap::new(),
+            prune_clock_offset: Duration::ZERO,
         })
     }
 
@@ -407,6 +413,7 @@ impl SyncedVault {
         self.dirty_from_corrupt = false;
         let first = std::mem::take(&mut self.first_save_after_unlock);
         self.maybe_backup(&bytes, item_count, first);
+        self.prune_orphan_attachments();
         Ok(())
     }
 

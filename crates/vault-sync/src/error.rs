@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use vault_core::{Uuid, VaultError};
+use vault_core::{AttachmentError, Uuid, VaultError};
 
 use crate::cloud::CloudError;
 
@@ -47,6 +47,24 @@ pub enum SyncError {
     /// The cloud provider could not supply the file.
     #[error(transparent)]
     Cloud(#[from] CloudError),
+    /// Sealing an attachment failed: larger than `MAX_ATTACHMENT_SIZE` (refused before any
+    /// byte is read), the input was not exactly `size` bytes, or the input reader failed. No
+    /// blob and no reference were left behind.
+    #[error(transparent)]
+    Attachment(#[from] AttachmentError),
+    /// The attachment blob is evicted to the cloud and did not download within
+    /// `DOWNLOAD_TIMEOUT` (03 §1.1 `NotDownloaded`). Retry later.
+    #[error("attachment {0} is not downloaded yet")]
+    AttachmentNotDownloaded(Uuid),
+    /// The item references the attachment but its blob is not in the attachments directory
+    /// (not synced yet, deleted, or the vault was restored from a backup; 03 §1.1 `Missing`).
+    #[error("attachment {0} is missing from the attachments directory")]
+    AttachmentMissing(Uuid),
+    /// The blob failed authentication (corrupt, truncated, swapped or not sealed for this
+    /// reference). Raised by `AttachmentReader` as the payload of an `io::Error`; every byte
+    /// already read from that reader must be discarded.
+    #[error("attachment {0} is corrupt or tampered")]
+    AttachmentTampered(Uuid),
 }
 
 impl SyncError {
