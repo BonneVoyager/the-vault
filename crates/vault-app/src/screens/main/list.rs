@@ -326,14 +326,24 @@ impl MainScreen {
                 // "Recently Created" stays hidden until core items carry a created_at.
             });
 
+        // The search row sits in the title-bar band, centred on the traffic lights.
         let header = ui::h_flex()
-            .px(px(12.))
-            .pb(px(8.))
+            .flex_none()
+            // Symmetric padding: at the default text size the row is exactly the band.
+            .py(px(ui::SEARCH_TOP))
+            .px(px(ui::COLUMN_PAD_X))
             .gap(px(4.))
             .child(
-                div().flex_1().child(
-                    ui::input(&self.search)
-                        .small()
+                div()
+                    .flex_1()
+                    .debug_selector(|| "list-search".into())
+                    .child(
+                        // `Input::h` is an inherent multi-line-only setter that shadows
+                        // `Styled::h`; call the trait method to size the single-line frame.
+                        gpui::Styled::h(
+                            ui::input(&self.search).small(),
+                            crate::theme::scaled(ui::SEARCH_HEIGHT, cx),
+                        )
                         .cleanable(true)
                         .prefix(
                             Icon::new(IconName::Search)
@@ -346,7 +356,7 @@ impl MainScreen {
                                 .text_color(theme.muted_foreground)
                                 .child("⌘F"),
                         ),
-                ),
+                    ),
             )
             .child(sort_button)
             .child({
@@ -414,48 +424,47 @@ impl MainScreen {
             .into_any_element()
         };
 
-        let footer =
-            ui::h_flex()
-                .px(px(12.))
-                .py(px(8.))
-                .border_t_1()
-                .border_color(theme.border)
-                .justify_between()
-                .child({
-                    let state = self.state.clone();
-                    let picker_state = self.state.clone();
-                    ui::popover(
-                        "kind-picker",
-                        Button::new("new-item")
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::Plus))
-                            .label("New")
-                            .tooltip("New item  ⌘N"),
-                        Anchor::BottomLeft,
-                        picker_open,
-                        move |open, _, cx| {
-                            state.update(cx, |s, cx| {
-                                if open {
-                                    s.open_kind_picker(String::new(), cx);
-                                } else {
-                                    s.close_kind_picker(cx);
-                                }
-                            });
-                        },
-                        move |_, cx| kind_picker(&picker_state, cx),
-                    )
-                })
-                .child(div().text_xs().text_color(theme.muted_foreground).child(
-                    match item_count {
+        let footer = super::column_footer(theme.border, cx)
+            .debug_selector(|| "list-footer".into())
+            .justify_between()
+            .child({
+                let state = self.state.clone();
+                let picker_state = self.state.clone();
+                ui::popover(
+                    "kind-picker",
+                    Button::new("new-item")
+                        .ghost()
+                        .small()
+                        .icon(Icon::new(IconName::Plus))
+                        .label("New")
+                        .tooltip("New item  ⌘N"),
+                    Anchor::BottomLeft,
+                    picker_open,
+                    move |open, _, cx| {
+                        state.update(cx, |s, cx| {
+                            if open {
+                                s.open_kind_picker(String::new(), cx);
+                            } else {
+                                s.close_kind_picker(cx);
+                            }
+                        });
+                    },
+                    move |_, cx| kind_picker(&picker_state, cx),
+                )
+            })
+            .child(
+                div()
+                    .debug_selector(|| "list-footer-count".into())
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(match item_count {
                         1 => "1 item".to_owned(),
                         n => format!("{n} items"),
-                    },
-                ));
+                    }),
+            );
 
         ui::v_flex()
             .size_full()
-            .pt(px(ui::TITLEBAR_HEIGHT))
             .border_r_1()
             .border_color(theme.border)
             .child(header)

@@ -227,6 +227,7 @@ impl MainScreen {
 
         ui::v_flex()
             .id("detail")
+            .debug_selector(|| "detail-column".into())
             .track_focus(&self.detail_focus)
             .key_context(DETAIL_CONTEXT)
             .size_full()
@@ -283,6 +284,7 @@ impl MainScreen {
         .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleFavorite), cx));
 
         let header = ui::h_flex()
+            .debug_selector(|| "detail-header".into())
             .gap(px(14.))
             .child(avatar(item.id, &item.title, 44.))
             .child(
@@ -324,7 +326,7 @@ impl MainScreen {
             .size_full()
             .overflow_y_scroll()
             .pt(px(ui::content_top(s)))
-            .px(px(28.))
+            .px(px(ui::COLUMN_PAD_X - ui::FOCUS_RING_WIDTH))
             .pb(px(64.))
             .gap(px(12.))
             .child(header)

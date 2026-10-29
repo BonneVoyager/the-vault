@@ -208,19 +208,22 @@ impl MainScreen {
                     }),
             )
             .child(
-                ui::v_flex()
-                    .px(px(8.))
-                    .pb(px(10.))
-                    .child(ui::divider(cx).mb(px(6.)))
-                    .child(nav_row(
-                        "nav-settings",
-                        IconName::Settings,
-                        "Settings",
-                        None,
-                        false,
-                        |window, cx| window.dispatch_action(Box::new(OpenSettings), cx),
-                        cx,
-                    )),
+                super::column_footer(theme.border, cx)
+                    .debug_selector(|| "sidebar-footer".into())
+                    .child(
+                        div()
+                            .flex_1()
+                            .debug_selector(|| "sidebar-footer-content".into())
+                            .child(nav_row(
+                                "nav-settings",
+                                IconName::Settings,
+                                "Settings",
+                                None,
+                                false,
+                                |window, cx| window.dispatch_action(Box::new(OpenSettings), cx),
+                                cx,
+                            )),
+                    ),
             )
             .into_any_element()
     }

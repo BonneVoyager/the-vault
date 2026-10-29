@@ -3,8 +3,8 @@
 //! device" password prompt. They sit in the title-bar band, above the item or editor.
 
 use gpui::{
-    AnyElement, App, Entity, IntoElement, ParentElement as _, Styled as _, div,
-    prelude::FluentBuilder as _, px,
+    AnyElement, App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _,
+    div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::alert::Alert;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -69,13 +69,18 @@ pub fn render(
     Some(
         ui::v_flex()
             .pt(px(ui::TITLEBAR_HEIGHT))
-            .px(px(28.))
+            // Same inset as the item and editor below (inside the detail's focus ring).
+            .px(px(ui::COLUMN_PAD_X - ui::FOCUS_RING_WIDTH))
             .gap(px(8.))
             .when(s.sync.corrupt, |col| {
                 col.child(Alert::error("banner-corrupt", CORRUPT).small())
             })
             .when(s.sync.waiting_for_cloud, |col| {
-                col.child(Alert::warning("banner-cloud", WAITING_FOR_CLOUD).small())
+                col.child(
+                    div()
+                        .debug_selector(|| "banner-cloud".into())
+                        .child(Alert::warning("banner-cloud", WAITING_FOR_CLOUD).small()),
+                )
             })
             .children(key_prompt)
             .into_any_element(),

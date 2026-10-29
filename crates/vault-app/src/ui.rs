@@ -27,16 +27,40 @@ const MAIN_DEFAULT: (f32, f32) = (1100., 720.);
 const MAIN_MIN: (f32, f32) = (820., 520.);
 /// Traffic-light inset from the window's top-left corner.
 const TRAFFIC_LIGHTS: (f32, f32) = (16., 16.);
-/// Height of the transparent titlebar strip that content must keep clear of.
+/// Height of one macOS traffic-light button.
+const TRAFFIC_LIGHT_SIZE: f32 = 14.;
+/// Height of the transparent titlebar strip that content must keep clear of. The
+/// sidebar's vault-name row starts below it because the traffic lights sit there.
 pub const TITLEBAR_HEIGHT: f32 = 44.;
+/// Height of the title-bar band: gpui sizes AppKit's titlebar container to the button
+/// height plus the traffic-light inset above and below, so the lights sit centred in it.
+/// The list's search row fills this band in the list column.
+pub const TOP_BAND_HEIGHT: f32 = 2. * TRAFFIC_LIGHTS.1 + TRAFFIC_LIGHT_SIZE;
+/// Height of the search field at the default text size. Set explicitly (scaled with the
+/// text size) because gpui-component's small input is `1.5 rem` and the rem differs
+/// between gpui-component's `Root` and ours.
+pub const SEARCH_HEIGHT: f32 = 24.;
+/// Top edge of the search field and of the detail header: centres the search field on
+/// the traffic lights at the default text size.
+pub const SEARCH_TOP: f32 = (TOP_BAND_HEIGHT - SEARCH_HEIGHT) / 2.;
+/// Left and right padding of the list's search row and the detail column, so the
+/// columns' content starts on the same inset.
+pub const COLUMN_PAD_X: f32 = 16.;
+/// Height of the sidebar and list footers, including their 1 px top divider. Scaled with
+/// the text size (`theme::scaled`) in both columns so they always match.
+pub const FOOTER_HEIGHT: f32 = 44.;
+/// Width of the transparent border `focus_ring` adds; content inside a focus-ringed
+/// column is inset by it.
+pub const FOCUS_RING_WIDTH: f32 = 1.;
 
-/// Top padding of the detail column's content: below the title-bar band, or just below
-/// the sync banners when they occupy it.
+/// Top padding of the detail column's content: level with the search field in the
+/// title-bar band, or just below the sync banners when they occupy it.
 pub fn content_top(s: &crate::state::AppState) -> f32 {
     if s.sync.has_banner() {
         12.
     } else {
-        TITLEBAR_HEIGHT
+        // The detail column carries a focus ring, which already insets its content.
+        SEARCH_TOP - FOCUS_RING_WIDTH
     }
 }
 

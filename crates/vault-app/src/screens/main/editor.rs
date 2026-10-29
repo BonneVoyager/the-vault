@@ -633,6 +633,7 @@ impl Render for Editor {
         };
 
         let header = ui::h_flex()
+            .debug_selector(|| "editor-header".into())
             .gap(px(8.))
             .child(
                 div()
@@ -664,7 +665,7 @@ impl Render for Editor {
             .size_full()
             .overflow_y_scroll()
             .pt(px(ui::content_top(s)))
-            .px(px(28.))
+            .px(px(ui::COLUMN_PAD_X - ui::FOCUS_RING_WIDTH))
             .pb(px(64.))
             .gap(px(10.))
             .when_some(new_kind, |col, kind| {

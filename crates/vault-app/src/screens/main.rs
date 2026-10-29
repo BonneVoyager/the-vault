@@ -34,6 +34,18 @@ use crate::{text, ui};
 const SIDEBAR: (f32, f32, f32) = (220., 180., 320.);
 const LIST: (f32, f32, f32) = (300., 240., 420.);
 
+/// A column footer: fixed height, full-width 1 px top divider, contents centred
+/// vertically. The sidebar and the item list both use it, so their dividers line up.
+fn column_footer(border: gpui::Hsla, cx: &App) -> gpui::Div {
+    ui::h_flex()
+        .flex_none()
+        .h(crate::theme::scaled(ui::FOOTER_HEIGHT, cx))
+        .px(px(8.))
+        .border_t_1()
+        .border_color(border)
+        .items_center()
+}
+
 /// Emitted after the user drags a column divider: `[sidebar, list]` widths.
 pub struct ColumnsResized(pub [f32; 2]);
 
@@ -264,7 +276,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use gpui::{Entity, TestAppContext, VisualTestContext, size};
+    use gpui::{Entity, Pixels, TestAppContext, VisualTestContext, size};
     use gpui_component::Root;
     use vault_core::{
         ExposeSecret as _, Field, FieldKind, Item, ItemKind, KdfParams, SecretString,
@@ -428,6 +440,102 @@ mod tests {
         }
         vcx.simulate_keystrokes("down cmd-shift-c cmd-l");
         assert!(state.read_with(&vcx, |s, _| s.locked));
+    }
+
+    /// The y (window pixels) of the painted top divider of the element at `area`. gpui
+    /// paints a border as one quad per edge, each clipped by its content mask, so the
+    /// divider is the quad covering `area` whose mask is a thin strip at its top.
+    fn top_divider_y(area: gpui::Bounds<Pixels>, vcx: &mut VisualTestContext) -> Option<Pixels> {
+        vcx.update(|window, _| {
+            let sf = window.scale_factor();
+            let scaled = area.scale(sf);
+            let near = |a: gpui::ScaledPixels, b: gpui::ScaledPixels| (a.0 - b.0).abs() < 0.5;
+            window
+                .painted_quads()
+                .iter()
+                .find(|q| {
+                    let mask = q.content_mask.bounds;
+                    near(q.bounds.origin.y, scaled.origin.y)
+                        && near(q.bounds.origin.x, scaled.origin.x)
+                        && near(q.bounds.size.width, scaled.size.width)
+                        && near(q.bounds.size.height, scaled.size.height)
+                        && q.border_widths.top.0 > 0.
+                        && near(mask.origin.y, q.bounds.origin.y)
+                        && mask.size.height.0 <= q.border_widths.top.0 + 1.
+                })
+                .map(|q| px(q.bounds.origin.y.0 / sf))
+        })
+    }
+
+    #[gpui::test]
+    fn columns_share_the_top_band_and_footer_grid(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut vcx) = open(true, dir.path(), cx);
+        assert!(state.read_with(&vcx, |s, _| s.selection.is_some()));
+        let bounds = |key: &'static str, vcx: &mut VisualTestContext| {
+            vcx.debug_bounds(key)
+                .unwrap_or_else(|| panic!("{key} not rendered"))
+        };
+        let near = |a: Pixels, b: Pixels| (a.as_f32() - b.as_f32()).abs() < 0.5;
+
+        // Search field inside the title-bar band, centred on the traffic lights, and the
+        // detail header's top level with it.
+        let search = bounds("list-search", &mut vcx);
+        let header = bounds("detail-header", &mut vcx);
+        assert_eq!(search.top(), px(ui::SEARCH_TOP));
+        assert!(search.bottom() <= px(ui::TOP_BAND_HEIGHT));
+        assert!(near(search.center().y, px(ui::TOP_BAND_HEIGHT / 2.)));
+        assert_eq!(header.top(), search.top());
+
+        // Same left inset in the list and the detail column.
+        let list_x = bounds("list-footer", &mut vcx).left();
+        assert_eq!(search.left() - list_x, px(ui::COLUMN_PAD_X));
+        let detail_x = bounds("detail-column", &mut vcx).left();
+        assert_eq!(header.left() - detail_x, px(ui::COLUMN_PAD_X));
+
+        // Footers: same height, divider at the same y, contents centred alike.
+        let side = bounds("sidebar-footer", &mut vcx);
+        let list = bounds("list-footer", &mut vcx);
+        assert_eq!(side.size.height, px(ui::FOOTER_HEIGHT));
+        assert_eq!(side.size.height, list.size.height);
+        assert_eq!(side.top(), list.top());
+        let side_divider = top_divider_y(side, &mut vcx).expect("sidebar footer divider");
+        let list_divider = top_divider_y(list, &mut vcx).expect("list footer divider");
+        assert_eq!(side_divider, list_divider);
+        let side_content = bounds("sidebar-footer-content", &mut vcx);
+        let list_content = bounds("list-footer-count", &mut vcx);
+        // Content centres sit half a divider below the box centre (1 px top border).
+        let centre = side.top() + px(0.5) + side.size.height / 2.;
+        assert!(near(side_content.center().y, centre));
+        assert!(near(list_content.center().y, centre));
+    }
+
+    #[gpui::test]
+    fn editor_and_sync_banner_share_the_detail_left_edge(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut vcx) = open(true, dir.path(), cx);
+        let edge = |key: &'static str, vcx: &mut VisualTestContext| {
+            vcx.debug_bounds(key)
+                .unwrap_or_else(|| panic!("{key} not rendered"))
+                .left()
+        };
+        let column = edge("detail-column", &mut vcx);
+        let read = edge("detail-header", &mut vcx);
+        assert_eq!(read - column, px(ui::COLUMN_PAD_X));
+
+        // Edit mode: the editor header starts where the read header did.
+        state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+        vcx.run_until_parked();
+        assert_eq!(edge("editor-header", &mut vcx), read);
+
+        // A sync banner above the editor sits on the same edge.
+        state.update(&mut vcx, |s, cx| {
+            s.sync.waiting_for_cloud = true;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert_eq!(edge("banner-cloud", &mut vcx), read);
+        assert_eq!(edge("editor-header", &mut vcx), read);
     }
 
     #[gpui::test]

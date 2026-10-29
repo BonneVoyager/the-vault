@@ -22,10 +22,53 @@ thread_local! {
     static CAPTURE_EXCLUSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Debug builds only: set to `1` at launch to keep app windows visible to screenshots, so
+/// UI screenshots can be taken for review. Release builds never read it.
+const ALLOW_CAPTURE_ENV: &str = "VAULT_ALLOW_SCREEN_CAPTURE";
+
+/// Whether app windows are hidden from screen capture. `debug` is
+/// `cfg!(debug_assertions)`; `env_value` is `VAULT_ALLOW_SCREEN_CAPTURE` and only counts
+/// when `debug` is true, so a release build always excludes.
+fn capture_exclusion_enabled(debug: bool, env_value: Option<&str>) -> bool {
+    !(debug && env_value == Some("1"))
+}
+
+/// The capture-exclusion decision, made once at launch (the first `VaultRoot`). Tests
+/// set it directly instead of touching the process environment.
+#[derive(Clone, Copy)]
+struct CaptureExclusion(bool);
+
+impl gpui::Global for CaptureExclusion {}
+
+impl CaptureExclusion {
+    fn from_launch() -> Self {
+        let debug = cfg!(debug_assertions);
+        // Release builds do not read the variable at all.
+        let env = if debug {
+            std::env::var(ALLOW_CAPTURE_ENV).ok()
+        } else {
+            None
+        };
+        let enabled = capture_exclusion_enabled(debug, env.as_deref());
+        if !enabled {
+            log::warn!(
+                "screen-capture exclusion disabled (VAULT_ALLOW_SCREEN_CAPTURE, debug build only)"
+            );
+        }
+        Self(enabled)
+    }
+}
+
 /// Hides every app window from screenshots and screen recording (NSWindow
 /// `sharingType = none`). Apple documents this as legacy and best effort: ScreenCaptureKit
-/// on recent macOS may ignore it. A no-op off the main thread (e.g. in tests).
-fn exclude_windows_from_capture() {
+/// on recent macOS may ignore it. Observed on the owner's Mac (macOS 27): system
+/// screenshots of excluded windows come out blank, so it is effective in practice.
+/// A no-op off the main thread (e.g. in tests), and skipped when [`CaptureExclusion`] is
+/// off.
+fn exclude_windows_from_capture(cx: &gpui::App) {
+    if cx.try_global::<CaptureExclusion>().is_some_and(|c| !c.0) {
+        return;
+    }
     vault_macos::exclude_app_windows_from_capture();
     #[cfg(test)]
     CAPTURE_EXCLUSIONS.with(|c| c.set(c.get() + 1));
@@ -56,6 +99,9 @@ impl VaultRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        if !cx.has_global::<CaptureExclusion>() {
+            cx.set_global(CaptureExclusion::from_launch());
+        }
         let columns = restore.and_then(|r| r.columns);
         let choose = cx.new(|cx| ChooseScreen::new(state.clone(), window, cx));
         let unlock = cx.new(|cx| UnlockScreen::new(state.clone(), window, cx));
@@ -92,7 +138,7 @@ impl VaultRoot {
             // Every window (this one, backup viewers) is wrapped in a gpui-component
             // `Root`; deferred so the NSWindow is registered with NSApp first.
             cx.observe_new::<gpui_component::Root>(|_, _, cx| {
-                cx.defer(|_| exclude_windows_from_capture());
+                cx.defer(|cx| exclude_windows_from_capture(cx));
             }),
         ];
 
@@ -111,7 +157,7 @@ impl VaultRoot {
         cx.set_global(actions::MainWindow(window.window_handle().window_id()));
         let screen = state.read(cx).screen;
         cx.defer_in(window, |this, window, cx| {
-            exclude_windows_from_capture();
+            exclude_windows_from_capture(cx);
             this.appear(window, cx);
         });
         let triggers = autolock::install(&state, cx);
@@ -245,6 +291,9 @@ mod tests {
         let calls = || CAPTURE_EXCLUSIONS.with(|c| c.get());
         let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
         cx.update(gpui_component::init);
+        // What launch decides without VAULT_ALLOW_SCREEN_CAPTURE (pinned so a developer's
+        // shell environment cannot change the test).
+        cx.update(|cx| cx.set_global(CaptureExclusion(capture_exclusion_enabled(true, None))));
         let before = calls();
         cx.add_window(|window, cx| {
             theme::apply(window, cx);
@@ -260,6 +309,44 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(calls() > after_main, "second window");
+    }
+
+    /// Debug build with VAULT_ALLOW_SCREEN_CAPTURE=1: no window is excluded. (The
+    /// decision is injected as launch would make it; setting the real environment
+    /// variable needs `unsafe` and would race other tests.)
+    #[gpui::test]
+    fn debug_escape_hatch_skips_capture_exclusion(cx: &mut TestAppContext) {
+        let calls = || CAPTURE_EXCLUSIONS.with(|c| c.get());
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        cx.update(gpui_component::init);
+        let enabled = capture_exclusion_enabled(true, Some("1"));
+        assert!(!enabled);
+        cx.update(|cx| cx.set_global(CaptureExclusion(enabled)));
+        let before = calls();
+        cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let view = cx.new(|cx| VaultRoot::new(state.clone(), None, window, cx));
+            Root::new(view, window, cx)
+        });
+        cx.add_window(|window, cx| {
+            let view = cx.new(|_| gpui::Empty);
+            Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(calls(), before, "no exclusion with the escape hatch on");
+    }
+
+    /// Only a debug build with the variable set to exactly `1` skips the exclusion;
+    /// release ignores the variable whatever its value.
+    #[test]
+    fn capture_exclusion_gating() {
+        assert!(!capture_exclusion_enabled(true, Some("1")));
+        assert!(capture_exclusion_enabled(true, None));
+        assert!(capture_exclusion_enabled(true, Some("0")));
+        assert!(capture_exclusion_enabled(true, Some("true")));
+        assert!(capture_exclusion_enabled(true, Some("")));
+        assert!(capture_exclusion_enabled(false, Some("1")));
+        assert!(capture_exclusion_enabled(false, None));
     }
 
     #[gpui::test]

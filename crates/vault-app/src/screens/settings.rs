@@ -110,15 +110,33 @@ fn retention_label(m: f32) -> String {
     }
 }
 
-/// One labelled settings row: label left, control right.
-fn row(label: &'static str, control: impl IntoElement, cx: &App) -> gpui::Div {
+/// One labelled settings row: label left, control right. Its divider comes from
+/// [`section`].
+fn row(label: &'static str, control: impl IntoElement) -> gpui::Div {
     ui::h_flex()
         .py(px(10.))
         .gap(px(12.))
-        .border_b_1()
-        .border_color(cx.theme().border)
         .child(div().flex_1().text_sm().child(label))
         .child(control)
+}
+
+/// A settings row plus whatever hangs under it (an inline form), which sits below the
+/// row's divider.
+pub(super) type SectionRow = (gpui::Div, Option<gpui::AnyElement>);
+
+/// A group of rows separated by hairlines: every row except the last gets a bottom
+/// border. Settings has no footer for a last line to close against, so nothing trails
+/// the final row. Each row is tagged `settings-row {name} {index}` for tests.
+pub(super) fn section(name: &'static str, rows: Vec<SectionRow>, cx: &App) -> gpui::Div {
+    let border = cx.theme().border;
+    let last = rows.len().saturating_sub(1);
+    ui::v_flex().children(rows.into_iter().enumerate().flat_map(|(ix, (row, below))| {
+        let row = row
+            .debug_selector(move || format!("settings-row {name} {ix}"))
+            .when(ix < last, |r| r.border_b_1().border_color(border))
+            .into_any_element();
+        std::iter::once(row).chain(below)
+    }))
 }
 
 /// A tinted inline confirm strip (restore, export).
@@ -201,8 +219,8 @@ impl SettingsView {
     fn general(&self, cx: &App) -> gpui::Div {
         let settings = self.state.read(cx).settings.clone();
         let state = self.state.clone();
-        ui::v_flex()
-            .child(row(
+        let rows = vec![
+            row(
                 "Auto-lock after",
                 choice(
                     "auto-lock",
@@ -212,9 +230,8 @@ impl SettingsView {
                     &self.state,
                     |s, v| s.auto_lock_minutes = v,
                 ),
-                cx,
-            ))
-            .child(row(
+            ),
+            row(
                 "Lock on sleep, screen lock or user switch",
                 Switch::new("lock-on-sleep")
                     .checked(settings.lock_on_sleep)
@@ -225,9 +242,8 @@ impl SettingsView {
                             s.update_settings(cx, |st| st.lock_on_sleep = on)
                         });
                     }),
-                cx,
-            ))
-            .child(row(
+            ),
+            row(
                 "Clear clipboard after",
                 choice(
                     "clipboard-clear",
@@ -237,9 +253,8 @@ impl SettingsView {
                     &self.state,
                     |s, v| s.clipboard_clear_secs = v,
                 ),
-                cx,
-            ))
-            .child(row(
+            ),
+            row(
                 "Appearance",
                 segmented(
                     "appearance",
@@ -251,9 +266,8 @@ impl SettingsView {
                     &self.state,
                     |st, ix| st.appearance = Appearance::ALL[ix],
                 ),
-                cx,
-            ))
-            .child(row(
+            ),
+            row(
                 "Text size",
                 segmented(
                     "text-size",
@@ -265,9 +279,14 @@ impl SettingsView {
                     &self.state,
                     |st, ix| st.text_size = TextSize::ALL[ix],
                 ),
-                cx,
-            ))
-            .children(self.login_item_row(cx))
+            ),
+        ];
+        let rows = rows
+            .into_iter()
+            .chain(self.login_item_row(cx))
+            .map(|r| (r, None))
+            .collect();
+        section("general", rows, cx)
     }
 
     /// "Launch at login" (hidden outside an .app bundle).
@@ -291,7 +310,7 @@ impl SettingsView {
                 .on_click(|_, _, _| vault_macos::open_login_items_settings())
                 .into_any_element(),
         };
-        Some(row("Launch at login", control, cx))
+        Some(row("Launch at login", control))
     }
 
     /// Sync & Backup (§2.5, 03 §4).
@@ -327,8 +346,6 @@ impl SettingsView {
         let location = ui::v_flex()
             .py(px(10.))
             .gap(px(6.))
-            .border_b_1()
-            .border_color(theme.border)
             .child(div().text_sm().child("Vault file"))
             .child(
                 div()
@@ -378,9 +395,9 @@ impl SettingsView {
                 }
             });
 
-        ui::v_flex()
-            .child(location)
-            .child(row(
+        let rows = vec![
+            location,
+            row(
                 "Automatic backups",
                 Switch::new("backup-enabled")
                     .checked(settings.backup_enabled)
@@ -391,21 +408,21 @@ impl SettingsView {
                             s.update_settings(cx, |st| st.backup_enabled = on)
                         });
                     }),
+            ),
+            row("Keep backups longer", retention),
+            row(
+                "Backups",
+                state_button("backup-now", "Back up now", &self.state, |s, cx| {
+                    s.backup_now(cx)
+                }),
+            ),
+        ];
+        ui::v_flex()
+            .child(section(
+                "sync",
+                rows.into_iter().map(|r| (r, None)).collect(),
                 cx,
             ))
-            .child(row("Keep backups longer", retention, cx))
-            .child(
-                ui::h_flex()
-                    .py(px(10.))
-                    .gap(px(12.))
-                    .child(div().flex_1().text_sm().child("Backups"))
-                    .child(state_button(
-                        "backup-now",
-                        "Back up now",
-                        &self.state,
-                        |s, cx| s.backup_now(cx),
-                    )),
-            )
             .child(self.backups(s, cx))
     }
 
@@ -420,23 +437,21 @@ impl SettingsView {
         if s.sync.backups.is_empty() {
             return ui::muted("No backups yet.", cx).into_any_element();
         }
-        let rows: Vec<gpui::AnyElement> = s
+        let rows = s
             .sync
             .backups
             .iter()
             .enumerate()
-            .map(|(ix, b)| self.backup_row(ix, b, s, cx))
+            .map(|(ix, b)| (self.backup_row(ix, b, s, cx), None))
             .collect();
-        ui::v_flex()
+        section("backups", rows, cx)
             .id("backups")
             .max_h(px(220.))
             .overflow_y_scroll()
-            .children(rows)
             .into_any_element()
     }
 
-    fn backup_row(&self, ix: usize, b: &BackupInfo, s: &AppState, cx: &App) -> gpui::AnyElement {
-        let theme = cx.theme();
+    fn backup_row(&self, ix: usize, b: &BackupInfo, s: &AppState, cx: &App) -> gpui::Div {
         let restore = s.sync.restore.as_ref().filter(|r| r.backup == b.path);
         let path = b.path.clone();
         let line = ui::h_flex()
@@ -465,11 +480,8 @@ impl SettingsView {
                 .when(s.locked, |b| b.tooltip("Unlock the vault to restore")),
             );
         ui::v_flex()
-            .border_b_1()
-            .border_color(theme.border)
             .child(line)
             .children(restore.map(|r| self.restore_prompt(r, s, cx)))
-            .into_any_element()
     }
 
     fn restore_prompt(&self, r: &RestorePrompt, s: &AppState, cx: &App) -> gpui::Div {
@@ -571,15 +583,14 @@ impl SettingsView {
         } else {
             div()
         };
-        ui::v_flex()
-            .child(row(
+        let rows = vec![
+            row(
                 "Import from CSV",
                 state_button("import-csv", "Import CSV\u{2026}", &self.state, |s, cx| {
                     s.choose_import_path(cx)
                 }),
-                cx,
-            ))
-            .child(row(
+            ),
+            row(
                 "Import from 1Password (1PUX)",
                 state_button(
                     "import-1pux",
@@ -587,22 +598,22 @@ impl SettingsView {
                     &self.state,
                     |s, cx| s.choose_import_1pux(cx),
                 ),
-                cx,
-            ))
-            .child(row(
-                "Import from KeePass (KDBX)",
-                not_yet("import-kdbx"),
-                cx,
-            ))
-            .child(row(
+            ),
+            row("Import from KeePass (KDBX)", not_yet("import-kdbx")),
+            row(
                 "Export to CSV (unencrypted)",
                 state_button("export-csv", "Export CSV\u{2026}", &self.state, |s, cx| {
                     s.set_export_confirm(true, cx)
                 })
                 .danger(),
-                cx,
-            ))
-            .child(export)
+            ),
+        ];
+        section(
+            "transfer",
+            rows.into_iter().map(|r| (r, None)).collect(),
+            cx,
+        )
+        .child(export)
     }
 
     fn about(&self, cx: &App) -> gpui::Div {
@@ -644,5 +655,167 @@ impl Render for SettingsView {
             .min_h(px(220.))
             .child(tabs)
             .child(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui::{TestAppContext, VisualTestContext};
+    use gpui_component::Root;
+    use vault_core::{Item, ItemKind, KdfParams, SecretString, Uuid};
+    use vault_sync::{NoopHooks, SyncedVault};
+
+    use super::*;
+    use crate::state::SecurityForm;
+    use crate::theme;
+
+    const SECTIONS: [&str; 6] = [
+        "general",
+        "security",
+        "security-advanced",
+        "sync",
+        "backups",
+        "transfer",
+    ];
+
+    /// Bounds of `settings-row {name} {ix}`, if rendered.
+    fn row_bounds(
+        name: &str,
+        ix: usize,
+        vcx: &mut VisualTestContext,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        let key: &'static str = Box::leak(format!("settings-row {name} {ix}").into_boxed_str());
+        vcx.debug_bounds(key)
+    }
+
+    /// Whether a quad with a bottom border is painted exactly over `bounds`.
+    fn has_bottom_border(bounds: gpui::Bounds<gpui::Pixels>, vcx: &mut VisualTestContext) -> bool {
+        vcx.update(|window, _| {
+            let b = bounds.scale(window.scale_factor());
+            let near = |a: gpui::ScaledPixels, c: gpui::ScaledPixels| (a.0 - c.0).abs() < 0.5;
+            window.painted_quads().iter().any(|q| {
+                near(q.bounds.origin.x, b.origin.x)
+                    && near(q.bounds.origin.y, b.origin.y)
+                    && near(q.bounds.size.width, b.size.width)
+                    && near(q.bounds.size.height, b.size.height)
+                    && q.border_widths.bottom.0 > 0.
+            })
+        })
+    }
+
+    /// For every section shown: a divider under each row but the last. Returns the
+    /// sections found with their row counts.
+    fn check_dividers(vcx: &mut VisualTestContext) -> Vec<(&'static str, usize)> {
+        let mut found = Vec::new();
+        for name in SECTIONS {
+            let rows: Vec<_> = (0..).map_while(|ix| row_bounds(name, ix, vcx)).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let dividers: Vec<bool> = rows.iter().map(|b| has_bottom_border(*b, vcx)).collect();
+            let last = rows.len() - 1;
+            for (ix, divided) in dividers.iter().enumerate() {
+                assert_eq!(
+                    *divided,
+                    ix < last,
+                    "{name} row {ix} of {}: divider {divided}",
+                    rows.len()
+                );
+            }
+            found.push((name, rows.len()));
+        }
+        found
+    }
+
+    fn show_tab(tab: usize, state: &Entity<AppState>, vcx: &mut VisualTestContext) {
+        state.update(vcx, |s, cx| {
+            s.settings_tab = tab;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+    }
+
+    /// The owner's screenshot showed a line under the last row of every tab: rows are
+    /// separated only between each other, nothing trails the final row of a section.
+    #[gpui::test]
+    fn no_divider_after_the_last_row(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = SyncedVault::create(
+            &dir.path().join("t.vault"),
+            &SecretString::new("pw".into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let device = vault.device_id();
+        for (n, title) in ["GitHub", "GitLab", "Codeberg"].into_iter().enumerate() {
+            let at = n as u64 + 1;
+            vault
+                .edit(|v| v.insert(Item::new(ItemKind::Login, title, device, at), at))
+                .unwrap();
+            vault.save().unwrap();
+            vault.backup_now().unwrap();
+        }
+
+        cx.update(gpui_component::init);
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        let window = cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let view = cx.new(|cx| SettingsView::new(state.clone(), window, cx));
+            Root::new(view, window, cx)
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        state.update(&mut vcx, |s, cx| {
+            s.install_unlocked_for_tests(vault);
+            s.refresh_backups();
+            s.open_settings(true, cx);
+        });
+        vcx.run_until_parked();
+
+        show_tab(0, &state, &mut vcx);
+        let general = check_dividers(&mut vcx);
+        assert!(
+            matches!(general[..], [("general", n)] if n >= 5),
+            "{general:?}"
+        );
+
+        // Security with an inline form open (it hangs below its row's divider) and the
+        // Advanced section expanded.
+        show_tab(SECURITY_TAB, &state, &mut vcx);
+        state.update(&mut vcx, |s, cx| {
+            s.toggle_security_advanced(cx);
+            s.set_security_form(Some(SecurityForm::ChangePassword), cx);
+        });
+        vcx.run_until_parked();
+        assert_eq!(
+            check_dividers(&mut vcx),
+            [("security", 3), ("security-advanced", 1)]
+        );
+
+        show_tab(SYNC_TAB, &state, &mut vcx);
+        let sync = check_dividers(&mut vcx);
+        assert!(
+            matches!(sync[..], [("sync", 4), ("backups", n)] if n >= 2),
+            "{sync:?}"
+        );
+
+        show_tab(TRANSFER_TAB, &state, &mut vcx);
+        assert_eq!(check_dividers(&mut vcx), [("transfer", 4)]);
+
+        show_tab(TABS.len() - 1, &state, &mut vcx);
+        assert!(check_dividers(&mut vcx).is_empty(), "About has no rows");
+
+        // Locked: Security shows only the Touch ID row, without a trailing line.
+        state.update(&mut vcx, |s, cx| {
+            s.lock(cx);
+            s.open_settings(true, cx);
+            s.settings_tab = SECURITY_TAB;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert_eq!(check_dividers(&mut vcx), [("security", 1)]);
     }
 }

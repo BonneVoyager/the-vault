@@ -7195,6 +7195,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-macos",
  "gpui-pre-platform",
+ "log",
  "rand 0.8.8",
  "serde",
  "serde_json",

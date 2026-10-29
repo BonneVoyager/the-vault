@@ -18,6 +18,7 @@ use gpui_component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use vault_core::SecretString;
 
+use super::settings::{SectionRow, section};
 use crate::state::{AppState, Busy, SECURITY_TAB, SecurityForm};
 use crate::ui;
 
@@ -235,14 +236,12 @@ fn take(input: &Entity<InputState>, window: &mut Window, cx: &mut App) -> Option
     Some(secret)
 }
 
-/// A labelled row: label (with an optional caption) left, control right.
+/// A labelled row: label (with an optional caption) left, control right. Its divider
+/// comes from [`section`].
 fn row(label: &'static str, caption: Option<String>, control: AnyElement, cx: &App) -> gpui::Div {
-    let theme = cx.theme();
     ui::h_flex()
         .py(px(10.))
         .gap(px(12.))
-        .border_b_1()
-        .border_color(theme.border)
         .child(
             ui::v_flex()
                 .flex_1()
@@ -275,7 +274,7 @@ fn error_line(error: Option<gpui::SharedString>, cx: &App) -> Option<gpui::Div> 
 impl SecurityView {
     /// The Touch ID toggle (04 §2 policy: on only after a password unlock in this
     /// session) plus the password prompt for turning it off.
-    fn touch_id_row(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn touch_id_row(&self, cx: &mut Context<Self>) -> SectionRow {
         let s = self.state.read(cx);
         let enabled = s.touch_enabled();
         let stale = s
@@ -317,47 +316,46 @@ impl SecurityView {
             })
             .child(toggle)
             .into_any_element();
-        let mut col = ui::v_flex().child(row("Unlock with Touch ID", caption, toggle, cx));
-        if disabling {
-            let working = busy == Some(Busy::DisablingTouchId);
-            col = col.child(
-                strip(false, cx)
+        let touch_row = row("Unlock with Touch ID", caption, toggle, cx);
+        if !disabling {
+            return (touch_row, None);
+        }
+        let working = busy == Some(Busy::DisablingTouchId);
+        let prompt = strip(false, cx)
+            .child(
+                div()
+                    .text_sm()
+                    .child("Enter your master password to turn off Touch ID."),
+            )
+            .children(
+                self.prompt(SecurityForm::DisableTouchId)
+                    .map(|i| ui::input(i).small().mask_toggle()),
+            )
+            .children(error_line(error, cx))
+            .child(
+                ui::h_flex()
+                    .gap(px(8.))
+                    .justify_end()
                     .child(
-                        div()
-                            .text_sm()
-                            .child("Enter your master password to turn off Touch ID."),
+                        Button::new("touch-off-cancel")
+                            .ghost()
+                            .small()
+                            .label("Cancel")
+                            .disabled(working)
+                            .on_click(cx.listener(|this, _, w, cx| this.open(None, w, cx))),
                     )
-                    .children(
-                        self.prompt(SecurityForm::DisableTouchId)
-                            .map(|i| ui::input(i).small().mask_toggle()),
-                    )
-                    .children(error_line(error, cx))
                     .child(
-                        ui::h_flex()
-                            .gap(px(8.))
-                            .justify_end()
-                            .child(
-                                Button::new("touch-off-cancel")
-                                    .ghost()
-                                    .small()
-                                    .label("Cancel")
-                                    .disabled(working)
-                                    .on_click(cx.listener(|this, _, w, cx| this.open(None, w, cx))),
-                            )
-                            .child(
-                                Button::new("touch-off-submit")
-                                    .primary()
-                                    .small()
-                                    .label("Turn Off")
-                                    .loading(working)
-                                    .on_click(cx.listener(|this, _, w, cx| {
-                                        this.submit_prompt(SecurityForm::DisableTouchId, w, cx)
-                                    })),
-                            ),
+                        Button::new("touch-off-submit")
+                            .primary()
+                            .small()
+                            .label("Turn Off")
+                            .loading(working)
+                            .on_click(cx.listener(|this, _, w, cx| {
+                                this.submit_prompt(SecurityForm::DisableTouchId, w, cx)
+                            })),
                     ),
             );
-        }
-        col.into_any_element()
+        (touch_row, Some(prompt.into_any_element()))
     }
 
     fn change_form(
@@ -496,7 +494,7 @@ impl Render for SecurityView {
         let s = self.state.read(cx);
         if s.locked || s.vault_path.is_none() {
             return ui::v_flex()
-                .child(touch_row)
+                .child(section("security", vec![touch_row], cx))
                 .child(div().py(px(10.)).child(ui::muted(
                     "Unlock the vault to change its security settings.",
                     cx,
@@ -566,37 +564,48 @@ impl Render for SecurityView {
             .on_click(move |_, _, cx| state.update(cx, |s, cx| s.toggle_security_advanced(cx)));
 
         let error_for = |f: SecurityForm| if form == Some(f) { error.clone() } else { None };
+        let change_form = (form == Some(SecurityForm::ChangePassword)).then(|| {
+            self.change_form(
+                busy == Some(Busy::ChangingPassword),
+                error_for(SecurityForm::ChangePassword),
+                cx,
+            )
+            .into_any_element()
+        });
+        let recalibrate_form = (form == Some(SecurityForm::Recalibrate)).then(|| {
+            self.recalibrate_form(
+                busy == Some(Busy::Recalibrating),
+                error_for(SecurityForm::Recalibrate),
+                cx,
+            )
+            .into_any_element()
+        });
+        let rows = vec![
+            touch_row,
+            (
+                row(
+                    "Master password",
+                    None,
+                    change_button.into_any_element(),
+                    cx,
+                ),
+                change_form,
+            ),
+            (
+                row(
+                    "Encryption strength",
+                    Some(match params {
+                        Some(p) => format!("{strength_text} \u{b7} {p}"),
+                        None => strength_text,
+                    }),
+                    strength_control,
+                    cx,
+                ),
+                recalibrate_form,
+            ),
+        ];
         let mut body = ui::v_flex()
-            .child(touch_row)
-            .child(row(
-                "Master password",
-                None,
-                change_button.into_any_element(),
-                cx,
-            ))
-            .when(form == Some(SecurityForm::ChangePassword), |col| {
-                col.child(self.change_form(
-                    busy == Some(Busy::ChangingPassword),
-                    error_for(SecurityForm::ChangePassword),
-                    cx,
-                ))
-            })
-            .child(row(
-                "Encryption strength",
-                Some(match params {
-                    Some(p) => format!("{strength_text} \u{b7} {p}"),
-                    None => strength_text,
-                }),
-                strength_control,
-                cx,
-            ))
-            .when(form == Some(SecurityForm::Recalibrate), |col| {
-                col.child(self.recalibrate_form(
-                    busy == Some(Busy::Recalibrating),
-                    error_for(SecurityForm::Recalibrate),
-                    cx,
-                ))
-            })
+            .child(section("security", rows, cx))
             .child(div().pt(px(8.)).child(disclosure));
         if advanced {
             let rotate_button = Button::new("rotate-key")
@@ -607,20 +616,25 @@ impl Render for SecurityView {
                 .on_click(
                     cx.listener(|this, _, w, cx| this.open(Some(SecurityForm::RotateKey), w, cx)),
                 );
-            body = body
-                .child(row(
-                    "Rotate vault key",
-                    Some("Replace the key that encrypts every item.".to_owned()),
-                    rotate_button.into_any_element(),
+            let rotate_form = (form == Some(SecurityForm::RotateKey)).then(|| {
+                self.rotate_form(
+                    busy == Some(Busy::RotatingKey),
+                    error_for(SecurityForm::RotateKey),
                     cx,
-                ))
-                .when(form == Some(SecurityForm::RotateKey), |col| {
-                    col.child(self.rotate_form(
-                        busy == Some(Busy::RotatingKey),
-                        error_for(SecurityForm::RotateKey),
-                        cx,
-                    ))
-                });
+                )
+                .into_any_element()
+            });
+            let rotate_row = row(
+                "Rotate vault key",
+                Some("Replace the key that encrypts every item.".to_owned()),
+                rotate_button.into_any_element(),
+                cx,
+            );
+            body = body.child(section(
+                "security-advanced",
+                vec![(rotate_row, rotate_form)],
+                cx,
+            ));
         }
         body.into_any_element()
     }

@@ -40,6 +40,9 @@ rand = { version = "^0.8.5", default-features = false, features = ["getrandom"] 
 # gpui reports problems (e.g. a missing text system) only through the `log` crate.
 # Surfaces those warnings on stderr; RUST_LOG overrides the default `warn` level.
 env_logger = "0.11.8"
+# `log::warn!` for the debug-only screen-capture escape hatch (root.rs). Already in the
+# graph via gpui and env_logger.
+log = "^0.4.34"
 
 # Compile Metal shaders at launch instead of in build.rs. Building them ahead of time
 # needs Xcode's separate Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`),
