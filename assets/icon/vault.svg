@@ -102,32 +102,16 @@
 
     <!-- six-spoke vault wheel: top, bottom, and four diagonals -->
     <g filter="url(#barShadow)">
-      <!-- vertical spokes -->
-      <g>
+      <!-- identical spokes at 60-degree intervals -->
+      <g id="spoke">
         <rect x="461" y="255" width="50" height="140" rx="16" fill="url(#steelBar)" stroke="#051c4b" stroke-width="4"/>
         <rect x="468" y="265" width="8" height="116" rx="4" fill="#fff" opacity=".50"/>
       </g>
-      <g>
-        <rect x="461" y="612" width="50" height="141" rx="16" fill="url(#steelBar)" stroke="#051c4b" stroke-width="4"/>
-        <rect x="468" y="623" width="8" height="115" rx="4" fill="#fff" opacity=".42"/>
-      </g>
-      <!-- diagonal spokes -->
-      <g transform="rotate(-55 486 503)">
-        <rect x="461" y="252" width="50" height="158" rx="16" fill="url(#steelBar)" stroke="#051c4b" stroke-width="4"/>
-        <rect x="468" y="264" width="8" height="128" rx="4" fill="#fff" opacity=".50"/>
-      </g>
-      <g transform="rotate(55 486 503)">
-        <rect x="461" y="252" width="50" height="158" rx="16" fill="url(#steelBar)" stroke="#051c4b" stroke-width="4"/>
-        <rect x="468" y="264" width="8" height="128" rx="4" fill="#fff" opacity=".50"/>
-      </g>
-      <g transform="rotate(-125 486 503)">
-        <rect x="461" y="252" width="50" height="158" rx="16" fill="url(#steelBar)" stroke="#051c4b" stroke-width="4"/>
-        <rect x="468" y="264" width="8" height="128" rx="4" fill="#fff" opacity=".44"/>
-      </g>
-      <g transform="rotate(125 486 503)">
-        <rect x="461" y="252" width="50" height="158" rx="16" fill="url(#steelBar)" stroke="#051c4b" stroke-width="4"/>
-        <rect x="468" y="264" width="8" height="128" rx="4" fill="#fff" opacity=".44"/>
-      </g>
+      <use xlink:href="#spoke" transform="rotate(60 486 503)"/>
+      <use xlink:href="#spoke" transform="rotate(120 486 503)"/>
+      <use xlink:href="#spoke" transform="rotate(180 486 503)"/>
+      <use xlink:href="#spoke" transform="rotate(240 486 503)"/>
+      <use xlink:href="#spoke" transform="rotate(300 486 503)"/>
     </g>
 
     <circle cx="486" cy="503" r="140" fill="none" stroke="#0084ff" stroke-opacity=".7" stroke-width="11" filter="url(#glow)"/>
