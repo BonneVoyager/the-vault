@@ -69,7 +69,7 @@ actions!(
         Minimize,
         /// Window ▸ Zoom.
         Zoom,
-        /// Help ▸ vault Help (placeholder).
+        /// Help ▸ Vault Help (placeholder).
         ShowHelp,
         /// File ▸ Import CSV…: CSV via the open panel.
         Import,
@@ -121,12 +121,12 @@ pub fn bind_keys(cx: &mut App) {
 /// Installs the menu bar. Called again when the sort changes, to move the checkmark.
 pub fn set_menus(sort: Sort, cx: &mut App) {
     cx.set_menus([
-        Menu::new("vault").items([
-            MenuItem::action("About vault", About),
+        Menu::new("Vault").items([
+            MenuItem::action("About Vault", About),
             MenuItem::separator(),
             MenuItem::action("Settings…", OpenSettings),
             MenuItem::separator(),
-            MenuItem::action("Quit vault", Quit),
+            MenuItem::action("Quit Vault", Quit),
         ]),
         Menu::new("File").items([
             MenuItem::action("New Vault…", NewVault),
@@ -187,7 +187,7 @@ pub fn set_menus(sort: Sort, cx: &mut App) {
             MenuItem::action("Minimize", Minimize),
             MenuItem::action("Zoom", Zoom),
         ]),
-        Menu::new("Help").items([MenuItem::action("vault Help", ShowHelp)]),
+        Menu::new("Help").items([MenuItem::action("Vault Help", ShowHelp)]),
     ]);
 }
 
@@ -243,7 +243,7 @@ pub fn register(state: &Entity<AppState>, cx: &mut App) {
     on::<NewVault>(state, cx, |s, cx| s.switch_vault(ChooseIntent::Create, cx));
     on::<OpenSettings>(state, cx, |s, cx| s.open_settings(true, cx));
     on::<About>(state, cx, |s, cx| {
-        s.show_toast(format!("vault {}", env!("CARGO_PKG_VERSION")), cx);
+        s.show_toast(format!("Vault {}", env!("CARGO_PKG_VERSION")), cx);
     });
     on::<ShowHelp>(state, cx, |s, cx| {
         s.show_toast("Help is not available yet", cx)

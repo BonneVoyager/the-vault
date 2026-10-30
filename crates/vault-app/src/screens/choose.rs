@@ -208,7 +208,7 @@ impl ChooseScreen {
                 div()
                     .text_xl()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Welcome to vault"),
+                    .child("Welcome to Vault"),
             )
             .child(ui::muted(
                 "Create a new vault or open one you already have.",

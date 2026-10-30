@@ -636,7 +636,7 @@ impl SettingsView {
 
     fn about(&self, cx: &App) -> gpui::Div {
         ui::v_flex().py(px(10.)).child(ui::muted(
-            format!("vault {}", env!("CARGO_PKG_VERSION")),
+            format!("Vault {}", env!("CARGO_PKG_VERSION")),
             cx,
         ))
     }

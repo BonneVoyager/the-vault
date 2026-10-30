@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/icon/vault-256.png" width="128" alt="vault icon"></p>
+<p align="center"><img src="assets/icon/vault-256.png" width="128" alt="Vault icon"></p>
 
 # The Vault
 
