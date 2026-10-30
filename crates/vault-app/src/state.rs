@@ -764,6 +764,10 @@ impl AppState {
                     this.unlocked();
                     this.password_unlocked(true);
                     this.stale_cleaned(cleaned);
+                    // The unlock merged the file on disk: our enclave slot may be gone.
+                    if this.recheck_touch_slot() {
+                        this.toast = Some(Toast::window(touch_id::SLOT_GONE));
+                    }
                 }
                 (Outcome::Locked, Ok(())) => {
                     vault.lock();
@@ -890,22 +894,11 @@ impl AppState {
             Some(vault) if vault.is_dirty() => Some(vault.save()),
             _ => None,
         };
-        let blocked = matches!(
-            saved,
-            Some(Err(SyncError::KeyMismatch | SyncError::SaveBlocked(_)))
-        );
         if let Some(e) = saved.and_then(|r| self.record_save(r)) {
             // Locking wins over keeping unsaved edits: an auto-lock must not be vetoed
-            // by a failing disk. The user sees why the edits are gone, or (when saving was
-            // refused) where vault-sync preserved them.
-            let message = if blocked {
-                format!(
-                    "Could not save before locking ({e}). Your changes were kept in the backups folder."
-                )
-            } else {
-                format!("Could not save before locking: {e}")
-            };
-            self.toast = Some(Toast::window(message));
+            // by a failing disk. `lock` below writes the dirty vault to the backups folder
+            // as an Unsaved backup (03 §8), so the user learns where the edits went.
+            self.toast = Some(Toast::window(lock_save_failed(&e)));
         }
         if let Some(vault) = self.vault.as_mut() {
             // The watcher keeps running: vault-sync needs it to see changes made while
@@ -1082,8 +1075,16 @@ fn error_message(e: &SyncError) -> String {
         SyncError::NoVault(p) => format!("No vault at {}. Removed from recents.", p.display()),
         SyncError::NotAPackage(_) => NOT_A_PACKAGE.into(),
         SyncError::AlreadyExists(p) => format!("{} already exists.", p.display()),
+        // `open` and `unlock` take the package's shared lock and wait for a writer.
+        SyncError::SaveLockTimeout(_) => sync::SAVE_BUSY.into(),
         other => other.to_string(),
     }
+}
+
+/// Toast when the save right before a lock failed. The dirty vault still reaches disk:
+/// `SyncedVault::lock` writes it to the backups folder as an Unsaved backup (03 §8).
+fn lock_save_failed(e: &str) -> String {
+    format!("Could not save before locking ({e}). Your changes were kept in the backups folder.")
 }
 
 #[cfg(test)]

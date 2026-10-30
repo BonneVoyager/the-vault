@@ -20,12 +20,16 @@
 //!
 //! Only the identical-pair tie is not resolved by timestamps. `device_id` is compared as
 //! raw bytes (`Uuid`'s `Ord`), which is what the spec means by "greater `device_id` bytes".
+//!
+//! **Header merge** (03 §5): the slot set and KDF parameters are last-writer-wins as a unit,
+//! keyed by `header.slots_modified_at`; see [`UnlockedVault::merge_from`].
 
 use std::cmp::Ordering;
 
 use secrecy::ExposeSecret;
 
 use super::{ATTACHMENT_TOMBSTONE_CAP, HISTORY_CAP, UnlockedVault};
+use crate::crypto::Keys;
 use crate::error::VaultError;
 use crate::item::{
     AttachmentRef, AttachmentTombstone, Field, FieldKind, HistoryEntry, Item, Millis,
@@ -43,18 +47,48 @@ pub struct MergeReport {
     pub deleted: usize,
     /// Ids whose merged result equals ours, including ids absent from theirs.
     pub unchanged: usize,
+    /// The slot set and KDF parameters were taken from theirs (their
+    /// `header.slots_modified_at` was greater; 03 §5 "Header merge").
+    pub header_updated: bool,
 }
 
 impl MergeReport {
-    /// `true` if the merge changed anything in ours (so a caller should save).
+    /// `true` if the merge changed anything in ours (so a caller should save): an item moved
+    /// or the header was taken from theirs.
     pub fn changed(&self) -> bool {
-        self.added + self.updated + self.deleted > 0
+        self.added + self.updated + self.deleted > 0 || self.header_updated
     }
 }
 
 impl UnlockedVault {
     /// Fold every item of `other` into `self` per `03-sync.md` §5. See the module docs for the
-    /// rules. Header, slots and keys of `self` are untouched; `other` is only read.
+    /// rules. `other` is only read.
+    ///
+    /// **Header merge** (03 §5). If `other.header.slots_modified_at` is greater than ours
+    /// (a missing stamp reads as 0), or equal with a greater `slots_device_id` (the
+    /// persisted device id of that change; greater bytes win, like item metadata, and a
+    /// missing id sorts below any present one), our whole slot set (key slots *and* opaque slots, in their order), KDF
+    /// parameters (with the unknown keys of the `kdf` map), stamp and device id are replaced by
+    /// theirs and `report.header_updated` is set; otherwise ours stay. Equal stamp *and*
+    /// device id (the same change seen twice, or two never-stamped headers) keeps ours, which
+    /// is what makes the merge idempotent. The persisted id is used rather than the
+    /// in-memory `device_id`: vault-sync opens the on-disk copy with the local device id, so
+    /// the two `UnlockedVault`s always carry the same one. A password change, re-calibration, slot add/remove or key rotation on one
+    /// device therefore survives the other device's next save instead of being reverted by
+    /// it. Top-level header extras, `vault_id` and `created_at` are never touched.
+    ///
+    /// **Key rotation.** Their slots wrap *their* `vault_key`, so whenever their header wins
+    /// our in-memory keys are replaced by theirs too (a no-op when both sides hold the same
+    /// key, which is every case except a rotation). The two always travel together: taking
+    /// slots that wrap key X while still encrypting items under key Y would write a file no
+    /// credential can open. The core cannot verify slots without a KEK and does not try;
+    /// `other` is an [`UnlockedVault`], so it *has* the key its slots wrap. Consequences:
+    /// after a merge that reports `header_updated`, any `VaultKeyHandle` exported earlier may
+    /// be stale and items are re-encrypted under the adopted key on the next `serialize`.
+    /// vault-sync reaches this path only after `unlock_with_key` failed on the rotated file
+    /// (`KeyRotatedOnDisk`) and the user re-entered a credential; if our stamp is the greater
+    /// one (a later local slot change), the rotation is undone by the merge and the other
+    /// device will in turn see `KeyRotatedOnDisk`. That is the LWW rule applied to keys.
     ///
     /// **Record timestamp always moves with content.** If the merged item differs from ours but
     /// the rule's `max(ours, theirs)` leaves `modified_at` equal to ours (e.g. ours
@@ -92,6 +126,20 @@ impl UnlockedVault {
             return Err(VaultError::Malformed("vault_id mismatch".into()));
         }
         let mut report = MergeReport::default();
+        // `Option` ordering puts a missing id below every present one.
+        let theirs_newer = (other.header.slots_stamp(), other.header.slots_device_id)
+            > (self.header.slots_stamp(), self.header.slots_device_id);
+        if theirs_newer {
+            self.header.slots = other.header.slots.clone();
+            self.header.kdf = other.header.kdf.clone();
+            self.header.kdf_extras = other.header.kdf_extras.clone();
+            self.header.slots_modified_at = other.header.slots_modified_at;
+            self.header.slots_device_id = other.header.slots_device_id;
+            // Dropping the previous `Keys` zeroizes them. Same key in all but the rotation
+            // case; see the docs above.
+            self.keys = Keys::from_vault_key(other.keys.vault_key.clone(), self.header.vault_id);
+            report.header_updated = true;
+        }
         for (id, theirs) in &other.items {
             match self.items.get(id) {
                 None => {

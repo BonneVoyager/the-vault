@@ -13,8 +13,8 @@ use common::*;
 use vault_core::format::{self, VaultFile};
 use vault_core::search::{Query, search};
 use vault_core::{
-    ExposeSecret, Field, FieldKind, Item, LockedVault, OpaqueSlot, SecretVec, Slot, SlotKind, Uuid,
-    VaultError, export_csv, merge,
+    ExposeSecret, Field, FieldKind, Item, LockedVault, OpaqueSlot, SecretVec, Slot, SlotKind,
+    TamperKind, Uuid, VaultError, export_csv, merge,
 };
 
 fn t(s: &str) -> Value {
@@ -74,7 +74,7 @@ fn no_password_slot_is_no_usable_slot() {
     let mut v = new_vault();
     populate(&mut v, 1);
     let kek = SecretVec::new(vec![3u8; 32]);
-    let enclave = v.add_enclave_slot(&kek);
+    let enclave = v.add_enclave_slot(&kek, 5_000);
     let bytes = v.serialize();
 
     // Only an opaque slot left: this build cannot unlock it with a password.
@@ -96,13 +96,19 @@ fn no_password_slot_is_no_usable_slot() {
         VaultError::Malformed(_)
     ));
 
-    // Only an enclave slot: same error for a password unlock; the enclave KEK still works.
+    // Only an enclave slot: same error for a password unlock, decided from the plaintext
+    // before any key work. The enclave KEK unwraps its slot, but the file is stamped
+    // (`add_enclave_slot`) and the slot set is digest-bound into the manifest (01 §4), so
+    // removing the password slot by hand is caught as Tampered(Manifest).
     let only_enclave = rewrite(&bytes, |f| {
         f.header.slots.retain(|s| s.is_key_of(SlotKind::Enclave));
     });
     let locked = LockedVault::parse(&only_enclave).unwrap();
     assert_eq!(locked.unlock(&pw()).unwrap_err(), VaultError::NoUsableSlot);
-    assert!(locked.unlock_with_kek(enclave, &kek).is_ok());
+    assert_eq!(
+        locked.unlock_with_kek(enclave, &kek).unwrap_err(),
+        VaultError::Tampered(TamperKind::Manifest)
+    );
 }
 
 #[test]
@@ -110,16 +116,16 @@ fn opaque_slot_can_be_removed_and_is_dropped_by_rotation() {
     let (bytes, opaque_id) = with_opaque_first();
 
     let mut v = unlock(&bytes).unwrap();
-    v.remove_slot(opaque_id).unwrap();
+    v.remove_slot(opaque_id, 5_000).unwrap();
     assert_eq!(v.slots().count(), 1);
     assert!(v.slots().all(|(_, k)| k == SlotKind::Password));
     assert!(matches!(
-        v.remove_slot(opaque_id).unwrap_err(),
+        v.remove_slot(opaque_id, 5_001).unwrap_err(),
         VaultError::Malformed(_)
     ));
 
     let mut v = unlock(&bytes).unwrap();
-    v.rotate_vault_key(&pw()).unwrap();
+    v.rotate_vault_key(&pw(), 5_000).unwrap();
     assert_eq!(v.slots().count(), 1, "opaque slot dropped by rotation");
     assert!(v.slots().all(|(_, k)| k == SlotKind::Password));
     let reopened = unlock(&v.serialize()).unwrap();
@@ -338,7 +344,7 @@ fn opaque_slot_constructor_rejects_known_kinds_and_reserved_keys() {
 fn duplicate_slot_ids_are_malformed() {
     let mut v = new_vault();
     let kek = SecretVec::new(vec![9u8; 32]);
-    let enclave = v.add_enclave_slot(&kek);
+    let enclave = v.add_enclave_slot(&kek, 5_000);
     let bytes = v.serialize();
 
     // Opaque slot shadowing the enclave slot's id, inserted ahead of it.
@@ -360,12 +366,28 @@ fn duplicate_slot_ids_are_malformed() {
         VaultError::Malformed(_)
     ));
     // Distinct ids are fine, and the enclave slot is still found by id with an opaque slot
-    // ahead of it.
-    let fine = rewrite(&bytes, |f| {
+    // ahead of it. The opaque slot is spliced into the *unstamped* file before the enclave
+    // slot is added, so the stamped header's digest covers it (splicing it into the stamped
+    // file would be a tamper, 01 §4).
+    let v = new_vault();
+    let with_opaque = rewrite(&v.serialize(), |f| {
         f.header.slots.insert(0, Slot::Opaque(opaque(0x77)));
     });
-    let locked = LockedVault::parse(&fine).unwrap();
+    let mut v = unlock(&with_opaque).unwrap();
+    let enclave = v.add_enclave_slot(&kek, 5_000);
+    let locked = LockedVault::parse(&v.serialize()).unwrap();
+    assert_eq!(locked.header().slots[0], Slot::Opaque(opaque(0x77)));
     assert!(locked.unlock_with_kek(enclave, &kek).is_ok());
+    let spliced = rewrite(&v.serialize(), |f| {
+        f.header.slots.insert(0, Slot::Opaque(opaque(0x78)));
+    });
+    assert_eq!(
+        LockedVault::parse(&spliced)
+            .unwrap()
+            .unlock_with_kek(enclave, &kek)
+            .unwrap_err(),
+        VaultError::Tampered(TamperKind::Manifest)
+    );
 }
 
 #[test]
@@ -471,7 +493,7 @@ fn opaque_slots_survive_slot_management_and_keep_order() {
         ]
     );
     let kek = SecretVec::new(vec![4u8; 32]);
-    let enclave = v.add_enclave_slot(&kek);
+    let enclave = v.add_enclave_slot(&kek, 5_000);
     assert_eq!(
         kinds(&v),
         [
@@ -481,7 +503,7 @@ fn opaque_slots_survive_slot_management_and_keep_order() {
             SlotKind::Enclave
         ]
     );
-    v.remove_slot(enclave).unwrap();
+    v.remove_slot(enclave, 5_001).unwrap();
     assert_eq!(
         kinds(&v),
         [

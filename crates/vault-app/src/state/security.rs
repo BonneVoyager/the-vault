@@ -197,7 +197,7 @@ impl AppState {
                     salt: KdfParams::recommended().salt,
                     ..v.header().kdf.clone()
                 };
-                v.change_password(&current, &new, kdf)
+                v.change_password(&current, &new, kdf, crate::text::now_millis())
             },
             |_: &mut Self| "Master password changed".into(),
         );
@@ -212,7 +212,7 @@ impl AppState {
             cx,
             move |v| {
                 let kdf = KdfParams::calibrate(target);
-                v.change_password(&password, &password, kdf)
+                v.change_password(&password, &password, kdf, crate::text::now_millis())
             },
             |_: &mut Self| "Encryption re-calibrated for this Mac".into(),
         );
@@ -230,7 +230,7 @@ impl AppState {
             Busy::RotatingKey,
             cx,
             move |v| {
-                v.rotate_vault_key(&password)?;
+                v.rotate_vault_key(&password, crate::text::now_millis())?;
                 if let Some(id) = vault_id
                     && let Err(e) = bio.unenroll(id)
                 {
@@ -410,6 +410,14 @@ mod tests {
             .clone()
     }
 
+    /// `header.slots_modified_at` of the file on disk (0 when absent).
+    fn on_disk_slots_stamp(path: &Path) -> u64 {
+        LockedVault::parse(&std::fs::read(path.join("vault.bin")).unwrap())
+            .unwrap()
+            .header()
+            .slots_stamp()
+    }
+
     fn titles(state: &Entity<AppState>, cx: &mut TestAppContext) -> Vec<String> {
         state.read_with(cx, |s, _| {
             let mut t: Vec<_> = s
@@ -428,6 +436,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (state, path) = setup(dir.path(), cx);
         let before = on_disk_kdf(&path);
+        let stamp_before = on_disk_slots_stamp(&path);
 
         // Validation and a wrong current password leave everything as it was.
         state.update(cx, |s, cx| {
@@ -452,11 +461,18 @@ mod tests {
             assert_eq!(s.security.form, Some(SecurityForm::ChangePassword));
         });
         assert!(unlocks(&path, PW, cx));
+        assert_eq!(
+            on_disk_slots_stamp(&path),
+            stamp_before,
+            "refused: header untouched"
+        );
 
         state.update(cx, |s, cx| {
             s.change_master_password(secret(PW), secret("new pw"), secret("new pw"), cx)
         });
         cx.run_until_parked();
+        // Saved at once with a newer stamp, so the header wins the merge elsewhere (03 §5).
+        assert!(on_disk_slots_stamp(&path) > stamp_before);
         state.read_with(cx, |s, _| {
             assert!(s.security.error.is_none());
             assert!(s.security.form.is_none(), "form closes on success");
@@ -479,12 +495,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (state, path) = setup(dir.path(), cx);
         let bytes_before = std::fs::read(path.join("vault.bin")).unwrap();
+        let stamp_before = on_disk_slots_stamp(&path);
         state.update(cx, |s, cx| s.rotate_key(secret("wrong"), cx));
         cx.run_until_parked();
         state.read_with(cx, |s, _| assert!(s.security.error.is_some()));
 
         state.update(cx, |s, cx| s.rotate_key(secret(PW), cx));
         cx.run_until_parked();
+        assert!(
+            on_disk_slots_stamp(&path) > stamp_before,
+            "rotation saved with a newer stamp"
+        );
         state.read_with(cx, |s, _| {
             assert!(s.security.error.is_none());
             assert_eq!(
@@ -513,6 +534,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (state, path) = setup(dir.path(), cx);
         let before = on_disk_kdf(&path);
+        let stamp_before = on_disk_slots_stamp(&path);
         state.update(cx, |s, cx| {
             // Zero target: calibrate stops after one probe at the recommended params.
             s.security.calibration_target = Duration::ZERO;
@@ -521,6 +543,10 @@ mod tests {
         });
         cx.run_until_parked();
         let after = on_disk_kdf(&path);
+        assert!(
+            on_disk_slots_stamp(&path) > stamp_before,
+            "saved with a newer stamp"
+        );
         assert_ne!(cost(&after), cost(&before));
         assert_eq!(cost(&after), cost(&KdfParams::recommended()));
         state.read_with(cx, |s, _| {

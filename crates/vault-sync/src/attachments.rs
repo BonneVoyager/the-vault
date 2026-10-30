@@ -92,6 +92,56 @@ fn newest_stamp(m: &fs::Metadata) -> Option<SystemTime> {
     }
 }
 
+/// Whether `path` is a regular file (not a symlink) present locally for longer than `grace`
+/// at `now`. Future-dated or unreadable files are never old.
+fn older_than(path: &Path, grace: Duration, now: SystemTime) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_file() => newest_stamp(&m)
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > grace),
+        _ => false,
+    }
+}
+
+/// `.vault.bin.tmp-<8 hex>`, the tmp name `write_atomic` uses for the primary.
+fn is_vault_tmp(name: &str) -> bool {
+    name.strip_prefix(&format!(".{}.tmp-", package::VAULT_FILE_NAME))
+        .is_some_and(|hex| hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Delete `.vault.bin.tmp-*` files directly in `package` that are older than
+/// [`STALE_TMP_GRACE`] (same age rule as blob tmp files): left by a crash between tmp
+/// creation and rename (03 §1 "never left behind"). Returns how many were deleted; individual
+/// delete failures are logged and skipped.
+pub(crate) fn prune_stale_vault_tmp(package: &Path, now: SystemTime) -> Result<usize, SyncError> {
+    let entries = match fs::read_dir(package) {
+        Ok(e) => e,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(SyncError::io(package, e)),
+    };
+    let mut pruned = 0;
+    for entry in entries {
+        let entry = entry.map_err(|e| SyncError::io(package, e))?;
+        if !entry.file_name().to_str().is_some_and(is_vault_tmp) {
+            continue;
+        }
+        let path = entry.path();
+        if !older_than(&path, STALE_TMP_GRACE, now) {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "removed stale vault tmp file");
+                pruned += 1;
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "could not remove stale vault tmp file");
+            }
+        }
+    }
+    Ok(pruned)
+}
+
 /// Delete orphaned blobs and stale tmp files in `dir` (03 §1.1). A `*.bin` whose id is not in
 /// `referenced` goes once its age (from `max(mtime, ctime)`, see the module docs) exceeds
 /// [`ORPHAN_GRACE`]; a blob tmp once it exceeds [`STALE_TMP_GRACE`]. Anything else (other
@@ -107,14 +157,7 @@ pub(crate) fn prune(
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(SyncError::io(dir, e)),
     };
-    let older_than = |path: &Path, grace: Duration| -> bool {
-        match fs::symlink_metadata(path) {
-            Ok(m) if m.file_type().is_file() => newest_stamp(&m)
-                .and_then(|t| now.duration_since(t).ok())
-                .is_some_and(|age| age > grace),
-            _ => false,
-        }
-    };
+    let older_than = |path: &Path, grace: Duration| older_than(path, grace, now);
     let mut pruned = 0;
     for entry in entries {
         let entry = entry.map_err(|e| SyncError::io(dir, e))?;
@@ -335,6 +378,33 @@ mod tests {
         assert!(is_blob_tmp(&format!(".{name}.tmp-0011aabb")));
         assert!(!is_blob_tmp(&format!("{name}.tmp-0011aabb")));
         assert!(!is_blob_tmp(".x.bin.tmp-0011aabb"));
+    }
+
+    #[test]
+    fn stale_vault_tmp_is_removed_after_an_hour_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join(".vault.bin.tmp-0011aabb");
+        let other = [
+            ".vault.bin.tmp-xyz",
+            "vault.bin",
+            ".lock",
+            ".x.bin.tmp-0011aabb",
+        ];
+        fs::write(&stale, b"x").unwrap();
+        for n in other {
+            fs::write(dir.path().join(n), b"x").unwrap();
+        }
+        let now = SystemTime::now();
+        assert_eq!(prune_stale_vault_tmp(dir.path(), now).unwrap(), 0);
+        assert!(stale.exists());
+        let later = now + STALE_TMP_GRACE + Duration::from_secs(60);
+        assert_eq!(prune_stale_vault_tmp(dir.path(), later).unwrap(), 1);
+        assert!(!stale.exists());
+        for n in other {
+            assert!(dir.path().join(n).exists(), "{n}");
+        }
+        assert!(is_vault_tmp(".vault.bin.tmp-DEADbeef"));
+        assert!(!is_vault_tmp("vault.bin.tmp-deadbeef"));
     }
 
     #[test]

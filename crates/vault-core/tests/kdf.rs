@@ -1,5 +1,8 @@
+mod common;
+
 use std::time::Duration;
 
+use common::*;
 use vault_core::KdfParams;
 use vault_core::kdf::{
     RECOMMENDED_M_COST_KIB, RECOMMENDED_P_COST, RECOMMENDED_T_COST, TEST_M_COST_KIB,
@@ -44,6 +47,39 @@ fn validate_bounds() {
             VaultError::Malformed(_)
         ));
     }
+}
+
+/// V-08: a tampered `t_cost` must not turn every unlock attempt into a half-minute Argon2
+/// run. Calibration never leaves `t = 3`, so 16 is already generous.
+#[test]
+fn t_cost_is_capped_at_16_in_validate_and_in_the_parser() {
+    use vault_core::kdf::MAX_T_COST;
+    use vault_core::{LockedVault, VaultError};
+    assert_eq!(MAX_T_COST, 16);
+    let mut p = KdfParams::for_tests();
+    p.t_cost = 16;
+    assert!(p.validate().is_ok());
+    p.t_cost = 17;
+    assert!(matches!(
+        p.validate().unwrap_err(),
+        VaultError::Malformed(m) if m.contains("t_cost")
+    ));
+    p.t_cost = 64;
+    assert!(p.validate().is_err(), "the old ceiling is gone");
+
+    // The parser rejects the header before any Argon2 work; 16 still parses (and the KEK is
+    // simply wrong for the stored slots, so it is a WrongPassword, never a hang).
+    let v = new_vault();
+    let bytes = v.serialize();
+    let t17 = rewrite(&bytes, |f| f.header.kdf.t_cost = 17);
+    assert!(matches!(
+        LockedVault::parse(&t17),
+        Err(VaultError::Malformed(m)) if m.contains("t_cost")
+    ));
+    let t16 = rewrite(&bytes, |f| f.header.kdf.t_cost = 16);
+    let locked = LockedVault::parse(&t16).unwrap();
+    assert_eq!(locked.kdf_params().t_cost, 16);
+    assert_eq!(locked.unlock(&pw()).unwrap_err(), VaultError::WrongPassword);
 }
 
 #[test]

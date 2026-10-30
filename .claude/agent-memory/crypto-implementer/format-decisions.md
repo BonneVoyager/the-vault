@@ -18,7 +18,8 @@ Decisions settled while implementing `crates/vault-core` P2 (2026-10-28). Later 
   `format::{slot_aad,item_aad,manifest_aad}` take it as first arg. Version 0 -> `UnsupportedVersion(0)`.
 
 **KDF bounds (security review):** `KdfParams::validate` — all costs non-zero, m_cost <= 1 GiB,
-t_cost <= 64, p_cost <= 64 — enforced in `Header::from_value` (-> `Malformed`) and `derive_kek`.
+t_cost <= 16 (was 64 until 2026-10-30, V-08), p_cost <= 64 — enforced in `Header::from_value`
+(-> `Malformed`) and `derive_kek`.
 Never remove: an uncapped header m_cost makes Argon2 allocate terabytes before the password check.
 
 **Canonical CBOR approach:** build `ciborium::Value` trees, run `format::canonicalize` (recursive
@@ -51,6 +52,8 @@ Items before manifest so a foreign record reports `Item`, not `Manifest`.
   matches chacha20poly1305), secrecy 0.8 (spec names `SecretVec`), ciborium 0.2, thiserror 2.
 - Fixtures `tests/fixtures/v1-basic.vault` / `v1-empty.vault` (01 §8) NOT yet generated.
 - Slot management (P4b) decisions live in [[slot-management-decisions]].
+- Header `slots_modified_at` (optional, written only when set) and the header merge live in
+  [[header-merge-decisions]] (2026-10-30).
 
 **Why:** these are the points where 01/02 were silent or ambiguous; changing any of them later
 changes bytes on disk or error mapping.

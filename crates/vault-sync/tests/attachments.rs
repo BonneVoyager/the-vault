@@ -298,11 +298,36 @@ fn missing_blob() {
 }
 
 #[test]
+fn removed_attachment_is_not_found_not_malformed() {
+    let (_dir, _path, mut v, item) = setup();
+    let id = add(&mut v, item, b"hello");
+    v.remove_attachment(item, id, NOW + 1).unwrap();
+    let err = v.open_attachment(item, id).unwrap_err();
+    assert!(
+        matches!(err, SyncError::AttachmentNotFound { item: i, id: x } if i == item && x == id),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        format!("attachment {id} not found on this item")
+    );
+    // Unknown item: same error.
+    let err = v.open_attachment(Uuid::from_u128(9), id).unwrap_err();
+    assert!(
+        matches!(err, SyncError::AttachmentNotFound { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn unknown_attachment_and_locked_are_errors() {
     let (_dir, _path, mut v, item) = setup();
     let id = add(&mut v, item, b"hello");
     let err = v.open_attachment(item, Uuid::from_u128(5)).unwrap_err();
-    assert!(matches!(err, SyncError::Vault(_)), "{err:?}");
+    assert!(
+        matches!(err, SyncError::AttachmentNotFound { item: i, id: x } if i == item && x == Uuid::from_u128(5)),
+        "{err:?}"
+    );
     v.save().unwrap();
     v.lock();
     assert!(matches!(

@@ -509,3 +509,13 @@ fn real_store_round_trip(cx: &mut TestAppContext) {
         AttachmentState::Missing
     );
 }
+
+#[test]
+fn attachment_not_found_has_its_own_toast() {
+    let e = SyncError::AttachmentNotFound {
+        item: Uuid::new_v4(),
+        id: Uuid::new_v4(),
+    };
+    assert_eq!(read_error(&e), NOT_FOUND);
+    assert_eq!(NOT_FOUND, "Attachment not found on this item.");
+}

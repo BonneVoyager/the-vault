@@ -11,14 +11,23 @@
 //! covered the moment it is committed and a reader regression on any old one fails loudly.
 //!
 //! `v1-forward.vault` exercises 01 §9 forward compatibility: it carries an opaque key slot
-//! of an unknown kind, a field of an unknown kind, and unknown keys at header, item and
-//! field level, as a newer build would write them.
+//! of an unknown kind, a field of an unknown kind, and an unknown key at every one of the
+//! eight map levels a newer build could add one to: header, `header.kdf`, the opaque slot,
+//! a known (password) key slot, an item record (plaintext), an item's encrypted payload, a
+//! field, and the manifest record. It never carries `slots_modified_at` (v1.1 header merge):
+//! a build that writes that key only does so after a slot mutation, so an untouched fixture
+//! must stay byte-identical through unlock + serialize.
 //!
 //! Item categories (`ItemPlain.kind`) were removed on 2026-10-30 without a version bump.
 //! Every fixture written before that still carries a `kind` entry per item; the reader keeps
 //! it as an unknown key in `Item::extras` and re-emits it verbatim, so the committed bytes
 //! are unchanged and the regenerators below add the entry to `extras` explicitly to stay
 //! byte-identical with what they produced before the removal.
+//!
+//! `v1-stamped.vault` (01 §2 `slots_modified_at` / `slots_device_id`, 01 §4 `header_digest`)
+//! is the one fixture whose header is stamped: one item, the password re-set at `T0 + 50`
+//! by device `0x11..`, so its manifest AAD carries the header digest. It proves a stamped
+//! file written today stays openable, and that the digest binding is checked on it.
 //!
 //! `v1-attach.vault` (01 §4 "Attachments (v1.1)") holds one item with two attachment
 //! references, an empty file and a 3-chunk file (2 MiB + 7 bytes), whose sealed blobs live
@@ -32,13 +41,25 @@ use vault_core::attachment::{CHUNK_SIZE, blob_file_name, new_ref, open, seal};
 use vault_core::format::VaultFile;
 use vault_core::{
     ExposeSecret, Field, FieldKind, Item, KdfParams, LockedVault, OpaqueSlot, SecretString, Slot,
-    SlotKind, UnlockedVault, Uuid, VaultError,
+    SlotKind, TamperKind, UnlockedVault, Uuid, VaultError,
 };
+
+/// Parse, edit the structure, re-encode (same as `common::rewrite`, kept local because this
+/// file does not pull in the shared helpers).
+fn rewrite(bytes: &[u8], edit: impl FnOnce(&mut VaultFile)) -> Vec<u8> {
+    let mut file = VaultFile::parse(bytes).unwrap();
+    edit(&mut file);
+    file.to_bytes()
+}
 
 const PASSWORD: &str = "correct horse battery staple";
 const BASIC: &[u8] = include_bytes!("fixtures/v1-basic.vault");
 const EMPTY: &[u8] = include_bytes!("fixtures/v1-empty.vault");
 const FORWARD: &[u8] = include_bytes!("fixtures/v1-forward.vault");
+const STAMPED: &[u8] = include_bytes!("fixtures/v1-stamped.vault");
+/// `v1-stamped.vault`: the item and the stamp.
+const STAMPED_ITEM_ID: [u8; 16] = [0x07; 16];
+const STAMPED_AT: u64 = T0 + 50;
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 const T0: u64 = 1_700_000_000_000;
 
@@ -69,6 +90,26 @@ fn t(s: &str) -> Value {
 
 fn header_extra() -> (Value, Value) {
     (t("x_header_future"), t("from a newer header"))
+}
+
+/// Unknown key inside `header.kdf` (e.g. a parameter of a future KDF variant).
+fn kdf_extra() -> (Value, Value) {
+    (t("x_kdf_future"), t("argon2id-next"))
+}
+
+/// Unknown key on the *known* password slot (not the opaque one).
+fn key_slot_extra() -> (Value, Value) {
+    (t("x_slot_known_future"), Value::Integer(9.into()))
+}
+
+/// Unknown plaintext key on the item record (outside the ciphertext, unauthenticated).
+fn record_extra() -> (Value, Value) {
+    (t("x_record_future"), Value::Bytes(vec![0xC0, 0xFF, 0xEE]))
+}
+
+/// Unknown plaintext key on the manifest record.
+fn manifest_extra() -> (Value, Value) {
+    (t("x_manifest_future"), Value::Bool(false))
 }
 
 /// The legacy per-item `kind` entry as pre-2026-10-30 writers emitted it; now an unknown key.
@@ -199,10 +240,92 @@ fn regenerate_forward_fixture() {
     future.extras.push(item_extra());
     vault.insert(future, T0 + 31);
 
-    // The opaque slot goes FIRST so the position test is meaningful.
+    // The remaining unknown-key sites are plaintext structure, so they are spliced in after
+    // encryption. The opaque slot goes FIRST so the position test is meaningful.
     let mut file = VaultFile::parse(&vault.serialize()).unwrap();
+    file.header.kdf_extras.push(kdf_extra());
+    file.header.slots[0]
+        .as_key_mut()
+        .expect("the password slot")
+        .extras
+        .push(key_slot_extra());
     file.header.slots.insert(0, Slot::Opaque(future_slot()));
+    assert_eq!(file.items.len(), 1);
+    file.items[0].extras.push(record_extra());
+    file.manifest.extras.push(manifest_extra());
     std::fs::write(format!("{FIXTURE_DIR}/v1-forward.vault"), file.to_bytes()).unwrap();
+}
+
+/// Builds `v1-stamped.vault` (see the module docs). Separate so the other fixtures' bytes
+/// are not churned.
+#[test]
+#[ignore]
+fn regenerate_stamped_fixture() {
+    let mut vault = new_vault();
+    let mut item = Item::new("Stamped", device(), T0 + 45);
+    item.id = Uuid::from_bytes(STAMPED_ITEM_ID);
+    item.fields = vec![field(
+        "password",
+        FieldKind::Password,
+        "still the same",
+        T0 + 45,
+    )];
+    vault.insert(item, T0 + 45);
+    // Same password, fresh KDF salt: the re-calibration path, which stamps the header.
+    vault
+        .change_password(&pw(), &pw(), KdfParams::for_tests(), STAMPED_AT)
+        .unwrap();
+    assert_eq!(vault.header().slots_modified_at, Some(STAMPED_AT));
+    assert_eq!(vault.header().slots_device_id, Some(device()));
+    std::fs::write(format!("{FIXTURE_DIR}/v1-stamped.vault"), vault.serialize()).unwrap();
+}
+
+#[test]
+fn v1_stamped_opens_and_its_header_is_digest_bound() {
+    let locked = LockedVault::parse(STAMPED).unwrap();
+    check_kdf(&locked);
+    let header = locked.header();
+    assert_eq!(header.slots_modified_at, Some(STAMPED_AT));
+    assert_eq!(header.slots_device_id, Some(device()));
+    assert_eq!(header.slots_stamp(), STAMPED_AT);
+    assert!(header.digest().is_some());
+    let vault = locked.unlock(&pw()).unwrap();
+    let item = vault.get(Uuid::from_bytes(STAMPED_ITEM_ID)).unwrap();
+    assert_eq!(item.title, "Stamped");
+    assert_eq!(
+        item.field("password").unwrap().value.expose_secret(),
+        "still the same"
+    );
+    assert_eq!(vault.items().count(), 1);
+
+    // The stamp survives a save, and the digest is checked on the committed bytes.
+    let again = vault.serialize();
+    let reopened = LockedVault::parse(&again).unwrap();
+    assert_eq!(reopened.header().slots_modified_at, Some(STAMPED_AT));
+    assert_eq!(reopened.header().slots_device_id, Some(device()));
+    assert!(reopened.unlock(&pw()).is_ok());
+    let manifest = VaultError::Tampered(TamperKind::Manifest);
+    let stripped = rewrite(STAMPED, |f| {
+        f.header.slots_modified_at = None;
+        f.header.slots_device_id = None;
+    });
+    assert_eq!(
+        LockedVault::parse(&stripped)
+            .unwrap()
+            .unlock(&pw())
+            .unwrap_err(),
+        manifest
+    );
+    let raised = rewrite(STAMPED, |f| {
+        f.header.slots_modified_at = Some(STAMPED_AT + 1)
+    });
+    assert_eq!(
+        LockedVault::parse(&raised)
+            .unwrap()
+            .unlock(&pw())
+            .unwrap_err(),
+        manifest
+    );
 }
 
 /// Builds `v1-attach.vault` and its two blobs (see the module docs). Separate from the other
@@ -408,6 +531,9 @@ fn assert_forward_header(locked: &LockedVault) {
     check_kdf(locked);
     let header = locked.header();
     assert_eq!(header.extras, vec![header_extra()]);
+    assert_eq!(header.kdf_extras, vec![kdf_extra()]);
+    assert_eq!(header.slots_modified_at, None, "untouched header: no stamp");
+    assert_eq!(header.slots_device_id, None);
     assert_eq!(header.slots.len(), 2);
     assert_eq!(
         header.slots[0],
@@ -415,6 +541,11 @@ fn assert_forward_header(locked: &LockedVault) {
         "opaque slot first"
     );
     assert!(header.slots[1].is_key_of(SlotKind::Password));
+    assert_eq!(
+        header.slots[1].as_key().unwrap().extras,
+        vec![key_slot_extra()],
+        "unknown key on the known slot"
+    );
     assert_eq!(
         locked.slots().map(|(_, k)| k).collect::<Vec<_>>(),
         [
@@ -433,27 +564,60 @@ fn v1_forward_unlocks_with_unknown_kinds_intact() {
     assert_eq!(vault.items_including_deleted().count(), 1);
 }
 
+/// The four plaintext unknown-key sites that live outside `Header`/`Item`: record, manifest
+/// (and, via `assert_forward_header`, `kdf` and the known slot).
+fn assert_forward_records(file: &VaultFile) {
+    assert_eq!(file.items.len(), 1);
+    assert_eq!(file.items[0].extras, vec![record_extra()], "item record");
+    assert_eq!(
+        file.manifest.extras,
+        vec![manifest_extra()],
+        "manifest record"
+    );
+}
+
 #[test]
 fn v1_forward_unknowns_survive_serialize_parse_roundtrip() {
     // The committed bytes are canonical, so a structural parse -> to_bytes is byte-identical;
-    // this proves the opaque slot (and every extra) is re-emitted verbatim, in position.
+    // this proves every one of the eight unknown-key sites (and the opaque slot) is re-emitted
+    // verbatim, in position.
     let file = VaultFile::parse(FORWARD).unwrap();
     assert_eq!(file.to_bytes(), FORWARD);
+    assert_forward_records(&file);
 
-    let vault = LockedVault::parse(FORWARD).unwrap().unlock(&pw()).unwrap();
+    let locked = LockedVault::parse(FORWARD).unwrap();
+    assert_forward_header(&locked);
+    let vault = locked.unlock(&pw()).unwrap();
     let again = vault.serialize();
     let relocked = LockedVault::parse(&again).unwrap();
     assert_forward_header(&relocked);
+    assert_forward_records(&VaultFile::parse(&again).unwrap());
     let reopened = relocked.unlock(&pw()).unwrap();
     let a = future_item(&vault);
     let b = future_item(&reopened);
     assert_eq!(a.modified_at, b.modified_at);
     assert_eq!(a.tags, b.tags);
-    // Byte-equal extras at all three levels (Value equality is structural; the encodings are
-    // canonical so structural equality is byte equality).
-    assert_eq!(a.extras, b.extras);
-    assert_eq!(a.fields[0].extras, b.fields[0].extras);
+    // Byte-equal extras at every level (Value equality is structural; the encodings are
+    // canonical so structural equality is byte equality). Sites 1-8: header, kdf, opaque
+    // slot, known slot, record, item payload, field, manifest.
     assert_eq!(vault.header().extras, reopened.header().extras);
+    assert_eq!(vault.header().extras, vec![header_extra()]);
+    assert_eq!(reopened.header().kdf_extras, vec![kdf_extra()]);
+    assert_eq!(reopened.header().slots[0], Slot::Opaque(future_slot()));
+    assert_eq!(
+        reopened.header().slots[1].as_key().unwrap().extras,
+        vec![key_slot_extra()]
+    );
+    assert_eq!(a.extras, b.extras);
+    assert_eq!(b.extras, vec![kind_extra(FUTURE_ITEM_KIND), item_extra()]);
+    assert_eq!(a.fields[0].extras, b.fields[0].extras);
+    assert_eq!(b.fields[0].extras, vec![field_extra()]);
+
+    // A second save is canonical and still carries everything: the extras are not merely
+    // tolerated once but preserved by this build's own writer.
+    let twice = VaultFile::parse(&reopened.serialize()).unwrap();
+    assert_forward_records(&twice);
+    assert_eq!(twice.header.kdf_extras, vec![kdf_extra()]);
 }
 
 #[test]
@@ -461,7 +625,7 @@ fn v1_forward_opaque_slot_survives_change_password() {
     let mut vault = LockedVault::parse(FORWARD).unwrap().unlock(&pw()).unwrap();
     let new_pw = SecretString::new("a different passphrase".to_owned());
     vault
-        .change_password(&pw(), &new_pw, KdfParams::for_tests())
+        .change_password(&pw(), &new_pw, KdfParams::for_tests(), T0)
         .unwrap();
     assert_eq!(vault.header().slots[0], Slot::Opaque(future_slot()));
     assert!(vault.header().slots[1].is_key_of(SlotKind::Password));
@@ -495,8 +659,8 @@ fn every_fixture_in_the_directory_opens() {
         .collect();
     names.sort();
     assert!(
-        names.len() >= 4,
-        "expected at least v1-attach, v1-basic, v1-empty, v1-forward; found {names:?}"
+        names.len() >= 5,
+        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-stamped; found {names:?}"
     );
     for name in &names {
         let bytes = std::fs::read(format!("{FIXTURE_DIR}/{name}")).unwrap();
@@ -513,8 +677,10 @@ fn every_fixture_in_the_directory_opens() {
             .unlock(&pw())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         // Every pre-2026-10-30 item carries a legacy `kind` entry, now an unknown key: it is
-        // never dropped and never resurfaces as anything else.
-        for item in vault.items_including_deleted() {
+        // never dropped and never resurfaces as anything else. (`v1-stamped` was written
+        // after the removal and has none.)
+        let legacy = name != "v1-stamped.vault";
+        for item in vault.items_including_deleted().filter(|_| legacy) {
             let kinds: Vec<_> = item
                 .extras
                 .iter()
@@ -526,8 +692,24 @@ fn every_fixture_in_the_directory_opens() {
                 "{name}: legacy kind is text"
             );
         }
+        // Only `v1-stamped` has had a slot mutation. A save by this build must neither invent
+        // the v1.1 stamp (old bytes would change on every round trip) nor lose it.
+        let committed = (file.header.slots_modified_at, file.header.slots_device_id);
+        assert_eq!(
+            committed.0.is_some(),
+            name == "v1-stamped.vault",
+            "{name}: committed stamp"
+        );
         // Whatever it holds, it must survive a save by this build, extras included.
         let again = vault.serialize();
+        assert_eq!(
+            {
+                let h = VaultFile::parse(&again).unwrap().header;
+                (h.slots_modified_at, h.slots_device_id)
+            },
+            committed,
+            "{name}: a plain save keeps slots_modified_at / slots_device_id as committed"
+        );
         let reopened = LockedVault::parse(&again)
             .unwrap_or_else(|e| panic!("{name}: re-parse: {e}"))
             .unlock(&pw())

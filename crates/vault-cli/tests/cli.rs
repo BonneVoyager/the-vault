@@ -406,3 +406,152 @@ fn attach_refuses_oversize_file() {
     );
     assert_eq!(ok(&vault(&f, PW, &["attach", "list", "Docs"])), "");
 }
+
+#[test]
+fn gen_rejects_degenerate_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("g.vault");
+    let o = vault(&f, PW, &["gen", "--length", "2"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("length must be at least 4 for the enabled character classes"),
+        "{err}"
+    );
+    // Fewer classes lower the minimum.
+    let o = vault(
+        &f,
+        PW,
+        &[
+            "gen",
+            "--length",
+            "2",
+            "--no-symbols",
+            "--no-digits",
+            "--no-upper",
+        ],
+    );
+    assert!(o.status.success());
+    assert_eq!(ok(&o).trim().len(), 2);
+    let o = vault(
+        &f,
+        PW,
+        &["gen", "--length", "1", "--no-symbols", "--no-digits"],
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("at least 2"));
+
+    let o = vault(&f, PW, &["gen", "--passphrase", "--words", "0"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("words must be at least 1"), "{err}");
+    assert!(
+        ok(&vault(&f, PW, &["gen", "--passphrase", "--words", "1"]))
+            .trim()
+            .len()
+            > 1
+    );
+}
+
+#[test]
+fn attach_get_removed_reports_not_found() {
+    let (dir, f) = attach_setup();
+    let src = dir.path().join("x.bin");
+    std::fs::write(&src, b"data").unwrap();
+    let id = ok(&vault(
+        &f,
+        PW,
+        &["attach", "add", "Docs", src.to_str().unwrap()],
+    ))
+    .trim()
+    .to_owned();
+    ok(&vault(&f, PW, &["attach", "rm", "Docs", &id]));
+    let out = dir.path().join("o.bin");
+    let o = vault(
+        &f,
+        PW,
+        &["attach", "get", "Docs", &id, out.to_str().unwrap()],
+    );
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("attachment not found"), "{err}");
+    assert!(!out.exists());
+}
+
+fn snapshot_count(pkg: &Path) -> usize {
+    std::fs::read_dir(pkg.join("backups"))
+        .map(|d| d.filter_map(Result::ok).count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn cli_writes_create_backups() {
+    let (dir, f) = attach_setup();
+    for t in ["One", "Two", "Three"] {
+        ok(&vault(&f, PW, &["add", "--template", "note", "--title", t]));
+    }
+    ok(&vault(&f, PW, &["rm", "Two"]));
+    assert!(snapshot_count(&f) >= 1, "no backups after add/rm");
+
+    let src = dir.path().join("b.bin");
+    std::fs::write(&src, b"payload").unwrap();
+    let before = snapshot_count(&f);
+    ok(&vault(
+        &f,
+        PW,
+        &["attach", "add", "Docs", src.to_str().unwrap()],
+    ));
+    assert!(snapshot_count(&f) >= 1 && snapshot_count(&f) >= before);
+}
+
+#[test]
+fn concurrent_adds_lose_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("c.vault");
+    ok(&vault(
+        &f,
+        PW,
+        &["init", "--kdf-test-params", "--allow-weak"],
+    ));
+    for run in 0..3 {
+        for r in 0..10 {
+            let spawn = |t: String| {
+                Command::new(env!("CARGO_BIN_EXE_vault"))
+                    .args([
+                        "--vault",
+                        f.to_str().unwrap(),
+                        "--password-env",
+                        "VAULT_TEST_PW",
+                    ])
+                    .args(["add", "--template", "note", "--title", &t])
+                    .env("VAULT_TEST_PW", PW)
+                    .env("VAULT_DEVICE_ID", "11111111-1111-4111-8111-111111111111")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            };
+            let a = spawn(format!("A{run}-{r}"));
+            let b = spawn(format!("B{run}-{r}"));
+            for c in [a, b] {
+                let o = c.wait_with_output().unwrap();
+                assert!(
+                    o.status.success(),
+                    "concurrent add failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+            }
+        }
+        let list = ok(&vault(&f, PW, &["list"]));
+        let expected = (run + 1) * 20;
+        for r in 0..=run {
+            for r2 in 0..10 {
+                for p in ["A", "B"] {
+                    let t = format!("{p}{r}-{r2}");
+                    assert!(list.contains(&t), "lost item {t}; run {run}\n{list}");
+                }
+            }
+        }
+        assert_eq!(list.lines().count(), expected, "{list}");
+    }
+}

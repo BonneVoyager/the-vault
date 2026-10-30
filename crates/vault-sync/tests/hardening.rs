@@ -23,6 +23,15 @@ const T0: u64 = 1_700_000_000_000;
 const DEV_A: Uuid = Uuid::from_u128(0xA);
 const DEV_B: Uuid = Uuid::from_u128(0xB);
 
+/// Wall-clock milliseconds, for core calls that stamp the header (`now`), so the stamp is
+/// newer than the one `create` set.
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 fn pw() -> SecretString {
     SecretString::new("correct horse battery staple".to_owned())
 }
@@ -197,7 +206,9 @@ fn key_mismatch_refuses_clean_save_kek_unlock_and_preserves_on_lock() {
     c.start_watching().unwrap();
     let rx_c = c.subscribe();
 
-    b.edit(|v| v.rotate_vault_key(&pw())).unwrap().unwrap();
+    b.edit(|v| v.rotate_vault_key(&pw(), wall_ms()))
+        .unwrap()
+        .unwrap();
     insert(&mut b, "from b");
     b.save().unwrap();
     let rotated = fs::read(&path).unwrap();

@@ -26,6 +26,7 @@ use std::collections::BTreeSet;
 
 use ciborium::Value;
 use secrecy::{ExposeSecret, SecretString};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -105,13 +106,24 @@ pub fn item_aad(
 ///
 /// `format_version` is the version from the file prefix; `item_count` is the number of
 /// `ItemRecord`s in the body (tombstones included).
-pub fn manifest_aad(format_version: u16, vault_id: Uuid, item_count: u32) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(16 + 4 + 2);
+pub fn manifest_aad(
+    format_version: u16,
+    vault_id: Uuid,
+    item_count: u32,
+    header_digest: Option<&[u8; HEADER_DIGEST_LEN]>,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(16 + 4 + 2 + HEADER_DIGEST_LEN);
     aad.extend_from_slice(vault_id.as_bytes());
     aad.extend_from_slice(&item_count.to_be_bytes());
     aad.extend_from_slice(&format_version.to_be_bytes());
+    if let Some(d) = header_digest {
+        aad.extend_from_slice(d);
+    }
     aad
 }
+
+/// Length of [`Header::digest`] (SHA-256).
+pub const HEADER_DIGEST_LEN: usize = 32;
 
 /// AAD for chunk `index` of an attachment blob (01 §4 "Attachments (v1.1)"):
 ///
@@ -628,14 +640,31 @@ pub struct Header {
     pub kdf_extras: Extras,
     /// At least one (opaque slots count). File order is preserved.
     pub slots: Vec<Slot>,
+    /// Unix millis of the last change to `slots` or `kdf` (01 §2, optional since v1.1):
+    /// password change, slot add/remove, re-calibration, key rotation. `None` when the file
+    /// has no such key (every v1.0 writer); treated as 0 by [`Header::slots_stamp`] and by the
+    /// header merge (03 §5). Only written when `Some`, so files that never had the key stay
+    /// byte-identical through a parse/write round trip.
+    pub slots_modified_at: Option<Millis>,
+    /// `device_id` of the device that made the change `slots_modified_at` records (01 §2,
+    /// optional since v1.1, `bytes(16)`). Breaks an exact stamp tie in the header merge:
+    /// greater bytes win, the same rule as item metadata (03 §5), so two devices converge;
+    /// a missing id sorts below any present one. Written only when `Some` (set together with
+    /// the stamp).
+    pub slots_device_id: Option<Uuid>,
     /// Unknown top-level header keys.
     pub extras: Extras,
 }
 
 impl Header {
-    /// The header as a (not yet canonicalised) `Value`.
-    pub fn to_value(&self) -> Value {
-        let kdf = build_map(
+    /// `slots_modified_at`, with a missing key reading as 0 (older than any real stamp).
+    pub fn slots_stamp(&self) -> Millis {
+        self.slots_modified_at.unwrap_or(0)
+    }
+
+    /// The `kdf` sub-map (known keys plus `kdf_extras`), not yet canonicalised.
+    fn kdf_value(&self) -> Value {
+        build_map(
             vec![
                 ("alg", text(KDF_ALG_ARGON2ID)),
                 ("m_cost", Value::from(self.kdf.m_cost_kib)),
@@ -644,19 +673,54 @@ impl Header {
                 ("salt", bytes(&self.kdf.salt)),
             ],
             &self.kdf_extras,
-        );
-        build_map(
-            vec![
-                ("vault_id", bytes(self.vault_id.as_bytes())),
-                ("created_at", Value::from(self.created_at)),
-                ("kdf", kdf),
-                (
-                    "slots",
-                    Value::Array(self.slots.iter().map(Slot::to_value).collect()),
-                ),
-            ],
-            &self.extras,
         )
+    }
+
+    /// `header_digest` (01 §4): present **only when `slots_modified_at` is `Some`**, in which
+    /// case it is `SHA-256(canonical CBOR of {"kdf": <kdf map>, "slots": [<slot maps in
+    /// header order, opaque slots included>], "slots_modified_at": u64,
+    /// "slots_device_id": bytes(16) if present})`. Appended to [`manifest_aad`] by the writer
+    /// and by every unlock path, so a stripped, re-stamped, replaced or spliced header fails
+    /// the manifest tag (`Tampered(Manifest)`): only a holder of the vault key can produce a
+    /// header that verifies, which is what makes the header merge (03 §5) safe against a
+    /// file-writing attacker. The input is built from the same values the writer emits and
+    /// run through the same canonicaliser, so digest input == bytes on disk. Files without
+    /// the stamp (every v1.0 file) keep the exact old AAD.
+    pub fn digest(&self) -> Option<[u8; HEADER_DIGEST_LEN]> {
+        let stamp = self.slots_modified_at?;
+        let mut entries = vec![
+            (text("kdf"), self.kdf_value()),
+            (
+                text("slots"),
+                Value::Array(self.slots.iter().map(Slot::to_value).collect()),
+            ),
+            (text("slots_modified_at"), Value::from(stamp)),
+        ];
+        if let Some(id) = self.slots_device_id {
+            entries.push((text("slots_device_id"), bytes(id.as_bytes())));
+        }
+        let input = encode(&canonicalize(Value::Map(entries)));
+        Some(Sha256::digest(&input).into())
+    }
+
+    /// The header as a (not yet canonicalised) `Value`.
+    pub fn to_value(&self) -> Value {
+        let mut known = vec![
+            ("vault_id", bytes(self.vault_id.as_bytes())),
+            ("created_at", Value::from(self.created_at)),
+            ("kdf", self.kdf_value()),
+            (
+                "slots",
+                Value::Array(self.slots.iter().map(Slot::to_value).collect()),
+            ),
+        ];
+        if let Some(stamp) = self.slots_modified_at {
+            known.push(("slots_modified_at", Value::from(stamp)));
+        }
+        if let Some(by) = self.slots_device_id {
+            known.push(("slots_device_id", bytes(by.as_bytes())));
+        }
+        build_map(known, &self.extras)
     }
 
     /// Canonical CBOR bytes of the header map (without the 10-byte file prefix).
@@ -698,6 +762,18 @@ impl Header {
         if let Some(dup) = slots.iter().map(Slot::id).find(|id| !ids.insert(*id)) {
             return Err(malformed(format!("header.slots: duplicate slot id {dup}")));
         }
+        // Optional (v1.1). Missing or `null` reads as "never stamped" (same for
+        // `slots_device_id` below): no digest is then bound into the manifest AAD, exactly as
+        // for a file that lacks the keys. Any other non-u64 / non-bytes(16) value is
+        // structural damage, like every other known key.
+        let slots_modified_at = match m.take("slots_modified_at") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(as_u64(v, "header.slots_modified_at")?),
+        };
+        let slots_device_id = match m.take("slots_device_id") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(as_uuid(v, "header.slots_device_id")?),
+        };
         Ok(Self {
             format_version,
             vault_id,
@@ -705,6 +781,8 @@ impl Header {
             kdf,
             kdf_extras,
             slots,
+            slots_modified_at,
+            slots_device_id,
             extras: m.finish(),
         })
     }
@@ -1210,6 +1288,94 @@ mod tests {
         assert!(MapReader::new("x", dup).is_err());
     }
 
+    /// `header_digest` input: exactly {kdf, slots, slots_modified_at[, slots_device_id]},
+    /// canonical, hashed with SHA-256; none without the stamp.
+    #[test]
+    fn header_digest_known_answer() {
+        let slot = KeySlot {
+            id: Uuid::from_u128(0x22),
+            kind: SlotKind::Password,
+            nonce: [7; NONCE_LEN],
+            wrapped_key: [9; WRAPPED_KEY_LEN],
+            created_at: 5,
+            extras: vec![(text("x"), Value::Bool(true))],
+        };
+        let mut header = Header {
+            format_version: FORMAT_VERSION,
+            vault_id: Uuid::from_u128(0x11),
+            created_at: 1,
+            kdf: KdfParams {
+                m_cost_kib: 8192,
+                t_cost: 1,
+                p_cost: 1,
+                salt: [3; 32],
+            },
+            kdf_extras: vec![(text("x_kdf"), Value::Integer(1.into()))],
+            slots: vec![
+                Slot::Key(slot),
+                Slot::Opaque(OpaqueSlot::new(Uuid::from_u128(0x33), "future", vec![]).unwrap()),
+            ],
+            slots_modified_at: None,
+            slots_device_id: None,
+            extras: vec![(text("x_header"), Value::Null)],
+        };
+        assert_eq!(header.digest(), None, "no stamp, no digest");
+
+        header.slots_modified_at = Some(1_700_000_000_000);
+        let Value::Map(full) = canonicalize(header.to_value()) else {
+            panic!()
+        };
+        let pick = |keys: &[&str]| {
+            Value::Map(
+                full.iter()
+                    .filter(|(k, _)| matches!(k, Value::Text(s) if keys.contains(&s.as_str())))
+                    .cloned()
+                    .collect(),
+            )
+        };
+        let expected = |v: Value| -> [u8; HEADER_DIGEST_LEN] {
+            Sha256::digest(encode(&canonicalize(v))).into()
+        };
+        assert_eq!(
+            header.digest().unwrap(),
+            expected(pick(&["kdf", "slots", "slots_modified_at"])),
+            "device id key absent when None"
+        );
+        assert_ne!(
+            header.digest().unwrap(),
+            expected(pick(&["kdf", "slots", "slots_modified_at", "vault_id"])),
+            "vault_id, created_at and header extras are not part of the digest"
+        );
+
+        header.slots_device_id = Some(Uuid::from_u128(0x44));
+        let Value::Map(full) = canonicalize(header.to_value()) else {
+            panic!()
+        };
+        let digest_with_id = header.digest().unwrap();
+        assert_eq!(
+            digest_with_id,
+            expected(Value::Map(
+                full.iter()
+                    .filter(|(k, _)| matches!(k, Value::Text(s) if ["kdf", "slots", "slots_modified_at", "slots_device_id"].contains(&s.as_str())))
+                    .cloned()
+                    .collect()
+            ))
+        );
+        // Every bound input moves the digest.
+        let mut h = header.clone();
+        h.slots_modified_at = Some(1_700_000_000_001);
+        assert_ne!(h.digest().unwrap(), digest_with_id);
+        let mut h = header.clone();
+        h.kdf.t_cost = 2;
+        assert_ne!(h.digest().unwrap(), digest_with_id);
+        let mut h = header.clone();
+        h.slots.swap(0, 1);
+        assert_ne!(h.digest().unwrap(), digest_with_id, "slot order is bound");
+        let mut h = header.clone();
+        h.extras.clear();
+        assert_eq!(h.digest().unwrap(), digest_with_id, "header extras are not");
+    }
+
     #[test]
     fn manifest_roundtrip() {
         let pairs = vec![(Uuid::from_u128(1), 5u64), (Uuid::from_u128(2), 7)];
@@ -1233,10 +1399,16 @@ mod tests {
         assert_eq!(&aad[32..40], &[0, 0, 0, 0, 0, 0, 1, 2]);
         assert_eq!(&aad[40..], &[0, 1]);
 
-        let aad = manifest_aad(FORMAT_VERSION, vid, 3);
+        let aad = manifest_aad(FORMAT_VERSION, vid, 3, None);
         assert_eq!(aad.len(), 16 + 4 + 2);
         assert_eq!(&aad[16..20], &[0, 0, 0, 3]);
         assert_eq!(&aad[20..], &[0, 1]);
+        // vault_id || item_count_be32 || version_be16 || header_digest(32), stamped files only.
+        let digest = [0xAB; HEADER_DIGEST_LEN];
+        let with = manifest_aad(FORMAT_VERSION, vid, 3, Some(&digest));
+        assert_eq!(with.len(), 16 + 4 + 2 + 32);
+        assert_eq!(&with[..22], &aad[..]);
+        assert_eq!(&with[22..], &digest);
 
         // vault_id || ref.id || index_be32 || chunk_count_be32 || attachment_version_be16
         assert_eq!(ATTACHMENT_VERSION, 1);

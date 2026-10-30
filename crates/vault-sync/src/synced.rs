@@ -17,11 +17,13 @@ use vault_core::{
     KdfParams, LockedVault, SecretString, SecretVec, SlotKind, UnlockedVault, Uuid, VaultError,
 };
 
-use crate::atomic::{Mode, write_atomic};
+use crate::atomic::{Mode, write_atomic_stat};
+use crate::attachments::prune_stale_vault_tmp;
 use crate::backup::{self, BackupInfo, BackupKind};
 use crate::cloud::CloudHooks;
 use crate::error::{SaveBlocked, SyncError};
 use crate::event::SyncEvent;
+use crate::lock::PackageLock;
 use crate::package;
 use crate::watch::Watcher;
 
@@ -31,14 +33,42 @@ pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// Fingerprint of the bytes most recently written to (or read from) the primary file, used to
 /// recognise our own writes echoing back through the watcher (03 §2 step 6, §3 steps 1-2).
 ///
-/// `hash` (blake3 of the exact bytes) is the authoritative comparison key. `(mtime, size)` is
-/// only a fast pre-check; `mtime` is `None` when the file could not be stat'ed after writing,
-/// in which case the echo check must go straight to the hash.
+/// `hash` (blake3 of the exact bytes) is the authoritative comparison key. `(mtime, ctime,
+/// inode, size)` is only a fast pre-check (03 §2 step 6): mtime and size alone miss a
+/// same-size write within one timestamp tick on coarse filesystems (V-05), while every atomic
+/// replace gets a new inode and the local kernel sets ctime on it. The stat fields are `None`
+/// when the file could not be stat'ed after writing; the echo check then goes straight to the
+/// hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LastWritten {
     pub mtime: Option<SystemTime>,
+    pub ctime: Option<SystemTime>,
+    pub inode: Option<u64>,
     pub size: u64,
     pub hash: [u8; 32],
+}
+
+impl LastWritten {
+    /// The step-1 pre-check: `meta` describes the very file this fingerprint was taken from.
+    /// Never true when the fingerprint has no stat.
+    pub(crate) fn stat_matches(&self, meta: &fs::Metadata) -> bool {
+        let (mtime, ctime, inode) = stat_of(meta);
+        self.mtime.is_some()
+            && self.size == meta.len()
+            && self.mtime == mtime
+            && self.ctime == ctime
+            && self.inode == inode
+    }
+}
+
+/// `(mtime, ctime, inode)` of `meta`.
+fn stat_of(meta: &fs::Metadata) -> (Option<SystemTime>, Option<SystemTime>, Option<u64>) {
+    use std::os::unix::fs::MetadataExt;
+    let ctime = u64::try_from(meta.ctime()).ok().and_then(|secs| {
+        let nanos = u32::try_from(meta.ctime_nsec()).ok()?;
+        SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs, nanos))
+    });
+    (meta.modified().ok(), ctime, Some(meta.ino()))
 }
 
 /// Plaintext header facts the unlock screen needs before any credential is entered.
@@ -210,15 +240,19 @@ impl SyncedVault {
             return Err(SyncError::NoVault(file));
         }
         hooks.ensure_downloaded(&file, DOWNLOAD_TIMEOUT)?;
-        let bytes = match fs::read(&file) {
-            Ok(b) => b,
+        // Shared lock around the read and the stat (03 §2): never between a writer's read and
+        // its rename. Cheap belt-and-braces, as rename is atomic anyway.
+        let read_lock = PackageLock::shared(path)?;
+        let (bytes, meta) = match read_with_stat(&file) {
+            Ok(r) => r,
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 return Err(SyncError::NoVault(file));
             }
             Err(e) => return Err(SyncError::io(&file, e)),
         };
+        drop(read_lock);
+        let last_written = Some(fingerprint(Some(&meta), &bytes));
         let locked = LockedVault::parse(&bytes)?;
-        let last_written = Some(fingerprint(&file, &bytes));
         hooks.pin(&file);
         tracing::info!(path = %path.display(), size = bytes.len(), "opened vault");
         Ok(Self {
@@ -338,6 +372,8 @@ impl SyncedVault {
         };
         self.locked_fallback = None;
         self.install(vault);
+        // Stale tmp cleanup runs only while unlocked (03 §1.1 "never while locked").
+        self.prune_stale_tmp(SystemTime::now() + self.prune_clock_offset);
         self.after_unlock();
         // Orphan cleanup once per unlock, only when memory provably matches what is on disk:
         // the primary was read, nothing is pending a write, saving is allowed.
@@ -357,18 +393,19 @@ impl SyncedVault {
         self.key_mismatch = false;
     }
 
-    /// Drop the unlocked vault (zeroizing its keys and items) and discard unsaved edits. The
-    /// app is expected to `save` first (03 §8 "Autosave").
+    /// Drop the unlocked vault (zeroizing its keys and items). The app is expected to `save`
+    /// first (03 §8 "Autosave"); `lock` itself never writes the primary.
     ///
-    /// When saving is impossible (a [`SyncEvent::KeyMismatch`] stands, or
+    /// Unsaved edits are not lost (03 §8): when the vault is dirty (a save failed or was not
+    /// attempted), or saving is impossible (a [`SyncEvent::KeyMismatch`] stands, or
     /// [`SyncError::SaveBlocked`] applies, dirty or not: our last saved state is then no longer
-    /// on disk either), the in-memory vault is first written,
-    /// encrypted, to the backups directory as `<name>-<timestamp>-unsaved.vault.bin`
-    /// ([`BackupKind::Unsaved`], [`SyncEvent::BackupTaken`]) so nothing is lost. It opens with
-    /// the password that unlocked this session.
+    /// on disk either), the in-memory vault is first written, encrypted, to the backups
+    /// directory as `<name>-<timestamp>-unsaved.vault.bin` ([`BackupKind::Unsaved`], never
+    /// pruned; [`SyncEvent::BackupTaken`]). It opens with the password that unlocked this
+    /// session. A clean vault that can be saved (the usual save-then-lock) writes nothing.
     pub fn lock(&mut self) {
         if let Some(vault) = &self.unlocked
-            && (self.key_mismatch || self.save_blocked.is_some())
+            && (self.dirty || self.key_mismatch || self.save_blocked.is_some())
             && !self.newest_unsaved_covers(vault)
         {
             let bytes = vault.serialize();
@@ -434,10 +471,24 @@ impl SyncedVault {
     /// landed since (with or without a watcher) is reconciled first (03 §3), so a peer's write
     /// is merged rather than overwritten. Refuses with [`SyncError::KeyMismatch`] or
     /// [`SyncError::SaveBlocked`] while either applies, even when clean.
+    ///
+    /// A dirty save holds the package's exclusive advisory lock (`<name>.vault/.lock`, 03 §2)
+    /// from the pre-write read through the rename, the backup and the cleanup, so another
+    /// process saving the same vault cannot interleave its read-modify-write with ours (V-02).
+    /// [`SyncError::SaveLockTimeout`] if the lock is not free within 10 s; nothing is written then.
     pub fn save(&mut self) -> Result<(), SyncError> {
         if self.unlocked.is_none() {
             return Err(SyncError::Locked);
         }
+        // Download an evicted primary BEFORE taking the lock: `ensure_downloaded` may block for
+        // up to 30 s, longer than another process waits for the lock. Inside, the re-check in
+        // `reconcile_primary` is then a no-op unless the file was evicted again meanwhile.
+        let _lock = if self.dirty {
+            self.ensure_primary_downloaded()?;
+            Some(PackageLock::exclusive(&self.path)?)
+        } else {
+            None
+        };
         // A primary we cannot read (cloud timeout, I/O) may hold a peer's unmerged version:
         // fail rather than overwrite it.
         if self.dirty {
@@ -466,14 +517,30 @@ impl SyncedVault {
         let first = std::mem::take(&mut self.first_save_after_unlock);
         self.maybe_backup(&bytes, item_count, first);
         self.prune_orphan_attachments();
+        self.prune_stale_tmp(SystemTime::now() + self.prune_clock_offset);
         Ok(())
+    }
+
+    /// Delete `.vault.bin.tmp-*` files in the package older than 1 h (03 §1.1, same rule as
+    /// attachment tmp files): left by a crash between tmp creation and rename. Failures are
+    /// logged only.
+    fn prune_stale_tmp(&self, now: SystemTime) {
+        match prune_stale_vault_tmp(&self.path, now) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(count = n, "removed stale vault tmp files"),
+            Err(e) => tracing::warn!(error = %e, "stale tmp cleanup failed"),
+        }
     }
 
     /// Steps 2-6 of 03 §2. `create` uses [`Mode::NoReplace`] so a file that appeared after its
     /// existence check is never clobbered; `save` uses [`Mode::Replace`].
     fn write(&mut self, bytes: &[u8], mode: Mode) -> Result<(), SyncError> {
-        write_atomic(&self.file, bytes, mode)?;
-        self.last_written = Some(fingerprint(&self.file, bytes));
+        let tmp_stat = write_atomic_stat(&self.file, bytes, mode)?;
+        self.last_written = Some(fingerprint_after_write(
+            &self.file,
+            tmp_stat.as_ref(),
+            bytes,
+        ));
         tracing::debug!(path = %self.file.display(), size = bytes.len(), "saved vault");
         Ok(())
     }
@@ -587,6 +654,9 @@ impl SyncedVault {
         let mut vault = locked.unlock(password)?;
         vault.set_device_id(self.device_id);
 
+        // Like `save`: no other writer between our read of the current primary and the
+        // replace. Released before `after_unlock`, whose conflict absorption saves (and locks).
+        let write_lock = PackageLock::exclusive(&self.path)?;
         match self.read_parsed(&self.file)? {
             Some(ReadParsed {
                 bytes: current,
@@ -615,6 +685,7 @@ impl SyncedVault {
         }
 
         self.write(&bytes, Mode::Replace)?;
+        drop(write_lock);
         self.locked = locked;
         self.locked_fallback = None;
         // An explicit restore replaces whatever is on disk (a newer-format file was refused
@@ -724,18 +795,71 @@ fn not_found(path: &Path) -> SyncError {
     SyncError::io(path, ErrorKind::NotFound.into())
 }
 
-/// Size and hash come from the bytes themselves; a failed stat only loses the mtime pre-check,
-/// never the write that already succeeded.
-fn fingerprint(path: &Path, bytes: &[u8]) -> LastWritten {
-    let mtime = match fs::metadata(path).and_then(|m| m.modified()) {
-        Ok(t) => Some(t),
+/// Open `path` once, `fstat` the handle, then read through that same handle, so the stat
+/// describes exactly the file whose bytes are returned even if the path is replaced meanwhile
+/// (03 §2 step 6). The stat is taken before the read: an in-place write after it changes the
+/// file's stat, so the next echo check reads again.
+pub(crate) fn read_with_stat(path: &Path) -> std::io::Result<(Vec<u8>, fs::Metadata)> {
+    read_with_stat_hooked(path, || {})
+}
+
+/// [`read_with_stat`] with `between` run after the open and before the fstat (tests replace
+/// the path there).
+fn read_with_stat_hooked(
+    path: &Path,
+    between: impl FnOnce(),
+) -> std::io::Result<(Vec<u8>, fs::Metadata)> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    between();
+    let meta = file.metadata()?;
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    file.read_to_end(&mut bytes)?;
+    Ok((bytes, meta))
+}
+
+/// Fingerprint right after our own atomic write. The stat comes from `path` (the rename may
+/// have changed ctime), but only if it is still the file we wrote: same inode, mtime and size
+/// as the tmp's pre-rename fstat (rename and link keep all three). Otherwise a daemon replaced
+/// it in between, and pairing its stat with our hash would make its version look like our
+/// echo; then no stat is stored and the next check goes to the hash.
+fn fingerprint_after_write(
+    path: &Path,
+    tmp_stat: Option<&fs::Metadata>,
+    bytes: &[u8],
+) -> LastWritten {
+    use std::os::unix::fs::MetadataExt;
+    let post = match fs::metadata(path) {
+        Ok(m) => Some(m),
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "could not stat vault; echo check will use the hash");
             None
         }
     };
+    let ours = match (tmp_stat, &post) {
+        (Some(t), Some(p)) => {
+            let same = t.ino() == p.ino()
+                && t.dev() == p.dev()
+                && t.len() == p.len()
+                && t.modified().ok() == p.modified().ok();
+            if !same {
+                tracing::warn!(path = %path.display(), "vault replaced right after our write; echo check will use the hash");
+            }
+            same
+        }
+        _ => false,
+    };
+    fingerprint(post.as_ref().filter(|_| ours), bytes)
+}
+
+/// Size and hash come from the bytes themselves; without a stat only the fast pre-check is
+/// lost, never the write that already succeeded.
+pub(crate) fn fingerprint(meta: Option<&fs::Metadata>, bytes: &[u8]) -> LastWritten {
+    let (mtime, ctime, inode) = meta.map_or((None, None, None), stat_of);
     LastWritten {
         mtime,
+        ctime,
+        inode,
         size: bytes.len() as u64,
         hash: *blake3::hash(bytes).as_bytes(),
     }
@@ -744,6 +868,49 @@ fn fingerprint(path: &Path, bytes: &[u8]) -> LastWritten {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// The path is replaced (rename, new inode) between open and fstat: the stat and the
+    /// bytes still both describe the file that was opened.
+    #[test]
+    fn read_with_stat_describes_the_opened_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.bin");
+        fs::write(&path, b"ours").unwrap();
+        let ino = fs::metadata(&path).unwrap().ino();
+        let (bytes, meta) = read_with_stat_hooked(&path, || {
+            let other = dir.path().join("other");
+            fs::write(&other, b"theirs!").unwrap();
+            fs::rename(&other, &path).unwrap();
+        })
+        .unwrap();
+        assert_eq!(bytes, b"ours");
+        assert_eq!(meta.ino(), ino);
+        assert_ne!(fs::metadata(&path).unwrap().ino(), ino);
+        // So a fingerprint from it does not match the replacement.
+        let lw = fingerprint(Some(&meta), &bytes);
+        assert!(!lw.stat_matches(&fs::metadata(&path).unwrap()));
+    }
+
+    /// A daemon replaces the file between our rename and our stat: no stat is recorded.
+    #[test]
+    fn fingerprint_after_write_drops_the_stat_of_a_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.bin");
+        let ours = b"ours".to_vec();
+        let tmp_stat = write_atomic_stat(&path, &ours, Mode::Replace).unwrap();
+        let lw = fingerprint_after_write(&path, tmp_stat.as_ref(), &ours);
+        assert!(lw.stat_matches(&fs::metadata(&path).unwrap()), "{lw:?}");
+
+        let tmp_stat = write_atomic_stat(&path, &ours, Mode::Replace).unwrap();
+        let other = dir.path().join("other");
+        fs::write(&other, b"thei").unwrap();
+        fs::rename(&other, &path).unwrap();
+        let lw = fingerprint_after_write(&path, tmp_stat.as_ref(), &ours);
+        assert_eq!((lw.mtime, lw.ctime, lw.inode), (None, None, None));
+        assert!(!lw.stat_matches(&fs::metadata(&path).unwrap()));
+        assert_eq!(&lw.hash, blake3::hash(&ours).as_bytes());
+    }
     use crate::cloud::NoopHooks;
 
     #[test]

@@ -4,7 +4,7 @@ mod common;
 
 use common::*;
 use vault_core::format::VaultFile;
-use vault_core::{LockedVault, TamperKind, VaultError};
+use vault_core::{LockedVault, TamperKind, Uuid, VaultError};
 
 fn other_device() -> vault_core::Uuid {
     vault_core::Uuid::from_u128(0x5E5E_5E5E_5E5E_5E5E_5E5E_5E5E_5E5E_5E5E)
@@ -144,6 +144,107 @@ fn duplicate_handle_unlocks_and_survives_original_drop() {
     assert_vaults_eq(&v, &opened);
 }
 
+/// 01 §4 `header_digest` on the `unlock_with_key` path (reviewer W1): a vault-sync peer
+/// opening a tampered file with its cached key gets `Tampered(Manifest)`, never a header to
+/// merge. The KDF params are checked here too (no slot is unwrapped on this path).
+#[test]
+fn header_digest_is_checked_by_unlock_with_key() {
+    let mut v = new_vault();
+    populate(&mut v, 2);
+    let handle = v.export_vault_key();
+    v.change_password(
+        &pw(),
+        &secret("another password"),
+        vault_core::KdfParams::for_tests(),
+        5_000,
+    )
+    .unwrap();
+    let cur = v.serialize();
+    let open = |bytes: &[u8]| {
+        LockedVault::parse(bytes)
+            .unwrap()
+            .unlock_with_key(&handle, device())
+    };
+    assert_vaults_eq(&v, &open(&cur).unwrap());
+    let manifest = VaultError::Tampered(TamperKind::Manifest);
+    for edit in [
+        (|f: &mut VaultFile| f.header.slots_modified_at = Some(6_000)) as fn(&mut VaultFile),
+        |f| f.header.slots_modified_at = Some(u64::MAX),
+        |f| f.header.slots_modified_at = None,
+        |f| f.header.slots_device_id = None,
+        |f| f.header.kdf.t_cost = 2,
+        |f| f.header.kdf.salt[0] ^= 1,
+        |f| f.header.slots.clear(),
+    ] {
+        let tampered = rewrite(&cur, edit);
+        match LockedVault::parse(&tampered) {
+            Ok(locked) => assert_eq!(
+                locked.unlock_with_key(&handle, device()).unwrap_err(),
+                manifest
+            ),
+            Err(VaultError::Malformed(_)) => {} // e.g. no slots at all
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+}
+
+/// The reviewer's gap: a merge whose `theirs` was opened with the cached key (vault-sync's
+/// normal path) adopts a legitimately newer header, and the result opens with the new
+/// password while the cached key still works (the vault key did not change).
+#[test]
+fn merge_through_unlock_with_key_adopts_newer_header() {
+    let mut a = new_vault();
+    populate(&mut a, 2);
+    let mut b = unlock(&a.serialize()).unwrap();
+    b.set_device_id(Uuid::from_u128(0xB));
+    let new_pw = secret("changed on B");
+    b.change_password(&pw(), &new_pw, vault_core::KdfParams::for_tests(), 5_000)
+        .unwrap();
+    let handle = a.export_vault_key();
+    let b_disk = LockedVault::parse(&b.serialize())
+        .unwrap()
+        .unlock_with_key(&handle, device())
+        .unwrap();
+    assert_eq!(b_disk.header().slots_modified_at, Some(5_000));
+    assert_eq!(b_disk.header().slots_device_id, Some(Uuid::from_u128(0xB)));
+
+    let report = a.merge_from(&b_disk).unwrap();
+    assert!(report.header_updated, "{report:?}");
+    let bytes = a.serialize();
+    let locked = LockedVault::parse(&bytes).unwrap();
+    assert_eq!(locked.unlock(&pw()).unwrap_err(), VaultError::WrongPassword);
+    assert_vaults_eq(&a, &locked.unlock(&new_pw).unwrap());
+    assert_vaults_eq(&a, &locked.unlock_with_key(&handle, device()).unwrap());
+    assert_eq!(locked.header().slots, b.header().slots);
+}
+
+/// A header merge that adopts a rotated vault key (03 §5) invalidates handles exported
+/// before it, exactly like a local rotation; a handle exported afterwards opens the result.
+#[test]
+fn handle_is_stale_after_merge_adopts_a_rotated_key() {
+    let mut a = new_vault();
+    populate(&mut a, 2);
+    let mut b = unlock(&a.serialize()).unwrap();
+    let stale = a.export_vault_key();
+    b.rotate_vault_key(&pw(), 7_000).unwrap();
+    let b_disk = LockedVault::parse(&b.serialize()).unwrap();
+    assert_eq!(
+        b_disk.unlock_with_key(&stale, device()).unwrap_err(),
+        VaultError::WrongPassword,
+        "vault-sync sees KeyRotatedOnDisk here and re-asks for a credential"
+    );
+    let report = a.merge_from(&b_disk.unlock(&pw()).unwrap()).unwrap();
+    assert!(report.header_updated);
+    let merged = LockedVault::parse(&a.serialize()).unwrap();
+    assert_eq!(
+        merged.unlock_with_key(&stale, device()).unwrap_err(),
+        VaultError::WrongPassword
+    );
+    let fresh = a.export_vault_key();
+    assert_vaults_eq(&a, &merged.unlock_with_key(&fresh, device()).unwrap());
+    assert_vaults_eq(&a, &merged.unlock(&pw()).unwrap());
+}
+
 #[test]
 fn handle_survives_change_password_but_not_rotation() {
     let mut v = new_vault();
@@ -154,6 +255,7 @@ fn handle_survives_change_password_but_not_rotation() {
         &pw(),
         &secret("another password"),
         vault_core::KdfParams::for_tests(),
+        5_000,
     )
     .unwrap();
     let after_change = LockedVault::parse(&v.serialize()).unwrap();
@@ -162,7 +264,8 @@ fn handle_survives_change_password_but_not_rotation() {
         &after_change.unlock_with_key(&handle, device()).unwrap(),
     );
 
-    v.rotate_vault_key(&secret("another password")).unwrap();
+    v.rotate_vault_key(&secret("another password"), 5_001)
+        .unwrap();
     let after_rotate = LockedVault::parse(&v.serialize()).unwrap();
     assert_eq!(
         after_rotate.unlock_with_key(&handle, device()).unwrap_err(),

@@ -7,6 +7,7 @@
 //!   attachments/<id hex>.bin        immutable blobs (03 §1.1)
 //!   backups/<name>-<stamp>.vault.bin snapshots, unsaved copies, absorbed conflict packages
 //!   .vault.bin.tmp-<8 hex>          transient
+//!   .lock                           advisory save lock (03 §2), empty
 //! ```
 
 use std::fs;
@@ -27,6 +28,14 @@ pub(crate) const PACKAGE_EXT: &str = ".vault";
 /// `<package>/vault.bin`.
 pub(crate) fn vault_file(package: &Path) -> PathBuf {
     package.join(VAULT_FILE_NAME)
+}
+
+/// Advisory lock file inside a package (03 §2).
+pub(crate) const LOCK_FILE_NAME: &str = ".lock";
+
+/// `<package>/.lock`.
+pub(crate) fn lock_file(package: &Path) -> PathBuf {
+    package.join(LOCK_FILE_NAME)
 }
 
 /// `<package>/attachments`.

@@ -52,7 +52,8 @@ fn guarantee_9_delete_then_merge_older_copy_stays_deleted() {
             added: 0,
             updated: 0,
             deleted: 0,
-            unchanged: 3
+            unchanged: 3,
+            header_updated: false
         }
     );
     assert!(!report.changed());
@@ -305,7 +306,8 @@ fn absent_items_and_tombstones_are_added() {
             added: 2,
             updated: 0,
             deleted: 0,
-            unchanged: 3
+            unchanged: 3,
+            header_updated: false
         },
         "two ids new to A; A's own extra item counts as unchanged"
     );
@@ -337,7 +339,8 @@ fn merge_is_idempotent_and_identical_copies_are_unchanged() {
             added: 1,
             updated: 1,
             deleted: 1,
-            unchanged: 2
+            unchanged: 2,
+            header_updated: false
         }
     );
     let a_after_first = unlock(&a.serialize()).unwrap();

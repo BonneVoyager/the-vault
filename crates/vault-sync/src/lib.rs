@@ -26,6 +26,7 @@ mod backup;
 mod cloud;
 mod error;
 mod event;
+mod lock;
 mod package;
 mod synced;
 mod watch;

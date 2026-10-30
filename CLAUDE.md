@@ -13,6 +13,7 @@ Native macOS password manager in Rust. Codename: **vault**. Specs live in `specs
 - Prefer small PR-sized changes. If a task needs more than ~400 lines of diff, stop and outline the split first.
 - When a spec is ambiguous, pick the simplest interpretation, implement it, and note the choice in the PR summary. Do not silently expand scope.
 - Do not add dependencies without listing them and why. Pin versions in `Cargo.toml` (`=x.y.z` for gpui and gpui-component; caret elsewhere).
+- After each major wave and before the owner commits it, remind the owner to run the `bug-hunter` agent (`.claude/agents/bug-hunter.md`): an independent spec-derived hunt that writes its checks before reading the code and reports to `docs/qa/`. It is slow and costly, so it never runs automatically; the orchestrator's checkpoint must end with "Bug hunt: run / not yet run for this wave".
 
 ## Workspace
 

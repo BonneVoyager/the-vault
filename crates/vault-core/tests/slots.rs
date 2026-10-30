@@ -11,6 +11,8 @@ use vault_core::{
 };
 
 const NEW_PASSWORD: &str = "new password, same vault key";
+/// `now` passed to every slot mutation (unix millis).
+const T_NOW: u64 = 1_700_000_000_000;
 
 fn new_pw() -> vault_core::SecretString {
     secret(NEW_PASSWORD)
@@ -27,7 +29,7 @@ fn vault_with_enclave() -> (UnlockedVault, Uuid, SecretVec<u8>) {
     let mut v = new_vault();
     populate(&mut v, 5);
     let kek = random_kek();
-    let slot = v.add_enclave_slot(&kek);
+    let slot = v.add_enclave_slot(&kek, T_NOW);
     (v, slot, kek)
 }
 
@@ -40,7 +42,7 @@ fn guarantee_8_change_password_leaves_vault_key_unchanged() {
     let (mut v, slot, kek) = vault_with_enclave();
     assert_eq!(kinds(&v), [SlotKind::Password, SlotKind::Enclave]);
 
-    v.change_password(&pw(), &new_pw(), KdfParams::for_tests())
+    v.change_password(&pw(), &new_pw(), KdfParams::for_tests(), T_NOW)
         .unwrap();
     let bytes = v.serialize();
     let locked = LockedVault::parse(&bytes).unwrap();
@@ -103,18 +105,18 @@ fn remove_slot_refuses_last_password_slot_and_removes_enclave() {
     let (mut v, slot, kek) = vault_with_enclave();
     let (password_slot, _) = v.slots().find(|(_, k)| *k == SlotKind::Password).unwrap();
 
-    let err = v.remove_slot(password_slot).unwrap_err();
+    let err = v.remove_slot(password_slot, T_NOW).unwrap_err();
     assert!(
         matches!(&err, VaultError::Malformed(m) if m.contains("last password slot")),
         "{err:?}"
     );
     assert!(matches!(
-        v.remove_slot(Uuid::new_v4()),
+        v.remove_slot(Uuid::new_v4(), T_NOW),
         Err(VaultError::Malformed(_))
     ));
     assert_eq!(kinds(&v), [SlotKind::Password, SlotKind::Enclave]);
 
-    v.remove_slot(slot).unwrap();
+    v.remove_slot(slot, T_NOW).unwrap();
     assert_eq!(kinds(&v), [SlotKind::Password]);
 
     let locked = LockedVault::parse(&v.serialize()).unwrap();
@@ -131,13 +133,13 @@ fn rotate_vault_key_reencrypts_items_drops_enclave_and_keeps_old_file_valid() {
     let old_bytes = v.serialize();
 
     assert!(matches!(
-        v.rotate_vault_key(&new_pw()),
+        v.rotate_vault_key(&new_pw(), T_NOW),
         Err(VaultError::WrongPassword)
     ));
     assert_eq!(kinds(&v), [SlotKind::Password, SlotKind::Enclave]);
 
     let header_before = v.header().clone();
-    v.rotate_vault_key(&pw()).unwrap();
+    v.rotate_vault_key(&pw(), T_NOW).unwrap();
     let header_after = v.header();
     assert_eq!(kinds(&v), [SlotKind::Password], "enclave slot dropped");
     assert_eq!(header_after.kdf, header_before.kdf, "kdf params unchanged");
@@ -183,7 +185,7 @@ fn change_password_with_wrong_old_leaves_header_unchanged() {
     let (mut v, _, _) = vault_with_enclave();
     let before = v.header().clone();
     assert!(matches!(
-        v.change_password(&new_pw(), &new_pw(), KdfParams::for_tests()),
+        v.change_password(&new_pw(), &new_pw(), KdfParams::for_tests(), T_NOW),
         Err(VaultError::WrongPassword)
     ));
     assert_eq!(v.header(), &before);
@@ -192,7 +194,7 @@ fn change_password_with_wrong_old_leaves_header_unchanged() {
     let mut bad = KdfParams::for_tests();
     bad.t_cost = 0;
     assert!(matches!(
-        v.change_password(&pw(), &new_pw(), bad),
+        v.change_password(&pw(), &new_pw(), bad, T_NOW),
         Err(VaultError::Malformed(_))
     ));
     assert_eq!(v.header(), &before);
@@ -209,7 +211,8 @@ fn change_password_replaces_slot_and_adopts_new_kdf_salt() {
     let mut params = KdfParams::for_tests();
     params.salt = [0x5a; 32];
     assert_ne!(params.salt, before.kdf.salt);
-    v.change_password(&pw(), &new_pw(), params.clone()).unwrap();
+    v.change_password(&pw(), &new_pw(), params.clone(), T_NOW)
+        .unwrap();
 
     let after = v.header();
     let password_slots: Vec<_> = after
@@ -243,12 +246,16 @@ fn add_enclave_slot_with_created_at_and_multiple_enclave_slots() {
     let mut v = new_vault();
     populate(&mut v, 2);
     let (k1, k2) = (random_kek(), random_kek());
-    let s1 = v.add_enclave_slot_with_created_at(&k1, 1_700_000_123);
-    let s2 = v.add_enclave_slot(&k2);
+    let s1 = v.add_enclave_slot_with_created_at(&k1, 1_700_000_123, T_NOW);
+    let s2 = v.add_enclave_slot(&k2, T_NOW);
     assert_ne!(s1, s2);
     let header = v.header();
     assert_eq!(header.slots[1].as_key().unwrap().created_at, 1_700_000_123);
-    assert_eq!(header.slots[2].as_key().unwrap().created_at, 0);
+    assert_eq!(
+        header.slots[2].as_key().unwrap().created_at,
+        T_NOW / 1000,
+        "created_at defaults to now in seconds"
+    );
 
     let locked = LockedVault::parse(&v.serialize()).unwrap();
     assert_vaults_eq(&v, &locked.unlock_with_kek(s1, &k1).unwrap());

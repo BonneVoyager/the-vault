@@ -92,7 +92,25 @@ pub(crate) fn add_template_tag(item: &mut Item, tag: &str) {
     }
 }
 
+/// Undo the CSV-injection guard of [`crate::export::export_csv`]: one leading `'` is dropped
+/// when (and only when) what follows it is a formula trigger (`=`, `+`, `-`, `@`, tab,
+/// carriage return) behind zero or more further `'`. So `'=x` -> `=x`, `''=x` -> `'=x` (what
+/// our export writes for an original `'=x`), while `'y`, a bare `'` and `''` are kept
+/// verbatim. One quote only, which makes export and import exact inverses.
+fn strip_formula_guard(cell: &str) -> &str {
+    match cell.strip_prefix('\'') {
+        Some(rest) if crate::export::trigger_behind_quotes(rest) => rest,
+        _ => cell,
+    }
+}
+
 /// Each row becomes a `login` item with a fresh id. Only non-empty mapped cells become fields.
+///
+/// One leading `'` before a formula trigger (`=`, `+`, `-`, `@`, tab, carriage return) is
+/// stripped from every cell, title included, so our own exports (and other managers that
+/// follow the same OWASP guidance) round-trip to the original values. A value that genuinely
+/// starts with `'=` and comes from a source that did *not* escape it loses that quote;
+/// accepted.
 pub fn import_csv(
     bytes: &[u8],
     mapping: &CsvMapping,
@@ -137,10 +155,11 @@ pub fn import_csv(
     let mut items = Vec::new();
     for rec in rdr.records() {
         let rec = rec.map_err(|e| ImportError::Csv(e.to_string()))?;
-        let mut item = Item::new(rec.get(title_col).unwrap_or(""), device_id, now);
+        let title = strip_formula_guard(rec.get(title_col).unwrap_or(""));
+        let mut item = Item::new(title, device_id, now);
         add_template_tag(&mut item, TAG_LOGIN);
         for (name, kind, col) in &parts {
-            let value = col.and_then(|c| rec.get(c)).unwrap_or("");
+            let value = strip_formula_guard(col.and_then(|c| rec.get(c)).unwrap_or(""));
             if !value.is_empty() {
                 item.fields.push(Field::new(
                     *name,

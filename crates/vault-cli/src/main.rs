@@ -274,6 +274,13 @@ fn state_str(s: AttachmentState) -> &'static str {
 }
 
 fn attach_get(sv: &SyncedVault, item: Uuid, id: Uuid, out: &Path) -> Result<()> {
+    let known = sv
+        .vault()
+        .and_then(|v| v.get(item))
+        .is_some_and(|it| it.attachments.iter().any(|a| a.id == id));
+    if !known {
+        bail!("attachment not found: {id}");
+    }
     let mut reader = sv.open_attachment(item, id).map_err(sync_err)?;
     let mut f = create_private(out)?;
     let result = std::io::copy(&mut reader, &mut f)
@@ -359,6 +366,20 @@ fn run(cli: Cli) -> Result<()> {
     match &cli.command {
         Cmd::Attach { cmd } => run_attach(&cli, cmd)?,
         Cmd::Gen(a) => {
+            if a.passphrase {
+                if a.words < 1 {
+                    bail!("words must be at least 1");
+                }
+            } else {
+                // Lowercase is always on; each other enabled class needs one character.
+                let min = 1
+                    + usize::from(!a.no_symbols)
+                    + usize::from(!a.no_digits)
+                    + usize::from(!a.no_upper);
+                if a.length < min {
+                    bail!("length must be at least {min} for the enabled character classes");
+                }
+            }
             let secret = if a.passphrase {
                 passphrase(&PassphraseSpec {
                     words: a.words,

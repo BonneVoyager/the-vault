@@ -27,6 +27,15 @@ use vault_sync::{
 const T0: u64 = 1_700_000_000_000;
 const DEADLINE: Duration = Duration::from_secs(20);
 
+/// Wall-clock milliseconds, for core calls that stamp the header (`now`), so the stamp is
+/// newer than the one `create` set.
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 fn pw() -> SecretString {
     SecretString::new("correct horse battery staple".to_owned())
 }
@@ -419,7 +428,9 @@ fn key_rotation_elsewhere_reports_mismatch_and_reverify_merges() {
     a.start_watching().unwrap();
     b.start_watching().unwrap();
     let mut ea = Events::new(&a);
-    b.edit(|v| v.rotate_vault_key(&pw())).unwrap().unwrap();
+    b.edit(|v| v.rotate_vault_key(&pw(), wall_ms()))
+        .unwrap()
+        .unwrap();
     b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
         .unwrap();
     b.save().unwrap();
@@ -536,7 +547,9 @@ fn key_mismatch_then_lock_preserves_a_clean_vault() {
     let (_dir, path, mut a, mut b, _id) = two_devices();
     a.start_watching().unwrap();
     let mut ea = Events::new(&a);
-    b.edit(|v| v.rotate_vault_key(&pw())).unwrap().unwrap();
+    b.edit(|v| v.rotate_vault_key(&pw(), wall_ms()))
+        .unwrap()
+        .unwrap();
     b.save().unwrap();
     let rotated = fs::read(&path).unwrap();
     assert!(wait_until(|| {

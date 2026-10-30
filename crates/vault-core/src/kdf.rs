@@ -19,8 +19,11 @@ pub const RECOMMENDED_P_COST: u32 = 4;
 pub const MAX_M_COST_KIB: u32 = 1024 * 1024;
 /// Memory cost used by [`KdfParams::for_tests`]: 8 MiB.
 pub const TEST_M_COST_KIB: u32 = 8 * 1024;
-/// Upper bound accepted for `t_cost` (header parsing and construction).
-pub const MAX_T_COST: u32 = 64;
+/// Upper bound accepted for `t_cost` (header parsing and construction). Calibration only
+/// ever raises `m_cost` and never leaves `t = 3`, so a header asking for more passes is
+/// either damaged or hostile: at 1 GiB each pass costs seconds, and a tampered `t = 64`
+/// made every unlock attempt take over half a minute before the password check (V-08).
+pub const MAX_T_COST: u32 = 16;
 /// Upper bound accepted for `p_cost` (header parsing and construction).
 pub const MAX_P_COST: u32 = 64;
 
@@ -41,9 +44,10 @@ pub struct KdfParams {
 
 impl KdfParams {
     /// Reject parameters outside the ranges this crate is willing to run: every cost must be
-    /// non-zero, `m_cost_kib <= 1 GiB` (the 01 §6 calibration ceiling), `t_cost <= 64`,
+    /// non-zero, `m_cost_kib <= 1 GiB` (the 01 §6 calibration ceiling), `t_cost <= 16`,
     /// `p_cost <= 64`. A hostile header must not be able to make Argon2 allocate terabytes or
-    /// iterate for hours before the password is even checked.
+    /// iterate for minutes before the password is even checked. Files written with `t <= 16`
+    /// (every file this crate ever produced; calibration keeps `t = 3`) are unaffected.
     pub fn validate(&self) -> Result<(), VaultError> {
         let bad = |what: &str| Err(VaultError::Malformed(format!("kdf.{what}: out of range")));
         if self.m_cost_kib == 0 || self.m_cost_kib > MAX_M_COST_KIB {

@@ -42,6 +42,25 @@ impl Default for PasswordSpec {
     }
 }
 
+impl PasswordSpec {
+    /// Number of character classes [`password`] draws from: the enabled ones, or 1 when none
+    /// is enabled (lowercase is used then).
+    fn class_count(&self) -> usize {
+        let n = [self.lower, self.upper, self.digits, self.symbols]
+            .into_iter()
+            .filter(|&b| b)
+            .count();
+        n.max(1)
+    }
+
+    /// The shortest password [`password`] can produce for this spec: one character per
+    /// enabled class (at least 1). A `length` below this is raised to it, so a UI that wants
+    /// to refuse rather than silently lengthen should check `spec.length >= min_length()`.
+    pub fn min_length(&self) -> usize {
+        self.class_count()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PassphraseSpec {
     pub words: usize,
@@ -69,8 +88,11 @@ fn class_chars(set: &str, exclude_ambiguous: bool) -> Vec<char> {
 
 /// Random password with at least one character from every enabled class.
 ///
-/// If `length` is below the number of enabled classes it is raised to that number. If no class
-/// is enabled, lowercase is used.
+/// **`length` is clamped up to [`PasswordSpec::min_length`]** (the number of enabled classes,
+/// at least 1): the "one of each class" guarantee needs that many characters, so a request
+/// for fewer yields exactly `min_length()` characters, never an empty or class-less string.
+/// Callers that would rather reject such a request must validate `length` themselves. If no
+/// class is enabled, lowercase is used.
 pub fn password(spec: &PasswordSpec) -> SecretString {
     let mut classes: Vec<Vec<char>> = Vec::new();
     for (enabled, set) in [
@@ -86,7 +108,8 @@ pub fn password(spec: &PasswordSpec) -> SecretString {
     if classes.is_empty() {
         classes.push(class_chars(LOWER, spec.exclude_ambiguous));
     }
-    let length = spec.length.max(classes.len());
+    debug_assert_eq!(classes.len(), spec.class_count());
+    let length = spec.length.max(spec.min_length());
     let pool: Vec<char> = classes.iter().flatten().copied().collect();
 
     let mut chars: Zeroizing<Vec<char>> = Zeroizing::new(Vec::with_capacity(length));
@@ -113,10 +136,14 @@ fn wordlist() -> &'static [&'static str] {
 
 /// Diceware-style passphrase from the bundled EFF large wordlist. With `number`, one random
 /// digit is appended to the last word.
+///
+/// **`words` is clamped up to 1**: a request for zero words would otherwise return an empty
+/// string (or a lone digit with `number`), which is not a passphrase. Callers that want to
+/// refuse `words == 0` must validate it themselves.
 pub fn passphrase(spec: &PassphraseSpec) -> SecretString {
     let list = wordlist();
     let mut out: Zeroizing<String> = Zeroizing::new(String::new());
-    for i in 0..spec.words {
+    for i in 0..spec.words.max(1) {
         if i > 0 {
             out.push(spec.separator);
         }

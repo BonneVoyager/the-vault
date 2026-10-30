@@ -96,9 +96,7 @@ impl SyncedVault {
         let r = vault
             .get(item)
             .and_then(|i| i.attachment(id))
-            .ok_or_else(|| {
-                VaultError::Malformed(format!("unknown attachment {id} on item {item}"))
-            })?
+            .ok_or(SyncError::AttachmentNotFound { item, id })?
             .clone();
         let path = attachments::blob_path(&self.path, id);
         match self.hooks.ensure_downloaded(&path, DOWNLOAD_TIMEOUT) {

@@ -56,6 +56,8 @@ const COPY_CHUNK: usize = 64 * 1024;
 
 pub const TOO_LARGE: &str = "File is larger than 100 MB";
 const MISSING: &str = "This attachment is missing. It has not synced to this Mac yet, or the vault was restored from a backup.";
+/// The item holds no such attachment (removed meanwhile, here or by a merge).
+pub const NOT_FOUND: &str = "Attachment not found on this item.";
 
 const IMAGE_EXTS: [(&str, gpui::ImageFormat); 4] = [
     ("png", gpui::ImageFormat::Png),
@@ -504,7 +506,7 @@ impl AppState {
         if outcome == Outcome::Locked {
             self.vault = Some(vault);
             if let Some(e) = saved.and_then(|r| self.record_save(r)) {
-                self.toast = Some(Toast::window(format!("Could not save before locking: {e}")));
+                self.toast = Some(Toast::window(super::lock_save_failed(&e)));
             }
         }
     }
@@ -566,6 +568,7 @@ impl AppState {
                 self.vault_changed();
                 self.schedule_autosave(cx);
             }
+            Err(SyncError::AttachmentNotFound { .. }) => self.show_toast(NOT_FOUND, cx),
             Err(e) => self.show_toast(format!("Could not remove the attachment: {e}"), cx),
         }
         cx.notify();
@@ -895,6 +898,7 @@ fn add_error(e: &SyncError) -> String {
 fn read_error(e: &SyncError) -> String {
     match e {
         SyncError::AttachmentMissing(_) => MISSING.into(),
+        SyncError::AttachmentNotFound { .. } => NOT_FOUND.into(),
         SyncError::AttachmentNotDownloaded(_) => {
             "The attachment did not download in time. Try again later.".into()
         }

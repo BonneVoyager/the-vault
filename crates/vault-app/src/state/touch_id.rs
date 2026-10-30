@@ -30,6 +30,10 @@ pub const PASSWORD_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Master password required again after this many failed Touch ID attempts.
 pub const MAX_TOUCH_FAILURES: u32 = 5;
 
+/// Toast when a merge took away this Mac's enclave slot.
+pub const SLOT_GONE: &str = "Another device changed this vault's keys, so Touch ID must be set up \
+                             again in Settings \u{25b8} Security.";
+
 /// Persisted per vault in `settings.json` under `touch_id.<vault_id>`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -117,7 +121,7 @@ fn remove_enrollment(
     if !present {
         return Ok(());
     }
-    vault.edit(|v| v.remove_slot(slot))??;
+    vault.edit(|v| v.remove_slot(slot, crate::text::now_millis()))??;
     vault.save()
 }
 
@@ -255,6 +259,29 @@ impl AppState {
                 )));
             }
         }
+    }
+
+    /// After a merge (watcher, pre-write, conflicted copy) or an unlock, which merges too:
+    /// the header merge (03 §5) may have replaced our slot set with another device's, so the
+    /// enclave slot this Mac enrolled can be gone (removed or rotated away over there).
+    /// "Enrolled on this device" is re-derived from the live slot ids; a missing slot marks
+    /// the policy stale, the same state a fingerprint change leads to. Another device's new
+    /// enclave slot changes nothing here. True when the enrollment just went stale.
+    pub(super) fn recheck_touch_slot(&mut self) -> bool {
+        let Some(slot) = self.policy().filter(|p| !p.stale).map(|p| p.slot_id) else {
+            return false;
+        };
+        let Some(vault) = self.unlocked_vault() else {
+            return false;
+        };
+        if vault
+            .slots()
+            .any(|(id, kind)| id == slot && kind == SlotKind::Enclave)
+        {
+            return false;
+        }
+        self.mark_stale();
+        true
     }
 
     fn mark_stale(&mut self) {
@@ -483,13 +510,13 @@ fn enroll(
     // Zeroized when dropped at the end of this function.
     let kek = SecretVec::new(bytes);
     let slot = vault
-        .edit(|v| v.add_enclave_slot(&kek))
+        .edit(|v| v.add_enclave_slot(&kek, crate::text::now_millis()))
         .map_err(|e| EnrollError {
             message: e.to_string(),
             unsaved: None,
         })?;
     let fail = |vault: &mut SyncedVault, message: String| {
-        let _ = vault.edit(|v| v.remove_slot(slot));
+        let _ = vault.edit(|v| v.remove_slot(slot, crate::text::now_millis()));
         EnrollError {
             message,
             unsaved: vault.save().err(),
@@ -584,6 +611,13 @@ mod tests {
             .collect()
     }
 
+    fn slots_stamp_on_disk(path: &Path) -> u64 {
+        LockedVault::parse(&std::fs::read(path.join("vault.bin")).unwrap())
+            .unwrap()
+            .header()
+            .slots_stamp()
+    }
+
     fn policy(state: &Entity<AppState>, cx: &mut TestAppContext) -> Option<TouchIdPolicy> {
         state.read_with(cx, |s, _| s.policy().cloned())
     }
@@ -593,9 +627,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (state, bio, path) = setup(dir.path(), cx);
         let vault_id = state.read_with(cx, |s, _| s.vault_id.unwrap());
+        let stamp_before = slots_stamp_on_disk(&path);
         enable(&state, cx);
         let slots = enclave_slots_on_disk(&path);
         assert_eq!(slots.len(), 1, "slot saved to disk");
+        assert!(
+            slots_stamp_on_disk(&path) > stamp_before,
+            "saved at once with a newer slots_modified_at (03 §5)"
+        );
         assert_eq!(bio.calls(), vec![Call::Enroll(vault_id, slots[0])]);
         let p = policy(&state, cx).unwrap();
         assert_eq!(p.slot_id, slots[0]);
@@ -823,6 +862,141 @@ mod tests {
             assert!(!s.touch_enabled());
             assert!(s.toast.as_ref().unwrap().message.contains("re-enrolled"));
         });
+    }
+
+    /// Ticks the app (watcher poll + events) until `done` holds; false after 20 s.
+    fn wait_for(
+        state: &Entity<AppState>,
+        cx: &mut TestAppContext,
+        done: impl Fn(&AppState) -> bool,
+    ) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(20) {
+            state.update(cx, |s, cx| s.tick(0.0, cx));
+            if state.read_with(cx, |s, _| done(s)) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        false
+    }
+
+    /// A second device on the same file, opened after this Mac's last slot change so its
+    /// own slot changes carry the newer `slots_modified_at` and win the header merge.
+    fn other_device(path: &Path) -> SyncedVault {
+        let mut other = SyncedVault::open(path, Uuid::new_v4(), Arc::new(NoopHooks)).unwrap();
+        other.unlock(&secret(PW)).unwrap();
+        other
+    }
+
+    fn toast(state: &Entity<AppState>, cx: &mut TestAppContext) -> Option<String> {
+        state.read_with(cx, |s, _| s.toast.as_ref().map(|t| t.message.to_string()))
+    }
+
+    #[gpui::test]
+    fn merge_that_removes_our_slot_marks_the_enrollment_stale(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, bio, path) = setup(dir.path(), cx);
+        let vault_id = state.read_with(cx, |s, _| s.vault_id.unwrap());
+        enable(&state, cx);
+        let ours = policy(&state, cx).unwrap().slot_id;
+        let mut other = other_device(&path);
+
+        // B enrolls its own Mac: a new enclave slot arrives; ours is still there.
+        let kek = SecretVec::new(vec![7u8; 32]);
+        let theirs = other
+            .edit(|v| v.add_enclave_slot(&kek, crate::text::now_millis()))
+            .unwrap();
+        other.save().unwrap();
+        assert!(wait_for(&state, cx, |s| {
+            s.unlocked_vault()
+                .is_some_and(|v| v.slots().any(|(id, _)| id == theirs))
+        }));
+        state.read_with(cx, |s, _| {
+            assert!(s.touch_enabled(), "another Mac's slot leaves ours alone");
+            assert!(!s.policy().unwrap().stale);
+        });
+
+        // B removes our slot (it turned this Mac's Touch ID off, or re-keyed).
+        other
+            .edit(|v| v.remove_slot(ours, crate::text::now_millis()))
+            .unwrap()
+            .unwrap();
+        other.save().unwrap();
+        assert!(wait_for(&state, cx, |s| s
+            .policy()
+            .is_some_and(|p| p.stale)));
+        state.read_with(cx, |s, _| {
+            assert!(!s.touch_enabled(), "Settings shows Touch ID off");
+            assert_eq!(s.touch_policy(), Err(TouchDenied::Stale));
+            assert!(
+                !s.unlocked_vault()
+                    .unwrap()
+                    .slots()
+                    .any(|(id, _)| id == ours),
+                "B's slot set replaced ours"
+            );
+        });
+        assert_eq!(toast(&state, cx).as_deref(), Some(SLOT_GONE));
+
+        // Locked: the unlock screen shows the "set up again" hint; the next password unlock
+        // removes the leftover Keychain item and forgets the policy.
+        lock(&state, cx);
+        state.read_with(cx, |s, _| {
+            assert_eq!(s.touch_policy(), Err(TouchDenied::Stale));
+        });
+        password_unlock(&state, PW, cx);
+        assert!(bio.calls().contains(&Call::Unenroll(vault_id)));
+        state.read_with(cx, |s, _| {
+            assert!(s.policy().is_none());
+            assert!(!s.touch_enabled());
+        });
+        assert_eq!(enclave_slots_on_disk(&path), vec![theirs]);
+    }
+
+    #[gpui::test]
+    fn unlock_that_merges_away_our_slot_marks_the_enrollment_stale(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _bio, path) = setup(dir.path(), cx);
+        enable(&state, cx);
+        let ours = policy(&state, cx).unwrap().slot_id;
+        lock(&state, cx);
+        let mut other = other_device(&path);
+        other
+            .edit(|v| v.remove_slot(ours, crate::text::now_millis()))
+            .unwrap()
+            .unwrap();
+        other.save().unwrap();
+        password_unlock(&state, PW, cx);
+        state.read_with(cx, |s, _| {
+            assert!(!s.locked);
+            assert!(s.policy().unwrap().stale);
+            assert!(!s.touch_enabled());
+        });
+        assert_eq!(toast(&state, cx).as_deref(), Some(SLOT_GONE));
+    }
+
+    #[gpui::test]
+    fn conflict_absorbed_rechecks_the_slot(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _bio, _path) = setup(dir.path(), cx);
+        enable(&state, cx);
+        let ours = policy(&state, cx).unwrap().slot_id;
+        // What absorbing a conflicted copy with a newer slot set does to the header.
+        state.update(cx, |s, _| {
+            s.vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| v.remove_slot(ours, crate::text::now_millis()))
+                .unwrap()
+                .unwrap();
+        });
+        let copy = dir.path().join("t (conflict).vault");
+        state.update(cx, |s, cx| {
+            s.handle_sync_event(vault_sync::SyncEvent::ConflictAbsorbed(copy), cx);
+        });
+        state.read_with(cx, |s, _| assert!(s.policy().unwrap().stale));
+        assert_eq!(toast(&state, cx).as_deref(), Some(SLOT_GONE));
     }
 
     #[test]

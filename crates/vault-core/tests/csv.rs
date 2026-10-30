@@ -74,6 +74,81 @@ fn export_then_import_round_trips() {
     assert!(note.fields.is_empty());
 }
 
+/// CSV injection: a cell that would be read as a formula by a spreadsheet is exported with a
+/// leading `'`, and `import_csv` strips exactly that quote again, so values round-trip.
+#[test]
+fn formula_cells_are_neutralised_on_export_and_restored_on_import() {
+    let mut evil = login("=HYPERLINK(\"http://evil.test\")", "+1 555 0100", "-secret");
+    evil.fields.push(field("url", FieldKind::Url, "@host"));
+    evil.fields
+        .push(field("notes", FieldKind::Notes, "\tindented"));
+    evil.fields.push(field("totp", FieldKind::Totp, "\rcr"));
+    // Values that already start with quotes: only quotes + trigger is affected (one more
+    // quote on export so one strip restores it); anything else is left alone.
+    let quoted = login("'=already quoted", "'plain apostrophe", "'");
+    let mut twice = Item::new("''=twice", Uuid::nil(), 1);
+    twice.fields.push(field("notes", FieldKind::Notes, "''"));
+    let v = vault(vec![evil, quoted, twice]);
+
+    let out = export_csv(&v);
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(out.0.as_slice());
+    let mut rows: Vec<Vec<String>> = rdr
+        .records()
+        .map(|r| r.unwrap().iter().map(str::to_owned).collect())
+        .collect();
+    rows.sort();
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        for cell in row {
+            assert!(
+                !cell.starts_with(['=', '+', '-', '@', '\t', '\r']),
+                "cell {cell:?} would be read as a formula"
+            );
+        }
+    }
+    assert_eq!(
+        rows[2],
+        [
+            "'=HYPERLINK(\"http://evil.test\")",
+            "'+1 555 0100",
+            "'-secret",
+            "'@host",
+            "'\tindented",
+            "'\rcr"
+        ]
+    );
+    assert_eq!(rows[0], ["'''=twice", "", "", "", "''", ""]);
+    assert_eq!(
+        rows[1],
+        ["''=already quoted", "'plain apostrophe", "'", "", "", ""]
+    );
+
+    let imported = import_csv(&out.0, &CsvMapping::default(), Uuid::nil(), 1).unwrap();
+    let mut got: Vec<&Item> = imported.iter().collect();
+    got.sort_by(|a, b| a.title.cmp(&b.title));
+    let mut orig: Vec<&Item> = v.items().collect();
+    orig.sort_by(|a, b| a.title.cmp(&b.title));
+    for (o, g) in orig.iter().zip(&got) {
+        assert_eq!(o.title, g.title);
+        for n in ["username", "password", "url", "notes", "totp"] {
+            assert_eq!(get(o, n), get(g, n), "{} / {n}", o.title);
+        }
+    }
+
+    // A foreign CSV that follows the same guidance: the quote is stripped only before a
+    // trigger character.
+    let foreign = b"title,username,password,url,notes,totp\n'=x,'y,'-z,,,\n'\t,'' ,''+,,,\n";
+    let items = import_csv(foreign, &CsvMapping::default(), Uuid::nil(), 1).unwrap();
+    assert_eq!(items[0].title, "=x");
+    assert_eq!(get(&items[0], "username"), "'y");
+    assert_eq!(get(&items[0], "password"), "-z");
+    assert_eq!(items[1].title, "\t");
+    assert_eq!(get(&items[1], "username"), "'' ");
+    assert_eq!(get(&items[1], "password"), "'+");
+}
+
 #[test]
 fn export_has_no_category_gate_on_credentials() {
     // Item kinds are gone (2026-10-30): a "note" (by template tag) that carries a password

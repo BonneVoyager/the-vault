@@ -58,7 +58,13 @@ pub struct SyncUi {
     pub save_failing: bool,
     /// The re-key warning toast is up; the Merged right after it stays quiet.
     pub rekey_toast_shown: bool,
+    /// An autosave hit the save lock (`SaveLockTimeout`) and was retried once; the next
+    /// failure is not retried. Reset by any other save outcome.
+    pub busy_retried: bool,
 }
+
+/// Toast when another process held the vault's save lock for too long (03 §2).
+pub const SAVE_BUSY: &str = "Another process is writing this vault. Try again in a moment.";
 
 impl SyncUi {
     /// True when a banner or prompt sits at the top of the detail column.
@@ -119,8 +125,28 @@ impl AppState {
             return;
         }
         let result = vault.save();
+        self.autosave_finished(result, cx);
+    }
+
+    /// Bookkeeping and toast for one autosave attempt. A save that waited out another
+    /// process's lock is retried once, `AUTOSAVE_DEBOUNCE` later.
+    pub(super) fn autosave_finished(
+        &mut self,
+        result: Result<(), SyncError>,
+        cx: &mut Context<Self>,
+    ) {
+        let busy = matches!(result, Err(SyncError::SaveLockTimeout(_)));
         if let Some(e) = self.record_save(result) {
-            self.show_toast(format!("Could not save: {e}"), cx);
+            if busy {
+                self.show_toast(SAVE_BUSY, cx);
+            } else {
+                self.show_toast(format!("Could not save: {e}"), cx);
+            }
+        }
+        let retry = busy && !self.sync.busy_retried && !self.locked;
+        self.sync.busy_retried = retry;
+        if retry {
+            self.schedule_autosave(cx);
         }
         cx.notify();
     }
@@ -172,6 +198,9 @@ impl AppState {
                 if report.changed() && !after_rekey {
                     self.show_toast("Vault updated from another device", cx);
                 }
+                if self.recheck_touch_slot() {
+                    self.show_toast(super::touch_id::SLOT_GONE, cx);
+                }
                 // vault-sync saves the merge itself; a clean vault means that save worked.
                 if self.vault.as_ref().is_some_and(|v| !v.is_dirty()) {
                     self.sync.corrupt = false;
@@ -189,6 +218,9 @@ impl AppState {
                 }
                 let name = text::file_name(&path);
                 self.show_toast(format!("Merged a conflicted copy ({name})"), cx);
+                if self.recheck_touch_slot() {
+                    self.show_toast(super::touch_id::SLOT_GONE, cx);
+                }
             }
             SyncEvent::CorruptOnDisk => {
                 self.sync.corrupt = true;
@@ -660,7 +692,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (state, mut other, _) = two_devices(dir.path(), cx);
         other
-            .edit(|v| v.rotate_vault_key(&secret(PW)))
+            .edit(|v| v.rotate_vault_key(&secret(PW), crate::text::now_millis()))
             .unwrap()
             .unwrap();
         other
@@ -714,7 +746,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         other
-            .edit(|v| v.rotate_vault_key(&secret(PW)))
+            .edit(|v| v.rotate_vault_key(&secret(PW), crate::text::now_millis()))
             .unwrap()
             .unwrap();
         other.save().unwrap();
@@ -770,6 +802,51 @@ mod tests {
             s.tick(0.0, cx);
             assert!(s.sync_events.as_ref().unwrap().is_empty());
             assert!(!s.sync.backups.is_empty());
+        });
+    }
+
+    /// The package's save lock held by "another process" (03 §2): the save waits out the
+    /// 10 s timeout once, toasts, and the autosave retries once 2 s later.
+    #[gpui::test]
+    fn busy_save_toasts_and_autosave_retries_once(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join("t.vault").join(".lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        state.update(cx, |s, cx| {
+            s.toggle_favorite(cx);
+            s.autosave = None;
+            s.autosave_pending = false;
+            s.save_now(cx);
+            assert_eq!(s.toast.as_ref().unwrap().message.as_ref(), SAVE_BUSY);
+            assert!(s.sync.save_failing && s.sync.busy_retried);
+            assert!(s.autosave_pending, "one retry scheduled");
+        });
+        lock.unlock().unwrap();
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE);
+        cx.run_until_parked();
+        state.read_with(cx, |s, _| {
+            assert!(!s.vault.as_ref().unwrap().is_dirty(), "the retry saved");
+            assert!(!s.sync.save_failing && !s.sync.busy_retried);
+        });
+
+        // A retry that hits the lock again gives up until the next edit.
+        let busy = || Err(SyncError::SaveLockTimeout(dir.path().join("t.vault")));
+        state.update(cx, |s, cx| {
+            s.autosave_finished(busy(), cx);
+            assert!(s.sync.busy_retried && s.autosave_pending);
+            s.autosave = None;
+            s.autosave_pending = false;
+            s.autosave_finished(busy(), cx);
+            assert!(!s.autosave_pending, "no second retry");
+            assert!(!s.sync.busy_retried, "the next edit's save may retry again");
+            assert_eq!(s.toast.as_ref().unwrap().message.as_ref(), SAVE_BUSY);
         });
     }
 

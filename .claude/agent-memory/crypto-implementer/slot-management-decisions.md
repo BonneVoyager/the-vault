@@ -9,6 +9,12 @@ Decisions settled while implementing `crates/vault-core` P4b (2026-10-28). vault
 enrolment) and vault-app must stay consistent with these. See also [[format-decisions]] and
 [[mutation-merge-decisions]].
 
+**2026-10-30 update:** every mutator below now takes a trailing `now: Millis` and stamps
+`header.slots_modified_at` on success (`change_password(old, new, kdf, now)`,
+`add_enclave_slot(kek, now)` with `created_at = now / 1000`,
+`add_enclave_slot_with_created_at(kek, created_at, now)`, `remove_slot(id, now)`,
+`rotate_vault_key(password, now)`). See [[header-merge-decisions]].
+
 **Shared verification path:** `unlock` and `unlock_with_kek` both end in
 `LockedVault::unlock_with_vault_key` (items -> manifest, unchanged). `unlock_with_kek` addresses a
 slot of ANY kind by id; it only differs in how the vault_key is unwrapped.

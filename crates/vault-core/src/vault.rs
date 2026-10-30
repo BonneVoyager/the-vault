@@ -9,7 +9,8 @@
 //! 2. Every item record is decrypted with its AAD, in file order; the first tag failure ->
 //!    `Tampered(Item(id))`. This runs *before* the manifest check so that a record moved in from
 //!    another vault is reported as `Item`, not `Manifest`.
-//! 3. The manifest is decrypted with `item_count` bound in the AAD -> `Tampered(Manifest)`.
+//! 3. The manifest is decrypted with `item_count` (and, for a stamped header, the
+//!    `header_digest` of 01 §4) bound in the AAD -> `Tampered(Manifest)`.
 //! 4. The manifest pairs must equal the records' `(id, modified_at)` sorted by id, exactly
 //!    (the manifest is required to already be in sorted order) -> `Tampered(Manifest)`.
 //!
@@ -20,7 +21,9 @@
 //! Key-slot management (`change_password`, `add_enclave_slot`, `remove_slot`,
 //! `rotate_vault_key`) only edits the plaintext header and the in-memory keys; items are
 //! re-encrypted on the next `serialize` because every item/manifest key derives from
-//! `vault_key` (01 §3).
+//! `vault_key` (01 §3). Each of them also stamps `header.slots_modified_at` with
+//! `max(now, previous + 1)` so the header merge (03 §5, [`UnlockedVault::merge_from`]) can
+//! tell which device's slot set is newer; the stamp is only ever written once it is set.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -304,7 +307,12 @@ impl LockedVault {
         let item_count = u32::try_from(self.file.items.len())
             .map_err(|_| VaultError::Malformed("more than u32::MAX item records".into()))?;
         let manifest = &self.file.manifest;
-        let aad = manifest_aad(version, vault_id, item_count);
+        // A stamped header is bound into the manifest AAD (01 §4 `header_digest`): a header
+        // that was stripped, re-stamped, replaced or spliced fails here as Tampered(Manifest)
+        // on every unlock path (`unlock_with_key` included; on an *empty* vault that path
+        // reports it as WrongPassword, see `first_failure_is_wrong_key`).
+        let digest = header.digest();
+        let aad = manifest_aad(version, vault_id, item_count, digest.as_ref());
         let on_fail = tag_failure(
             first_failure_is_wrong_key && pairs.is_empty(),
             TamperKind::Manifest,
@@ -423,6 +431,8 @@ impl UnlockedVault {
                 kdf,
                 kdf_extras: Vec::new(),
                 slots: vec![slot],
+                slots_modified_at: None,
+                slots_device_id: None,
                 extras: Vec::new(),
             },
             keys: Keys::from_vault_key(vault_key, vault_id),
@@ -845,6 +855,16 @@ impl UnlockedVault {
         self.header.slots.iter().map(|s| (s.id(), s.kind()))
     }
 
+    /// Advance `header.slots_modified_at` to `max(now, previous + 1)` (03 §5 "Header merge")
+    /// and record this device as `slots_device_id`. Strictly monotone for the same reason
+    /// item stamps are (see [`stamp`]): a slot change made on a device whose clock is behind
+    /// must still beat the untouched copy it was made from, instead of tying. The device id
+    /// breaks the remaining exact-millisecond ties between two devices deterministically.
+    fn bump_slots_stamp(&mut self, now: Millis) {
+        self.header.slots_modified_at = Some(stamp(now, self.header.slots_stamp()));
+        self.header.slots_device_id = Some(self.device_id);
+    }
+
     /// Derive the KEK for `password` under the header's current KDF params and prove it
     /// unwraps at least one `password` slot. Returns that KEK so the caller can re-wrap under
     /// it. The AEAD tag is the only check; the unwrapped bytes are not compared to anything.
@@ -872,6 +892,10 @@ impl UnlockedVault {
     /// keep their position. Items are untouched in memory and re-encrypted with fresh nonces
     /// on the next `serialize` (guarantee 8).
     ///
+    /// This is also the re-calibration path (same password, new `kdf`). Either way
+    /// `header.slots_modified_at` is stamped from `now` (unix millis, caller's clock) so the
+    /// change wins the header merge on other devices (03 §5).
+    ///
     /// # Errors
     ///
     /// `WrongPassword` if `old` unwraps no password slot; `NoUsableSlot` if there is none;
@@ -882,6 +906,7 @@ impl UnlockedVault {
         old: &SecretString,
         new: &SecretString,
         kdf: KdfParams,
+        now: Millis,
     ) -> Result<(), VaultError> {
         self.verify_password(old)?;
         let new_kek = crypto::derive_kek(new, &kdf)?;
@@ -903,24 +928,27 @@ impl UnlockedVault {
             *slot = fresh;
         }
         self.header.kdf = kdf;
+        self.bump_slots_stamp(now);
         Ok(())
     }
 
     /// Add an `enclave` slot wrapping the current `vault_key` under a caller-held 32-byte KEK
     /// (01 §2; phase 4 stores that KEK in the Keychain behind Touch ID). Returns the new slot's
-    /// id, which the caller must keep to call [`LockedVault::unlock_with_kek`] later. The
-    /// slot's `created_at` is 0 because the core never reads the clock; use
-    /// [`UnlockedVault::add_enclave_slot_with_created_at`] to record a real timestamp.
+    /// id, which the caller must keep to call [`LockedVault::unlock_with_kek`] later. `now`
+    /// (unix millis, caller's clock) stamps `header.slots_modified_at` (03 §5) and, divided
+    /// down to seconds, the slot's `created_at`; use
+    /// [`UnlockedVault::add_enclave_slot_with_created_at`] to set `created_at` explicitly.
     ///
     /// # Panics
     ///
     /// If `kek` is not exactly 32 bytes. The signature (02) has no error channel, and a
     /// mis-sized KEK is a caller bug, not a runtime condition: the caller generated it.
-    pub fn add_enclave_slot(&mut self, kek: &SecretVec<u8>) -> Uuid {
-        self.add_enclave_slot_with_created_at(kek, 0)
+    pub fn add_enclave_slot(&mut self, kek: &SecretVec<u8>, now: Millis) -> Uuid {
+        self.add_enclave_slot_with_created_at(kek, now / 1000, now)
     }
 
-    /// Like [`UnlockedVault::add_enclave_slot`], stamping `created_at` (unix seconds).
+    /// Like [`UnlockedVault::add_enclave_slot`], with an explicit slot `created_at` (unix
+    /// seconds) independent of `now`.
     ///
     /// # Panics
     ///
@@ -929,6 +957,7 @@ impl UnlockedVault {
         &mut self,
         kek: &SecretVec<u8>,
         created_at: u64,
+        now: Millis,
     ) -> Uuid {
         let kek = crypto::kek_from_bytes(kek).expect("enclave KEK must be exactly 32 bytes");
         let slot = new_slot(
@@ -941,6 +970,7 @@ impl UnlockedVault {
         );
         let id = slot.id;
         self.header.slots.push(Slot::Key(slot));
+        self.bump_slots_stamp(now);
         id
     }
 
@@ -949,14 +979,15 @@ impl UnlockedVault {
     /// Keychain-held material, and refuses to remove the last slot of any kind, since the
     /// parser requires at least one (01 §2). The second guard is unreachable through this API
     /// today (the password-slot guard fires first) and exists so a future constructor cannot
-    /// produce an unparseable header.
+    /// produce an unparseable header. On success `header.slots_modified_at` is stamped from
+    /// `now` (03 §5); on error nothing changes.
     ///
     /// # Errors
     ///
     /// `Malformed("no such slot ..")` if `id` is not in the header;
     /// `Malformed("cannot remove last password slot")` / `Malformed("cannot remove last
     /// slot")` when refused.
-    pub fn remove_slot(&mut self, id: Uuid) -> Result<(), VaultError> {
+    pub fn remove_slot(&mut self, id: Uuid, now: Millis) -> Result<(), VaultError> {
         let slots = &mut self.header.slots;
         let index = slots
             .iter()
@@ -975,6 +1006,7 @@ impl UnlockedVault {
             return Err(VaultError::Malformed("cannot remove last slot".into()));
         }
         slots.remove(index);
+        self.bump_slots_stamp(now);
         Ok(())
     }
 
@@ -999,10 +1031,20 @@ impl UnlockedVault {
     /// Bytes already written are not affected: an earlier `serialize` output remains a valid,
     /// independent vault under the old password and old enclave KEKs.
     ///
+    /// `header.slots_modified_at` is stamped from `now` (03 §5). On another device the
+    /// rotated file no longer opens with the cached vault key; vault-sync reports that as
+    /// `KeyRotatedOnDisk` and re-asks for a credential before any merge, and the merge then
+    /// carries the newer header *and* its vault key together (see
+    /// [`UnlockedVault::merge_from`]).
+    ///
     /// # Errors
     ///
     /// `WrongPassword` if `password` unwraps no password slot. The vault is then unchanged.
-    pub fn rotate_vault_key(&mut self, password: &SecretString) -> Result<(), VaultError> {
+    pub fn rotate_vault_key(
+        &mut self,
+        password: &SecretString,
+        now: Millis,
+    ) -> Result<(), VaultError> {
         let kek = self.verify_password(password)?;
         let new_key = crypto::random_key();
         let version = self.header.format_version;
@@ -1018,6 +1060,7 @@ impl UnlockedVault {
         }
         // Dropping the previous `Keys` zeroizes the old vault key and its subkeys.
         self.keys = Keys::from_vault_key(new_key, vault_id);
+        self.bump_slots_stamp(now);
         Ok(())
     }
 
@@ -1048,7 +1091,8 @@ impl UnlockedVault {
         // BTreeMap iteration is already sorted by id (Uuid orders by bytes).
         let item_count = u32::try_from(records.len()).expect("more than u32::MAX items");
         let nonce = crypto::random_nonce();
-        let aad = manifest_aad(version, vault_id, item_count);
+        let digest = self.header.digest();
+        let aad = manifest_aad(version, vault_id, item_count, digest.as_ref());
         let ct = crypto::seal(
             &self.keys.manifest_key,
             &nonce,

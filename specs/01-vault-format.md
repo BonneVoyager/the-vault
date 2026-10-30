@@ -31,6 +31,8 @@ Parsers reject: wrong magic, `format_version > SUPPORTED`, `header_len` beyond E
     "salt":      bytes(32)     random
   }
   "slots": [ KeySlot, ... ]   at least one
+  "slots_modified_at": u64     optional (v1.1); unix millis of the last change to slots or kdf (password change, add/remove slot, re-calibrate, key rotation); merge takes the newer header (03 §5)
+  "slots_device_id": bytes(16)  optional (v1.1); device that made that change; merge tie-break (03 §5)
 }
 ```
 
@@ -51,7 +53,7 @@ Parsers reject: wrong magic, `format_version > SUPPORTED`, `header_len` beyond E
 - `passkey` slot (post-phase-5, macOS 15): extra keys `credential_id: bytes`, `prf_salt: bytes(32)` (random, static per slot), `rp_id: tstr`. KEK = `HKDF-SHA256(ikm = prf_output, salt = vault_id, info = "vault/slot/passkey/v1")` where `prf_output` is the 32-byte WebAuthn PRF result for `prf_salt` from the passkey assertion. The password slot stays; either factor unlocks. The PRF output must be identical on every device that holds the synced passkey; verify this before relying on cross-device unlock. Not yet implemented.
 - `recovery` slot (v2): reserved.
 
-AAD for unwrapping any slot: `magic || format_version || vault_id || slot.id || slot.kind`. Tampering with KDF params does not break unwrap (they're not in AAD by design — otherwise you can't rotate them); it just makes derivation produce the wrong KEK and the tag fails. Tampering with `vault_id` fails every slot.
+AAD for unwrapping any slot: `magic || format_version || vault_id || slot.id || slot.kind`. Tampering with KDF params does not break unwrap (they're not in AAD by design — otherwise you can't rotate them); it just makes derivation produce the wrong KEK and the tag fails. Tampering with `vault_id` fails every slot. Once a file carries `slots_modified_at`, the KDF params and slots are additionally bound through the manifest's `header_digest` (§4), so tampering with them is detected via the manifest on the `unlock_with_key` path (`Tampered(Manifest)`); on the password path a KDF edit still surfaces as `WrongPassword` because the slot unwrap fails before the manifest is reached.
 
 Multiple `password` slots are allowed in the format but v1 UI exposes one.
 
@@ -152,7 +154,9 @@ Field `modified_at` is the merge unit (see `03-sync.md`). An item's top-level `m
 }
 ```
 
-AAD = `vault_id || item_count_be32 || format_version_be16`. Encrypted with `manifest_key`.
+AAD = `vault_id || item_count_be32 || format_version_be16 [|| header_digest]`. Encrypted with `manifest_key`.
+
+`header_digest` (v1.1, owner-approved 2026-10-30) is appended **only when the header carries `slots_modified_at`**: `SHA-256(canonical CBOR of { "kdf": <kdf map>, "slots": [<slot maps, in header order, including opaque slots>], "slots_modified_at": u64, "slots_device_id": bytes(16) if present })`, 32 bytes. Files without the stamp (every v1.0 file and all committed fixtures) keep the exact old AAD and stay byte-identical. Because the manifest is sealed under a key derived from `vault_key`, only a device holding the vault key can produce a header that verifies: a stripped, re-stamped, replaced or spliced header fails the manifest tag on every unlock path, including `unlock_with_key`. This is what makes the header merge in `03` §5 safe against a file-writing attacker. Fixture: `v1-stamped.vault` (header with stamp, device id and digest-bound manifest).
 
 On unlock, the decrypted manifest must match the `(id, modified_at)` pairs of the item records exactly. Mismatch → `VaultError::Tampered(TamperKind::Manifest)`. This catches an attacker dropping items, duplicating items, or rolling an item back to an older ciphertext they captured earlier.
 

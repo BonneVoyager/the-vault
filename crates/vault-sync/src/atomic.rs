@@ -64,6 +64,17 @@ impl Drop for TmpGuard<'_> {
 /// `mode`, then best-effort fsync the directory. On any failure the tmp is removed and `path`
 /// is untouched.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), SyncError> {
+    write_atomic_with(path, bytes, mode, |src, dst| fs::hard_link(src, dst)).map(drop)
+}
+
+/// [`write_atomic`], returning the `fstat` of the tmp handle taken after its fsync and before
+/// the rename (`None` if that fstat failed). Rename and link keep the inode, mtime and size,
+/// so a later stat of `path` that disagrees shows the file was replaced since.
+pub(crate) fn write_atomic_stat(
+    path: &Path,
+    bytes: &[u8],
+    mode: Mode,
+) -> Result<Option<fs::Metadata>, SyncError> {
     write_atomic_with(path, bytes, mode, |src, dst| fs::hard_link(src, dst))
 }
 
@@ -75,7 +86,7 @@ pub(crate) fn write_atomic_stream(
     mode: Mode,
     fill: impl FnOnce(&mut File, &Path) -> Result<(), SyncError>,
 ) -> Result<(), SyncError> {
-    write_atomic_inner(path, mode, fill, |src, dst| fs::hard_link(src, dst))
+    write_atomic_inner(path, mode, fill, |src, dst| fs::hard_link(src, dst)).map(drop)
 }
 
 /// [`write_atomic`] with the hard-link call injectable, so tests can simulate filesystems
@@ -85,7 +96,7 @@ fn write_atomic_with(
     bytes: &[u8],
     mode: Mode,
     link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
-) -> Result<(), SyncError> {
+) -> Result<Option<fs::Metadata>, SyncError> {
     write_atomic_inner(
         path,
         mode,
@@ -99,7 +110,7 @@ fn write_atomic_inner(
     mode: Mode,
     fill: impl FnOnce(&mut File, &Path) -> Result<(), SyncError>,
     link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
-) -> Result<(), SyncError> {
+) -> Result<Option<fs::Metadata>, SyncError> {
     let tmp = tmp_path(path);
     let mut file = open_tmp(&tmp).map_err(|e| SyncError::io(&tmp, e))?;
     let mut guard = TmpGuard {
@@ -109,6 +120,7 @@ fn write_atomic_inner(
 
     fill(&mut file, &tmp)?;
     file.sync_all().map_err(|e| SyncError::io(&tmp, e))?;
+    let tmp_stat = file.metadata().ok();
     drop(file);
 
     match mode {
@@ -143,7 +155,7 @@ fn write_atomic_inner(
     if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
         tracing::debug!(dir = %dir.display(), error = %e, "directory fsync skipped");
     }
-    Ok(())
+    Ok(tmp_stat)
 }
 
 fn open_tmp(tmp: &Path) -> std::io::Result<File> {

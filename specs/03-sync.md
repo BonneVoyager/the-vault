@@ -37,11 +37,11 @@ Everything in `.backups/` is a complete, independently-openable vault file. Back
 3. fsync(tmp)
 4. rename(tmp, <name>.vault/vault.bin)             atomic on APFS / HFS+ / ext4
 5. fsync(package dir)                              best-effort; ignore ENOTSUP
-6. record (mtime, size, blake3(bytes)) as `last_written`
+6. record (mtime, ctime, inode, size, blake3(bytes)) as `last_written`   (V-05: mtime+size alone misses a same-size write within one timestamp tick on coarse filesystems)
 7. maybe_backup(bytes)                             §4
 ```
 
-Never write in place. Never truncate-then-write. If step 4 fails, delete the tmp and surface the error; the old file is intact.
+Steps 1–7 run under an exclusive advisory lock on `<name>.vault/.lock` (flock), taken before the pre-write merge's read and released after the rename, so two processes (the app and the CLI, or two CLI commands) cannot interleave a read-modify-write and lose items (V-02). Never write in place. Never truncate-then-write. If step 4 fails, delete the tmp and surface the error; the old file is intact.
 
 ## 3. Watching and reacting to external changes
 
@@ -111,6 +111,8 @@ Field-level merge, keyed by `field.name`:
 `attachments` are merged by union on `id` (sorted by `added_at`, then `id`); `removed_attachments` tombstones are unioned with the greatest `removed_at` per id, and a ref is dropped when a tombstone for its id has `removed_at ≥ added_at`. Unlike fields, an attachment removal therefore survives a merge with a device that still holds the ref.
 
 Result item `modified_at = max(ours, theirs)`. Merged item takes `device_id` of whichever side supplied the winning metadata.
+
+**Header merge** (added 2026-10-30 after the bug hunt, V-01/V-03): the header carries `slots_modified_at`; `merge_from` takes the whole slot set and KDF parameters from whichever side has the greater stamp (tie → the side whose `slots_device_id` bytes are greater — the header records the device that last changed the slots next to the stamp — so both devices converge). When the other side wins, the in-memory vault key is replaced by theirs as well (their slots wrap their key); a later local slot change with a greater stamp wins back by LWW. A password change, slot add/remove, re-calibration or key rotation on one device therefore survives the other device's next save. The vault key is unchanged by a password change, so the other device keeps working with its cached key; a key rotation is detected as before (`KeyRotatedOnDisk`).
 
 Timestamps are monotone per item: every write stamps `max(now, previous + 1)`, so a clock that went backwards cannot resurrect a deleted item or let an older edit win. If a merge changes an item's content without changing its `modified_at` (possible when both sides carry the same timestamp), the merge bumps `modified_at` by one so the manifest check and the other device see the change. Two devices converge within two merge rounds.
 

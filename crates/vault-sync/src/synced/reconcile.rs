@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -160,13 +160,12 @@ impl SyncedVault {
     /// last wrote or read, recording them as seen. `None` when unchanged, missing or
     /// unavailable (events emitted as needed).
     fn read_primary_if_changed(&mut self) -> Result<Option<Vec<u8>>, SyncError> {
-        if let Err(e) = self.hooks.ensure_downloaded(&self.file, DOWNLOAD_TIMEOUT) {
-            self.cloud_unavailable(&self.file.clone(), &e);
-            return Err(e.into());
-        }
-        // Step 1: (mtime, size) pre-check against our own last write.
-        let meta = match fs::metadata(&self.file) {
-            Ok(m) => m,
+        self.ensure_primary_downloaded()?;
+        // Step 1: (mtime, ctime, inode, size) pre-check against our own last write. One handle
+        // for the stat and the read, so both describe the same file even if the path is
+        // replaced meanwhile.
+        let mut file = match fs::File::open(&self.file) {
+            Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 // Mid-replace by another writer, or deleted; the next event will tell.
                 tracing::debug!(path = %self.file.display(), "primary missing");
@@ -174,26 +173,31 @@ impl SyncedVault {
             }
             Err(e) => return Err(SyncError::io(&self.file, e)),
         };
-        if let Some(lw) = self.last_written
-            && lw.size == meta.len()
-            && lw.mtime.is_some()
-            && lw.mtime == meta.modified().ok()
-        {
+        let meta = file.metadata().map_err(|e| SyncError::io(&self.file, e))?;
+        if self.last_written.is_some_and(|lw| lw.stat_matches(&meta)) {
             return Ok(None);
         }
         // Step 2: hash check.
-        let bytes = match fs::read(&self.file) {
-            Ok(b) => b,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(SyncError::io(&self.file, e)),
-        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|e| SyncError::io(&self.file, e))?;
         let unchanged = self
             .last_written
             .is_some_and(|lw| lw.hash == *blake3::hash(&bytes).as_bytes());
         // Either way this version has now been seen: refresh the stat so repeated events for
         // the same bytes stop at step 1.
-        self.last_written = Some(fingerprint(&self.file, &bytes));
+        self.last_written = Some(fingerprint(Some(&meta), &bytes));
         Ok((!unchanged).then_some(bytes))
+    }
+
+    /// `ensure_downloaded` for the primary; on failure emits `CloudUnavailable` and returns
+    /// the error.
+    pub(super) fn ensure_primary_downloaded(&self) -> Result<(), SyncError> {
+        if let Err(e) = self.hooks.ensure_downloaded(&self.file, DOWNLOAD_TIMEOUT) {
+            self.cloud_unavailable(&self.file, &e);
+            return Err(e.into());
+        }
+        Ok(())
     }
 
     /// Steps 3-4 plus the save-block bookkeeping: the parsed vault if it is a valid file of

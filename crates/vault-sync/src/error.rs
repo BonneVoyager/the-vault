@@ -49,6 +49,11 @@ pub enum SyncError {
     /// file of this vault in a supported format is next seen on disk.
     #[error("{0}")]
     SaveBlocked(SaveBlocked),
+    /// Another process (or another `SyncedVault` on the same package) held the package's
+    /// advisory lock (`<name>.vault/.lock`, 03 §2) for longer than 10 s. Nothing was written;
+    /// retry.
+    #[error("another process is writing this vault")]
+    SaveLockTimeout(PathBuf),
     /// The filesystem watcher could not be started.
     #[error("file watcher: {0}")]
     Watch(String),
@@ -60,6 +65,11 @@ pub enum SyncError {
     /// blob and no reference were left behind.
     #[error(transparent)]
     Attachment(#[from] AttachmentError),
+    /// The item does not exist or holds no reference to this attachment (it was removed, or
+    /// the id is wrong). Distinct from [`SyncError::AttachmentMissing`], where the reference
+    /// exists but its blob does not.
+    #[error("attachment {id} not found on this item")]
+    AttachmentNotFound { item: Uuid, id: Uuid },
     /// The attachment blob is evicted to the cloud and did not download within
     /// `DOWNLOAD_TIMEOUT` (03 §1.1 `NotDownloaded`). Retry later.
     #[error("attachment {0} is not downloaded yet")]
