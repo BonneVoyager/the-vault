@@ -44,7 +44,6 @@ pub fn section(
     if !editing && item.attachments.is_empty() && pending.is_empty() {
         return None;
     }
-    let theme = cx.theme();
     let add = {
         let state = state.clone();
         Button::new("attachment-add")
@@ -57,17 +56,7 @@ pub fn section(
             .clickable_when(s.can_attach() && s.busy.is_none())
             .on_click(move |_, _, cx| state.update(cx, |s, cx| s.pick_attachment_files(cx)))
     };
-    let header = ui::h_flex()
-        .gap(px(8.))
-        .child(
-            div()
-                .flex_1()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.muted_foreground)
-                .child("Attachments"),
-        )
-        .child(add);
+    let header = ui::h_flex().gap(px(8.)).child(section_title(cx)).child(add);
 
     let rows = item
         .attachments
@@ -93,6 +82,41 @@ pub fn section(
             )
             .children(rows)
             .children(pending_rows)
+            .into_any_element(),
+    )
+}
+
+fn section_title(cx: &App) -> gpui::Div {
+    div()
+        .flex_1()
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(cx.theme().muted_foreground)
+        .child("Attachments")
+}
+
+/// Read-only item windows use the same attachment title and rows.
+pub(super) fn reference_section(s: &AppState, item: &Item, cx: &App) -> Option<AnyElement> {
+    if item.attachments.is_empty() {
+        return None;
+    }
+    Some(
+        ui::v_flex()
+            .gap(px(2.))
+            .child(section_title(cx))
+            .children(item.attachments.iter().map(|a| {
+                row_shell(
+                    if preview_kind(&a.name, a.size) == Some(PreviewKind::Text) {
+                        IconName::FileText
+                    } else {
+                        IconName::File
+                    },
+                    a.name.clone().into(),
+                    a.size,
+                    tag_for(s.attachment_state(a.id)),
+                    cx,
+                )
+            }))
             .into_any_element(),
     )
 }

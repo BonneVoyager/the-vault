@@ -5,7 +5,7 @@
 //! cached listing.
 
 pub(crate) mod attachments;
-mod detail;
+pub(crate) mod detail;
 mod editor;
 mod generator;
 mod list;
@@ -22,6 +22,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, IntoElement, ListAlignment,
     ListState, ParentElement as _, Render, Styled as _, Subscription, Task, Window, px,
 };
+use gpui_component::ActiveTheme as _;
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use vault_core::Uuid;
@@ -159,6 +160,16 @@ impl MainScreen {
         window.focus(&self.list_focus, cx);
     }
 
+    pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        ui::focus_input(&self.search, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_focused(&self, window: &Window, cx: &App) -> bool {
+        use gpui::Focusable as _;
+        self.search.read(cx).focus_handle(cx).is_focused(window)
+    }
+
     fn focus(&mut self, target: FocusTarget, window: &mut Window, cx: &mut Context<Self>) {
         match target {
             FocusTarget::Search => ui::focus_input(&self.search, window, cx),
@@ -226,6 +237,11 @@ impl MainScreen {
 
 impl Render for MainScreen {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Keep typography consistent when this screen is hosted independently of VaultRoot.
+        let rem = crate::theme::rem_size(cx);
+        if window.rem_size() != rem {
+            window.set_rem_size(rem);
+        }
         let (sidebar_visible, sidebar_toggles, reduce_motion) = {
             let s = self.state.read(cx);
             (s.sidebar_visible, s.sidebar_toggles, s.reduce_motion)
@@ -267,6 +283,7 @@ impl Render for MainScreen {
         // (underneath), and the controls in it opt out with `ui::no_window_drag`.
         gpui::div()
             .size_full()
+            .text_size(cx.theme().font_size)
             .relative()
             .child(ui::window_drag_band())
             .child(
@@ -349,7 +366,7 @@ mod tests {
         populated: bool,
         dir: &std::path::Path,
         cx: &mut TestAppContext,
-    ) -> (Entity<AppState>, VisualTestContext) {
+    ) -> (Entity<AppState>, Entity<MainScreen>, VisualTestContext) {
         let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
         let path = vault(dir, populated).path().to_owned();
         cx.update(|cx| {
@@ -371,15 +388,131 @@ mod tests {
         });
         let mut vcx = VisualTestContext::from_window(window.into(), cx);
         let main = main.unwrap();
-        vcx.update(|window, cx| main.update(cx, |m, cx| m.appear(window, cx)));
+        vcx.update(|window, cx| {
+            main.update(cx, |m, cx| {
+                m.sync(window, cx);
+                m.appear(window, cx);
+            })
+        });
         vcx.run_until_parked();
-        (state, vcx)
+        (state, main, vcx)
+    }
+
+    #[gpui::test]
+    fn double_click_opens_pinned_detail_window_that_closes_on_lock(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (state, main, mut vcx) = open(true, dir.path(), cx);
+        let board = crate::clipboard::fake::FakePasteboard::default();
+        state.update(&mut vcx, |s, _| s.set_pasteboard(Box::new(board.clone())));
+        let main_window = vcx.cx.update(|cx| cx.windows()[0]);
+        // A–Z rows: # header, untitled item, G header, GitHub item.
+        main.read_with(&vcx, |m, _| m.list_state.scroll_to_reveal_item(3));
+        vcx.run_until_parked();
+        let row = main.read_with(&vcx, |m, _| m.list_state.bounds_for_item(3).unwrap());
+        let at = row.center();
+        vcx.simulate_click(at, Modifiers::default());
+        assert_eq!(vcx.cx.update(|cx| cx.windows().len()), 1);
+        vcx.simulate_event(MouseDownEvent {
+            position: at,
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        vcx.simulate_event(MouseUpEvent {
+            position: at,
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 2,
+        });
+        assert_eq!(
+            state.read_with(&vcx, |s, _| s.selected_item().map(|i| i.title.clone())),
+            Some("GitHub".into())
+        );
+        let detail_window = vcx
+            .cx
+            .update(|cx| cx.windows())
+            .into_iter()
+            .find(|window| window.window_id() != main_window.window_id())
+            .expect("second window");
+        let mut detail = VisualTestContext::from_window(detail_window, &vcx.cx);
+        detail.run_until_parked();
+        assert_eq!(detail.window_title().as_deref(), Some("GitHub"));
+        assert!(detail.debug_bounds("detail-title GitHub").is_some());
+        for selector in [
+            "detail-header",
+            "field-row 1",
+            "field-row 4",
+            "detail-footer",
+        ] {
+            assert_eq!(
+                detail.debug_bounds(selector).unwrap().size.height,
+                vcx.debug_bounds(selector).unwrap().size.height,
+                "same detail layout for {selector}"
+            );
+        }
+
+        let visa = state.read_with(&vcx, |s, _| {
+            s.listing
+                .items
+                .iter()
+                .copied()
+                .find(|id| s.unlocked_vault().unwrap().get(*id).unwrap().title == "Visa")
+                .unwrap()
+        });
+        state.update(&mut vcx, |s, cx| s.select(visa, cx));
+        detail.run_until_parked();
+        assert_eq!(detail.window_title().as_deref(), Some("GitHub"));
+        assert!(detail.debug_bounds("detail-title GitHub").is_some());
+
+        // Value clicks copy from the pinned item, even with Visa selected in the main window.
+        let username = detail.debug_bounds("field-value 0").unwrap().center();
+        detail.simulate_click(username, Modifiers::default());
+        assert_eq!(board.contents().as_deref(), Some("chris"));
+        let password = detail.debug_bounds("field-value 1").unwrap().center();
+        detail.simulate_click(password, Modifiers::default());
+        assert_eq!(board.contents().as_deref(), Some("new"));
+        assert!(detail.debug_bounds("field-masked 1").is_some());
+        for key in ["enter", "space"] {
+            board.set("another value");
+            detail.simulate_keystrokes(key);
+            detail.simulate_event(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse(key).unwrap(),
+            });
+            assert_eq!(board.contents().as_deref(), Some("new"));
+        }
+        let totp = detail.debug_bounds("field-value 2").unwrap().center();
+        detail.simulate_click(totp, Modifiers::default());
+        let code = board.contents().unwrap();
+        assert_eq!(code.len(), 6);
+        assert!(code.bytes().all(|byte| byte.is_ascii_digit()));
+        assert!(detail.debug_bounds("detail-copy-feedback").is_some());
+        assert!(
+            state.read_with(&vcx, |s, _| s.toast.is_none()),
+            "copy feedback stays in the item window"
+        );
+        detail.executor().advance_clock(Duration::from_secs(3));
+        detail.run_until_parked();
+        assert!(detail.debug_bounds("detail-copy-feedback").is_none());
+
+        let history = detail.debug_bounds("history-toggle").unwrap().center();
+        detail.simulate_click(history, Modifiers::default());
+        let old_password = detail.debug_bounds("history-copy 0").unwrap().center();
+        detail.simulate_click(old_password, Modifiers::default());
+        assert_eq!(board.contents().as_deref(), Some("old"));
+        assert!(!state.read_with(&vcx, |s, _| s.history_open));
+
+        state.update(&mut vcx, |s, cx| s.lock(cx));
+        vcx.run_until_parked();
+        assert_eq!(vcx.cx.update(|cx| cx.windows().len()), 1);
     }
 
     #[gpui::test]
     fn keyboard_drives_the_populated_screen(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (state, mut vcx) = open(true, dir.path(), cx);
+        let (state, _, mut vcx) = open(true, dir.path(), cx);
         let first = state.read_with(&vcx, |s, _| {
             assert_eq!(s.listing.items.len(), 3);
             s.selection
@@ -492,7 +625,7 @@ mod tests {
     fn title_band_moves_the_window_only_from_empty_space(cx: &mut TestAppContext) {
         use gpui::point;
         let dir = tempfile::tempdir().unwrap();
-        let (state, mut vcx) = open(true, dir.path(), cx);
+        let (state, _, mut vcx) = open(true, dir.path(), cx);
         assert!(state.read_with(&vcx, |s, _| s.selection.is_some()));
         let bounds = |key: &'static str, vcx: &mut VisualTestContext| {
             vcx.debug_bounds(key)
@@ -535,7 +668,7 @@ mod tests {
     #[gpui::test]
     fn columns_share_the_top_band_and_footer_grid(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (state, mut vcx) = open(true, dir.path(), cx);
+        let (state, _, mut vcx) = open(true, dir.path(), cx);
         assert!(state.read_with(&vcx, |s, _| s.selection.is_some()));
         let bounds = |key: &'static str, vcx: &mut VisualTestContext| {
             vcx.debug_bounds(key)
@@ -578,7 +711,7 @@ mod tests {
     #[gpui::test]
     fn editor_and_sync_banner_share_the_detail_left_edge(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (state, mut vcx) = open(true, dir.path(), cx);
+        let (state, _, mut vcx) = open(true, dir.path(), cx);
         let edge = |key: &'static str, vcx: &mut VisualTestContext| {
             vcx.debug_bounds(key)
                 .unwrap_or_else(|| panic!("{key} not rendered"))
@@ -606,7 +739,7 @@ mod tests {
     #[gpui::test]
     fn empty_vault_renders(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (state, mut vcx) = open(false, dir.path(), cx);
+        let (state, _, mut vcx) = open(false, dir.path(), cx);
         // Every action on an empty vault is a harmless no-op.
         vcx.simulate_keystrokes("down up enter cmd-d cmd-shift-c cmd-shift-t cmd-shift-r");
         vcx.simulate_keystrokes("cmd-1 cmd-2 cmd-e cmd-backspace cmd-s cmd-n");
@@ -648,7 +781,7 @@ mod tests {
     #[gpui::test]
     fn edit_new_delete_and_generator_flows(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        let (state, mut vcx) = open(true, dir.path(), cx);
+        let (state, _, mut vcx) = open(true, dir.path(), cx);
         vcx.simulate_keystrokes("down");
         let gh = state.read_with(&vcx, |s, _| s.selection.unwrap());
 

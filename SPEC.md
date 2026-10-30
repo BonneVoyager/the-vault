@@ -1,5 +1,7 @@
 # 05 — `vault-app`: UI
 
+> Reference draft. The maintained UI specification is [specs/05-ui.md](specs/05-ui.md).
+
 Framework: `gpui` + `gpui-component`, versions pinned with `=`. Treat gpui as pre-1.0: wrap any API we touch in more than two places behind our own thin helper so an upstream rename is a one-file fix.
 
 Reference look: 1Password 8 for macOS. Three columns, 13 pt system font, generous whitespace, subtle borders rather than heavy chrome, native-feeling vibrancy on the sidebar in light mode.

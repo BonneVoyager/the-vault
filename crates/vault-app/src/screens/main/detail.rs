@@ -5,6 +5,7 @@
 //! Secrets are exposed only for a revealed field, a TOTP code, or the copy actions.
 
 use std::time::Duration;
+use std::{collections::HashSet, rc::Rc};
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Context, Entity, ExternalPaths, FontWeight,
@@ -15,7 +16,6 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::progress::ProgressCircle;
 use gpui_component::tag::Tag;
-use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use vault_core::{ExposeSecret, Field, FieldKind, HistoryEntry, Item};
@@ -37,6 +37,50 @@ const HISTORY_SHOWN: usize = 10;
 /// The code turns amber and the ring pulses under this many seconds (§2.3 "under 5 s").
 const TOTP_URGENT_SECS: u32 = 5;
 
+#[derive(Clone)]
+pub(crate) enum DetailAction {
+    Copy(CopyTarget),
+    CopyHistory(u64),
+    Reveal(String),
+    OpenUrl(usize),
+    ToggleHistory,
+}
+
+#[derive(Clone)]
+pub(crate) struct DetailActions(pub Rc<DetailHandler>);
+
+type DetailHandler = dyn Fn(DetailAction, &mut App);
+
+impl DetailActions {
+    fn main(state: Entity<AppState>) -> Self {
+        Self(Rc::new(move |action, cx| {
+            state.update(cx, |s, cx| match action {
+                DetailAction::Copy(target) => s.copy(target, cx),
+                DetailAction::CopyHistory(stamp) => {
+                    if let Some(ix) = s
+                        .selected_item()
+                        .and_then(|item| item.history.iter().position(|h| h.replaced_at == stamp))
+                    {
+                        s.copy(CopyTarget::History(ix), cx);
+                    }
+                }
+                DetailAction::Reveal(name) => s.toggle_reveal(&name, cx),
+                DetailAction::OpenUrl(ix) => s.open_url(Some(ix), cx),
+                DetailAction::ToggleHistory => s.toggle_history(cx),
+            })
+        }))
+    }
+}
+
+/// One read-mode renderer for the main detail column and pinned item windows.
+pub(crate) struct ReadDetail<'a> {
+    pub state: &'a Entity<AppState>,
+    pub revealed: &'a HashSet<String>,
+    pub history_open: bool,
+    pub actions: DetailActions,
+    pub standalone: bool,
+}
+
 /// True when the selected item shows a TOTP code (the view then re-renders every second).
 pub fn shows_totp(s: &AppState) -> bool {
     s.main_active()
@@ -49,11 +93,11 @@ fn copy_button(
     id: impl Into<gpui::ElementId>,
     label: &str,
     target: CopyTarget,
-    state: &Entity<AppState>,
+    actions: &DetailActions,
 ) -> Button {
-    let state = state.clone();
+    let actions = actions.clone();
     ui::icon_button(id, IconName::Copy, label)
-        .on_click(move |_, _, cx| state.update(cx, |s, cx| s.copy(target, cx)))
+        .on_click(move |_, _, cx| (actions.0)(DetailAction::Copy(target), cx))
 }
 
 fn reveal_button(
@@ -61,21 +105,18 @@ fn reveal_button(
     name: &str,
     revealed: bool,
     what: &str,
-    state: &Entity<AppState>,
+    actions: &DetailActions,
 ) -> Button {
     let (icon, verb) = if revealed {
         (IconName::EyeOff, "Hide")
     } else {
         (IconName::Eye, "Reveal")
     };
-    let state = state.clone();
+    let actions = actions.clone();
     let name = name.to_owned();
     ui::icon_button(("reveal", ix), icon, &format!("{verb} {what}"))
-        .on_click(move |_, _, cx| state.update(cx, |s, cx| s.toggle_reveal(&name, cx)))
+        .on_click(move |_, _, cx| (actions.0)(DetailAction::Reveal(name.clone()), cx))
 }
-
-/// Hint on a field's value area; clicking (or Enter/Space on it) copies the value.
-const CLICK_TO_COPY: &str = "Click to copy";
 
 /// A field's value area in read mode: clicking it does exactly what the row's Copy
 /// button does (`AppState::copy`), so a masked value is copied without being revealed.
@@ -84,30 +125,14 @@ fn copy_on_click(
     ix: usize,
     what: &str,
     shown: AnyElement,
-    state: &Entity<AppState>,
+    actions: &DetailActions,
     cx: &App,
 ) -> impl IntoElement {
-    let theme = cx.theme();
-    let hover = theme.accent.opacity(0.6);
-    let state = state.clone();
-    div()
-        .id(("field-value", ix))
-        .tab_index(0)
+    let actions = actions.clone();
+    ui::copy_value_area(("field-value", ix), what, cx)
         // Tests click the value by this key (no-op outside test builds).
         .debug_selector(move || format!("field-value {ix}"))
-        .aria_label(SharedString::from(format!("{what}. {CLICK_TO_COPY}")))
-        .flex_1()
-        .min_w_0()
-        // Pad for the hover fill, then pull back so the text stays under the label.
-        .ml(px(-(4. + ui::FOCUS_RING_WIDTH)))
-        .px(px(4.))
-        .py(px(2.))
-        .rounded(theme.radius)
-        .map(|el| ui::focus_ring(el, cx))
-        .clickable()
-        .hover(move |style| style.bg(hover))
-        .tooltip(|window, cx| Tooltip::new(CLICK_TO_COPY).build(window, cx))
-        .on_click(move |_, _, cx| state.update(cx, |s, cx| s.copy(CopyTarget::Field(ix), cx)))
+        .on_click(move |_, _, cx| (actions.0)(DetailAction::Copy(CopyTarget::Field(ix)), cx))
         .child(shown)
 }
 
@@ -246,7 +271,15 @@ impl MainScreen {
             _ if s.is_editing() => ui::no_window_drag(div().size_full())
                 .child(self.render_editing(s, cx))
                 .into_any_element(),
-            Some(item) => self.render_item(item, s, cx).into_any_element(),
+            Some(item) => ReadDetail {
+                state: &self.state,
+                revealed: &s.revealed,
+                history_open: s.history_open,
+                actions: DetailActions::main(self.state.clone()),
+                standalone: false,
+            }
+            .render_item(item, s, cx)
+            .into_any_element(),
             None if detail_placeholder(s) == Some(ONBOARDING_TITLE) => {
                 ui::no_window_drag(div().size_full())
                     .child(onboarding(&self.state, cx))
@@ -306,15 +339,7 @@ impl MainScreen {
                 reduce_motion,
             ))
             .when_some(toast, |col, message| {
-                col.child(
-                    ui::h_flex()
-                        .absolute()
-                        .bottom(px(20.))
-                        .left_0()
-                        .right_0()
-                        .justify_center()
-                        .child(ui::pill(message, cx)),
-                )
+                col.child(ui::detail_copy_feedback(message, cx))
             })
             .children(save_sheet)
             .into_any_element()
@@ -348,8 +373,15 @@ impl MainScreen {
             )
             .into_any_element()
     }
+}
 
-    fn render_item(&self, item: &Item, s: &AppState, cx: &App) -> impl IntoElement {
+impl ReadDetail<'_> {
+    pub(crate) fn render_item(
+        &self,
+        item: &Item,
+        s: &AppState,
+        cx: &App,
+    ) -> gpui::Stateful<gpui::Div> {
         let theme = cx.theme();
         let now = text::now_millis();
         let device = if item.device_id == s.device_id() {
@@ -388,6 +420,10 @@ impl MainScreen {
                     .min_w_0()
                     .child(
                         div()
+                            .debug_selector({
+                                let title = item.title.clone();
+                                move || format!("detail-title {title}")
+                            })
                             .text_xl()
                             .font_weight(FontWeight::SEMIBOLD)
                             .truncate()
@@ -396,34 +432,36 @@ impl MainScreen {
                     .child(ui::muted(kind_singular(item.kind), cx)),
             )
             // The buttons reach into the title-bar band: clicks there must not move the window.
-            .child(
-                ui::no_window_drag(ui::h_flex())
-                    .debug_selector(|| "detail-header-buttons".into())
-                    .flex_none()
-                    .gap(px(14.))
-                    .child(favorite)
-                    .child(
-                        ui::icon_button("delete", IconName::Trash, "Delete  ⌘⌫").on_click(
-                            |_, window, cx| window.dispatch_action(Box::new(DeleteItem), cx),
+            .when(!self.standalone, |header| {
+                header.child(
+                    ui::no_window_drag(ui::h_flex())
+                        .debug_selector(|| "detail-header-buttons".into())
+                        .flex_none()
+                        .gap(px(14.))
+                        .child(favorite)
+                        .child(
+                            ui::icon_button("delete", IconName::Trash, "Delete  ⌘⌫").on_click(
+                                |_, window, cx| window.dispatch_action(Box::new(DeleteItem), cx),
+                            ),
+                        )
+                        .child(
+                            Button::new("edit")
+                                .small()
+                                .label("Edit")
+                                .tooltip("Edit  ⌘E")
+                                .clickable()
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(EditItem), cx)
+                                }),
                         ),
-                    )
-                    .child(
-                        Button::new("edit")
-                            .small()
-                            .label("Edit")
-                            .tooltip("Edit  ⌘E")
-                            .clickable()
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(EditItem), cx)
-                            }),
-                    ),
-            );
+                )
+            });
 
         let mut fields: Vec<AnyElement> = Vec::with_capacity(item.fields.len() + 1);
         for (ix, field) in item.fields.iter().enumerate() {
-            fields.push(self.render_field(ix, field, item, s, now, cx));
+            fields.push(self.render_field(ix, field, item, now, cx));
             if Some(ix) == first_password && !item.history.is_empty() {
-                fields.push(self.render_history(item, s, now, cx));
+                fields.push(self.render_history(item, now, cx));
             }
         }
 
@@ -431,16 +469,22 @@ impl MainScreen {
             .id("detail-scroll")
             .size_full()
             .overflow_y_scroll()
-            .pt(px(ui::content_top(s)))
+            .pt(px(if self.standalone {
+                16.
+            } else {
+                ui::content_top(s)
+            }))
             .px(px(ui::COLUMN_PAD_X - ui::FOCUS_RING_WIDTH))
             .pb(px(64.))
             .gap(px(12.))
             .child(header)
             // Everything below the header holds controls and can scroll up into the
             // title-bar band; mark it so clicks there never move the window.
-            .children(
-                prompts::delete(s, &self.state, cx).map(|p| ui::no_window_drag(div()).child(p)),
-            )
+            .when(!self.standalone, |col| {
+                col.children(
+                    prompts::delete(s, self.state, cx).map(|p| ui::no_window_drag(div()).child(p)),
+                )
+            })
             .when(!item.tags.is_empty(), |col| {
                 col.child(
                     ui::h_flex().gap(px(6.)).flex_wrap().children(
@@ -466,8 +510,12 @@ impl MainScreen {
             })
             .child(ui::no_window_drag(ui::v_flex()).children(fields))
             .children(
-                attachments::section(s, &self.state, item, false, cx)
-                    .map(|a| ui::no_window_drag(div()).child(a)),
+                (if self.standalone {
+                    attachments::reference_section(s, item, cx)
+                } else {
+                    attachments::section(s, self.state, item, false, cx)
+                })
+                .map(|a| ui::no_window_drag(div()).child(a)),
             )
             .child(
                 ui::muted(
@@ -486,12 +534,11 @@ impl MainScreen {
         ix: usize,
         field: &Field,
         item: &Item,
-        s: &AppState,
         now: u64,
         cx: &App,
     ) -> AnyElement {
         let theme = cx.theme();
-        let revealed = s.revealed.contains(&field.name);
+        let revealed = self.revealed.contains(&field.name);
         let value = field.value.expose_secret();
         let card_number = crate::listing::is_card_number(item, field);
         // Extra buttons before the copy button, which every field gets.
@@ -509,7 +556,7 @@ impl MainScreen {
         let shown: AnyElement = match field.kind {
             _ if card_number => {
                 buttons.push(
-                    reveal_button(ix, &field.name, revealed, "card number", &self.state)
+                    reveal_button(ix, &field.name, revealed, "card number", &self.actions)
                         .into_any_element(),
                 );
                 if revealed {
@@ -527,23 +574,25 @@ impl MainScreen {
                     "value"
                 };
                 buttons.push(
-                    reveal_button(ix, &field.name, revealed, what, &self.state).into_any_element(),
+                    reveal_button(ix, &field.name, revealed, what, &self.actions)
+                        .into_any_element(),
                 );
                 if revealed {
                     mono(value.to_string(), cx).into_any_element()
                 } else {
                     mono(text::DOTS, cx)
+                        .debug_selector(move || format!("field-masked {ix}"))
                         .text_color(theme.muted_foreground)
                         .into_any_element()
                 }
             }
             FieldKind::Totp => self.render_totp(ix, field, now, cx),
             FieldKind::Url => {
-                let state = self.state.clone();
+                let actions = self.actions.clone();
                 buttons.push(
                     ui::icon_button(("open", ix), IconName::ExternalLink, "Open in browser  ⌘⇧O")
                         .on_click(move |_, _, cx| {
-                            state.update(cx, |s, cx| s.open_url(Some(ix), cx));
+                            (actions.0)(DetailAction::OpenUrl(ix), cx);
                         })
                         .into_any_element(),
                 );
@@ -569,7 +618,7 @@ impl MainScreen {
                 ("copy", ix),
                 &copy_label,
                 CopyTarget::Field(ix),
-                &self.state,
+                &self.actions,
             )
             .into_any_element(),
         );
@@ -590,7 +639,7 @@ impl MainScreen {
                 ui::h_flex()
                     .gap(px(4.))
                     .min_h(px(28.))
-                    .child(copy_on_click(ix, &field.name, shown, &self.state, cx))
+                    .child(copy_on_click(ix, &field.name, shown, &self.actions, cx))
                     .children(buttons),
             )
             .into_any_element()
@@ -657,9 +706,17 @@ impl MainScreen {
             .into_any_element()
     }
 
-    fn render_history(&self, item: &Item, s: &AppState, now: u64, cx: &App) -> AnyElement {
+    fn render_history(&self, item: &Item, now: u64, cx: &App) -> AnyElement {
         let entries: Vec<&HistoryEntry> = item.history.iter().collect();
-        history_disclosure(&entries, None, s, &self.state, now, cx)
+        history_view(
+            &entries,
+            None,
+            self.state,
+            self.history_open,
+            self.actions.clone(),
+            now,
+            cx,
+        )
     }
 }
 
@@ -675,15 +732,35 @@ pub(super) fn history_disclosure(
     now: u64,
     cx: &App,
 ) -> AnyElement {
+    history_view(
+        history,
+        removed,
+        state,
+        s.history_open,
+        DetailActions::main(state.clone()),
+        now,
+        cx,
+    )
+}
+
+fn history_view(
+    history: &[&HistoryEntry],
+    removed: Option<usize>,
+    state: &Entity<AppState>,
+    open: bool,
+    actions: DetailActions,
+    now: u64,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
-    let open = s.history_open;
     let editing = removed.is_some();
     let count = history.len().min(HISTORY_SHOWN);
     let pending = removed.unwrap_or(0);
     let toggle = {
-        let state = state.clone();
+        let actions = actions.clone();
         ui::h_flex()
             .id("history-toggle")
+            .debug_selector(|| "history-toggle".into())
             .tab_index(0)
             .gap(px(4.))
             .py(px(6.))
@@ -704,7 +781,7 @@ pub(super) fn history_disclosure(
             .when(pending > 0, |row| {
                 row.child(format!("\u{b7} {pending} removed on save"))
             })
-            .on_click(move |_, _, cx| state.update(cx, |s, cx| s.toggle_history(cx)))
+            .on_click(move |_, _, cx| (actions.0)(DetailAction::ToggleHistory, cx))
     };
 
     let entries = history
@@ -714,23 +791,15 @@ pub(super) fn history_disclosure(
         .map(|(j, h)| {
             let stamp = h.replaced_at;
             let copy = {
-                let state = state.clone();
+                let actions = actions.clone();
                 // By stamp in the stored item: in edit mode the shown list skips removals.
                 ui::icon_button(
                     ("history-copy", j),
                     IconName::Copy,
                     "Copy previous password",
                 )
-                .on_click(move |_, _, cx| {
-                    state.update(cx, |s, cx| {
-                        let ix = s
-                            .selected_item()
-                            .and_then(|it| it.history.iter().position(|h| h.replaced_at == stamp));
-                        if let Some(ix) = ix {
-                            s.copy(CopyTarget::History(ix), cx);
-                        }
-                    })
-                })
+                .debug_selector(move || format!("history-copy {j}"))
+                .on_click(move |_, _, cx| (actions.0)(DetailAction::CopyHistory(stamp), cx))
             };
             let remove = editing.then(|| {
                 let state = state.clone();

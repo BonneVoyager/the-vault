@@ -9,13 +9,14 @@ use std::path::{Path, PathBuf};
 use gpui::{
     Anchor, AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Div, Entity,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, PathPromptOptions,
-    Pixels, Point, Render, Result, SharedString, Styled as _, Task, TitlebarOptions, Window,
-    WindowBounds, WindowHandle, WindowOptions, point, prelude::FluentBuilder as _, px, relative,
-    size,
+    Pixels, Point, Render, Result, SharedString, Stateful, StatefulInteractiveElement as _,
+    Styled as _, Task, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, point,
+    prelude::FluentBuilder as _, px, relative, size,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState, TextareaState};
 use gpui_component::popover::Popover;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme as _, Icon, Root, Selectable, Sizable as _};
 use gpui_kit_assets::IconName;
 use vault_core::{ExposeSecret as _, PassphraseSpec, SecretString, passphrase, strength_bits};
@@ -649,6 +650,39 @@ pub fn focus_ring<E: gpui::InteractiveElement + gpui::Styled>(el: E, cx: &App) -
     el.border_1()
         .border_color(gpui::transparent_black())
         .focus_visible(move |style| style.border_color(ring))
+}
+
+/// Shared copyable value area for the main detail view and item windows.
+/// Callers supply the value and copy handler; Tab, Enter and Space work like a button.
+pub fn copy_value_area(id: impl Into<gpui::ElementId>, what: &str, cx: &App) -> Stateful<Div> {
+    let theme = cx.theme();
+    let hover = theme.accent.opacity(0.6);
+    gpui::div()
+        .id(id)
+        .tab_index(0)
+        .aria_label(SharedString::from(format!("{what}. Click to copy")))
+        .flex_1()
+        .min_w_0()
+        .ml(px(-(4. + FOCUS_RING_WIDTH)))
+        .px(px(4.))
+        .py(px(2.))
+        .rounded(theme.radius)
+        .map(|el| focus_ring(el, cx))
+        .clickable()
+        .hover(move |style| style.bg(hover))
+        .tooltip(|window, cx| Tooltip::new("Click to copy").build(window, cx))
+}
+
+/// Transient copy feedback, positioned consistently over either detail host.
+pub fn detail_copy_feedback(message: impl Into<SharedString>, cx: &App) -> Div {
+    h_flex()
+        .debug_selector(|| "detail-copy-feedback".into())
+        .absolute()
+        .bottom(px(20.))
+        .left_0()
+        .right_0()
+        .justify_center()
+        .child(pill(message, cx))
 }
 
 /// Empty-state art (05 §2.3): a tinted disc holding `icon`, with an optional `badge` icon

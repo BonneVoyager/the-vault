@@ -159,11 +159,15 @@ impl VaultRoot {
                     (s.screen, s.choose_request.is_some())
                 };
                 if screen != this.screen {
+                    let was_unlock = this.screen == Screen::Unlock;
                     if this.screen == Screen::Unlock {
                         this.unlock.update(cx, |u, cx| u.disappear(window, cx));
                     }
                     this.screen = screen;
                     this.appear(window, cx);
+                    if was_unlock && screen == Screen::Main {
+                        this.main.update(cx, |m, cx| m.focus_search(window, cx));
+                    }
                 } else if screen == Screen::Choose && request {
                     this.appear(window, cx);
                 }
@@ -409,6 +413,51 @@ mod tests {
         assert!(capture_exclusion_enabled(true, Some("")));
         assert!(capture_exclusion_enabled(false, Some("1")));
         assert!(capture_exclusion_enabled(false, None));
+    }
+
+    #[gpui::test]
+    fn password_unlock_focuses_search(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+        use vault_core::{KdfParams, SecretString};
+        use vault_sync::{NoopHooks, SyncedVault};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.vault");
+        drop(
+            SyncedVault::create(
+                &path,
+                &SecretString::new("pw".into()),
+                KdfParams::for_tests(),
+                Uuid::new_v4(),
+                Arc::new(NoopHooks),
+            )
+            .unwrap(),
+        );
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            actions::bind_keys(cx);
+            actions::register(&state, cx);
+        });
+        let mut root = None;
+        let window = cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let view = cx.new(|cx| VaultRoot::new(state.clone(), None, window, cx));
+            root = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        state.update(&mut vcx, |s, cx| s.open_vault(path, cx));
+        vcx.run_until_parked();
+        state.update(&mut vcx, |s, cx| {
+            s.unlock(SecretString::new("pw".into()), cx)
+        });
+        vcx.run_until_parked();
+        assert_eq!(state.read_with(&vcx, |s, _| s.screen), Screen::Main);
+        vcx.update(|window, cx| {
+            let main = root.as_ref().unwrap().read(cx).main.clone();
+            assert!(main.read(cx).search_focused(window, cx));
+        });
     }
 
     #[gpui::test]

@@ -179,9 +179,17 @@ fn render_row(
                             ))
                         })
                         .children(badge)
-                        .on_click(move |_, window, cx| {
+                        .on_click(move |event, window, cx| {
                             state.update(cx, |s, cx| s.select(id, cx));
                             window.focus(&focus, cx);
+                            if event.click_count() == 2
+                                && let Err(err) =
+                                    crate::screens::open_item_window(state.clone(), id, cx)
+                            {
+                                state.update(cx, |s, cx| {
+                                    s.show_toast(format!("Could not open item: {err}"), cx)
+                                });
+                            }
                         }),
                 )
                 .into_any_element()
@@ -473,6 +481,7 @@ impl MainScreen {
             .child(
                 ui::v_flex()
                     .id("item-list")
+                    .debug_selector(|| "item-list".into())
                     .track_focus(&self.list_focus)
                     .key_context(LIST_CONTEXT)
                     .flex_1()

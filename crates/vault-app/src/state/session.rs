@@ -267,11 +267,28 @@ impl AppState {
     }
 
     pub(super) fn copy_secret(&mut self, value: SecretString, cx: &mut Context<Self>) {
+        let Some(secs) = self.copy_value_for_window(value, cx) else {
+            return;
+        };
+        self.toast_at(
+            format!("Copied — clears in {secs} s"),
+            ToastPlace::Detail,
+            COPIED_TTL,
+            cx,
+        );
+    }
+
+    /// Shared clipboard and expiry behavior; the calling window supplies its feedback.
+    pub fn copy_value_for_window(
+        &mut self,
+        value: SecretString,
+        cx: &mut Context<Self>,
+    ) -> Option<u32> {
         let generation = self.clipboard.copy(&value);
         drop(value);
         let Some(generation) = generation else {
             self.show_toast("Could not copy to the clipboard", cx);
-            return;
+            return None;
         };
         let secs = self.settings.clipboard_clear_secs;
         self.clipboard_clear = Some(cx.spawn(async move |this, cx| {
@@ -281,12 +298,7 @@ impl AppState {
             this.update(cx, |this, _| this.clipboard.expire(generation))
                 .ok();
         }));
-        self.toast_at(
-            format!("Copied — clears in {secs} s"),
-            ToastPlace::Detail,
-            COPIED_TTL,
-            cx,
-        );
+        Some(secs)
     }
 
     /// Opens a URL field of the selected item in the default browser: `fields[ix]`, or
