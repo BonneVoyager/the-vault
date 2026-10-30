@@ -58,6 +58,9 @@ const KDF_TARGET: Duration = Duration::from_millis(500);
 const TOAST_TTL: Duration = Duration::from_secs(3);
 /// Longest the quit hook waits for in-flight background work.
 const BACKGROUND_QUIT_WAIT: Duration = Duration::from_secs(30);
+/// Shortest time "Unlocking…" stays up, from the start of a password or Touch ID unlock
+/// to its result (success or failure), so the card never flashes (specs/05-ui.md §2.2).
+pub const MIN_UNLOCK_HOLD: Duration = Duration::from_millis(500);
 
 /// Whether the world moved on while a background task ran (see `AppState::run_bg`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +108,11 @@ pub enum Busy {
 }
 
 impl Busy {
+    /// A password or Touch ID unlock, held for at least `AppState::unlock_hold`.
+    fn is_unlock(self) -> bool {
+        matches!(self, Self::Unlocking | Self::TouchUnlocking)
+    }
+
     /// The unlocked vault is inside the task: sync events must wait for it.
     pub fn holds_unlocked_vault(self) -> bool {
         matches!(
@@ -394,7 +402,9 @@ pub struct AppState {
     pub vault_path: Option<PathBuf>,
     /// Inline error for the current screen (wrong password, unreadable file, ...).
     pub error: Option<SharedString>,
-    /// Bumped on every wrong password; keys the shake animation.
+    /// Bumped on every wrong password; keys the shake animation. Reset by `lock` and on
+    /// unlock: gpui forgets an animation's progress while its element is off-screen, so a
+    /// non-zero count would replay the shake whenever the unlock screen reappears.
     pub unlock_failures: u32,
     /// Bumped on every unlock; keys the locked→unlocked crossfade.
     pub unlock_count: u32,
@@ -406,6 +416,12 @@ pub struct AppState {
     sync_events: Option<Receiver<SyncEvent>>,
     epoch: u64,
     lock_gen: u64,
+    /// [`MIN_UNLOCK_HOLD`] in the app. Zero in tests unless a test opts in: gpui's
+    /// `run_until_parked` does not fire timers, and most tests unlock that way.
+    pub(crate) unlock_hold: Duration,
+    /// Tests: fake-clock time every background task takes before its work runs.
+    #[cfg(test)]
+    pub(crate) fake_work_time: Duration,
     /// False in tests so they never touch the user's recent.json or settings.json.
     persist_recent: bool,
     clipboard: Clipboard,
@@ -490,6 +506,13 @@ impl AppState {
             device_id,
             sync_events: None,
             epoch: 0,
+            unlock_hold: if cfg!(test) {
+                Duration::ZERO
+            } else {
+                MIN_UNLOCK_HOLD
+            },
+            #[cfg(test)]
+            fake_work_time: Duration::ZERO,
             lock_gen: 0,
             persist_recent,
             // Tests never touch the real pasteboard.
@@ -762,6 +785,8 @@ impl AppState {
     /// The single place that decides whether a result is stale: `finish` learns whether
     /// the vault was closed (`epoch` changed) or locked (`lock_gen` changed) meanwhile.
     /// `busy` is cleared unless the vault was closed, since a later request may own it.
+    /// Unlocks finish no earlier than [`MIN_UNLOCK_HOLD`] after they started; staleness is
+    /// judged after that wait, so a lock or switch during it still wins.
     fn run_bg<R: Send + 'static>(
         &mut self,
         busy: Busy,
@@ -786,6 +811,16 @@ impl AppState {
         self.error = None;
         cx.notify();
         let (epoch, lock_gen) = (self.epoch, self.lock_gen);
+        let executor = cx.background_executor().clone();
+        // The executor's clock, not `Instant::now`, so tests can drive it.
+        let started = executor.now();
+        let hold = if busy.is_unlock() {
+            self.unlock_hold
+        } else {
+            Duration::ZERO
+        };
+        #[cfg(test)]
+        let (work_time, clock) = (self.fake_work_time, executor.clone());
         // Signalled when `work` returns, so quit can wait for it (`wait_for_background`).
         let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
         self.background_done = Some(done_rx);
@@ -794,12 +829,20 @@ impl AppState {
         // session must be reopened (⌘O). Unsaved edits in it are lost; vault-sync's
         // operations used here do not panic on I/O or crypto errors, they return them.
         let task = cx.background_executor().spawn(async move {
+            #[cfg(test)]
+            if !work_time.is_zero() {
+                clock.timer(work_time).await;
+            }
             let result = work();
             let _ = done_tx.send(());
             result
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
+            let remaining = hold.saturating_sub(executor.now().saturating_duration_since(started));
+            if !remaining.is_zero() {
+                executor.timer(remaining).await;
+            }
             this.update(cx, |this, cx| {
                 let outcome = if epoch != this.epoch {
                     Outcome::Closed
@@ -826,6 +869,7 @@ impl AppState {
         self.error = None;
         self.vault_changed();
         self.screen = Screen::Main;
+        self.unlock_failures = 0;
         self.unlock_count = self.unlock_count.wrapping_add(1);
         self.touch_activity();
     }
@@ -872,6 +916,7 @@ impl AppState {
             self.touch.auto = TouchAuto::OnActivation;
         }
         self.unlocked_with_password_at = None;
+        self.unlock_failures = 0;
         self.locked = true;
         self.autosave = None;
         self.autosave_pending = false;

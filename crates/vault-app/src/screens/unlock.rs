@@ -288,14 +288,19 @@ impl Render for UnlockScreen {
                     .when(unlocking, |area| area.child(unlocking_overlay(cx))),
             );
 
-        // Each wrong password gets a fresh element id, which restarts the animation.
+        // Each wrong password gets a fresh element id, which restarts the animation. The
+        // count is zero after a lock or unlock (`AppState::lock`), so the screen appearing
+        // never replays an old shake.
         let card: AnyElement = if failures == 0 || reduce_motion {
             card.into_any_element()
         } else {
-            card.relative()
-                .with_animation(("shake", failures), Animation::new(SHAKE), |card, t| {
-                    card.left(px(shake_offset(t)))
-                })
+            div()
+                .debug_selector(|| "unlock-shake".into())
+                .child(card.relative().with_animation(
+                    ("shake", failures),
+                    Animation::new(SHAKE),
+                    |card, t| card.left(px(shake_offset(t))),
+                ))
                 .into_any_element()
         };
         ui::centered(cx).child(card)
@@ -313,6 +318,33 @@ mod tests {
 
     use super::*;
     use crate::actions;
+    use crate::state::MIN_UNLOCK_HOLD;
+
+    const MS: Duration = Duration::from_millis(1);
+
+    /// Holds unlocks for the real minimum and makes every background task take `work`
+    /// on the fake clock.
+    fn timed(state: &Entity<AppState>, work: Duration, vcx: &mut VisualTestContext) {
+        state.update(vcx, |s, _| {
+            s.unlock_hold = MIN_UNLOCK_HOLD;
+            s.fake_work_time = work;
+        });
+    }
+
+    /// Runs ready tasks and fires timers due within `by`, ending with the clock at `by`.
+    fn advance(by: Duration, vcx: &mut VisualTestContext) {
+        vcx.executor().advance_clock(by);
+    }
+
+    fn unlocking(state: &Entity<AppState>, vcx: &mut VisualTestContext) -> bool {
+        state.read_with(vcx, |s, _| s.busy == Some(Busy::Unlocking))
+    }
+
+    fn unlock(state: &Entity<AppState>, password: &str, vcx: &mut VisualTestContext) {
+        state.update(vcx, |s, cx| {
+            s.unlock(SecretString::new(password.into()), cx)
+        });
+    }
 
     /// The unlock screen on its own window, with a fresh vault opened (locked).
     fn open(
@@ -458,5 +490,154 @@ mod tests {
         assert!(vcx.debug_bounds("unlock-password").is_some());
         assert!(vcx.debug_bounds("unlocking").is_none());
         assert!(field_focused(&screen, &mut vcx));
+    }
+
+    #[gpui::test]
+    fn lock_does_not_replay_the_shake(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _, mut vcx) = open(dir.path(), cx);
+        assert!(vcx.debug_bounds("unlock-shake").is_none());
+
+        // Wrong password: shake.
+        state.update(&mut vcx, |s, cx| {
+            s.unlock(SecretString::new("bad".into()), cx)
+        });
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("unlock-shake").is_some(),
+            "wrong password shakes"
+        );
+
+        // ⌘L / idle / sidebar Lock while the error is showing: the next unlock screen
+        // starts still.
+        state.update(&mut vcx, |s, cx| s.lock(cx));
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| assert_eq!(s.unlock_failures, 0));
+        assert!(
+            vcx.debug_bounds("unlock-shake").is_none(),
+            "no shake after lock"
+        );
+
+        // Fail, unlock, lock: the old failure does not shake the new unlock screen.
+        state.update(&mut vcx, |s, cx| {
+            s.unlock(SecretString::new("bad".into()), cx)
+        });
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("unlock-shake").is_some());
+        state.update(&mut vcx, |s, cx| {
+            s.unlock(SecretString::new("pw".into()), cx)
+        });
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| assert_eq!(s.screen, Screen::Main));
+        state.update(&mut vcx, |s, cx| s.lock(cx));
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| assert_eq!(s.screen, Screen::Unlock));
+        assert!(
+            vcx.debug_bounds("unlock-shake").is_none(),
+            "no shake after lock"
+        );
+        assert!(vcx.debug_bounds("unlock-card").is_some());
+
+        // A wrong password still shakes afterwards.
+        state.update(&mut vcx, |s, cx| {
+            s.unlock(SecretString::new("bad".into()), cx)
+        });
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("unlock-shake").is_some());
+    }
+
+    #[gpui::test]
+    fn fast_unlock_holds_until_the_minimum(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _, mut vcx) = open(dir.path(), cx);
+        timed(&state, 50 * MS, &mut vcx);
+        unlock(&state, "pw", &mut vcx);
+        // Decrypted at 50 ms, still "Unlocking…" at 499 ms.
+        advance(MIN_UNLOCK_HOLD - MS, &mut vcx);
+        assert!(unlocking(&state, &mut vcx), "held at 499 ms");
+        assert!(
+            state.read_with(&vcx, |s, _| s.vault.is_none()),
+            "result waits"
+        );
+        assert!(vcx.debug_bounds("unlocking").is_some());
+        advance(MS, &mut vcx);
+        state.read_with(&vcx, |s, _| {
+            assert_eq!(s.screen, Screen::Main, "shown at 500 ms");
+            assert!(!s.locked && s.busy.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn slow_unlock_is_not_delayed(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _, mut vcx) = open(dir.path(), cx);
+        timed(&state, 800 * MS, &mut vcx);
+        unlock(&state, "pw", &mut vcx);
+        advance(800 * MS - MS, &mut vcx);
+        assert!(unlocking(&state, &mut vcx), "still decrypting at 799 ms");
+        // Shown the moment decryption finishes, with no hold on top.
+        advance(MS, &mut vcx);
+        state.read_with(&vcx, |s, _| {
+            assert_eq!(s.screen, Screen::Main);
+            assert!(s.busy.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn failed_unlock_holds_too(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _, mut vcx) = open(dir.path(), cx);
+        timed(&state, 50 * MS, &mut vcx);
+        unlock(&state, "bad", &mut vcx);
+        advance(MIN_UNLOCK_HOLD - MS, &mut vcx);
+        assert!(unlocking(&state, &mut vcx));
+        state.read_with(&vcx, |s, _| {
+            assert!(s.error.is_none() && s.unlock_failures == 0);
+        });
+        assert!(vcx.debug_bounds("unlock-shake").is_none(), "no early shake");
+        advance(MS, &mut vcx);
+        state.read_with(&vcx, |s, _| {
+            assert!(s.busy.is_none() && s.error.is_some());
+            assert_eq!(s.unlock_failures, 1);
+        });
+        assert!(vcx.debug_bounds("unlock-shake").is_some());
+
+        // A slow failure shows the moment it is known.
+        timed(&state, 800 * MS, &mut vcx);
+        unlock(&state, "bad", &mut vcx);
+        advance(800 * MS - MS, &mut vcx);
+        assert!(unlocking(&state, &mut vcx));
+        advance(MS, &mut vcx);
+        state.read_with(&vcx, |s, _| {
+            assert!(s.busy.is_none());
+            assert_eq!(s.unlock_failures, 2);
+        });
+    }
+
+    #[gpui::test]
+    fn lock_or_switch_during_the_hold_discards_the_result(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _, mut vcx) = open(dir.path(), cx);
+        timed(&state, 50 * MS, &mut vcx);
+        unlock(&state, "pw", &mut vcx);
+        advance(100 * MS, &mut vcx);
+        assert!(unlocking(&state, &mut vcx), "decrypted, holding");
+        state.update(&mut vcx, |s, cx| s.lock(cx));
+        advance(MIN_UNLOCK_HOLD, &mut vcx);
+        state.read_with(&vcx, |s, _| {
+            assert!(s.locked && s.busy.is_none());
+            assert_eq!(s.screen, Screen::Unlock);
+            assert!(s.vault.as_ref().is_some_and(|v| v.vault().is_none()));
+        });
+
+        unlock(&state, "pw", &mut vcx);
+        advance(100 * MS, &mut vcx);
+        assert!(unlocking(&state, &mut vcx));
+        state.update(&mut vcx, |s, cx| s.switch_vault(ChooseIntent::Home, cx));
+        advance(MIN_UNLOCK_HOLD, &mut vcx);
+        state.read_with(&vcx, |s, _| {
+            assert!(s.locked && s.vault.is_none());
+            assert_eq!(s.screen, Screen::Choose);
+        });
     }
 }

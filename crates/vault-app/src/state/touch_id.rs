@@ -660,6 +660,29 @@ mod tests {
     }
 
     #[gpui::test]
+    fn touch_unlock_holds_the_minimum(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _, _) = setup(dir.path(), cx);
+        enable(&state, cx);
+        lock(&state, cx);
+        let ms = Duration::from_millis(1);
+        state.update(cx, |s, _| s.unlock_hold = super::super::MIN_UNLOCK_HOLD);
+        state.update(cx, |s, cx| s.touch_unlock(cx));
+        // The fake Touch ID answers at once; the result waits for the hold.
+        cx.executor()
+            .advance_clock(super::super::MIN_UNLOCK_HOLD - ms);
+        state.read_with(cx, |s, _| {
+            assert_eq!(s.busy, Some(Busy::TouchUnlocking), "held");
+            assert!(s.locked);
+        });
+        cx.executor().advance_clock(ms);
+        state.read_with(cx, |s, _| {
+            assert!(s.busy.is_none() && !s.locked);
+            assert_eq!(s.screen, Screen::Main);
+        });
+    }
+
+    #[gpui::test]
     fn policy_gates_deny(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (state, bio, _) = setup(dir.path(), cx);
