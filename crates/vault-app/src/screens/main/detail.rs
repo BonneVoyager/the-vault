@@ -11,7 +11,7 @@ use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Context, Entity, ExternalPaths, FontWeight,
     InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, ease_in_out,
-    prelude::FluentBuilder as _, px,
+    prelude::FluentBuilder as _, px, relative,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::progress::ProgressCircle;
@@ -623,24 +623,36 @@ impl ReadDetail<'_> {
             .into_any_element(),
         );
 
-        ui::v_flex()
+        ui::h_flex()
             .debug_selector(move || format!("field-row {ix}"))
-            .py(px(8.))
-            .gap(px(2.))
+            .w_full()
+            .items_start()
+            .py(px(12.))
+            .gap(px(16.))
             .border_b_1()
             .border_color(theme.border)
             .child(
                 div()
-                    .text_xs()
+                    .debug_selector(move || format!("field-label {ix}"))
+                    .w(relative(0.26))
+                    .min_w(px(80.))
+                    .max_w(px(140.))
+                    .flex_shrink_0()
+                    .pt(px(3.))
+                    .whitespace_normal()
                     .text_color(theme.muted_foreground)
                     .child(field.name.clone()),
             )
             .child(
                 ui::h_flex()
+                    .debug_selector(move || format!("field-content {ix}"))
+                    .flex_1()
+                    .min_w_0()
+                    .items_start()
                     .gap(px(4.))
                     .min_h(px(28.))
                     .child(copy_on_click(ix, &field.name, shown, &self.actions, cx))
-                    .children(buttons),
+                    .child(ui::h_flex().flex_none().gap(px(4.)).children(buttons)),
             )
             .into_any_element()
     }
@@ -693,6 +705,8 @@ impl ReadDetail<'_> {
 
         let code = text::group_code(&totp.code(now));
         ui::h_flex()
+            .min_w_0()
+            .flex_wrap()
             .gap(px(12.))
             .child(
                 mono(code.clone(), cx)
@@ -859,7 +873,7 @@ fn history_view(
 
 #[cfg(test)]
 mod tests {
-    //! Headless render tests for the password warnings and the field-group separator.
+    //! Headless render tests for detail layout, copying and password warnings.
 
     use std::sync::Arc;
 
@@ -1133,6 +1147,58 @@ mod tests {
         vcx.run_until_parked();
         assert_eq!(board.contents(), None);
         state.read_with(&vcx, |s, _| assert!(s.toast.is_none()));
+    }
+
+    #[gpui::test]
+    fn field_labels_and_values_share_aligned_rows_at_different_widths(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, ids, mut vcx) = open_items(
+            dir.path(),
+            |device| {
+                let mut item = login("Alpha", STRONG, device);
+                item.fields.push(Field::new(
+                    "notes",
+                    FieldKind::Notes,
+                    SecretString::new("First line\nSecond line\nThird line".into()),
+                    1,
+                ));
+                item.fields.push(Field::new(
+                    "A custom field with a longer label",
+                    FieldKind::Text,
+                    SecretString::new("Value".into()),
+                    1,
+                ));
+                vec![item]
+            },
+            cx,
+        );
+        select(&state, ids[0], &mut vcx);
+        for width in [820., 1100., 1400.] {
+            vcx.simulate_resize(gpui::size(px(width), px(900.)));
+            vcx.run_until_parked();
+            let first = vcx.debug_bounds("field-content 0").unwrap();
+            for (row, label, content) in [
+                ("field-row 0", "field-label 0", "field-content 0"),
+                ("field-row 1", "field-label 1", "field-content 1"),
+                ("field-row 2", "field-label 2", "field-content 2"),
+                ("field-row 3", "field-label 3", "field-content 3"),
+            ] {
+                let row = vcx.debug_bounds(row).unwrap();
+                let label = vcx.debug_bounds(label).unwrap();
+                let content = vcx.debug_bounds(content).unwrap();
+                assert_eq!(content.left(), first.left(), "aligned value column");
+                assert!(label.right() < content.left(), "label beside its value");
+                assert_eq!(label.top(), content.top(), "same row baseline padding");
+                assert!(content.size.width > px(0.));
+                assert!(content.right() <= row.right(), "content fits its row");
+            }
+            let single = vcx.debug_bounds("field-row 0").unwrap();
+            let notes = vcx.debug_bounds("field-row 2").unwrap();
+            assert!(
+                notes.size.height > single.size.height,
+                "notes retain line breaks"
+            );
+        }
     }
 
     #[gpui::test]
