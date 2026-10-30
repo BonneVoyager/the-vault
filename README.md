@@ -1,6 +1,6 @@
 <p align="center"><img src="assets/icon/vault-256.png" width="128" alt="vault icon"></p>
 
-# TheVault
+# The Vault
 
 A native macOS password manager in Rust: no webview, local-first, and one encrypted file you can put anywhere.
 
