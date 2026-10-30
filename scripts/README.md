@@ -22,3 +22,10 @@ variables. `--dry-run` prints codesign, notarytool and hdiutil commands without 
 them; secrets are never printed. `entitlements.plist` is empty until gpui needs more.
 
 With the Apple ID path the password is visible in `ps` during `--wait`; use a keychain profile to avoid that.
+
+Vault files are package directories named `<name>.vault/`. `Info.plist` exports the UTI
+`dev.aurora.vault` (conforms to `com.apple.package` and `public.data`, extension `vault`) and
+declares a matching document type with `LSTypeIsPackage`, so Finder shows a vault as a single
+file and opens it with Vault. The UTI reuses the app icon (`Vault.icns`); no separate document
+icon is bundled. Launch Services reads this when the app is first registered, so a freshly
+copied app may need `lsregister -f Vault.app` before existing folders are recognised.

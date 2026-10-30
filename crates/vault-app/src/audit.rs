@@ -107,7 +107,7 @@ pub fn audit(vault: &UnlockedVault) -> Issues {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vault_core::{Field, Item, ItemKind, KdfParams, SecretString};
+    use vault_core::{Field, Item, KdfParams, SecretString};
 
     const STRONG: &str = "correct-Horse-battery-staple-42";
     const STRONG_2: &str = "Tr0ub4dor&3-plus-much-more-entropy";
@@ -118,7 +118,7 @@ mod tests {
     }
 
     fn login(v: &mut UnlockedVault, title: &str, passwords: &[&str]) -> Uuid {
-        let mut item = Item::new(ItemKind::Login, title, v.device_id(), 1);
+        let mut item = Item::new(title, v.device_id(), 1);
         for (i, pw) in passwords.iter().enumerate() {
             item.fields.push(Field::new(
                 format!("password{i}"),
@@ -175,10 +175,10 @@ mod tests {
     #[test]
     fn only_password_fields_are_audited() {
         let mut v = vault();
-        let mut item = Item::new(ItemKind::Login, "Pin", v.device_id(), 1);
+        let mut item = Item::new("Pin", v.device_id(), 1);
         for kind in [
             FieldKind::Text,
-            FieldKind::Number,
+            FieldKind::Date,
             FieldKind::Notes,
             FieldKind::Other,
         ] {

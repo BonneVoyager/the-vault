@@ -96,7 +96,7 @@ AAD = `vault_id || item.id || modified_at_be64 || format_version_be16`.
 
 ```
 {
-  "kind":        "login" | "note" | "card" | "identity"
+  "kind":        (removed 2026-10-30: categories replaced by template tags; writers omit it, readers keep it as an unknown key)
   "title":       tstr
   "deleted_at":  u64 | null     tombstone when non-null; fields may be empty then
   "device_id":   bytes(16)      device that made the latest change
@@ -111,7 +111,7 @@ AAD = `vault_id || item.id || modified_at_be64 || format_version_be16`.
 
 Field = {
   "name":        tstr           unique within item, e.g. "username", "password", "totp", "url", "notes", or user-defined
-  "kind":        "text" | "password" | "totp" | "url" | "notes" | "email" | "date" | "month_year" | "number"
+  "kind":        "text" | "password" | "totp" | "url" | "notes" | "email" | "date" | "month_year"   ("number" removed 2026-10-30; an old "number" reads as an unknown kind and is preserved)
   "value":       tstr           for "totp": full otpauth:// URI
   "modified_at": u64            unix millis
   "section":     tstr | null    optional grouping label

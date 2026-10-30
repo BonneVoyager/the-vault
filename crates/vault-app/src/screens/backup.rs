@@ -10,7 +10,7 @@
 //! It closes, dropping the decrypted backup, as soon as the live vault locks.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _,
@@ -47,6 +47,16 @@ pub struct BackupWindow {
     /// Redraws once a second while open so a TOTP code stays current.
     _ticker: gpui::Task<()>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The vault file to read for a backup entry: a snapshot is a `.vault.bin` file, an
+/// absorbed conflict copy is a whole package directory (03 §6).
+fn backup_file(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.join(vault_sync::VAULT_FILE_NAME)
+    } else {
+        path.to_owned()
+    }
 }
 
 /// Opens the viewer for `path` in a new window.
@@ -152,7 +162,7 @@ impl BackupWindow {
         cx.notify();
         let path = self.path.clone();
         let task = cx.background_executor().spawn(async move {
-            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let bytes = std::fs::read(backup_file(&path)).map_err(|e| e.to_string())?;
             let locked = LockedVault::parse(&bytes).map_err(|e| e.to_string())?;
             locked.unlock(&password).map_err(|e| match e {
                 vault_core::VaultError::WrongPassword => "Wrong password. Try again.".to_owned(),
@@ -489,7 +499,7 @@ mod tests {
     use std::sync::Arc;
 
     use gpui::{TestAppContext, VisualTestContext};
-    use vault_core::{Field, ItemKind, KdfParams};
+    use vault_core::{Field, KdfParams};
     use vault_sync::{NoopHooks, SyncedVault};
 
     use super::*;
@@ -509,7 +519,7 @@ mod tests {
         let device = vault.device_id();
         vault
             .edit(|v| {
-                let mut gh = Item::new(ItemKind::Login, "GitHub", device, 1);
+                let mut gh = Item::new("GitHub", device, 1);
                 gh.fields = vec![Field::new(
                     "password",
                     FieldKind::Password,
@@ -517,7 +527,7 @@ mod tests {
                     1,
                 )];
                 v.insert(gh, 1);
-                v.insert(Item::new(ItemKind::Note, "Alarm code", device, 1), 1);
+                v.insert(Item::new("Alarm code", device, 1), 1);
             })
             .unwrap();
         vault.save().unwrap();
@@ -559,7 +569,7 @@ mod tests {
         let device = vault.device_id();
         vault
             .edit(|v| {
-                let mut item = Item::new(ItemKind::Login, "Gadget", device, 1);
+                let mut item = Item::new("Gadget", device, 1);
                 let mut pin =
                     Field::new("pin", FieldKind::Other, SecretString::new("4711".into()), 1);
                 pin.kind_raw = Some("x-future-pin".into());
@@ -668,7 +678,7 @@ mod tests {
         let device = vault.device_id();
         vault
             .edit(|v| {
-                let mut item = Item::new(ItemKind::Note, "Passport", device, 1);
+                let mut item = Item::new("Passport", device, 1);
                 item.attachments
                     .push(vault_core::attachment::new_ref("scan.pdf", 2_500_000, 1).unwrap());
                 v.insert(item, 1);
@@ -726,5 +736,42 @@ mod tests {
         state.update(cx, |s, cx| s.open_backup(backup.clone(), cx));
         cx.run_until_parked();
         assert_eq!(cx.update(|cx| cx.windows().len()), before);
+    }
+
+    /// An absorbed iCloud conflict copy is a whole package directory: the viewer reads its
+    /// vault.bin, and `open_backup` opens a window for it.
+    #[gpui::test]
+    fn opens_a_conflict_package_dir(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = setup(dir.path(), cx);
+        let conflict = dir.path().join("conflict-x.vault");
+        let mut other = SyncedVault::create(
+            &conflict,
+            &SecretString::new(PW.into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let device = other.device_id();
+        other
+            .edit(|v| v.insert(Item::new("From the other Mac", device, 1), 1))
+            .unwrap();
+        other.save().unwrap();
+        drop(other);
+        assert!(conflict.is_dir());
+
+        let (view, mut vcx) = window(&state, &conflict, cx);
+        view.update(&mut vcx, |w, cx| w.unlock(SecretString::new(PW.into()), cx));
+        vcx.run_until_parked();
+        view.read_with(&vcx, |w, _| {
+            assert!(w.is_open(), "{:?}", w.error);
+            assert_eq!(w.item_ids().len(), 1);
+        });
+
+        let before = vcx.update(|_, cx| cx.windows().len());
+        state.update(&mut vcx, |s, cx| s.open_backup(conflict.clone(), cx));
+        vcx.run_until_parked();
+        assert_eq!(vcx.update(|_, cx| cx.windows().len()), before + 1);
     }
 }

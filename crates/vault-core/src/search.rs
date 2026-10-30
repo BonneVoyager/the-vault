@@ -4,12 +4,13 @@ use secrecy::ExposeSecret;
 use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
 
-use crate::item::{FieldKind, Item, ItemKind};
+use crate::item::{FieldKind, Item};
 use crate::vault::UnlockedVault;
 
+/// Search filters. There is no category filter: item kinds were removed on 2026-10-30, and
+/// template tags (`login`, `note`, ...) are matched through `tag` like any other tag.
 pub struct Query<'a> {
     pub text: &'a str,
-    pub kind: Option<ItemKind>,
     pub tag: Option<&'a str>,
     pub favorites_only: bool,
 }
@@ -68,13 +69,12 @@ fn rank(item: &Item, q: &str) -> Option<u8> {
     None
 }
 
-/// Filter by kind / tag / favourite, then rank by text. Ties break by title.
+/// Filter by tag / favourite, then rank by text. Ties break by title.
 pub fn search<'a>(vault: &'a UnlockedVault, q: &Query) -> Vec<&'a Item> {
     let text = fold(q.text.trim());
     let tag = q.tag.map(fold);
     let mut hits: Vec<(u8, Zeroizing<String>, &'a Item)> = vault
         .items()
-        .filter(|i| q.kind.is_none_or(|k| i.kind == k))
         .filter(|i| !q.favorites_only || i.favorite)
         .filter(|i| {
             tag.as_ref()

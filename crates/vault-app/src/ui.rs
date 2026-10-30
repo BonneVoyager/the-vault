@@ -292,8 +292,20 @@ pub fn muted(text: impl Into<SharedString>, cx: &App) -> Div {
 
 /// Shows the native open panel and resolves to the single chosen path, or `None`.
 pub fn pick_path(directories: bool, prompt: &str, cx: &App) -> Task<Option<PathBuf>> {
+    pick_one(!directories, directories, prompt, cx)
+}
+
+/// Open panel for a `<name>.vault` package. gpui 0.3.10 has no content-type filter, so
+/// both files and folders are selectable: a bundled app with the `dev.aurora.vault` UTI
+/// shows packages as single items, an unbundled run shows them as folders. The caller
+/// validates the pick (`SyncedVault::open` refuses non-packages).
+pub fn pick_vault_package(cx: &App) -> Task<Option<PathBuf>> {
+    pick_one(true, true, "Open Vault", cx)
+}
+
+fn pick_one(files: bool, directories: bool, prompt: &str, cx: &App) -> Task<Option<PathBuf>> {
     let rx = cx.prompt_for_paths(PathPromptOptions {
-        files: !directories,
+        files,
         directories,
         multiple: false,
         prompt: Some(SharedString::from(prompt.to_owned())),

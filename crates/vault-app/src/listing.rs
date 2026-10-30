@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use gpui::SharedString;
 use vault_core::search::{Query, search};
-use vault_core::{ExposeSecret, Field, FieldKind, Item, ItemKind, UnlockedVault, Uuid};
+use vault_core::{ExposeSecret, Field, FieldKind, Item, UnlockedVault, Uuid};
 
 use crate::audit::{Issue, Issues};
 use crate::state::{Filter, Sort};
@@ -50,19 +50,8 @@ impl Listing {
 pub struct Counts {
     pub all: usize,
     pub favorites: usize,
-    /// Indexed like `ItemKind::ALL`.
-    pub kinds: [usize; 4],
     /// Tags case-insensitively merged, sorted alphabetically, with their item counts.
     pub tags: Vec<(String, usize)>,
-}
-
-impl Counts {
-    pub fn kind(&self, kind: ItemKind) -> usize {
-        ItemKind::ALL
-            .iter()
-            .position(|k| *k == kind)
-            .map_or(0, |i| self.kinds[i])
-    }
 }
 
 pub fn counts(vault: &UnlockedVault) -> Counts {
@@ -72,9 +61,6 @@ pub fn counts(vault: &UnlockedVault) -> Counts {
     for item in vault.items() {
         counts.all += 1;
         counts.favorites += usize::from(item.favorite);
-        if let Some(i) = ItemKind::ALL.iter().position(|k| *k == item.kind) {
-            counts.kinds[i] += 1;
-        }
         let mut seen: Vec<String> = Vec::new();
         for tag in &item.tags {
             let key = tag.to_lowercase();
@@ -116,10 +102,6 @@ pub fn compute(
 ) -> Listing {
     let q = Query {
         text: query,
-        kind: match filter {
-            Filter::Kind(k) => Some(*k),
-            _ => None,
-        },
         tag: match filter {
             Filter::Tag(t) => Some(t.as_str()),
             _ => None,
@@ -162,38 +144,38 @@ pub fn compute(
     }
 }
 
-/// Second line of a list row: username, card last four, or the note's first line.
+/// Second line of a list row: the username when it is not sensitive, else a
+/// `card`-tagged item's number as `•••• 4242`, else the first line of the notes.
 pub fn subtitle(item: &Item) -> String {
-    match item.kind {
-        ItemKind::Card => item
-            .field("number")
-            .and_then(|f| text::last4(f.value.expose_secret()))
-            .map(|l| format!("•••• {l}"))
-            .unwrap_or_default(),
-        ItemKind::Note => item
-            .fields
-            .iter()
-            .find(|f| f.kind == FieldKind::Notes)
-            .and_then(|f| {
-                f.value
-                    .expose_secret()
-                    .lines()
-                    .map(str::trim)
-                    .find(|l| !l.is_empty())
-                    .map(|l| text::truncate(l, 80))
-            })
-            .unwrap_or_default(),
-        // An unknown kind from a newer app version: show a username if it has one.
-        ItemKind::Login | ItemKind::Identity | ItemKind::Other => username_field(item)
-            .map(|f| f.value.expose_secret().to_string())
-            .unwrap_or_default(),
+    if let Some(f) = username_field(item) {
+        return f.value.expose_secret().to_string();
     }
+    if let Some(last4) = item
+        .fields
+        .iter()
+        .find(|f| is_card_number(item, f))
+        .and_then(|f| text::last4(f.value.expose_secret()))
+    {
+        return format!("•••• {last4}");
+    }
+    item.fields
+        .iter()
+        .find(|f| f.kind == FieldKind::Notes)
+        .and_then(|f| {
+            f.value
+                .expose_secret()
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(|l| text::truncate(l, 80))
+        })
+        .unwrap_or_default()
 }
 
-/// A card's number field: masked as `•••• 4242` until revealed (main detail and the
-/// backup viewer share this rule).
+/// A card's number field: the `number` field of a `card`-tagged item, masked as
+/// `•••• 4242` until revealed (main detail and the backup viewer share this rule).
 pub fn is_card_number(item: &Item, field: &Field) -> bool {
-    item.kind == ItemKind::Card && field.name == "number"
+    field.name == "number" && crate::templates::is_card(item)
 }
 
 /// The field ⌘⇧U copies and the list subtitle shows: `username`, else the first email.
@@ -231,19 +213,19 @@ mod tests {
         UnlockedVault::create(&pw, KdfParams::for_tests(), Uuid::new_v4())
     }
 
-    fn add(v: &mut UnlockedVault, kind: ItemKind, title: &str, now: u64) -> Uuid {
-        let item = Item::new(kind, title, v.device_id(), now);
+    fn add(v: &mut UnlockedVault, title: &str, now: u64) -> Uuid {
+        let item = Item::new(title, v.device_id(), now);
         v.insert(item, now)
     }
 
     #[test]
     fn groups_alphabetically_with_hash_first() {
         let mut v = vault();
-        add(&mut v, ItemKind::Login, "beta", 1);
-        add(&mut v, ItemKind::Login, "Alpha", 2);
-        add(&mut v, ItemKind::Login, "1Password import", 3);
-        add(&mut v, ItemKind::Login, "_hidden", 4);
-        add(&mut v, ItemKind::Login, "Apple", 5);
+        add(&mut v, "beta", 1);
+        add(&mut v, "Alpha", 2);
+        add(&mut v, "1Password import", 3);
+        add(&mut v, "_hidden", 4);
+        add(&mut v, "Apple", 5);
         let l = compute(&v, "", &Filter::All, Sort::Alphabetical, Rc::default());
         let headers: Vec<_> = l
             .rows
@@ -261,8 +243,8 @@ mod tests {
     #[test]
     fn recent_sort_and_search_have_no_headers() {
         let mut v = vault();
-        let old = add(&mut v, ItemKind::Login, "Old", 10);
-        let new = add(&mut v, ItemKind::Login, "New", 20);
+        let old = add(&mut v, "Old", 10);
+        let new = add(&mut v, "New", 20);
         let l = compute(&v, "", &Filter::All, Sort::RecentlyModified, Rc::default());
         assert_eq!(l.items, [new, old]);
         assert!(l.rows.iter().all(|r| matches!(r, Row::Item(_))));
@@ -274,9 +256,9 @@ mod tests {
     #[test]
     fn filters_and_counts() {
         let mut v = vault();
-        let gh = add(&mut v, ItemKind::Login, "GitHub", 1);
-        add(&mut v, ItemKind::Note, "Wifi", 2);
-        let card = add(&mut v, ItemKind::Card, "Visa", 3);
+        let gh = add(&mut v, "GitHub", 1);
+        add(&mut v, "Wifi", 2);
+        let card = add(&mut v, "Visa", 3);
         v.update(gh, 4, |it| {
             it.favorite = true;
             it.tags = vec!["Infra".into(), "work".into()];
@@ -284,6 +266,9 @@ mod tests {
         .unwrap();
         v.update(card, 5, |it| it.tags = vec!["infra".into()])
             .unwrap();
+        // No category filter any more: a text search spans every item.
+        let search_all = compute(&v, "i", &Filter::All, Sort::Alphabetical, Rc::default());
+        assert_eq!(search_all.items.len(), 3);
 
         let fav = compute(
             &v,
@@ -293,14 +278,6 @@ mod tests {
             Rc::default(),
         );
         assert_eq!(fav.items, [gh]);
-        let cards = compute(
-            &v,
-            "",
-            &Filter::Kind(ItemKind::Card),
-            Sort::Alphabetical,
-            Rc::default(),
-        );
-        assert_eq!(cards.items, [card]);
         let infra = compute(
             &v,
             "",
@@ -312,7 +289,6 @@ mod tests {
 
         let c = counts(&v);
         assert_eq!((c.all, c.favorites), (3, 1));
-        assert_eq!(c.kind(ItemKind::Note), 1);
         assert_eq!(c.tags.len(), 2);
         assert_eq!(c.tags[0].0.to_lowercase(), "infra");
         assert_eq!(c.tags[0].1, 2);
@@ -321,7 +297,8 @@ mod tests {
 
     #[test]
     fn subtitles() {
-        let mut card = Item::new(ItemKind::Card, "Visa", Uuid::new_v4(), 1);
+        let mut card =
+            crate::templates::tagged(crate::templates::Template::Card, "Visa", Uuid::new_v4(), 1);
         card.fields.push(Field::new(
             "number",
             FieldKind::Text,
@@ -329,7 +306,7 @@ mod tests {
             1,
         ));
         assert_eq!(subtitle(&card), "•••• 4242");
-        let mut note = Item::new(ItemKind::Note, "n", Uuid::new_v4(), 1);
+        let mut note = Item::new("n", Uuid::new_v4(), 1);
         note.fields.push(Field::new(
             "notes",
             FieldKind::Notes,
@@ -337,7 +314,7 @@ mod tests {
             1,
         ));
         assert_eq!(subtitle(&note), "first line");
-        let mut login = Item::new(ItemKind::Login, "l", Uuid::new_v4(), 1);
+        let mut login = Item::new("l", Uuid::new_v4(), 1);
         login.fields.push(Field::new(
             "username",
             FieldKind::Text,
@@ -345,13 +322,25 @@ mod tests {
             1,
         ));
         assert_eq!(subtitle(&login), "chris");
+        // An untagged item's `number` is not a card number: no last-4 subtitle.
+        let mut plain = Item::new("p", Uuid::new_v4(), 1);
+        plain.fields.push(Field::new(
+            "number",
+            FieldKind::Text,
+            SecretString::new("4242 4242 4242 4242".into()),
+            1,
+        ));
+        assert_eq!(subtitle(&plain), "");
+        assert!(!is_card_number(&plain, &plain.fields[0]));
+        assert!(is_card_number(&card, &card.fields[0]));
     }
 
     #[test]
     fn sensitive_username_field_never_reaches_the_subtitle() {
         for kind in [FieldKind::Other, FieldKind::Password, FieldKind::Totp] {
-            for item_kind in [ItemKind::Login, ItemKind::Other] {
-                let mut item = Item::new(item_kind, "l", Uuid::new_v4(), 1);
+            for tags in [vec![], vec!["login".to_owned()]] {
+                let mut item = Item::new("l", Uuid::new_v4(), 1);
+                item.tags = tags.clone();
                 let mut field = Field::new(
                     "username",
                     kind,
@@ -362,12 +351,12 @@ mod tests {
                     field.kind_raw = Some("future-secret".into());
                 }
                 item.fields.push(field);
-                assert_eq!(subtitle(&item), "", "{kind:?} in {item_kind:?}");
+                assert_eq!(subtitle(&item), "", "{kind:?} with {tags:?}");
                 assert!(username_field(&item).is_none());
             }
         }
         // A sensitive "username" falls back to the first email field.
-        let mut item = Item::new(ItemKind::Login, "l", Uuid::new_v4(), 1);
+        let mut item = Item::new("l", Uuid::new_v4(), 1);
         item.fields.push(Field::new(
             "username",
             FieldKind::Other,

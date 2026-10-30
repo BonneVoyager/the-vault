@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tempfile::TempDir;
 use vault_core::attachment::{CHUNK_SIZE, MAX_ATTACHMENT_SIZE, blob_file_name};
-use vault_core::{AttachmentError, Item, ItemKind, KdfParams, SecretString, Uuid};
+use vault_core::{AttachmentError, Item, KdfParams, SecretString, Uuid};
 use vault_sync::{
     AttachmentState, CloudError, CloudHooks, NoopHooks, SyncError, SyncEvent, SyncedVault,
 };
@@ -36,7 +36,7 @@ fn setup() -> (TempDir, PathBuf, SyncedVault, Uuid) {
     )
     .unwrap();
     let item = v
-        .edit(|vault| vault.insert(Item::new(ItemKind::Login, "mail", Uuid::nil(), NOW), NOW))
+        .edit(|vault| vault.insert(Item::new("mail", Uuid::nil(), NOW), NOW))
         .unwrap();
     v.save().unwrap();
     (dir, path, v, item)
@@ -107,7 +107,7 @@ fn ref_ids(v: &SyncedVault, item: Uuid) -> Vec<Uuid> {
 
 /// Make the vault dirty with an unrelated edit, so `save` writes.
 fn touch(v: &mut SyncedVault, title: &str) {
-    v.edit(|vault| vault.insert(Item::new(ItemKind::Note, title, Uuid::nil(), NOW), NOW))
+    v.edit(|vault| vault.insert(Item::new(title, Uuid::nil(), NOW), NOW))
         .unwrap();
 }
 
@@ -157,6 +157,7 @@ fn add_save_reopen_and_stream_identical_bytes() {
 
     v.save().unwrap();
     assert!(tmp_leftovers(dir.path()).is_empty());
+    assert!(tmp_leftovers(&path).is_empty());
 
     let mut other = SyncedVault::open(&path, DEV_B, Arc::new(NoopHooks)).unwrap();
     other.unlock(&pw()).unwrap();
@@ -324,7 +325,9 @@ fn unknown_attachment_and_locked_are_errors() {
 struct EvictedBlobs;
 impl CloudHooks for EvictedBlobs {
     fn is_evicted(&self, path: &Path) -> bool {
-        path.extension().is_some_and(|e| e == "bin")
+        path.parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == "attachments")
     }
     fn ensure_downloaded(&self, path: &Path, _timeout: Duration) -> Result<(), CloudError> {
         if self.is_evicted(path) {
@@ -432,10 +435,45 @@ fn prune_skips_clean_saves_and_locked_vaults() {
     assert!(matches!(v.save(), Err(SyncError::Locked)));
     assert!(orphan.exists());
 
+    // Unlocking runs cleanup once (memory and disk agree).
     v.unlock(&pw()).unwrap();
-    touch(&mut v, "now");
-    v.save().unwrap();
     assert!(!orphan.exists());
+}
+
+#[test]
+fn orphan_cleanup_runs_once_at_unlock() {
+    let (_dir, path, mut v, item) = setup();
+    let kept = add(&mut v, item, b"kept");
+    v.save().unwrap();
+    let orphan = v.attachments_dir().join(blob_file_name(Uuid::from_u128(1)));
+    fs::write(&orphan, b"x").unwrap();
+    v.set_prune_clock_offset_for_tests(2 * DAY);
+    v.lock();
+    assert!(orphan.exists(), "never while locked");
+
+    let events = v.subscribe();
+    v.unlock(&pw()).unwrap();
+    assert!(!orphan.exists());
+    assert!(blob(&v, kept).exists());
+    assert_eq!(pruned_counts(&events), vec![1]);
+
+    // Not when the unlocked state may not match disk: here the primary is now a newer format
+    // (saving is blocked, its references are unknown).
+    fs::write(&orphan, b"x").unwrap();
+    v.lock();
+    let file = path.join(vault_sync::VAULT_FILE_NAME);
+    let mut newer = fs::read(&file).unwrap();
+    newer[4..6].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    fs::write(&file, &newer).unwrap();
+    v.unlock(&pw()).unwrap();
+    assert!(orphan.exists());
+
+    // Nor when the primary is missing: the unlock opens the copy held in memory, but what is
+    // on disk (a peer's references) is unknown.
+    v.lock();
+    fs::remove_file(&file).unwrap();
+    v.unlock(&pw()).unwrap();
+    assert!(orphan.exists());
 }
 
 /// A peer's blob that lands before the vault file referencing it carries the peer's (old)
@@ -667,4 +705,181 @@ fn removal_survives_merge_on_both_devices_and_blob_is_pruned() {
     );
     assert_eq!(a.attachment_state(id), AttachmentState::Missing);
     assert_eq!(b.attachment_state(id), AttachmentState::Missing);
+}
+
+/// A conflicted package (03 §6) holding a blob we lack: the merge brings its reference, the
+/// blob is copied into our `attachments/`, and the whole package moves into `backups/`.
+#[test]
+fn conflict_package_with_extra_blob_is_absorbed_whole() {
+    let (dir, path, mut a, item) = setup();
+    a.start_watching().unwrap();
+    let events = a.subscribe();
+
+    // B works on a copy of the package under a name that is not a candidate yet.
+    let staging = dir.path().join("staging");
+    fs::create_dir(&staging).unwrap();
+    let file = vault_sync::VAULT_FILE_NAME;
+    fs::copy(path.join(file), staging.join(file)).unwrap();
+    let mut b = SyncedVault::open(&staging, DEV_B, Arc::new(NoopHooks)).unwrap();
+    b.unlock(&pw()).unwrap();
+    let big = three_chunks();
+    let id = add(&mut b, item, &big);
+    b.save().unwrap();
+    drop(b);
+    assert_eq!(a.attachment_state(id), AttachmentState::Missing);
+
+    // The provider renames it into place as the loser of a conflict.
+    let conflict = dir.path().join("test 2.vault");
+    fs::rename(&staging, &conflict).unwrap();
+    assert!(wait_until(|| {
+        a.poll();
+        !conflict.exists()
+    }));
+
+    assert!(has_ref(&a, item, id));
+    assert_eq!(a.attachment_state(id), AttachmentState::Present);
+    assert_eq!(mode(&blob(&a, id)), 0o600);
+    assert_eq!(read_all(&a, item, id).unwrap(), big);
+    assert!(tmp_leftovers(&a.attachments_dir()).is_empty());
+    let absorbed = a
+        .backups()
+        .unwrap()
+        .into_iter()
+        .find(|b| b.is_conflict())
+        .expect("conflict package listed");
+    assert!(absorbed.path.starts_with(path.join("backups")));
+    assert!(
+        absorbed
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-test 2.vault")
+    );
+    // Moved whole: its vault file and its own copy of the blob are still inside.
+    assert!(absorbed.path.join(file).is_file());
+    assert!(
+        absorbed
+            .path
+            .join("attachments")
+            .join(blob_file_name(id))
+            .is_file()
+    );
+    assert!(
+        events
+            .try_iter()
+            .any(|e| e == SyncEvent::ConflictAbsorbed(absorbed.path.clone()))
+    );
+    // On disk too: a fresh open sees the reference.
+    let mut c = SyncedVault::open(&path, Uuid::from_u128(0xC), Arc::new(NoopHooks)).unwrap();
+    c.unlock(&pw()).unwrap();
+    assert!(has_ref(&c, item, id));
+}
+
+/// A blob we already have is not replaced by the conflicted package's copy.
+#[test]
+fn conflict_package_does_not_replace_existing_blobs() {
+    let (dir, path, mut a, item) = setup();
+    let id = add(&mut a, item, b"ours");
+    a.save().unwrap();
+    let ours = fs::read(blob(&a, id)).unwrap();
+    a.lock();
+
+    let conflict = dir
+        .path()
+        .join("test (Mac's conflicted copy 2026-10-30).vault");
+    fs::create_dir_all(conflict.join("attachments")).unwrap();
+    let file = vault_sync::VAULT_FILE_NAME;
+    fs::copy(path.join(file), conflict.join(file)).unwrap();
+    fs::write(
+        conflict.join("attachments").join(blob_file_name(id)),
+        b"junk",
+    )
+    .unwrap();
+
+    a.start_watching().unwrap();
+    // Seen while locked: deferred, absorbed at unlock.
+    assert!(wait_until(|| {
+        a.poll();
+        a.unlock(&pw()).unwrap();
+        !conflict.exists()
+    }));
+    assert_eq!(fs::read(blob(&a, id)).unwrap(), ours);
+}
+
+/// A conflicted package whose items reference a blob that has not arrived inside it yet: it
+/// is merged, but only moved once the blob arrives (and is copied).
+#[test]
+fn conflict_package_waits_for_a_late_blob() {
+    let (dir, path, mut a, item) = setup();
+    a.start_watching().unwrap();
+    let staging = dir.path().join("staging");
+    fs::create_dir(&staging).unwrap();
+    let file = vault_sync::VAULT_FILE_NAME;
+    fs::copy(path.join(file), staging.join(file)).unwrap();
+    let mut b = SyncedVault::open(&staging, DEV_B, Arc::new(NoopHooks)).unwrap();
+    b.unlock(&pw()).unwrap();
+    let id = add(&mut b, item, b"late");
+    b.save().unwrap();
+    drop(b);
+    // The blob is still in transit.
+    let in_transit = dir.path().join("in-transit.bin");
+    fs::rename(
+        staging.join("attachments").join(blob_file_name(id)),
+        &in_transit,
+    )
+    .unwrap();
+
+    let conflict = dir.path().join("test 2.vault");
+    fs::rename(&staging, &conflict).unwrap();
+    assert!(wait_until(|| {
+        a.poll();
+        has_ref(&a, item, id)
+    }));
+    for _ in 0..20 {
+        a.poll();
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(conflict.exists(), "moved before its blob arrived");
+    assert_eq!(a.attachment_state(id), AttachmentState::Missing);
+
+    fs::rename(
+        &in_transit,
+        conflict.join("attachments").join(blob_file_name(id)),
+    )
+    .unwrap();
+    assert!(wait_until(|| {
+        a.poll();
+        !conflict.exists()
+    }));
+    assert_eq!(read_all(&a, item, id).unwrap(), b"late");
+}
+
+/// A conflicted package without `vault.bin` that only holds blobs (they arrived after the
+/// package was absorbed): blobs we lack are copied in; the remnant stays in place.
+#[test]
+fn blob_only_conflict_package_contributes_its_blobs() {
+    let (dir, _path, mut a, item) = setup();
+    let id = add(&mut a, item, b"precious");
+    a.save().unwrap();
+    let blob_bytes = fs::read(blob(&a, id)).unwrap();
+    fs::remove_file(blob(&a, id)).unwrap();
+    assert_eq!(a.attachment_state(id), AttachmentState::Missing);
+    a.start_watching().unwrap();
+
+    let remnant = dir.path().join("test 2.vault");
+    let staging = dir.path().join(".staging");
+    fs::create_dir_all(staging.join("attachments")).unwrap();
+    fs::write(
+        staging.join("attachments").join(blob_file_name(id)),
+        &blob_bytes,
+    )
+    .unwrap();
+    fs::rename(&staging, &remnant).unwrap();
+    assert!(wait_until(|| {
+        a.poll();
+        a.attachment_state(id) == AttachmentState::Present
+    }));
+    assert_eq!(read_all(&a, item, id).unwrap(), b"precious");
+    assert!(remnant.exists());
 }

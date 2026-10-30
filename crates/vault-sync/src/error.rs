@@ -22,9 +22,17 @@ pub enum SyncError {
     /// The operation needs an unlocked vault.
     #[error("vault is locked")]
     Locked,
-    /// `open` found no file at this path.
-    #[error("no vault file at {}", .0.display())]
+    /// `open` found no vault package at this path, or the package has no `vault.bin`.
+    #[error("no vault at {}", .0.display())]
     NoVault(PathBuf),
+    /// `open` was given a regular file. Vaults are package directories (`<name>.vault/`
+    /// containing `vault.bin`); the earlier single-file layout is not supported or migrated.
+    #[error(
+        "{} is a file, not a vault package (a `.vault` folder containing vault.bin); \
+         this vault format is no longer supported, create a new vault",
+        .0.display()
+    )]
+    NotAPackage(PathBuf),
     /// `create` refuses to overwrite an existing path.
     #[error("{} already exists", .0.display())]
     AlreadyExists(PathBuf),

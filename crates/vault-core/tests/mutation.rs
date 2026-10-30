@@ -4,7 +4,7 @@ mod common;
 
 use common::*;
 use vault_core::vault::HISTORY_CAP;
-use vault_core::{ExposeSecret, Field, FieldKind, Item, ItemKind, Uuid, VaultError};
+use vault_core::{ExposeSecret, Field, FieldKind, Item, Uuid, VaultError};
 
 fn vault_with_item(now: u64) -> (vault_core::UnlockedVault, Uuid) {
     let mut v = new_vault();
@@ -76,7 +76,7 @@ fn update_new_fields_and_metadata_only() {
 
     v.update(id, 4_000, |item| {
         item.fields
-            .push(Field::new("pin", FieldKind::Number, secret("1234"), 0));
+            .push(Field::new("pin", FieldKind::Text, secret("1234"), 0));
         item.fields
             .push(Field::new("note2", FieldKind::Notes, secret("x"), 3_500));
         // An explicit future timestamp on a field drags the item along.
@@ -215,7 +215,7 @@ fn delete_tombstones_and_purge() {
     assert_eq!(v.items().next().unwrap().id, c);
 
     // Round-trip of a vault with a tombstone that still carries fields.
-    let d = v.insert(Item::new(ItemKind::Note, "n", Uuid::nil(), 1), 1);
+    let d = v.insert(Item::new("n", Uuid::nil(), 1), 1);
     v.delete(d, 2).unwrap();
     let u = unlock(&v.serialize()).unwrap();
     assert_vaults_eq(&v, &u);

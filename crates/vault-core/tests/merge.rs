@@ -6,8 +6,7 @@ use common::*;
 use vault_core::vault::MergeReport;
 use vault_core::vault::merge::item_eq;
 use vault_core::{
-    ExposeSecret, Field, FieldKind, HistoryEntry, Item, ItemKind, KdfParams, UnlockedVault, Uuid,
-    VaultError,
+    ExposeSecret, Field, FieldKind, HistoryEntry, Item, KdfParams, UnlockedVault, Uuid, VaultError,
 };
 
 fn dev_a() -> Uuid {
@@ -194,7 +193,7 @@ fn field_present_on_one_side_only_is_taken() {
     let id = ids[0];
     a.update(id, 2_000, |i| {
         i.fields
-            .push(Field::new("pin", FieldKind::Number, secret("0000"), 2_000));
+            .push(Field::new("pin", FieldKind::Text, secret("0000"), 2_000));
     })
     .unwrap();
     b.update(id, 3_000, |i| {
@@ -390,10 +389,7 @@ fn round_trip_after_merge() {
     a.delete(ids[3], 2_003).unwrap();
     b.set_field(ids[3], "username", secret("back"), 2_004)
         .unwrap();
-    b.insert(
-        Item::new(ItemKind::Note, "fresh", Uuid::nil(), 2_005),
-        2_005,
-    );
+    b.insert(Item::new("fresh", Uuid::nil(), 2_005), 2_005);
 
     let b_snap = unlock(&b.serialize()).unwrap();
     let report = a.merge_from(&b_snap).unwrap();

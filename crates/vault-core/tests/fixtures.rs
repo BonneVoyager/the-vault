@@ -11,8 +11,14 @@
 //! covered the moment it is committed and a reader regression on any old one fails loudly.
 //!
 //! `v1-forward.vault` exercises 01 §9 forward compatibility: it carries an opaque key slot
-//! of an unknown kind, an item and a field of unknown kinds, and unknown keys at header,
-//! item and field level, as a newer build would write them.
+//! of an unknown kind, a field of an unknown kind, and unknown keys at header, item and
+//! field level, as a newer build would write them.
+//!
+//! Item categories (`ItemPlain.kind`) were removed on 2026-10-30 without a version bump.
+//! Every fixture written before that still carries a `kind` entry per item; the reader keeps
+//! it as an unknown key in `Item::extras` and re-emits it verbatim, so the committed bytes
+//! are unchanged and the regenerators below add the entry to `extras` explicitly to stay
+//! byte-identical with what they produced before the removal.
 //!
 //! `v1-attach.vault` (01 §4 "Attachments (v1.1)") holds one item with two attachment
 //! references, an empty file and a 3-chunk file (2 MiB + 7 bytes), whose sealed blobs live
@@ -25,8 +31,8 @@ use ciborium::Value;
 use vault_core::attachment::{CHUNK_SIZE, blob_file_name, new_ref, open, seal};
 use vault_core::format::VaultFile;
 use vault_core::{
-    ExposeSecret, Field, FieldKind, Item, ItemKind, KdfParams, LockedVault, OpaqueSlot,
-    SecretString, Slot, SlotKind, UnlockedVault, Uuid, VaultError,
+    ExposeSecret, Field, FieldKind, Item, KdfParams, LockedVault, OpaqueSlot, SecretString, Slot,
+    SlotKind, UnlockedVault, Uuid, VaultError,
 };
 
 const PASSWORD: &str = "correct horse battery staple";
@@ -63,6 +69,11 @@ fn t(s: &str) -> Value {
 
 fn header_extra() -> (Value, Value) {
     (t("x_header_future"), t("from a newer header"))
+}
+
+/// The legacy per-item `kind` entry as pre-2026-10-30 writers emitted it; now an unknown key.
+fn kind_extra(kind: &str) -> (Value, Value) {
+    (t("kind"), t(kind))
 }
 
 fn item_extra() -> (Value, Value) {
@@ -119,8 +130,9 @@ fn regenerate_fixtures() {
 
     let mut vault = new_vault();
 
-    let mut github = Item::new(ItemKind::Login, "GitHub", device(), T0);
+    let mut github = Item::new("GitHub", device(), T0);
     github.id = Uuid::from_bytes([0x01; 16]);
+    github.extras.push(kind_extra("login"));
     github.tags = vec!["dev".into()];
     github.fields = vec![
         field("username", FieldKind::Text, "chris@example.com", T0),
@@ -140,8 +152,9 @@ fn regenerate_fixtures() {
     ];
     vault.insert(github, T0 + 3);
 
-    let mut wifi = Item::new(ItemKind::Note, "Wifi", device(), T0 + 10);
+    let mut wifi = Item::new("Wifi", device(), T0 + 10);
     wifi.id = Uuid::from_bytes([0x02; 16]);
+    wifi.extras.push(kind_extra("note"));
     wifi.fields = vec![field(
         "notes",
         FieldKind::Notes,
@@ -150,8 +163,9 @@ fn regenerate_fixtures() {
     )];
     vault.insert(wifi, T0 + 10);
 
-    let mut visa = Item::new(ItemKind::Card, "Visa", device(), T0 + 20);
+    let mut visa = Item::new("Visa", device(), T0 + 20);
     visa.id = Uuid::from_bytes([0x03; 16]);
+    visa.extras.push(kind_extra("card"));
     visa.fields = vec![
         field("number", FieldKind::Text, "4111111111111111", T0 + 20),
         field("expiry", FieldKind::MonthYear, "12/29", T0 + 21),
@@ -171,9 +185,9 @@ fn regenerate_forward_fixture() {
     let mut vault = new_vault();
     vault.header_extras_mut().push(header_extra());
 
-    let mut future = Item::new(ItemKind::Other, "Future thing", device(), T0 + 30);
-    future.kind_raw = Some(FUTURE_ITEM_KIND.to_owned());
+    let mut future = Item::new("Future thing", device(), T0 + 30);
     future.id = Uuid::from_bytes(FUTURE_ITEM_ID);
+    future.extras.push(kind_extra(FUTURE_ITEM_KIND));
     future.tags = vec!["future".into()];
     let mut f = field("future", FieldKind::Other, "future-value", T0 + 30);
     f.kind_raw = Some(FUTURE_FIELD_KIND.to_owned());
@@ -199,8 +213,9 @@ fn regenerate_attach_fixture() {
     std::fs::create_dir_all(ATTACH_DIR).unwrap();
     let mut vault = new_vault();
 
-    let mut item = Item::new(ItemKind::Note, "With attachments", device(), T0 + 40);
+    let mut item = Item::new("With attachments", device(), T0 + 40);
     item.id = Uuid::from_bytes(ATTACH_ITEM_ID);
+    item.extras.push(kind_extra("note"));
     item.fields = vec![field("notes", FieldKind::Notes, "see attached", T0 + 40)];
     let id = vault.insert(item, T0 + 40);
 
@@ -227,6 +242,7 @@ fn v1_attach_refs_and_blobs_open() {
     let vault = locked.unlock(&pw()).unwrap();
     let item = vault.get(Uuid::from_bytes(ATTACH_ITEM_ID)).unwrap();
     assert_eq!(item.title, "With attachments");
+    assert_eq!(item.extras, vec![kind_extra("note")], "legacy kind kept");
     assert_eq!(item.attachments.len(), 2);
     let mut ids: Vec<_> = vault.attachment_ids().collect();
     ids.sort();
@@ -303,7 +319,7 @@ fn v1_basic_unlocks_and_matches() {
     };
 
     let github = by_title("GitHub");
-    assert_eq!(github.kind, ItemKind::Login);
+    assert_eq!(github.extras, vec![kind_extra("login")], "legacy kind kept");
     assert_eq!(github.tags, vec!["dev".to_owned()]);
     assert_fields(
         github,
@@ -320,7 +336,7 @@ fn v1_basic_unlocks_and_matches() {
     );
 
     let wifi = by_title("Wifi");
-    assert_eq!(wifi.kind, ItemKind::Note);
+    assert_eq!(wifi.extras, vec![kind_extra("note")]);
     assert!(wifi.tags.is_empty());
     assert_eq!(wifi.fields.len(), 1);
     let notes = wifi.field("notes").unwrap();
@@ -331,7 +347,7 @@ fn v1_basic_unlocks_and_matches() {
     );
 
     let visa = by_title("Visa");
-    assert_eq!(visa.kind, ItemKind::Card);
+    assert_eq!(visa.extras, vec![kind_extra("card")]);
     assert!(visa.tags.is_empty());
     assert_fields(
         visa,
@@ -367,12 +383,14 @@ fn future_item(vault: &UnlockedVault) -> &Item {
     assert_eq!(items.len(), 1);
     let item = items[0];
     assert_eq!(item.id, Uuid::from_bytes(FUTURE_ITEM_ID));
-    assert_eq!(item.kind, ItemKind::Other);
-    assert!(item.kind.is_other());
-    assert_eq!(item.kind_raw.as_deref(), Some(FUTURE_ITEM_KIND));
-    assert_eq!(item.kind_str(), FUTURE_ITEM_KIND);
     assert_eq!(item.title, "Future thing");
-    assert_eq!(item.extras, vec![item_extra()]);
+    // Extras come back in the file's canonical key order: "kind" (4 bytes) sorts before
+    // "x_item_future" (13 bytes).
+    assert_eq!(
+        item.extras,
+        vec![kind_extra(FUTURE_ITEM_KIND), item_extra()],
+        "unknown item kind is just another unknown key"
+    );
     let f = item.field("future").unwrap();
     assert_eq!(f.kind, FieldKind::Other);
     assert_eq!(f.kind_raw.as_deref(), Some(FUTURE_FIELD_KIND));
@@ -457,10 +475,13 @@ fn v1_forward_opaque_slot_survives_change_password() {
 }
 
 #[test]
-fn v1_forward_items_yields_unknown_kind_item() {
+fn v1_forward_items_yields_item_with_unknown_kind_in_extras() {
     let vault = LockedVault::parse(FORWARD).unwrap().unlock(&pw()).unwrap();
-    let kinds: Vec<_> = vault.items().map(|i| (i.kind, i.kind_str())).collect();
-    assert_eq!(kinds, [(ItemKind::Other, FUTURE_ITEM_KIND)]);
+    let kinds: Vec<_> = vault
+        .items()
+        .map(|i| i.extras.iter().find(|(k, _)| k == &t("kind")).cloned())
+        .collect();
+    assert_eq!(kinds, [Some(kind_extra(FUTURE_ITEM_KIND))]);
 }
 
 /// The policy test: every committed fixture, of every version, must parse and unlock with the
@@ -483,16 +504,44 @@ fn every_fixture_in_the_directory_opens() {
             name.starts_with('v') && name.contains('-'),
             "{name}: fixtures are named v<FORMAT_VERSION>-<name>.vault"
         );
+        // The committed bytes are canonical: a structural parse -> to_bytes is byte-identical.
+        let file = VaultFile::parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(file.to_bytes(), bytes, "{name}: structural round trip");
         let locked = LockedVault::parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
         check_kdf(&locked);
         let vault = locked
             .unlock(&pw())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
-        // Whatever it holds, it must survive a save by this build.
+        // Every pre-2026-10-30 item carries a legacy `kind` entry, now an unknown key: it is
+        // never dropped and never resurfaces as anything else.
+        for item in vault.items_including_deleted() {
+            let kinds: Vec<_> = item
+                .extras
+                .iter()
+                .filter(|(k, _)| k == &t("kind"))
+                .collect();
+            assert_eq!(kinds.len(), 1, "{name}: item {} legacy kind", item.title);
+            assert!(
+                matches!(kinds[0].1, Value::Text(_)),
+                "{name}: legacy kind is text"
+            );
+        }
+        // Whatever it holds, it must survive a save by this build, extras included.
         let again = vault.serialize();
-        LockedVault::parse(&again)
+        let reopened = LockedVault::parse(&again)
             .unwrap_or_else(|e| panic!("{name}: re-parse: {e}"))
             .unlock(&pw())
             .unwrap_or_else(|e| panic!("{name}: re-unlock: {e}"));
+        let before: Vec<_> = vault.items_including_deleted().collect();
+        let after: Vec<_> = reopened.items_including_deleted().collect();
+        assert_eq!(before.len(), after.len(), "{name}: item count after save");
+        for (a, b) in before.iter().zip(&after) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(
+                a.extras, b.extras,
+                "{name}: item {} extras after save",
+                a.title
+            );
+        }
     }
 }

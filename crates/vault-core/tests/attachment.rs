@@ -11,7 +11,7 @@ use vault_core::attachment::{
     new_ref, open, seal,
 };
 use vault_core::vault::ATTACHMENT_TOMBSTONE_CAP;
-use vault_core::{AttachmentRef, AttachmentTombstone, Item, ItemKind, LockedVault, Uuid};
+use vault_core::{AttachmentRef, AttachmentTombstone, Item, LockedVault, Uuid};
 
 const TAG: usize = 16;
 
@@ -391,7 +391,7 @@ fn invalid_refs_are_refused_on_every_write_path() {
     assert_eq!(v.get(id).unwrap().modified_at, before);
 
     // `try_insert` reports, `insert` panics; nothing lands either way.
-    let mut item = Item::new(ItemKind::Note, "n", Uuid::nil(), 1);
+    let mut item = Item::new("n", Uuid::nil(), 1);
     item.attachments.push(huge);
     let iid = item.id;
     assert!(matches!(
@@ -443,7 +443,7 @@ fn add_and_remove_on_a_tombstone() {
 #[test]
 fn old_file_without_attachments_key_still_parses() {
     // A v1 writer always wrote `attachments: []`; the decoder also accepts a missing key.
-    let item = Item::new(ItemKind::Note, "n", Uuid::nil(), 1);
+    let item = Item::new("n", Uuid::nil(), 1);
     let plain = vault_core::format::encode_item_plain(&item);
     let mut v: ciborium::Value = ciborium::from_reader(plain.as_slice()).unwrap();
     let ciborium::Value::Map(entries) = &mut v else {
@@ -651,7 +651,7 @@ fn removal_under_a_clock_behind_the_add_still_wins_the_merge() {
     let err = a.update(id, far + 2000, |item| item.attachments.push(again.clone()));
     assert!(matches!(err, Err(vault_core::VaultError::Malformed(_))));
     assert_eq!(att_ids(a.get(id).unwrap()), vec![lid], "rolled back");
-    let mut item = Item::new(ItemKind::Note, "n", Uuid::nil(), 1);
+    let mut item = Item::new("n", Uuid::nil(), 1);
     item.removed_attachments.push(AttachmentTombstone {
         id: rid,
         removed_at: 5,
@@ -778,7 +778,7 @@ fn attachment_tombstones_are_capped_and_purged() {
     assert!(v.get(id).unwrap().removed_attachments.is_empty());
 
     // The cap is also enforced on insert/update and in a merge.
-    let mut item = Item::new(ItemKind::Note, "n", Uuid::nil(), 1);
+    let mut item = Item::new("n", Uuid::nil(), 1);
     for i in 0..n as u64 {
         item.removed_attachments.push(AttachmentTombstone {
             id: Uuid::new_v4(),

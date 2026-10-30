@@ -1,5 +1,6 @@
-//! Sidebar (specs/05-ui.md §2.3): sections with right-aligned muted counts, collapsible
-//! alphabetical tags, Settings and a Lock button at the bottom.
+//! Sidebar (specs/05-ui.md §2.3): All Items, Favorites, then collapsible alphabetical
+//! tags (template tags carry their template's icon), with right-aligned muted counts;
+//! Settings and a Lock button at the bottom. No category rows since 2026-10-30.
 //!
 //! Hand-rolled rather than gpui-component's `Sidebar`: that widget paints from
 //! `theme.tokens` (which our theme overrides do not reach), has no dividers between
@@ -13,35 +14,11 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
-use vault_core::ItemKind;
 
 use super::MainScreen;
 use crate::actions::{Lock, OpenSettings};
 use crate::state::Filter;
 use crate::ui::{self, Clickable as _};
-
-/// Sidebar label and icon for an item kind.
-pub fn kind_label(kind: ItemKind) -> (&'static str, IconName) {
-    match kind {
-        ItemKind::Login => ("Logins", IconName::KeyRound),
-        ItemKind::Note => ("Notes", IconName::StickyNote),
-        ItemKind::Card => ("Cards", IconName::CreditCard),
-        ItemKind::Identity => ("Identities", IconName::IdCard),
-        // A kind from a newer app version: no sidebar category, shown under All only.
-        ItemKind::Other => ("Other", IconName::Inbox),
-    }
-}
-
-/// Singular name of an item kind ("Login", "Identity").
-pub fn kind_singular(kind: ItemKind) -> &'static str {
-    match kind {
-        ItemKind::Login => "Login",
-        ItemKind::Note => "Note",
-        ItemKind::Card => "Card",
-        ItemKind::Identity => "Identity",
-        ItemKind::Other => "Item",
-    }
-}
 
 /// Height of a sidebar row; the footer's Lock button is a square of this side.
 fn row_height(cx: &App) -> gpui::Pixels {
@@ -88,8 +65,10 @@ fn nav_row(
     let height = row_height(cx);
     let theme = cx.theme();
     let label = label.into();
+    let selector_label = label.clone();
     ui::h_flex()
         .id(id)
+        .debug_selector(move || format!("nav {selector_label} icon={icon:?}"))
         .tab_index(0)
         .h(height)
         .px(px(8.))
@@ -138,19 +117,6 @@ impl MainScreen {
             }
         };
 
-        let kinds = ItemKind::ALL.into_iter().map(|kind| {
-            let (label, icon) = kind_label(kind);
-            nav_row(
-                SharedString::from(format!("nav-{}", kind.as_str())),
-                icon,
-                label,
-                Some(counts.kind(kind)),
-                filter == Filter::Kind(kind),
-                pick(Filter::Kind(kind)),
-                cx,
-            )
-        });
-
         let tags_toggle = {
             let state = self.state.clone();
             move |_: &mut Window, cx: &mut App| state.update(cx, |s, cx| s.toggle_tags(cx))
@@ -158,10 +124,10 @@ impl MainScreen {
         let tags = counts.tags.iter().enumerate().map(|(i, (tag, n))| {
             nav_row(
                 ("nav-tag", i),
-                IconName::Tag,
+                crate::templates::tag_icon(tag),
                 format!("#{tag}"),
                 Some(*n),
-                matches!(&filter, Filter::Tag(t) if t.eq_ignore_ascii_case(tag)),
+                matches!(&filter, Filter::Tag(t) if crate::templates::tag_matches(t, tag)),
                 pick(Filter::Tag(tag.clone())),
                 cx,
             )
@@ -210,8 +176,6 @@ impl MainScreen {
                         pick(Filter::Favorites),
                         cx,
                     ))
-                    .child(ui::divider(cx).my(px(6.)))
-                    .children(kinds)
                     .child(ui::divider(cx).my(px(6.)))
                     .child(nav_row(
                         "nav-tags",
@@ -285,6 +249,89 @@ mod tests {
     use crate::actions;
     use crate::root::VaultRoot;
     use crate::state::{AppState, Screen};
+    use crate::templates::Template;
+
+    /// All Items and Favorites, then tags; template tags carry their template's icon and
+    /// every other tag the generic tag glyph. No category rows.
+    #[gpui::test]
+    fn sidebar_has_no_category_rows_and_shows_tag_icons(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.vault");
+        let mut vault = SyncedVault::create(
+            &path,
+            &SecretString::new("pw".into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let device = vault.device_id();
+        vault
+            .edit(|v| {
+                for (i, t) in Template::ALL.into_iter().enumerate() {
+                    v.insert(t.new_item(t.label(), device, i as u64), i as u64);
+                }
+                let mut work = vault_core::Item::new("Other", device, 9);
+                work.tags = vec!["work".into()];
+                v.insert(work, 9);
+            })
+            .unwrap();
+        vault.save().unwrap();
+        let path = vault.path().to_owned();
+        drop(vault);
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            actions::bind_keys(cx);
+            actions::register(&state, cx);
+        });
+        let window = cx.add_window(|window, cx| {
+            crate::theme::apply(window, cx);
+            let view = cx.new(|cx| VaultRoot::new(state.clone(), None, window, cx));
+            Root::new(view, window, cx)
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        state.update(&mut vcx, |s, cx| s.open_vault(path, cx));
+        vcx.run_until_parked();
+        state.update(&mut vcx, |s, cx| {
+            s.unlock(SecretString::new("pw".into()), cx)
+        });
+        vcx.run_until_parked();
+        assert_eq!(state.read_with(&vcx, |s, _| s.screen), Screen::Main);
+
+        let all = vcx
+            .debug_bounds("nav All Items icon=LayoutList")
+            .expect("All Items");
+        let fav = vcx
+            .debug_bounds("nav Favorites icon=Star")
+            .expect("Favorites");
+        assert!(all.top() < fav.top());
+        for gone in ["Logins", "Notes", "Cards", "Identities"] {
+            for icon in ["KeyRound", "StickyNote", "CreditCard", "IdCard", "Inbox"] {
+                let sel: &'static str = Box::leak(format!("nav {gone} icon={icon}").into());
+                assert!(vcx.debug_bounds(sel).is_none(), "{gone} row still shown");
+            }
+        }
+        let mut last = fav.top();
+        for (tag, icon) in [
+            ("card", "CreditCard"),
+            ("identity", "IdCard"),
+            ("login", "KeyRound"),
+            ("note", "StickyNote"),
+            ("work", "Tag"),
+        ] {
+            let sel: &'static str = Box::leak(format!("nav #{tag} icon={icon}").into());
+            let row = vcx
+                .debug_bounds(sel)
+                .unwrap_or_else(|| panic!("#{tag} with the {icon} glyph"));
+            assert!(row.top() > last, "#{tag} sorted after the rows above");
+            last = row.top();
+        }
+        state.read_with(&vcx, |s, _| {
+            assert_eq!(s.counts.all, 5);
+            assert_eq!(s.counts.tags.len(), 5);
+        });
+    }
 
     #[gpui::test]
     fn footer_has_settings_and_a_lock_button_that_locks(cx: &mut TestAppContext) {

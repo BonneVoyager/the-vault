@@ -1,13 +1,15 @@
-//! A movable, item-pinned detail window. It reads the live vault by ID so a selection
-//! change in the main window cannot change its contents. The window closes on lock.
+//! A movable, item-pinned detail window (specs/05-ui.md §2.3). It reads the live vault by
+//! ID so a selection change in the main window cannot change its contents. One window per
+//! item, tracked in `AppState`: it closes on lock and vault switch (`AppState::lock`) and
+//! when its item is deleted (its own observer).
 
 use std::collections::HashSet;
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext as _, Bounds, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, Styled as _, Subscription, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, div, prelude::FluentBuilder as _, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, Styled as _, Subscription, Task, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, div, prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::{ActiveTheme as _, Root};
 use vault_core::{ExposeSecret as _, FieldKind, SecretString, Uuid};
@@ -16,17 +18,19 @@ use super::main::detail::{DetailAction, DetailActions, ReadDetail};
 use crate::state::{AppState, CopyTarget, parse_totp};
 use crate::{text, theme, ui};
 
+/// Window title. Fixed, so the item's name never reaches Mission Control or the Window menu.
+const TITLE: &str = "Item details";
+
+/// Opens the window pinned to `id`, or brings its existing window to the front.
 pub fn open_item_window(
     state: Entity<AppState>,
     id: Uuid,
     cx: &mut App,
-) -> gpui::Result<gpui::AnyWindowHandle> {
-    let title = state
-        .read(cx)
-        .unlocked_vault()
-        .and_then(|vault| vault.get(id))
-        .map(|item| item.title.clone())
-        .unwrap_or_else(|| "Item details".into());
+) -> gpui::Result<AnyWindowHandle> {
+    if let Some(handle) = state.update(cx, |s, cx| s.item_window(id, cx)) {
+        handle.update(cx, |_, window, _| window.activate_window())?;
+        return Ok(handle);
+    }
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
@@ -35,18 +39,32 @@ pub fn open_item_window(
         ))),
         window_min_size: Some(size(px(360.), px(360.))),
         titlebar: Some(TitlebarOptions {
-            title: Some(title.clone().into()),
+            title: Some(TITLE.into()),
             ..Default::default()
         }),
         ..Default::default()
     };
-    let handle = cx.open_window(options, |window, cx| {
-        window.set_window_title(&title);
-        theme::apply(window, cx);
-        let view = cx.new(|cx| ItemWindow::new(state, id, window, cx));
-        cx.new(|cx| Root::new(view, window, cx))
-    })?;
-    Ok(handle.into())
+    let view_state = state.clone();
+    let handle: AnyWindowHandle = cx
+        .open_window(options, |window, cx| {
+            window.set_window_title(TITLE);
+            theme::apply(window, cx);
+            let view = cx.new(|cx| ItemWindow::new(view_state, id, window, cx));
+            cx.new(|cx| Root::new(view, window, cx))
+        })?
+        .into();
+    state.update(cx, |s, _| s.track_item_window(id, handle));
+    Ok(handle)
+}
+
+/// The pinned item is live and has a TOTP field, so its code needs a re-render every
+/// second (the item-window twin of `detail::shows_totp`).
+fn pinned_totp(s: &AppState, id: Uuid) -> bool {
+    s.main_active()
+        && s.unlocked_vault()
+            .and_then(|vault| vault.get(id))
+            .filter(|item| !item.is_deleted())
+            .is_some_and(|item| item.fields.iter().any(|f| f.kind == FieldKind::Totp))
 }
 
 struct ItemWindow {
@@ -56,13 +74,14 @@ struct ItemWindow {
     history_open: bool,
     status_clear: Option<gpui::Task<()>>,
     status: Option<String>,
-    _ticker: gpui::Task<()>,
+    /// Re-renders every wall-clock second; only while the item has a TOTP field.
+    ticker: Option<Task<()>>,
     _subscription: Subscription,
 }
 
 impl ItemWindow {
     fn new(state: Entity<AppState>, id: Uuid, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let subscription = cx.observe_in(&state, window, move |_, state, window, cx| {
+        let subscription = cx.observe_in(&state, window, move |this, state, window, cx| {
             let s = state.read(cx);
             let exists = s
                 .unlocked_vault()
@@ -71,26 +90,40 @@ impl ItemWindow {
             if !s.main_active() || !exists {
                 window.remove_window();
             } else {
+                this.sync_ticker(cx);
                 cx.notify();
             }
         });
-        let ticker = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
-                    break;
-                }
-            }
-        });
-        Self {
+        let mut this = Self {
             state,
             id,
             revealed: HashSet::new(),
             history_open: false,
             status_clear: None,
             status: None,
-            _ticker: ticker,
+            ticker: None,
             _subscription: subscription,
+        };
+        this.sync_ticker(cx);
+        this
+    }
+
+    /// Starts or stops the one-second ticker as the item gains or loses a TOTP field.
+    fn sync_ticker(&mut self, cx: &mut Context<Self>) {
+        if !pinned_totp(self.state.read(cx), self.id) {
+            self.ticker = None;
+        } else if self.ticker.is_none() {
+            self.ticker = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    let to_next_second = 1000 - text::now_millis() % 1000;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(to_next_second + 5))
+                        .await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
         }
     }
 
@@ -192,7 +225,6 @@ impl Render for ItemWindow {
             .and_then(|v| v.get(self.id))
             .filter(|item| !item.is_deleted())
             .map(|item| {
-                window.set_window_title(&item.title);
                 ReadDetail {
                     state: &self.state,
                     revealed: &self.revealed,
@@ -216,5 +248,185 @@ impl Render for ItemWindow {
             .when_some(self.status.clone(), |root, status| {
                 root.child(ui::detail_copy_feedback(status, cx))
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui::TestAppContext;
+    use vault_core::{Field, Item, KdfParams};
+    use vault_sync::{NoopHooks, SyncedVault};
+
+    use super::*;
+    use crate::state::{ChooseIntent, Screen};
+
+    const TOTP_URI: &str = "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP";
+
+    /// An unlocked state with a plain item and an item with a TOTP field.
+    fn setup(dir: &std::path::Path, cx: &mut TestAppContext) -> (Entity<AppState>, Uuid, Uuid) {
+        let mut vault = SyncedVault::create(
+            &dir.join("t.vault"),
+            &SecretString::new("pw".into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let device = vault.device_id();
+        let (plain, totp) = vault
+            .edit(|v| {
+                let mut plain = Item::new("Plain", device, 10);
+                plain.fields.push(Field::new(
+                    "password",
+                    FieldKind::Password,
+                    SecretString::new("hunter2".into()),
+                    10,
+                ));
+                let mut totp = Item::new("With code", device, 10);
+                totp.fields.push(Field::new(
+                    "totp",
+                    FieldKind::Totp,
+                    SecretString::new(TOTP_URI.into()),
+                    10,
+                ));
+                (v.insert(plain, 10), v.insert(totp, 10))
+            })
+            .unwrap();
+        vault.save().unwrap();
+        cx.update(gpui_component::init);
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        state.update(cx, |s, _| s.install_unlocked_for_tests(vault));
+        (state, plain, totp)
+    }
+
+    fn open(state: &Entity<AppState>, id: Uuid, cx: &mut TestAppContext) -> AnyWindowHandle {
+        let handle = cx
+            .update(|cx| open_item_window(state.clone(), id, cx))
+            .unwrap();
+        cx.run_until_parked();
+        handle
+    }
+
+    fn window_count(cx: &mut TestAppContext) -> usize {
+        cx.update(|cx| cx.windows().len())
+    }
+
+    fn ticking(handle: AnyWindowHandle, cx: &mut TestAppContext) -> bool {
+        let root = handle.downcast::<Root>().unwrap();
+        cx.update(|cx| {
+            let view = root.read(cx).unwrap().view().clone();
+            view.downcast::<ItemWindow>()
+                .unwrap()
+                .read(cx)
+                .ticker
+                .is_some()
+        })
+    }
+
+    #[gpui::test]
+    fn second_open_focuses_the_existing_window(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, totp) = setup(dir.path(), cx);
+        let first = open(&state, plain, cx);
+        let other = open(&state, totp, cx);
+        cx.update_window(other, |_, window, _| window.activate_window())
+            .unwrap();
+        assert_eq!(cx.update(|cx| cx.active_window()), Some(other));
+        let before = window_count(cx);
+
+        let again = open(&state, plain, cx);
+        assert_eq!(again, first, "same window, not a new one");
+        assert_eq!(window_count(cx), before);
+        assert_eq!(
+            cx.update(|cx| cx.active_window()),
+            Some(first),
+            "brought forward"
+        );
+        assert_eq!(state.read_with(cx, |s, _| s.item_windows.len()), 2);
+        let title = gpui::VisualTestContext::from_window(first, cx).window_title();
+        assert_eq!(
+            title.as_deref(),
+            Some(TITLE),
+            "the item name stays out of the title"
+        );
+
+        // Closed by the user, then reopened: a fresh window, the dead handle forgotten.
+        cx.update_window(first, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        let reopened = open(&state, plain, cx);
+        assert_ne!(reopened, first);
+        state.read_with(cx, |s, _| {
+            assert_eq!(s.item_windows.len(), 2);
+            assert!(!s.item_windows.iter().any(|(_, h)| *h == first));
+        });
+    }
+
+    #[gpui::test]
+    fn lock_closes_item_windows(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, totp) = setup(dir.path(), cx);
+        let before = window_count(cx);
+        open(&state, plain, cx);
+        open(&state, totp, cx);
+        assert_eq!(window_count(cx), before + 2);
+        state.update(cx, |s, cx| s.lock(cx));
+        cx.run_until_parked();
+        assert_eq!(window_count(cx), before);
+        assert!(state.read_with(cx, |s, _| s.item_windows.is_empty()));
+    }
+
+    #[gpui::test]
+    fn vault_switch_closes_item_windows(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, _) = setup(dir.path(), cx);
+        let before = window_count(cx);
+        open(&state, plain, cx);
+        state.update(cx, |s, cx| s.switch_vault(ChooseIntent::Home, cx));
+        cx.run_until_parked();
+        assert_eq!(state.read_with(cx, |s, _| s.screen), Screen::Choose);
+        assert_eq!(window_count(cx), before);
+        assert!(state.read_with(cx, |s, _| s.item_windows.is_empty()));
+    }
+
+    #[gpui::test]
+    fn deleting_the_item_closes_its_window(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, totp) = setup(dir.path(), cx);
+        let before = window_count(cx);
+        let doomed = open(&state, plain, cx);
+        open(&state, totp, cx);
+        state.update(cx, |s, cx| {
+            s.select(plain, cx);
+            s.request_delete(cx);
+            s.confirm_delete(cx);
+        });
+        cx.run_until_parked();
+        assert!(state.read_with(cx, |s, _| {
+            s.unlocked_vault().unwrap().get(plain).unwrap().is_deleted()
+        }));
+        assert_eq!(
+            window_count(cx),
+            before + 1,
+            "only the deleted item's window"
+        );
+        assert!(!cx.update(|cx| cx.windows().contains(&doomed)));
+        assert_eq!(
+            state.update(cx, |s, cx| s.item_window(plain, cx)),
+            None,
+            "its handle is pruned"
+        );
+    }
+
+    #[gpui::test]
+    fn ticker_runs_only_with_a_totp_field(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, totp) = setup(dir.path(), cx);
+        let plain_window = open(&state, plain, cx);
+        let totp_window = open(&state, totp, cx);
+        assert!(!ticking(plain_window, cx), "no TOTP, no ticker");
+        assert!(ticking(totp_window, cx));
     }
 }

@@ -11,17 +11,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use vault_core::{
-    CsvMapping, ExposeSecret, Field, FieldKind, Item, ItemKind, KdfParams, LockedVault,
-    PassphraseSpec, PasswordSpec, Query, SecretString, Totp, UnlockedVault, Uuid, VaultError,
-    attachment::MAX_ATTACHMENT_SIZE, export_csv, import_csv, passphrase, password, search,
-    strength_bits,
+    CsvMapping, ExposeSecret, Field, FieldKind, Item, KdfParams, PassphraseSpec, PasswordSpec,
+    Query, SecretString, Totp, UnlockedVault, Uuid, VaultError, attachment::MAX_ATTACHMENT_SIZE,
+    export_csv, import_csv, passphrase, password, search, strength_bits,
 };
 use vault_sync::{AttachmentState, NoopHooks, SyncError, SyncedVault};
 
 #[derive(Parser)]
 #[command(name = "vault", about = "Dev/debug CLI for the vault password manager")]
 struct Cli {
-    /// Path to the vault file.
+    /// Path to the vault package directory (`<name>.vault`).
     #[arg(long, global = true, env = "VAULT_FILE")]
     vault: Option<PathBuf>,
     /// Read the master password from this environment variable instead of prompting.
@@ -52,8 +51,6 @@ enum Cmd {
     },
     /// List items.
     List {
-        #[arg(long)]
-        kind: Option<String>,
         #[arg(long)]
         tag: Option<String>,
         #[arg(long)]
@@ -108,8 +105,9 @@ enum AttachCmd {
 
 #[derive(Args)]
 struct AddArgs {
-    #[arg(long)]
-    kind: String,
+    /// Starting template: login, note, card or identity. Adds the matching tag.
+    #[arg(long, default_value = "login", value_parser = ["login", "note", "card", "identity"])]
+    template: String,
     #[arg(long)]
     title: String,
     #[arg(long)]
@@ -157,14 +155,6 @@ fn device_id() -> Result<Uuid> {
     vault_macos::try_device_id().context("resolving device id")
 }
 
-fn load(path: &Path, password: &SecretString) -> Result<UnlockedVault> {
-    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let locked = LockedVault::parse(&bytes)?;
-    let mut vault = locked.unlock(password)?;
-    vault.set_device_id(device_id()?);
-    Ok(vault)
-}
-
 /// Create a new file readable only by the owner; fails if it already exists.
 fn create_private(path: &Path) -> Result<fs::File> {
     OpenOptions::new()
@@ -175,47 +165,13 @@ fn create_private(path: &Path) -> Result<fs::File> {
         .with_context(|| format!("creating {}", path.display()))
 }
 
-fn store(path: &Path, vault: &UnlockedVault) -> Result<()> {
-    let name = path
-        .file_name()
-        .with_context(|| format!("{} has no file name", path.display()))?
-        .to_string_lossy();
-    let suffix = &Uuid::new_v4().simple().to_string()[..8];
-    let tmp = path.with_file_name(format!(".{name}.tmp-{suffix}"));
-    let result = (|| -> Result<()> {
-        let mut f = create_private(&tmp)?;
-        f.write_all(&vault.serialize())
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("syncing {}", tmp.display()))?;
-        fs::rename(&tmp, path)
-            .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))
-    })();
-    if let Err(e) = result {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    // Best effort: make the rename durable.
-    if let Some(parent) = path.parent() {
-        let parent = if parent.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            parent
-        };
-        if let Ok(d) = fs::File::open(parent) {
-            let _ = d.sync_all();
-        }
-    }
-    Ok(())
-}
-
 /// What `get` prints for a field: secrets are masked unless `reveal` is set.
 fn display_value(item: &Item, f: &Field, reveal: bool) -> String {
     let raw = f.value.expose_secret();
     if reveal {
         return raw.clone();
     }
-    if item.kind == ItemKind::Card && f.name == "number" {
+    if f.name == "number" && item.tags.iter().any(|t| t == "card") {
         let digits: Vec<char> = raw.chars().filter(|c| !c.is_whitespace()).collect();
         if digits.len() >= 4 {
             let last4: String = digits[digits.len() - 4..].iter().collect();
@@ -286,10 +242,6 @@ fn find_item(vault: &UnlockedVault, key: &str) -> Result<Uuid> {
     }
 }
 
-fn parse_kind(s: &str) -> Result<ItemKind> {
-    ItemKind::parse(s).with_context(|| format!("unknown kind {s:?} (login|note|card|identity)"))
-}
-
 /// Keep `VaultError` reachable for the exit-code mapping in `main`.
 fn sync_err(e: SyncError) -> anyhow::Error {
     match e {
@@ -302,6 +254,11 @@ fn open_synced(path: &Path, password: &SecretString) -> Result<SyncedVault> {
     let mut sv = SyncedVault::open(path, device_id()?, Arc::new(NoopHooks)).map_err(sync_err)?;
     sv.unlock(password).map_err(sync_err)?;
     Ok(sv)
+}
+
+fn open_cli(cli: &Cli) -> Result<SyncedVault> {
+    let path = vault_path(cli)?;
+    open_synced(&path, &master_password(cli, false)?)
 }
 
 fn synced_item(sv: &SyncedVault, key: &str) -> Result<Uuid> {
@@ -442,18 +399,12 @@ fn run(cli: Cli) -> Result<()> {
                 );
                 k
             };
-            let vault = UnlockedVault::create(&pw, kdf, device_id()?);
-            // Reserve the final path atomically; fails if it already exists.
-            drop(create_private(&path)?);
-            if let Err(e) = store(&path, &vault) {
-                let _ = fs::remove_file(&path);
-                return Err(e);
-            }
+            SyncedVault::create(&path, &pw, kdf, device_id()?, Arc::new(NoopHooks))
+                .map_err(sync_err)?;
             println!("created {}", path.display());
         }
         Cmd::Add(a) => {
             let path = vault_path(&cli)?;
-            let kind = parse_kind(&a.kind)?;
             let pw = master_password(&cli, false)?;
             let item_pw = if a.password_field {
                 Some(if cli.password_env.is_some() {
@@ -477,10 +428,40 @@ fn run(cli: Cli) -> Result<()> {
                 Totp::parse_uri(uri.expose_secret())
                     .map_err(|e| anyhow::anyhow!("invalid totp URI: {e}"))?;
             }
-            let mut vault = load(&path, &pw)?;
+            let mut sv = open_synced(&path, &pw)?;
             let now = now_millis();
-            let mut item = Item::new(kind, a.title.clone(), vault.device_id(), now);
+            let mut item = Item::new(a.title.clone(), sv.device_id(), now);
             item.tags = a.tags.clone();
+            if !item.tags.contains(&a.template) {
+                item.tags.push(a.template.clone());
+            }
+            match a.template.as_str() {
+                "login" => {
+                    if a.username.is_none() {
+                        item.fields.push(Field::new(
+                            "username",
+                            FieldKind::Text,
+                            SecretString::new(String::new()),
+                            now,
+                        ));
+                    }
+                    if item_pw.is_none() {
+                        item.fields.push(Field::new(
+                            "password",
+                            FieldKind::Password,
+                            SecretString::new(String::new()),
+                            now,
+                        ));
+                    }
+                }
+                "note" if a.notes.is_none() => item.fields.push(Field::new(
+                    "notes",
+                    FieldKind::Notes,
+                    SecretString::new(String::new()),
+                    now,
+                )),
+                _ => {}
+            }
             let mut push = |name: &str, kind: FieldKind, v: SecretString| {
                 item.fields.push(Field::new(name, kind, v, now));
             };
@@ -499,68 +480,66 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(v) = totp_uri {
                 push("totp", FieldKind::Totp, v);
             }
-            let id = vault.insert(item, now);
-            store(&path, &vault)?;
+            let id = sv.edit(|v| v.insert(item, now)).map_err(sync_err)?;
+            sv.save().map_err(sync_err)?;
             println!("{id}");
         }
         Cmd::Get {
             id_or_title,
             reveal,
         } => {
-            let path = vault_path(&cli)?;
-            let vault = load(&path, &master_password(&cli, false)?)?;
+            let sv = open_cli(&cli)?;
+            let vault = sv.vault().context("vault is locked")?;
             let item = vault
-                .get(find_item(&vault, id_or_title)?)
+                .get(find_item(vault, id_or_title)?)
                 .context("item vanished")?;
             println!("id:    {}", item.id);
             println!("title: {}", item.title);
-            println!("kind:  {}", item.kind_str());
             println!("tags:  {}", item.tags.join(", "));
             for f in &item.fields {
                 println!("{}: {}", f.name, display_value(item, f, *reveal));
             }
         }
         Cmd::List {
-            kind,
             tag,
             favorites,
             query,
         } => {
-            let path = vault_path(&cli)?;
-            let vault = load(&path, &master_password(&cli, false)?)?;
-            let kind = kind.as_deref().map(parse_kind).transpose()?;
+            let sv = open_cli(&cli)?;
+            let vault = sv.vault().context("vault is locked")?;
             let q = Query {
                 text: query.as_deref().unwrap_or(""),
-                kind,
                 tag: tag.as_deref(),
                 favorites_only: *favorites,
             };
-            for item in search(&vault, &q) {
+            for item in search(vault, &q) {
                 let short = &item.id.simple().to_string()[..8];
                 let user = item
                     .field("username")
                     .filter(|f| !f.kind.is_sensitive())
                     .map(|f| f.value.expose_secret().as_str())
                     .filter(|u| !u.is_empty());
+                let tags = item.tags.join(",");
                 match user {
-                    Some(u) => println!("{short}  {:<8}  {}  {u}", item.kind_str(), item.title),
-                    None => println!("{short}  {:<8}  {}", item.kind_str(), item.title),
+                    Some(u) => println!("{short}  {}  {u}  [{tags}]", item.title),
+                    None => println!("{short}  {}  [{tags}]", item.title),
                 }
             }
         }
         Cmd::Rm { id_or_title } => {
-            let path = vault_path(&cli)?;
-            let mut vault = load(&path, &master_password(&cli, false)?)?;
-            let id = find_item(&vault, id_or_title)?;
-            vault.delete(id, now_millis())?;
-            store(&path, &vault)?;
+            let mut sv = open_cli(&cli)?;
+            let id = synced_item(&sv, id_or_title)?;
+            sv.edit(|v| v.delete(id, now_millis()))
+                .map_err(sync_err)?
+                .map_err(anyhow::Error::from)?;
+            sv.save().map_err(sync_err)?;
             println!("deleted {id}");
         }
         Cmd::Totp { id_or_title } => {
-            let path = vault_path(&cli)?;
-            let vault = load(&path, &master_password(&cli, false)?)?;
+            let sv = open_cli(&cli)?;
+            let vault = sv.vault().context("vault is locked")?;
             let item = vault
-                .get(find_item(&vault, id_or_title)?)
+                .get(find_item(vault, id_or_title)?)
                 .context("item vanished")?;
             let field = item
                 .fields
@@ -586,8 +565,8 @@ fn run(cli: Cli) -> Result<()> {
             if !*yes {
                 bail!("export writes ALL secrets in plaintext; re-run with --yes to confirm");
             }
-            let path = vault_path(&cli)?;
-            let vault = load(&path, &master_password(&cli, false)?)?;
+            let sv = open_cli(&cli)?;
+            let vault = sv.vault().context("vault is locked")?;
             eprintln!(
                 "WARNING: writing UNENCRYPTED passwords and secrets to {}",
                 out.display()
@@ -595,7 +574,7 @@ fn run(cli: Cli) -> Result<()> {
             eprintln!(
                 "WARNING: anyone who can read that file can read every secret. Delete it after use."
             );
-            let export = export_csv(&vault);
+            let export = export_csv(vault);
             let mut f = if *force {
                 let f = OpenOptions::new()
                     .write(true)
@@ -619,16 +598,18 @@ fn run(cli: Cli) -> Result<()> {
             if format != "csv" {
                 bail!("unsupported format {format:?}");
             }
-            let path = vault_path(&cli)?;
-            let mut vault = load(&path, &master_password(&cli, false)?)?;
+            let mut sv = open_cli(&cli)?;
             let bytes = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
             let now = now_millis();
-            let items = import_csv(&bytes, &CsvMapping::default(), vault.device_id(), now)?;
+            let items = import_csv(&bytes, &CsvMapping::default(), sv.device_id(), now)?;
             let count = items.len();
-            for item in items {
-                vault.insert(item, now);
-            }
-            store(&path, &vault)?;
+            sv.edit(|v| {
+                for item in items {
+                    v.insert(item, now);
+                }
+            })
+            .map_err(sync_err)?;
+            sv.save().map_err(sync_err)?;
             println!("imported {count} items");
         }
     }
@@ -665,8 +646,11 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
-    fn item(kind: ItemKind, fname: &str, fkind: FieldKind, v: &str) -> Item {
-        let mut i = Item::new(kind, "t", Uuid::nil(), 0);
+    fn item(card: bool, fname: &str, fkind: FieldKind, v: &str) -> Item {
+        let mut i = Item::new("t", Uuid::nil(), 0);
+        if card {
+            i.tags.push("card".to_owned());
+        }
         i.fields
             .push(Field::new(fname, fkind, SecretString::new(v.to_owned()), 0));
         i
@@ -675,28 +659,23 @@ mod tests {
     #[test]
     fn masks_totp_and_password() {
         let uri = "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP";
-        let i = item(ItemKind::Login, "totp", FieldKind::Totp, uri);
+        let i = item(false, "totp", FieldKind::Totp, uri);
         assert_eq!(display_value(&i, &i.fields[0], false), "********");
         assert_eq!(display_value(&i, &i.fields[0], true), uri);
-        let i = item(ItemKind::Login, "password", FieldKind::Password, "pw");
+        let i = item(false, "password", FieldKind::Password, "pw");
         assert_eq!(display_value(&i, &i.fields[0], false), "********");
     }
 
     #[test]
     fn masks_card_number_to_last4() {
-        let i = item(
-            ItemKind::Card,
-            "number",
-            FieldKind::Text,
-            "4111 1111 1111 1234",
-        );
+        let i = item(true, "number", FieldKind::Text, "4111 1111 1111 1234");
         let masked = display_value(&i, &i.fields[0], false);
         assert!(
             masked.ends_with(" 1234") && !masked.contains("4111"),
             "{masked}"
         );
         assert_eq!(display_value(&i, &i.fields[0], true), "4111 1111 1111 1234");
-        let short = item(ItemKind::Card, "number", FieldKind::Text, "12");
+        let short = item(true, "number", FieldKind::Text, "12");
         assert_eq!(display_value(&short, &short.fields[0], false), "********");
     }
 }

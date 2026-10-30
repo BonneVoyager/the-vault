@@ -1,11 +1,12 @@
 //! Attachment methods of [`SyncedVault`] (03 §1.1, §8, v1.1). Blobs are immutable, so the
-//! watcher, merge, conflict copies and backups never touch them; only `add_attachment` writes
-//! one and only orphan cleanup after `save` deletes one.
+//! watcher, merge and backups never touch them. `add_attachment` writes one, absorbing a
+//! conflicted package copies in the blobs we lack (03 §6), and only orphan cleanup (after a
+//! `save` that wrote, and once after `unlock`) deletes one.
 
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use vault_core::attachment;
@@ -14,13 +15,13 @@ use vault_core::{Millis, Uuid, VaultError};
 use super::{DOWNLOAD_TIMEOUT, SyncedVault};
 use crate::atomic::{Mode, write_atomic_stream};
 use crate::attachments::{self, AttachmentReader, AttachmentState};
-use crate::backup;
 use crate::cloud::CloudError;
 use crate::error::SyncError;
 use crate::event::SyncEvent;
+use crate::package;
 
 impl SyncedVault {
-    /// `<dir>/<name>.vault.attachments/`. Created (mode 0700) by the first `add_attachment`.
+    /// `<name>.vault/attachments/`. Created (mode 0700) by the first `add_attachment`.
     pub fn attachments_dir(&self) -> PathBuf {
         attachments::attachments_dir(&self.path)
     }
@@ -50,7 +51,7 @@ impl SyncedVault {
         let vault_id = vault.vault_id();
 
         let dir = self.attachments_dir();
-        backup::ensure_dir(&dir)?;
+        package::ensure_dir(&dir)?;
         let id = r.id;
         let blob = attachments::blob_path(&self.path, id);
         // `seal` consumes the reference and hands it back only on success (one ref, one seal).
@@ -159,8 +160,8 @@ impl SyncedVault {
         self.prune_clock_offset = offset;
     }
 
-    /// Orphan cleanup (03 §1.1), run after a save that wrote the file, when disk and memory
-    /// agree. Failures are logged, never returned: the save itself succeeded.
+    /// Orphan cleanup (03 §1.1), run after a save that wrote the file and once after a
+    /// successful unlock, when disk and memory agree. Failures are logged, never returned.
     pub(super) fn prune_orphan_attachments(&self) {
         let Some(vault) = &self.unlocked else {
             return;
@@ -172,5 +173,52 @@ impl SyncedVault {
             Ok(n) => self.emit(SyncEvent::AttachmentsPruned(n)),
             Err(e) => tracing::warn!(error = %e, "attachment orphan cleanup failed"),
         }
+    }
+
+    /// 03 §6: copy every blob in `from`'s `attachments/` that we lack into ours (atomic,
+    /// 0600, never replacing an existing blob: blobs are immutable, so an existing one with the
+    /// same id is the same blob). Each source is downloaded first; any failure stops the copy
+    /// and is returned so the caller leaves the conflicted package in place. Returns the
+    /// number of blobs copied.
+    pub(super) fn copy_missing_blobs(&self, from: &Path) -> Result<usize, SyncError> {
+        let src_dir = package::attachments_dir(from);
+        let entries = match fs::read_dir(&src_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(SyncError::io(&src_dir, e)),
+        };
+        let mut copied = 0;
+        for entry in entries {
+            let entry = entry.map_err(|e| SyncError::io(&src_dir, e))?;
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(attachments::parse_blob_name) else {
+                continue;
+            };
+            let src = entry.path();
+            let dst = attachments::blob_path(&self.path, id);
+            if fs::symlink_metadata(&dst).is_ok() || self.hooks.is_evicted(&dst) {
+                continue;
+            }
+            if !fs::symlink_metadata(&src).is_ok_and(|m| m.is_file())
+                && !self.hooks.is_evicted(&src)
+            {
+                continue;
+            }
+            self.hooks.ensure_downloaded(&src, DOWNLOAD_TIMEOUT)?;
+            let mut input = File::open(&src).map_err(|e| SyncError::io(&src, e))?;
+            package::ensure_dir(&self.attachments_dir())?;
+            match write_atomic_stream(&dst, Mode::NoReplace, |file, tmp| {
+                std::io::copy(&mut input, file)
+                    .map(drop)
+                    .map_err(|e| SyncError::io(tmp, e))
+            }) {
+                Ok(()) => copied += 1,
+                // Raced with another copy of the same immutable blob.
+                Err(SyncError::AlreadyExists(_)) => {}
+                Err(e) => return Err(e),
+            }
+            tracing::debug!(attachment = %id, "copied blob from conflicted package");
+        }
+        Ok(copied)
     }
 }

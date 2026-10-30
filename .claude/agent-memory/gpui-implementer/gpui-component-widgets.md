@@ -70,3 +70,5 @@ Verified 2026-10-29 (cursors, 0.8.1):
 - Dialog's built-in close button (absolute top-right, gpui-base `DialogClose`) keeps the arrow: use `.close_button(false)` and put your own button in `.title(element)` (title accepts any element; give it `w_full()`).
 - gpui-component Switch's outer wrapper has no element id; the inner gpui-base switch carries the id.
 - vault-app rule: every click target goes through `ui::Clickable` (`.clickable()` / `.clickable_when(enabled)`; false sets the arrow explicitly). `ui::icon_button` already includes `.clickable()`.
+
+Verified 2026-10-30 (no-categories change): `IconName` (generated in gpui-kit-assets build.rs) derives Clone, Copy, Debug, Eq, PartialEq, Hash, so `format!("{icon:?}")` gives "KeyRound" and works in debug selectors. `Tag` implements `Styled` (`Tag::secondary().small().flex_none()` compiles). Removable chip (Tag small + xsmall icon button) is 26 px tall vs 24 px for the small Input at rem 13: a wrapping chip row grows 2 px on the first chip. Fix that kept layout stable: `h_flex().id(..).flex_none().h(theme::scaled(28.))` + `.items_center().overflow_x_scroll()` (no `flex_wrap`), children `flex_none`.

@@ -4,7 +4,7 @@ use std::io::Write;
 
 use serde_json::{Value, json};
 use vault_core::import::{ImportError, import_1pux};
-use vault_core::{ExposeSecret, FieldKind, Item, ItemKind, Uuid};
+use vault_core::{ExposeSecret, FieldKind, Item, Uuid};
 
 const NOW: u64 = 1_700_000_000_000;
 
@@ -93,14 +93,10 @@ fn imports_active_items() {
     }
     let ids: std::collections::HashSet<_> = items.iter().map(|i| i.id).collect();
     assert_eq!(ids.len(), 4);
+    // Categories map to template tags (item kinds were removed on 2026-10-30).
     assert_eq!(
-        items.iter().map(|i| i.kind).collect::<Vec<_>>(),
-        [
-            ItemKind::Login,
-            ItemKind::Note,
-            ItemKind::Card,
-            ItemKind::Identity
-        ]
+        items.iter().map(|i| i.tags[0].as_str()).collect::<Vec<_>>(),
+        ["login", "note", "card", "identity"]
     );
     assert!(items.iter().all(|i| i.title != "Old"));
     assert_eq!(items[3].title, "Untitled");
@@ -112,7 +108,7 @@ fn login_fields_tags_favorite_history() {
     let login = &items[0];
     assert_eq!(login.title, "Example");
     assert!(login.favorite);
-    assert_eq!(login.tags, ["work", "dev"]);
+    assert_eq!(login.tags, ["login", "work", "dev"]);
     assert_eq!(val(login, "username"), "alice");
     assert_eq!(login.field("username").unwrap().kind, FieldKind::Text);
     assert_eq!(val(login, "password"), "s3cret");
@@ -168,6 +164,24 @@ fn card_note_identity() {
         id.field("first name").unwrap().section.as_deref(),
         Some("Name")
     );
+}
+
+#[test]
+fn template_tag_dedups_case_insensitively_with_source_tags() {
+    // The source already tags the item "Login" / "CARD": keep its spelling and position, do
+    // not add a second copy. Items without such a tag get the lowercase template tag first.
+    let data = export(vec![
+        json!({"state": "active", "categoryUuid": "001",
+               "details": {}, "overview": {"title": "A", "tags": ["work", "Login"]}}),
+        json!({"state": "active", "categoryUuid": "002",
+               "details": {}, "overview": {"title": "B", "tags": ["CARD"]}}),
+        json!({"state": "active", "categoryUuid": "004",
+               "details": {}, "overview": {"title": "C", "tags": ["x"]}}),
+    ]);
+    let items = import_1pux(&archive(&data), Uuid::nil(), NOW).unwrap();
+    assert_eq!(items[0].tags, ["work", "Login"]);
+    assert_eq!(items[1].tags, ["CARD"]);
+    assert_eq!(items[2].tags, ["identity", "x"]);
 }
 
 #[test]

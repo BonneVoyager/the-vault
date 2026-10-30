@@ -218,7 +218,7 @@ mod tests {
     use std::path::Path;
 
     use gpui::{AppContext as _, Entity, TestAppContext};
-    use vault_core::{Field, FieldKind, Item, ItemKind, KdfParams, Uuid};
+    use vault_core::{Field, FieldKind, Item, KdfParams, Uuid};
     use vault_sync::{NoopHooks, SyncedVault};
 
     use super::fake::FakeScanner;
@@ -244,7 +244,7 @@ mod tests {
         let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
         let key = state.update(cx, |st, _| {
             st.install_unlocked_for_tests(vault);
-            let mut item = Item::new(ItemKind::Login, "Example", st.device_id(), 1);
+            let mut item = Item::new("Example", st.device_id(), 1);
             item.fields = vec![Field::new("one-time code", FieldKind::Totp, s(""), 1)];
             st.mode = Mode::Edit(EditBuffer::new(item));
             st.edit_buffer().unwrap().keys[0]
@@ -282,7 +282,7 @@ mod tests {
             st.scan_totp_qr_image(key, PathBuf::from("/tmp/qr.png"), cx);
             // Cancel, then edit another item whose TOTP field has the same row key.
             st.mode = Mode::View;
-            let mut other = Item::new(ItemKind::Login, "Other", st.device_id(), 1);
+            let mut other = Item::new("Other", st.device_id(), 1);
             other.fields = vec![Field::new("one-time code", FieldKind::Totp, s(""), 1)];
             st.mode = Mode::Edit(EditBuffer::new(other));
             st.edit_session = st.edit_session.wrapping_add(1);
@@ -363,7 +363,7 @@ mod tests {
         state.update(cx, |st, cx| {
             st.set_qr_scanner(FakeScanner::returning(Ok(vec![s(VALID)])));
             st.scan_totp_qr_image(key, path.clone(), cx);
-            let mut other = Item::new(ItemKind::Login, "Other", st.device_id(), 1);
+            let mut other = Item::new("Other", st.device_id(), 1);
             other.fields = vec![Field::new("one-time code", FieldKind::Totp, s(""), 1)];
             st.mode = Mode::Edit(EditBuffer::new(other));
             st.edit_session = st.edit_session.wrapping_add(1);
@@ -391,7 +391,7 @@ mod tests {
                     // back afterwards so a write would be observable.
                     st.lock(cx);
                     assert!(st.locked);
-                    let mut item = Item::new(ItemKind::Login, "Example", st.device_id(), 1);
+                    let mut item = Item::new("Example", st.device_id(), 1);
                     item.fields = vec![Field::new("one-time code", FieldKind::Totp, s(""), 1)];
                     st.mode = Mode::Edit(EditBuffer::new(item));
                     st.toast = None;

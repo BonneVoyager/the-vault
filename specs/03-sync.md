@@ -8,21 +8,24 @@ Dependencies: `vault-core`, `notify` (+ `notify-debouncer-full`), `tempfile`, `f
 
 ```
 <dir>/
-  <name>.vault                      the vault
-  <name>.vault.attachments/         (v1.1)
-  <name>.vault.backups/
-    <name>-2026-10-28T14-03-11Z.vault
-    ...
-  .<name>.vault.tmp-<8 hex>         transient; never left behind on clean exit
+  <name>.vault/                     a macOS package (directory shown as one icon; UTI dev.aurora.vault, LSTypeIsPackage)
+    vault.bin                       the vault file (format per 01, unchanged)
+    attachments/<id hex>.bin        (v1.1)
+    backups/
+      <name>-2026-10-28T14-03-11Z.vault.bin
+      ...
+    .vault.bin.tmp-<8 hex>          transient; never left behind on clean exit
 ```
+
+Decided 2026-10-30, before any real vault existed: the package replaces the former `<name>.vault` file plus `<name>.vault.attachments/` and `<name>.vault.backups/` siblings. One Finder item to drag, copy, delete or back up; cloud providers sync the files inside individually, so writes stay small. Without the app installed the package shows as a plain folder, which is intact. Conflict copies come in two shapes (§6): whole sibling packages (iCloud) and per-file copies of `vault.bin` inside the package (Dropbox, Google Drive, Syncthing). Both are absorbed and moved into `backups/`.
 
 Everything in `.backups/` is a complete, independently-openable vault file. Backups are encrypted; the directory is safe to sync.
 
 ### 1.1 Attachments directory
 
-`<name>.vault.attachments/<id hex>.bin`, one immutable blob per attachment (`01` §4). Writes are atomic (tmp + fsync + rename, mode 0600) like the vault. Reads call `ensure_downloaded` first; an evicted or absent blob is reported as `AttachmentState::NotDownloaded` / `Missing`, never as an error that blocks the item. Blobs are immutable, so there is nothing to merge.
+`<name>.vault/attachments/<id hex>.bin`, one immutable blob per attachment (`01` §4). Writes are atomic (tmp + fsync + rename, mode 0600) like the vault. Reads call `ensure_downloaded` first; an evicted or absent blob is reported as `AttachmentState::NotDownloaded` / `Missing`, never as an error that blocks the item. Blobs are immutable, so there is nothing to merge.
 
-**Orphan cleanup**: after each `save` that wrote the file, a blob whose id is referenced by no item (live or tombstoned) is deleted once it has been present locally for more than 24 h. "Present locally" is measured from `max(mtime, ctime)`: cloud providers preserve the source device's mtime, but ctime is set by the local kernel on create or rename and cannot be forged, so a peer's blob that arrives before its vault file always gets the full grace period. The same rule applies to stale tmp files (1 h). Cleanup never runs while locked. References are judged by this device's state after the pre-save merge; a reference a peer holds only in memory does not protect its blob once the grace period has passed (the app's 2 s autosave keeps that window theoretical). Deleting an item keeps its refs on the tombstone until `purge_tombstones_older_than`, so the other device learns about the deletion before the blob can go.
+**Orphan cleanup**: after each `save` that wrote the file, and once after a successful unlock from locked (only when the primary was read, nothing is dirty and saving is not blocked), a blob whose id is referenced by no item (live or tombstoned) is deleted once it has been present locally for more than 24 h. "Present locally" is measured from `max(mtime, ctime)`: cloud providers preserve the source device's mtime, but ctime is set by the local kernel on create or rename and cannot be forged, so a peer's blob that arrives before its vault file always gets the full grace period. The same rule applies to stale tmp files (1 h). Cleanup never runs while locked. References are judged by this device's state after the pre-save merge; a reference a peer holds only in memory does not protect its blob once the grace period has passed (the app's 2 s autosave keeps that window theoretical). Deleting an item keeps its refs on the tombstone until `purge_tombstones_older_than`, so the other device learns about the deletion before the blob can go.
 
 **Limitation (owner decision 2026-10-29): attachments are not backed up.** Snapshots copy only the vault file. Restoring a backup may yield references whose blobs are gone; those show as `Missing`. Attachment size cap 100 MB per file.
 
@@ -30,10 +33,10 @@ Everything in `.backups/` is a complete, independently-openable vault file. Back
 
 ```
 1. bytes = vault.serialize()
-2. write bytes to <dir>/.<name>.vault.tmp-<rand>   (O_CREAT|O_EXCL, mode 0600)
+2. write bytes to <name>.vault/.vault.bin.tmp-<rand>   (O_CREAT|O_EXCL, mode 0600)
 3. fsync(tmp)
-4. rename(tmp, <dir>/<name>.vault)                 atomic on APFS / HFS+ / ext4
-5. fsync(dir)                                      best-effort; ignore ENOTSUP
+4. rename(tmp, <name>.vault/vault.bin)             atomic on APFS / HFS+ / ext4
+5. fsync(package dir)                              best-effort; ignore ENOTSUP
 6. record (mtime, size, blake3(bytes)) as `last_written`
 7. maybe_backup(bytes)                             §4
 ```
@@ -42,9 +45,9 @@ Never write in place. Never truncate-then-write. If step 4 fails, delete the tmp
 
 ## 3. Watching and reacting to external changes
 
-Watcher: `notify` recursive on `<dir>` (non-recursive is enough, but iCloud sometimes fires on the parent), debounced 500 ms. Events on paths other than `<name>.vault` and conflict-copy patterns (§6) are ignored.
+Watcher: one `notify` recursive watch on the package's PARENT directory with no initial tree scan, debounced 500 ms (a second watch would restart the FSEvents stream). Classification: the package dir or `<name>.vault/vault.bin` → primary changed; `<name>.vault/attachments/**`, `backups/**` and tmp files → ignored; sibling `X.vault/` packages, `X.vault/vault.bin`, `X.vault/attachments/*` (a late blob re-triggers a deferred package move), and `<name>.vault/vault*.bin` files other than `vault.bin` → conflict candidates (§6); deeper paths ignored.
 
-On a debounced event for `<name>.vault`:
+On a debounced event for `<name>.vault/vault.bin`:
 
 ```
 1. stat the file. If (mtime, size) == last_written → ignore (our own write echoing back).
@@ -119,9 +122,9 @@ Clock skew: timestamps come from each device's wall clock. If skew exceeds a few
 
 Cloud providers resolve simultaneous writes by creating a sibling file instead of merging. Patterns to detect (case-insensitive, in `<dir>` only):
 
-- Dropbox: `<name> (<host>'s conflicted copy <date>).vault`
-- iCloud: `<name> 2.vault`, `<name> 3.vault`, … (iCloud renames the loser with a numeric suffix)
-- Generic: any `*.vault` in `<dir>` whose header `vault_id` equals ours and whose path is not the primary
+- Whole-package (iCloud): `<name> 2.vault/`, `<name> 3.vault/`, … and `<name> (<host>'s conflicted copy <date>).vault/`
+- Per-file (Dropbox, Google Drive, Syncthing sync the files inside the package individually): `<name>.vault/vault (<host>'s conflicted copy <date>).bin`, `<name>.vault/vault 2.bin`, …
+- Generic: any such candidate whose header `vault_id` equals ours
 
 On watcher event for a file matching the Dropbox pattern or any new `*.vault` in `<dir>`:
 
@@ -129,7 +132,7 @@ On watcher event for a file matching the Dropbox pattern or any new `*.vault` in
 1. parse; if vault_id != ours → ignore (it's some other vault the user put there)
 2. unlock with cached key (if locked, defer to next unlock; keep a list of pending conflict paths)
 3. ours.merge_from(theirs); save()
-4. move the conflict file to <name>.vault.backups/conflict-<timestamp>-<original filename>
+4. whole-package: copy any attachment blobs we lack (never replacing), then move the whole package to <name>.vault/backups/conflict-<timestamp>-<original name>/ — deferred to the next event while blobs referenced by the merged items are still missing from both sides; per-file: move the file to <name>.vault/backups/conflict-<timestamp>-<original name>.vault.bin
 5. emit SyncEvent::ConflictAbsorbed(path)
 ```
 

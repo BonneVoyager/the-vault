@@ -1,10 +1,11 @@
-//! Watcher-driven reconciliation (03 §3, §6, §9): two instances on one path, conflicted copies,
-//! corruption, changes while locked, key rotation by another device.
+//! Watcher-driven reconciliation (03 §1, §3, §6, §9): two instances on one package, conflicted
+//! packages, corruption, changes while locked, key rotation by another device.
 //!
 //! Flakiness guards: every wait is a deadline loop around `poll()` (never a bare sleep for a
-//! positive assertion); planted files are written to a hidden tmp name and renamed in, so the
-//! watcher never sees a half-written `.vault`; the only fixed wait is the negative "no echo"
-//! check, which waits several debounce windows.
+//! positive assertion); planted files are written to a hidden tmp name and renamed in, and
+//! planted packages are filled under a hidden name and renamed in, so the watcher never sees a
+//! half-written `vault.bin`; the only fixed waits are the negative checks, which wait several
+//! debounce windows.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,9 +17,12 @@ use crossbeam_channel::Receiver;
 use tempfile::TempDir;
 use vault_core::format::VaultFile;
 use vault_core::{
-    ExposeSecret, Field, FieldKind, Item, ItemKind, KdfParams, LockedVault, SecretString, Uuid,
+    ExposeSecret, Field, FieldKind, Item, KdfParams, LockedVault, SecretString, Uuid,
 };
-use vault_sync::{BackupKind, DEBOUNCE, NoopHooks, SaveBlocked, SyncError, SyncEvent, SyncedVault};
+use vault_sync::{
+    BackupKind, DEBOUNCE, NoopHooks, SaveBlocked, SyncError, SyncEvent, SyncedVault,
+    VAULT_FILE_NAME,
+};
 
 const T0: u64 = 1_700_000_000_000;
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -71,12 +75,12 @@ fn wait_until(mut done: impl FnMut() -> bool) -> bool {
 }
 
 /// Device A creates the vault with one login (username + password), saves, and device B opens
-/// and unlocks it. Neither is watching yet.
+/// and unlocks it. Neither is watching yet. The returned path is the package's `vault.bin`.
 fn two_devices() -> (TempDir, PathBuf, SyncedVault, SyncedVault, Uuid) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("test.vault");
+    let package = dir.path().join("test.vault");
     let mut a = SyncedVault::create(
-        &path,
+        &package,
         &pw(),
         KdfParams::for_tests(),
         DEV_A,
@@ -85,7 +89,7 @@ fn two_devices() -> (TempDir, PathBuf, SyncedVault, SyncedVault, Uuid) {
     .unwrap();
     let id = a
         .edit(|v| {
-            let mut item = Item::new(ItemKind::Login, "mail", Uuid::nil(), T0);
+            let mut item = Item::new("mail", Uuid::nil(), T0);
             item.fields
                 .push(Field::new("username", FieldKind::Text, secret("alice"), T0));
             item.fields.push(Field::new(
@@ -98,9 +102,9 @@ fn two_devices() -> (TempDir, PathBuf, SyncedVault, SyncedVault, Uuid) {
         })
         .unwrap();
     a.save().unwrap();
-    let mut b = SyncedVault::open(&path, DEV_B, Arc::new(NoopHooks)).unwrap();
+    let mut b = SyncedVault::open(&package, DEV_B, Arc::new(NoopHooks)).unwrap();
     b.unlock(&pw()).unwrap();
-    (dir, path, a, b, id)
+    (dir, package.join(VAULT_FILE_NAME), a, b, id)
 }
 
 fn field(v: &SyncedVault, id: Uuid, name: &str) -> Option<String> {
@@ -131,6 +135,34 @@ fn plant(dst: &Path, bytes: &[u8]) {
     let tmp = dst.with_file_name(".planting.tmp");
     fs::write(&tmp, bytes).unwrap();
     fs::rename(&tmp, dst).unwrap();
+}
+
+/// Put a package holding `vault.bin` = `bytes` at `dst` in one rename (filled under a hidden
+/// name first). An existing package there is swapped out in the same instant and deleted.
+fn plant_package(dst: &Path, bytes: &[u8]) {
+    let staging = dst.with_file_name(".staging-package");
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join(VAULT_FILE_NAME), bytes).unwrap();
+    let old = dst.with_file_name(".old-package");
+    let replaced = dst.exists();
+    if replaced {
+        fs::rename(dst, &old).unwrap();
+    }
+    fs::rename(&staging, dst).unwrap();
+    if replaced {
+        fs::remove_dir_all(&old).unwrap();
+    }
+}
+
+/// Poll for several debounce windows; returns the number of signals drained.
+fn drain_for(v: &mut SyncedVault, windows: u32) -> usize {
+    let mut drained = 0;
+    let until = Instant::now() + DEBOUNCE * windows;
+    while Instant::now() < until {
+        drained += v.poll();
+        thread::sleep(Duration::from_millis(25));
+    }
+    drained
 }
 
 fn on_disk(path: &Path) -> LockedVault {
@@ -255,15 +287,15 @@ fn own_save_is_not_merged() {
     );
 }
 
-/// B's unsaved state (one extra item) written as a sibling named `name`; A absorbs it.
+/// B's unsaved state (one extra item) written as a sibling package named `name`; A absorbs it.
 fn absorb_sibling(name: &str) {
     let (dir, path, mut a, mut b, _id) = two_devices();
     a.start_watching().unwrap();
     let mut ea = Events::new(&a);
-    b.edit(|v| v.insert(Item::new(ItemKind::Login, "from b", Uuid::nil(), T0), T0))
+    b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
         .unwrap();
     let copy = dir.path().join(name);
-    plant(&copy, &b.vault().unwrap().serialize());
+    plant_package(&copy, &b.vault().unwrap().serialize());
 
     assert!(
         wait_until(|| {
@@ -288,8 +320,10 @@ fn absorb_sibling(name: &str) {
     assert!(moved_name.ends_with(&format!("-{name}")), "{moved_name}");
     assert_eq!(
         moved.parent().unwrap(),
-        dir.path().join("test.vault.backups")
+        dir.path().join("test.vault").join("backups")
     );
+    // The whole package moved.
+    assert!(moved.join(VAULT_FILE_NAME).is_file());
     assert!(
         a.backups()
             .unwrap()
@@ -326,16 +360,16 @@ fn foreign_vault_sibling_is_left_alone() {
         Arc::new(NoopHooks),
     )
     .unwrap();
-    let bytes = fs::read(&other_path).unwrap();
+    let bytes = fs::read(other_path.join(VAULT_FILE_NAME)).unwrap();
     let planted = dir.path().join("other.vault");
-    plant(&planted, &bytes);
+    plant_package(&planted, &bytes);
 
     assert!(wait_until(|| {
         a.poll();
         ea.pump();
         ea.any(|e| *e == SyncEvent::ForeignVault)
     }));
-    assert_eq!(fs::read(&planted).unwrap(), bytes);
+    assert_eq!(fs::read(planted.join(VAULT_FILE_NAME)).unwrap(), bytes);
     assert!(!ea.any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_))));
     assert_eq!(titles(&a), ["mail"]);
 }
@@ -365,7 +399,7 @@ fn change_while_locked_is_seen_at_unlock() {
     a.start_watching().unwrap();
     a.lock();
     let mut ea = Events::new(&a);
-    b.edit(|v| v.insert(Item::new(ItemKind::Login, "from b", Uuid::nil(), T0), T0))
+    b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
         .unwrap();
     b.save().unwrap();
 
@@ -386,7 +420,7 @@ fn key_rotation_elsewhere_reports_mismatch_and_reverify_merges() {
     b.start_watching().unwrap();
     let mut ea = Events::new(&a);
     b.edit(|v| v.rotate_vault_key(&pw())).unwrap().unwrap();
-    b.edit(|v| v.insert(Item::new(ItemKind::Login, "from b", Uuid::nil(), T0), T0))
+    b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
         .unwrap();
     b.save().unwrap();
     let rotated = fs::read(&path).unwrap();
@@ -398,7 +432,7 @@ fn key_rotation_elsewhere_reports_mismatch_and_reverify_merges() {
     }));
     // In-memory untouched, disk untouched, saving refused.
     assert_eq!(titles(&a), ["mail"]);
-    a.edit(|v| v.insert(Item::new(ItemKind::Login, "from a", Uuid::nil(), T0), T0))
+    a.edit(|v| v.insert(Item::new("from a", Uuid::nil(), T0), T0))
         .unwrap();
     assert!(matches!(a.save(), Err(SyncError::KeyMismatch)));
     assert_eq!(fs::read(&path).unwrap(), rotated);
@@ -419,10 +453,10 @@ fn key_rotation_elsewhere_reports_mismatch_and_reverify_merges() {
 fn conflict_seen_while_locked_is_absorbed_on_unlock() {
     let (dir, _path, mut a, mut b, _id) = two_devices();
     a.lock();
-    b.edit(|v| v.insert(Item::new(ItemKind::Login, "from b", Uuid::nil(), T0), T0))
+    b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
         .unwrap();
     let copy = dir.path().join("test 2.vault");
-    plant(&copy, &b.vault().unwrap().serialize());
+    plant_package(&copy, &b.vault().unwrap().serialize());
 
     // Starting the watcher queues existing siblings; the locked poll defers them.
     a.start_watching().unwrap();
@@ -473,7 +507,7 @@ fn newer_format_primary_is_reported_and_never_overwritten() {
 #[test]
 fn tampered_primary_keeps_in_memory_and_is_rewritten() {
     let (_dir, path, mut a, _b, _id) = two_devices();
-    a.edit(|v| v.insert(Item::new(ItemKind::Login, "second", Uuid::nil(), T0), T0))
+    a.edit(|v| v.insert(Item::new("second", Uuid::nil(), T0), T0))
         .unwrap();
     a.save().unwrap();
     a.start_watching().unwrap();
@@ -540,7 +574,7 @@ fn foreign_sibling_is_reported_once_per_content() {
     };
     let planted = dir.path().join("other.vault");
     let first = foreign(1);
-    plant(&planted, &first);
+    plant_package(&planted, &first);
     let is_foreign = |e: &SyncEvent| *e == SyncEvent::ForeignVault;
     assert!(wait_until(|| {
         a.poll();
@@ -548,20 +582,15 @@ fn foreign_sibling_is_reported_once_per_content() {
         ea.count(is_foreign) == 1
     }));
 
-    // Same bytes again (new inode, new events): not reported again.
-    plant(&planted, &first);
-    let mut drained = 0;
-    let until = Instant::now() + DEBOUNCE * 5;
-    while Instant::now() < until {
-        drained += a.poll();
-        thread::sleep(Duration::from_millis(25));
-    }
+    // Same bytes again (new package, new events): not reported again.
+    plant_package(&planted, &first);
+    let drained = drain_for(&mut a, 5);
     ea.pump();
     assert!(drained > 0, "rewrite produced no watcher signal");
     assert_eq!(ea.count(is_foreign), 1);
 
     // Different content: reported again.
-    plant(&planted, &foreign(2));
+    plant_package(&planted, &foreign(2));
     assert!(wait_until(|| {
         a.poll();
         ea.pump();
@@ -605,7 +634,7 @@ fn foreign_primary_then_clean_lock_preserves_our_state() {
 #[test]
 fn tampered_primary_then_lock_without_save_is_rewritten_after_unlock() {
     let (_dir, path, mut a, _b, _id) = two_devices();
-    a.edit(|v| v.insert(Item::new(ItemKind::Login, "second", Uuid::nil(), T0), T0))
+    a.edit(|v| v.insert(Item::new("second", Uuid::nil(), T0), T0))
         .unwrap();
     a.save().unwrap();
     a.start_watching().unwrap();
@@ -638,10 +667,10 @@ fn restore_while_locked_absorbs_queued_conflicts() {
     let (dir, _path, mut a, mut b, _id) = two_devices();
     let snap = a.backups().unwrap()[0].path.clone();
     a.lock();
-    b.edit(|v| v.insert(Item::new(ItemKind::Login, "from b", Uuid::nil(), T0), T0))
+    b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
         .unwrap();
     let copy = dir.path().join("test 2.vault");
-    plant(&copy, &b.vault().unwrap().serialize());
+    plant_package(&copy, &b.vault().unwrap().serialize());
     a.start_watching().unwrap();
     assert!(wait_until(|| a.poll() > 0));
     assert!(copy.exists(), "absorbed while locked");
@@ -652,4 +681,183 @@ fn restore_while_locked_absorbs_queued_conflicts() {
     assert!(ea.any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_))));
     assert!(!copy.exists());
     assert!(titles(&a).contains(&"from b".to_owned()));
+}
+
+/// Only `vault.bin` and sibling packages matter: writes under `attachments/` and `backups/`,
+/// tmp files in the package, and a sibling `*.vault` that is a plain file (the old layout)
+/// produce nothing.
+#[test]
+fn watcher_ignores_attachments_backups_and_non_package_siblings() {
+    let (dir, path, mut a, mut b, _id) = two_devices();
+    let package = path.parent().unwrap().to_owned();
+    let attachments = package.join("attachments");
+    fs::create_dir_all(&attachments).unwrap();
+    let backups = package.join("backups");
+    a.start_watching().unwrap();
+    // Let anything from setup settle.
+    drain_for(&mut a, 3);
+    let mut ea = Events::new(&a);
+
+    plant(
+        &attachments.join("00000000000000000000000000000001.bin"),
+        b"blob",
+    );
+    // A provider's conflicted copy of a blob is not a vault-file conflict.
+    plant(
+        &attachments.join("00000000000000000000000000000001 (Mac's conflicted copy).bin"),
+        &b.vault().unwrap().serialize(),
+    );
+    plant(
+        &attachments.join("vault 2.bin"),
+        &b.vault().unwrap().serialize(),
+    );
+    plant(
+        &backups.join("test-2020-01-01T00-00-00Z.vault.bin"),
+        b"snap",
+    );
+    fs::create_dir(backups.join("conflict-2020-01-01T00-00-00Z-test 2.vault")).unwrap();
+    fs::write(package.join(".vault.bin.tmp-0011aabb"), b"tmp").unwrap();
+    assert_eq!(
+        drain_for(&mut a, 5),
+        0,
+        "events inside the package were not ignored"
+    );
+
+    // A sibling `.vault` file is a candidate name but not a package: never absorbed.
+    b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
+        .unwrap();
+    let file_copy = dir.path().join("test 2.vault");
+    plant(&file_copy, &b.vault().unwrap().serialize());
+    assert!(drain_for(&mut a, 5) > 0, "sibling produced no signal");
+    ea.pump();
+    assert!(file_copy.is_file());
+    assert!(!ea.any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_) | SyncEvent::Merged(_))));
+    assert_eq!(titles(&a), ["mail"]);
+
+    // Positive control: the primary itself is still watched.
+    plant(&path, &b.vault().unwrap().serialize());
+    assert!(wait_until(|| {
+        a.poll();
+        titles(&a) == ["from b", "mail"]
+    }));
+}
+
+/// A provider may create the package directory before `vault.bin` arrives inside it: the
+/// arrival is its own event, and the package is absorbed then.
+#[test]
+fn conflict_package_whose_vault_file_arrives_late_is_absorbed() {
+    let (dir, _path, mut a, mut b, _id) = two_devices();
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+    let copy = dir.path().join("test 2.vault");
+    fs::create_dir(&copy).unwrap();
+    assert!(wait_until(|| a.poll() > 0));
+    drain_for(&mut a, 2);
+    assert!(copy.exists());
+
+    b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
+        .unwrap();
+    plant(&copy.join(VAULT_FILE_NAME), &b.vault().unwrap().serialize());
+    assert!(wait_until(|| {
+        a.poll();
+        ea.pump();
+        ea.any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_)))
+    }));
+    assert_eq!(titles(&a), ["from b", "mail"]);
+    assert!(!copy.exists());
+}
+
+/// B's unsaved state (one extra item) written as a per-file conflicted copy of `vault.bin`
+/// named `name` inside the package (Dropbox, Google Drive, Syncthing); A absorbs it.
+fn absorb_inner_file(name: &str) {
+    let (_dir, path, mut a, mut b, _id) = two_devices();
+    let package = path.parent().unwrap().to_owned();
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+    b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
+        .unwrap();
+    let copy = package.join(name);
+    plant(&copy, &b.vault().unwrap().serialize());
+
+    assert!(
+        wait_until(|| {
+            a.poll();
+            ea.pump();
+            ea.any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_)))
+        }),
+        "{name} not absorbed"
+    );
+    assert_eq!(titles(&a), ["from b", "mail"]);
+    assert!(!copy.exists());
+    let moved = ea
+        .seen
+        .iter()
+        .find_map(|e| match e {
+            SyncEvent::ConflictAbsorbed(p) => Some(p.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(moved.parent().unwrap(), package.join("backups"));
+    let stem = name.strip_suffix(".bin").unwrap();
+    let moved_name = moved.file_name().unwrap().to_str().unwrap();
+    assert!(moved_name.starts_with("conflict-"), "{moved_name}");
+    assert!(
+        moved_name.ends_with(&format!("-{stem}.vault.bin")),
+        "{moved_name}"
+    );
+    assert!(moved.is_file());
+    let listed = a.backups().unwrap();
+    assert!(listed.iter().any(|i| i.path == moved && i.is_conflict()));
+    assert_eq!(on_disk(&path).unlock(&pw()).unwrap().items().count(), 2);
+    // The moved copy restores like a snapshot.
+    a.restore_from(&moved, &pw()).unwrap();
+    assert_eq!(titles(&a), ["from b", "mail"]);
+}
+
+#[test]
+fn dropbox_per_file_conflicted_copy_is_absorbed() {
+    absorb_inner_file("vault (Chris's conflicted copy 2026-10-30).bin");
+}
+
+#[test]
+fn numbered_per_file_copy_is_absorbed() {
+    absorb_inner_file("vault 2.bin");
+}
+
+#[test]
+fn per_file_copy_seen_while_locked_is_absorbed_on_unlock() {
+    let (_dir, path, mut a, mut b, _id) = two_devices();
+    a.lock();
+    b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
+        .unwrap();
+    let copy = path.parent().unwrap().join("vault 2.bin");
+    plant(&copy, &b.vault().unwrap().serialize());
+    // Existing per-file copies are queued by the start-up scan.
+    a.start_watching().unwrap();
+    assert!(wait_until(|| a.poll() > 0));
+    assert!(copy.exists());
+    a.unlock(&pw()).unwrap();
+    assert_eq!(titles(&a), ["from b", "mail"]);
+    assert!(!copy.exists());
+}
+
+/// Opening through a symlink resolves it: the watcher observes the real parent directory.
+#[test]
+fn symlinked_package_is_resolved_and_watched() {
+    let (_dir, path, _a, mut b, _id) = two_devices();
+    let real = path.parent().unwrap().to_owned();
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("link.vault");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let mut c = SyncedVault::open(&link, Uuid::from_u128(0xC), Arc::new(NoopHooks)).unwrap();
+    assert_eq!(c.path(), fs::canonicalize(&real).unwrap());
+    c.unlock(&pw()).unwrap();
+    c.start_watching().unwrap();
+    b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
+        .unwrap();
+    b.save().unwrap();
+    assert!(wait_until(|| {
+        c.poll();
+        titles(&c) == ["from b", "mail"]
+    }));
 }

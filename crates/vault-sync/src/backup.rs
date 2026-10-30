@@ -1,10 +1,10 @@
 //! Snapshots and retention (03 §1, §4).
 //!
-//! Snapshots live in `<dir>/<name>.vault.backups/` as `<name>-<YYYY-MM-DDTHH-MM-SSZ>.vault`
-//! (UTC). Two snapshots in the same second get `-2`, `-3`, ... before `.vault`. Conflict
-//! absorptions (03 §6) drop `conflict-<timestamp>-<original name>` into the same directory;
-//! they are listed and rotated like snapshots. Any other file there is ignored and never
-//! deleted.
+//! Snapshots live in `<name>.vault/backups/` as `<name>-<YYYY-MM-DDTHH-MM-SSZ>.vault.bin`
+//! (UTC), copies of the package's `vault.bin`. Two snapshots in the same second get `-2`,
+//! `-3`, ... before `.vault.bin`. Conflict absorptions (03 §6) move the whole conflicted
+//! package into the same directory as `conflict-<timestamp>-<original name>/`; they are listed
+//! but never rotated. Any other entry there is ignored and never deleted.
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -13,8 +13,9 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::atomic::{Mode, parent_dir, write_atomic};
+use crate::atomic::{Mode, write_atomic};
 use crate::error::SyncError;
+use crate::package::{self, backups_dir, ensure_dir, file_name, vault_name};
 
 const HOUR: u64 = 3600;
 const DAY: u64 = 24 * HOUR;
@@ -31,13 +32,18 @@ pub const RETENTION_MULTIPLIER_DEFAULT: f32 = 1.0;
 /// Length of `YYYY-MM-DDTHH-MM-SSZ`.
 const STAMP_LEN: usize = 20;
 const CONFLICT_PREFIX: &str = "conflict-";
+/// Extension of a snapshot file (a copy of the package's `vault.bin`).
+const SNAPSHOT_EXT: &str = ".vault.bin";
 
-/// One file in the backups directory.
+/// One entry in the backups directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupInfo {
+    /// A `.vault.bin` snapshot file, or the directory of an absorbed conflict package (pass
+    /// either to `restore_from`).
     pub path: PathBuf,
     /// Parsed from the file name (second precision), not from filesystem metadata.
     pub taken_at: SystemTime,
+    /// File size; for a conflict package, the size of its `vault.bin` (0 if absent).
     pub size: u64,
     /// Orders files that share a `taken_at` second: the `-N` file-name suffix for snapshots
     /// (1 when absent), 0 for conflict copies (03 §6).
@@ -48,19 +54,19 @@ pub struct BackupInfo {
 /// What a file in the backups directory holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupKind {
-    /// `<name>-<timestamp>[-N].vault`: bytes that were on disk (03 §4).
+    /// `<name>-<timestamp>[-N].vault.bin`: bytes that were on disk (03 §4).
     Snapshot,
-    /// `<name>-<timestamp>-unsaved[-N].vault`: state that would otherwise be lost and is never
+    /// `<name>-<timestamp>-unsaved[-N].vault.bin`: state that would otherwise be lost and is never
     /// pruned. Either the in-memory vault, preserved when it locked while saving was
     /// impossible (opens with that session's password), or the raw bytes of an unparseable
     /// primary, kept before `restore_from` replaced it (may not open at all).
     Unsaved,
-    /// `conflict-<timestamp>-<original name>`: an absorbed conflicted copy (03 §6).
+    /// `conflict-<timestamp>-<original name>/`: an absorbed conflicted package (03 §6).
     Conflict,
 }
 
 impl BackupInfo {
-    /// A `conflict-<timestamp>-<orig>` file rather than one of our own snapshots.
+    /// A `conflict-<timestamp>-<orig>` package rather than one of our own snapshots.
     pub fn is_conflict(&self) -> bool {
         self.kind == BackupKind::Conflict
     }
@@ -171,27 +177,6 @@ pub(crate) fn parse_stamp(s: &str) -> Option<SystemTime> {
 // ---------------------------------------------------------------------------------------------
 // Names and paths
 
-/// `<dir>/<file name>.backups`, e.g. `test.vault` -> `test.vault.backups`.
-pub(crate) fn backups_dir(vault_path: &Path) -> PathBuf {
-    parent_dir(vault_path).join(format!("{}.backups", file_name(vault_path)))
-}
-
-pub(crate) fn file_name(vault_path: &Path) -> String {
-    vault_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "vault".to_owned())
-}
-
-/// `<name>` in `<name>.vault`; the whole file name if it lacks the extension.
-fn vault_name(vault_path: &Path) -> String {
-    let f = file_name(vault_path);
-    match f.strip_suffix(".vault") {
-        Some(n) if !n.is_empty() => n.to_owned(),
-        _ => f,
-    }
-}
-
 const UNSAVED_TAG: &str = "-unsaved";
 
 fn snapshot_file_name(name: &str, stamp: &str, kind: BackupKind, seq: u32) -> String {
@@ -201,9 +186,9 @@ fn snapshot_file_name(name: &str, stamp: &str, kind: BackupKind, seq: u32) -> St
         ""
     };
     if seq <= 1 {
-        format!("{name}-{stamp}{tag}.vault")
+        format!("{name}-{stamp}{tag}{SNAPSHOT_EXT}")
     } else {
-        format!("{name}-{stamp}{tag}-{seq}.vault")
+        format!("{name}-{stamp}{tag}-{seq}{SNAPSHOT_EXT}")
     }
 }
 
@@ -221,7 +206,7 @@ fn parse_file_name(file: &str, name: &str) -> Option<(SystemTime, u32, BackupKin
     let rest = file
         .strip_prefix(name)?
         .strip_prefix('-')?
-        .strip_suffix(".vault")?;
+        .strip_suffix(SNAPSHOT_EXT)?;
     let t = parse_stamp(rest.get(..STAMP_LEN)?)?;
     let tail = rest.get(STAMP_LEN..)?;
     let (kind, tail) = match tail.strip_prefix(UNSAVED_TAG) {
@@ -313,11 +298,11 @@ pub fn retain(
 // ---------------------------------------------------------------------------------------------
 // Files
 
-/// Every snapshot and conflict file for the vault at `vault_path`, newest first. A missing
-/// backups directory is an empty list.
-pub(crate) fn list_backups(vault_path: &Path) -> Result<Vec<BackupInfo>, SyncError> {
-    let dir = backups_dir(vault_path);
-    let name = vault_name(vault_path);
+/// Every snapshot and conflict package of the vault package at `package`, newest first. A
+/// missing backups directory is an empty list.
+pub(crate) fn list_backups(package: &Path) -> Result<Vec<BackupInfo>, SyncError> {
+    let dir = backups_dir(package);
+    let name = vault_name(package);
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -332,16 +317,22 @@ pub(crate) fn list_backups(vault_path: &Path) -> Result<Vec<BackupInfo>, SyncErr
             continue;
         };
         let meta = match entry.metadata() {
-            Ok(m) if m.is_file() => m,
-            Ok(_) => continue,
+            Ok(m) => m,
             // Raced with a deletion (another device's retention, say).
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
             Err(e) => return Err(SyncError::io(entry.path(), e)),
         };
+        let size = if meta.is_file() {
+            meta.len()
+        } else if meta.is_dir() && kind == BackupKind::Conflict {
+            fs::metadata(package::vault_file(&entry.path())).map_or(0, |m| m.len())
+        } else {
+            continue;
+        };
         out.push(BackupInfo {
             path: entry.path(),
             taken_at,
-            size: meta.len(),
+            size,
             seq,
             kind,
         });
@@ -350,32 +341,17 @@ pub(crate) fn list_backups(vault_path: &Path) -> Result<Vec<BackupInfo>, SyncErr
     Ok(out)
 }
 
-/// Create the backups directory (0700) if needed.
-pub(crate) fn ensure_dir(dir: &Path) -> Result<(), SyncError> {
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    match builder.create(dir) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
-        Err(e) => Err(SyncError::io(dir, e)),
-    }
-}
-
 /// Atomically write `bytes` as a new snapshot taken at `now`; never overwrites an existing
 /// file (same-second collisions get the next `-N`).
 pub(crate) fn write_snapshot(
-    vault_path: &Path,
+    package: &Path,
     bytes: &[u8],
     now: SystemTime,
     kind: BackupKind,
 ) -> Result<PathBuf, SyncError> {
-    let dir = backups_dir(vault_path);
+    let dir = backups_dir(package);
     ensure_dir(&dir)?;
-    let name = vault_name(vault_path);
+    let name = vault_name(package);
     let stamp = format_stamp(now);
     for seq in 1..=1000 {
         let path = dir.join(snapshot_file_name(&name, &stamp, kind, seq));
@@ -396,12 +372,12 @@ pub(crate) fn write_snapshot(
 /// Run [`retain`] over the backups directory and delete what it rejects, except `protect`
 /// (the snapshot just written). Individual delete failures are logged and skipped.
 pub(crate) fn apply_retention(
-    vault_path: &Path,
+    package: &Path,
     now: SystemTime,
     multiplier: f32,
     protect: &Path,
 ) -> Result<usize, SyncError> {
-    let infos = list_backups(vault_path)?;
+    let infos = list_backups(package)?;
     let (_, delete) = retain(&infos, now, multiplier);
     let mut deleted = 0;
     for info in delete.iter().filter(|i| i.path != protect) {
@@ -419,36 +395,64 @@ pub(crate) fn apply_retention(
     Ok(deleted)
 }
 
-/// Move a conflicted copy into the backups directory as `conflict-<timestamp>-<original
-/// name>` (03 §6 step 4); never deletes it. A name clash in the same second inserts `-N-`
-/// after the timestamp. Returns the new path.
-pub(crate) fn absorb_conflict_file(
-    vault_path: &Path,
+/// Move a whole conflicted package into the backups directory as `conflict-<timestamp>-<original
+/// name>/` (03 §6 step 4); never deletes it. Returns the new path.
+pub(crate) fn absorb_conflict_package(
+    package: &Path,
     src: &Path,
     now: SystemTime,
 ) -> Result<PathBuf, SyncError> {
-    let dir = backups_dir(vault_path);
-    ensure_dir(&dir)?;
+    move_conflict(package, src, &file_name(src), now)
+}
+
+/// Move a per-file conflicted copy of `vault.bin` (`<pkg>/vault 2.bin`, ...) into the backups
+/// directory as `conflict-<timestamp>-<original stem>.vault.bin` (03 §6 step 4), so it lists
+/// and restores like a snapshot file. Returns the new path.
+pub(crate) fn absorb_conflict_file(
+    package: &Path,
+    src: &Path,
+    now: SystemTime,
+) -> Result<PathBuf, SyncError> {
     let orig = file_name(src);
+    let stem = match orig.len().checked_sub(".bin".len()) {
+        Some(i) if i > 0 && orig.is_char_boundary(i) && orig[i..].eq_ignore_ascii_case(".bin") => {
+            &orig[..i]
+        }
+        _ => orig.as_str(),
+    };
+    move_conflict(package, src, &format!("{stem}{SNAPSHOT_EXT}"), now)
+}
+
+/// Rename `src` to `backups/conflict-<stamp>-<target>`; never deletes it. A name clash in the
+/// same second inserts `-N-` after the timestamp.
+fn move_conflict(
+    package: &Path,
+    src: &Path,
+    target: &str,
+    now: SystemTime,
+) -> Result<PathBuf, SyncError> {
+    let dir = backups_dir(package);
+    ensure_dir(&dir)?;
     let stamp = format_stamp(now);
     for n in 1..=1000 {
         let dst = if n == 1 {
-            dir.join(format!("{CONFLICT_PREFIX}{stamp}-{orig}"))
+            dir.join(format!("{CONFLICT_PREFIX}{stamp}-{target}"))
         } else {
-            dir.join(format!("{CONFLICT_PREFIX}{stamp}-{n}-{orig}"))
+            dir.join(format!("{CONFLICT_PREFIX}{stamp}-{n}-{target}"))
         };
         match fs::symlink_metadata(&dst) {
             Ok(_) => continue,
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(SyncError::io(&dst, e)),
         }
-        // Same filesystem (the backups dir is a sibling), so this is an atomic rename.
+        // Same filesystem (a sibling of our package, or a file inside it), so this is an
+        // atomic rename.
         fs::rename(src, &dst).map_err(|e| SyncError::io(src, e))?;
         tracing::info!(from = %src.display(), to = %dst.display(), "absorbed conflicted copy");
         return Ok(dst);
     }
     Err(SyncError::AlreadyExists(
-        dir.join(format!("{CONFLICT_PREFIX}{stamp}-{orig}")),
+        dir.join(format!("{CONFLICT_PREFIX}{stamp}-{target}")),
     ))
 }
 
@@ -538,19 +542,19 @@ mod tests {
     fn file_names_parse() {
         let t = at(1_793_196_191);
         assert_eq!(
-            parse_file_name("test-2026-10-28T14-03-11Z.vault", "test"),
+            parse_file_name("test-2026-10-28T14-03-11Z.vault.bin", "test"),
             Some((t, 1, BackupKind::Snapshot))
         );
         assert_eq!(
-            parse_file_name("test-2026-10-28T14-03-11Z-3.vault", "test"),
+            parse_file_name("test-2026-10-28T14-03-11Z-3.vault.bin", "test"),
             Some((t, 3, BackupKind::Snapshot))
         );
         assert_eq!(
-            parse_file_name("test-2026-10-28T14-03-11Z-unsaved.vault", "test"),
+            parse_file_name("test-2026-10-28T14-03-11Z-unsaved.vault.bin", "test"),
             Some((t, 1, BackupKind::Unsaved))
         );
         assert_eq!(
-            parse_file_name("test-2026-10-28T14-03-11Z-unsaved-2.vault", "test"),
+            parse_file_name("test-2026-10-28T14-03-11Z-unsaved-2.vault.bin", "test"),
             Some((t, 2, BackupKind::Unsaved))
         );
         for kind in [BackupKind::Snapshot, BackupKind::Unsaved] {
@@ -567,29 +571,25 @@ mod tests {
             Some((t, 0, BackupKind::Conflict))
         );
         assert_eq!(
-            parse_file_name("my-vault-2026-10-28T14-03-11Z.vault", "my-vault"),
+            parse_file_name("my-vault-2026-10-28T14-03-11Z.vault.bin", "my-vault"),
             Some((t, 1, BackupKind::Snapshot))
         );
         for bad in [
-            "other-2026-10-28T14-03-11Z.vault",
+            "other-2026-10-28T14-03-11Z.vault.bin",
             "test-2026-10-28T14-03-11Z.vault.bak",
-            "test-2026-10-28T14-03-11Z-.vault",
-            "test-2026-10-28T14-03-11Z-x.vault",
-            "test-2026-10-28T14-03-11Z-unsaved-.vault",
-            "test-2026-10-28T14-03-11Z-unsavedx.vault",
-            ".test-2026-10-28T14-03-11Z.vault.tmp-0011aabb",
+            "test-2026-10-28T14-03-11Z.vault",
+            "test-2026-10-28T14-03-11Z.vault.bin.bak",
+            "test-2026-10-28T14-03-11Z-.vault.bin",
+            "test-2026-10-28T14-03-11Z-x.vault.bin",
+            "test-2026-10-28T14-03-11Z-unsaved-.vault.bin",
+            "test-2026-10-28T14-03-11Z-unsavedx.vault.bin",
+            ".test-2026-10-28T14-03-11Z.vault.bin.tmp-0011aabb",
             "conflict-2026-10-28T14-03-11Z-",
             "conflict-garbage-test.vault",
             "notes.txt",
         ] {
             assert_eq!(parse_file_name(bad, "test"), None, "{bad}");
         }
-        assert_eq!(vault_name(Path::new("/x/test.vault")), "test");
-        assert_eq!(vault_name(Path::new("/x/plain")), "plain");
-        assert_eq!(
-            backups_dir(Path::new("/x/test.vault")),
-            Path::new("/x/test.vault.backups")
-        );
     }
 
     #[test]
@@ -756,7 +756,7 @@ mod tests {
         let mut b = a.clone();
         b.path = a
             .path
-            .with_file_name(format!("test-{}-2.vault", format_stamp(a.taken_at)));
+            .with_file_name(format!("test-{}-2.vault.bin", format_stamp(a.taken_at)));
         b.seq = 2;
         a.size = 2;
         let (keep, delete) = retain(&[a.clone(), b.clone()], at(NOW), 1.0);

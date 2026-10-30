@@ -14,13 +14,12 @@ use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 
 use super::MainScreen;
-use vault_core::ItemKind;
 
-use super::sidebar::{kind_label, kind_singular};
 use crate::actions::{LIST_CONTEXT, SortAlphabetical, SortRecentlyModified};
 use crate::audit::Issue;
 use crate::listing::{self, Row};
 use crate::state::{AppState, GeneratorTarget, Sort};
+use crate::templates::Template;
 use crate::ui::{self, Clickable as _};
 
 /// Row height at the default text size; scaled by the text size step.
@@ -201,16 +200,16 @@ fn render_row(
 /// Width of the icon slot in menu rows, so every label starts at the same x.
 const MENU_ICON_SLOT: f32 = 20.;
 
-/// The ⌘N kind picker: one row per item kind. Uses the title the picker was opened with.
+/// The ⌘N Templates menu: one row per template. Uses the title the picker was opened with.
 /// Rows are laid out like the sidebar's: fixed icon slot, left-aligned label.
-fn kind_picker(state: &Entity<AppState>, cx: &App) -> AnyElement {
+fn template_picker(state: &Entity<AppState>, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let height = crate::theme::scaled(28., cx);
-    let rows = ItemKind::ALL.into_iter().map(|kind| {
-        let (_, icon) = kind_label(kind);
+    let rows = Template::ALL.into_iter().map(|template| {
         let state = state.clone();
         ui::h_flex()
-            .id(SharedString::from(format!("new-{}", kind.as_str())))
+            .id(SharedString::from(format!("new-{}", template.tag())))
+            .debug_selector(move || format!("new-{}", template.tag()))
             .tab_index(0)
             .w_full()
             .h(height)
@@ -228,20 +227,18 @@ fn kind_picker(state: &Entity<AppState>, cx: &App) -> AnyElement {
                     .flex_none()
                     .w(px(MENU_ICON_SLOT))
                     .justify_center()
-                    .child(Icon::new(icon).size_4().text_color(theme.muted_foreground)),
+                    .child(
+                        Icon::new(template.icon())
+                            .size_4()
+                            .text_color(theme.muted_foreground),
+                    ),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(kind_singular(kind)),
-            )
+            .child(div().flex_1().min_w_0().truncate().child(template.label()))
             // Focusable divs also fire `on_click` on Enter / Space.
             .on_click(move |_, _, cx| {
                 state.update(cx, |s, cx| {
-                    let title = s.kind_picker.clone().unwrap_or_default();
-                    s.begin_new(kind, title, cx);
+                    let title = s.template_picker.clone().unwrap_or_default();
+                    s.begin_new(template, title, cx);
                 });
             })
     });
@@ -296,12 +293,13 @@ fn empty_state(
         .when_some(action, |col, (label, title)| {
             col.child(
                 Button::new("empty-create")
+                    .debug_selector(|| "empty-create".into())
                     .primary()
                     .small()
                     .label(label)
                     .clickable()
                     .on_click(move |_, _, cx| {
-                        state.update(cx, |s, cx| s.open_kind_picker(title.clone(), cx));
+                        state.update(cx, |s, cx| s.open_template_picker(title.clone(), cx));
                     }),
             )
         })
@@ -317,7 +315,7 @@ impl MainScreen {
         let placeholder = list_placeholder(s);
         let rows = s.listing.rows.clone();
         let item_count = s.listing.items.len();
-        let picker_open = s.kind_picker.is_some();
+        let picker_open = s.template_picker.is_some();
         let generator_open = s.generator_target == Some(GeneratorTarget::Global);
 
         let sort_button = ui::icon_button("sort", IconName::SortAscending, "Sort items")
@@ -453,13 +451,13 @@ impl MainScreen {
                     move |open, _, cx| {
                         state.update(cx, |s, cx| {
                             if open {
-                                s.open_kind_picker(String::new(), cx);
+                                s.open_template_picker(String::new(), cx);
                             } else {
-                                s.close_kind_picker(cx);
+                                s.close_template_picker(cx);
                             }
                         });
                     },
-                    move |_, cx| kind_picker(&picker_state, cx),
+                    move |_, cx| template_picker(&picker_state, cx),
                 )
             })
             .child(
@@ -550,30 +548,85 @@ mod tests {
 
     /// Opens the New popover with ⌘N, tabs `tabs` times, presses `key`, and returns the
     /// kind of the item being created.
-    fn pick(tabs: usize, key: &'static str, cx: &mut TestAppContext) -> Option<ItemKind> {
+    fn pick(tabs: usize, key: &'static str, cx: &mut TestAppContext) -> Option<Template> {
         let dir = tempfile::tempdir().unwrap();
         let (state, mut vcx) = open(dir.path(), cx);
         vcx.simulate_keystrokes("cmd-n");
         vcx.run_until_parked();
-        assert!(state.read_with(&vcx, |s, _| s.kind_picker.is_some()));
+        assert!(state.read_with(&vcx, |s, _| s.template_picker.is_some()));
         for _ in 0..tabs {
             vcx.simulate_keystrokes("tab");
         }
         press(&mut vcx, key);
         vcx.run_until_parked();
         state.read_with(&vcx, |s, _| match &s.mode {
-            Mode::New(kind, _) => Some(*kind),
+            Mode::New(template, buffer) => {
+                // The template's fields and its one tag; no category.
+                assert_eq!(buffer.item.tags, [template.tag()]);
+                let fields: Vec<_> = buffer
+                    .item
+                    .fields
+                    .iter()
+                    .map(|f| (f.name.as_str(), f.kind))
+                    .collect();
+                assert_eq!(fields, template.fields());
+                Some(*template)
+            }
             _ => None,
         })
     }
 
     #[gpui::test]
-    fn kind_picker_row_activates_with_enter(cx: &mut TestAppContext) {
-        assert_eq!(pick(1, "enter", cx), Some(ItemKind::Login));
+    fn template_picker_row_activates_with_enter(cx: &mut TestAppContext) {
+        assert_eq!(pick(1, "enter", cx), Some(Template::Login));
     }
 
     #[gpui::test]
-    fn kind_picker_row_activates_with_space(cx: &mut TestAppContext) {
-        assert_eq!(pick(2, "space", cx), Some(ItemKind::Note));
+    fn template_picker_row_activates_with_space(cx: &mut TestAppContext) {
+        assert_eq!(pick(2, "space", cx), Some(Template::Note));
+    }
+
+    /// "No results" offers "Create '<query>'": it opens the Templates menu, and the
+    /// picked template starts a new item titled with the query.
+    #[gpui::test]
+    fn create_from_query_opens_templates_with_the_query_as_title(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut vcx) = open(dir.path(), cx);
+        state.update(&mut vcx, |s, cx| {
+            let device = s.device_id();
+            s.vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| v.insert(vault_core::Item::new("GitHub", device, 1), 1))
+                .unwrap();
+            s.vault_changed();
+            s.set_query("Bank".into(), cx);
+        });
+        vcx.run_until_parked();
+        assert_eq!(
+            state.read_with(&vcx, |s, _| list_placeholder(s)),
+            Some(NO_RESULTS)
+        );
+
+        let button = vcx.debug_bounds("empty-create").expect("Create button");
+        vcx.simulate_click(button.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        assert_eq!(
+            state.read_with(&vcx, |s, _| s.template_picker.clone()),
+            Some("Bank".to_owned()),
+            "the Templates menu opens with the query"
+        );
+
+        let row = vcx.debug_bounds("new-card").expect("Templates menu shown");
+        vcx.simulate_click(row.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| match &s.mode {
+            Mode::New(template, buffer) => {
+                assert_eq!(*template, Template::Card);
+                assert_eq!(buffer.item.title, "Bank");
+                assert!(s.template_picker.is_none());
+            }
+            other => panic!("not creating: {}", matches!(other, Mode::View)),
+        });
     }
 }

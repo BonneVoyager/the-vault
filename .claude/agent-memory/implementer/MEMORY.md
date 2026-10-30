@@ -1,4 +1,4 @@
-- [vault-sync structure](vault-sync-structure.md) — modules incl. backup.rs, attachments.rs, state model, rand 0.8 pin, snapshot naming/retention, §8 deviations
+- [vault-sync structure](vault-sync-structure.md) — package dir layout (package.rs), backup.rs, attachments.rs, state model, rand 0.8 pin, snapshot naming, §8 deviations
 - [objc2 patterns](objc2-patterns.md) — objc2 0.6/0.3.2 API shapes, observers, NSPasteboard, NSURL, Security/LAContext, SMAppService, CG capture, NSBitmapImageRep lazy decode, rqrr, NSColor accent
 - [vault-macos layout](vault-macos-layout.md) — modules incl. appearance.rs, biometric.rs, login_item.rs, qr.rs (screen + image file), cfg split, no vault-sync dep, device_id fallback, entitlement need
-- [notify watcher](notify-watcher.md) — P3.3 poll() threading design, FSEvents path quirk, step-6c convergence fix, test patterns
+- [notify watcher](notify-watcher.md) — poll() design, single recursive parent watch + NoCache (stream-restart cost), FSEvents quirks, tests

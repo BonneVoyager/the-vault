@@ -3,8 +3,7 @@
 
 use vault_core::format::VaultFile;
 use vault_core::{
-    ExposeSecret, Field, FieldKind, Item, ItemKind, KdfParams, LockedVault, SecretString,
-    UnlockedVault, Uuid,
+    ExposeSecret, Field, FieldKind, Item, KdfParams, LockedVault, SecretString, UnlockedVault, Uuid,
 };
 
 pub const PASSWORD: &str = "correct horse battery staple";
@@ -25,22 +24,18 @@ pub fn secret(s: impl Into<String>) -> SecretString {
     SecretString::new(s.into())
 }
 
-/// A login item with username, password, totp, url and notes fields.
+/// An item with username, password, totp, url and notes fields. Every fourth item carries a
+/// different template tag (the replacement for the removed item kinds).
 pub fn sample_item(i: u64, now: u64) -> Item {
-    let kind = match i % 4 {
-        0 => ItemKind::Login,
-        1 => ItemKind::Note,
-        2 => ItemKind::Card,
-        _ => ItemKind::Identity,
+    let template = match i % 4 {
+        0 => "login",
+        1 => "note",
+        2 => "card",
+        _ => "identity",
     };
-    let mut item = Item::new(
-        kind,
-        format!("Item {i} \u{1F511} caf\u{e9}"),
-        Uuid::nil(),
-        now,
-    );
+    let mut item = Item::new(format!("Item {i} \u{1F511} caf\u{e9}"), Uuid::nil(), now);
     item.favorite = i.is_multiple_of(3);
-    item.tags = vec!["work".into(), format!("tag{}", i % 5)];
+    item.tags = vec![template.into(), "work".into(), format!("tag{}", i % 5)];
     item.fields.push(Field::new(
         "username",
         FieldKind::Text,
@@ -111,7 +106,6 @@ pub fn assert_field_eq(a: &Field, b: &Field) {
 
 pub fn assert_item_eq(a: &Item, b: &Item) {
     assert_eq!(a.id, b.id);
-    assert_eq!(a.kind, b.kind);
     assert_eq!(a.title, b.title);
     assert_eq!(a.deleted_at, b.deleted_at);
     assert_eq!(a.device_id, b.device_id);

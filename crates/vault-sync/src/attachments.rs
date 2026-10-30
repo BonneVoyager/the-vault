@@ -1,4 +1,4 @@
-//! Attachment blobs on disk (03 §1.1): the `<name>.vault.attachments/` directory, the
+//! Attachment blobs on disk (03 §1.1): the package's `attachments/` directory, the
 //! streaming [`AttachmentReader`], and orphan cleanup. The `SyncedVault` methods that use
 //! these live in `synced/attachments.rs`.
 //!
@@ -29,9 +29,8 @@ use vault_core::attachment::{self, AttachmentError};
 use vault_core::{AttachmentRef, Uuid};
 use zeroize::Zeroizing;
 
-use crate::atomic::parent_dir;
-use crate::backup;
 use crate::error::SyncError;
+use crate::package;
 
 /// An unreferenced blob is deleted by orphan cleanup only once its mtime is older than this
 /// (03 §1.1): it may belong to an item that has not synced yet.
@@ -52,19 +51,19 @@ pub enum AttachmentState {
     Missing,
 }
 
-/// `<dir>/<name>.vault.attachments`.
-pub(crate) fn attachments_dir(vault_path: &Path) -> PathBuf {
-    parent_dir(vault_path).join(format!("{}.attachments", backup::file_name(vault_path)))
+/// `<name>.vault/attachments`.
+pub(crate) fn attachments_dir(package: &Path) -> PathBuf {
+    package::attachments_dir(package)
 }
 
 /// `<attachments dir>/<32 lowercase hex>.bin`.
-pub(crate) fn blob_path(vault_path: &Path, id: Uuid) -> PathBuf {
-    attachments_dir(vault_path).join(attachment::blob_file_name(id))
+pub(crate) fn blob_path(package: &Path, id: Uuid) -> PathBuf {
+    attachments_dir(package).join(attachment::blob_file_name(id))
 }
 
 /// The attachment id of a blob file name, only if `name` is exactly what
 /// [`attachment::blob_file_name`] produces (lowercase, no dashes).
-fn parse_blob_name(name: &str) -> Option<Uuid> {
+pub(crate) fn parse_blob_name(name: &str) -> Option<Uuid> {
     let hex = name.strip_suffix(".bin")?;
     if hex.len() != 32 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         return None;
@@ -363,11 +362,11 @@ mod tests {
     #[test]
     fn dir_layout() {
         let p = Path::new("/x/My.vault");
-        assert_eq!(attachments_dir(p), Path::new("/x/My.vault.attachments"));
+        assert_eq!(attachments_dir(p), Path::new("/x/My.vault/attachments"));
         let id = Uuid::from_u128(1);
         assert_eq!(
             blob_path(p, id),
-            Path::new("/x/My.vault.attachments/00000000000000000000000000000001.bin")
+            Path::new("/x/My.vault/attachments/00000000000000000000000000000001.bin")
         );
     }
 }

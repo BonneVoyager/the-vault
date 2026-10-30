@@ -208,7 +208,6 @@ fn removed_history_cbor_shape_and_absent_when_empty() {
     assert_eq!(
         keys,
         [
-            "kind",
             "tags",
             "title",
             "fields",

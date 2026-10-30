@@ -10,7 +10,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::item::{Field, FieldKind, HistoryEntry, Item, ItemKind, Millis};
+use crate::item::{Field, FieldKind, HistoryEntry, Item, Millis};
 
 #[derive(Debug, Error)]
 pub enum ImportError {
@@ -75,6 +75,23 @@ fn resolve(name: &str, headers: Option<&csv::StringRecord>) -> Result<Option<usi
     }
 }
 
+/// Template tags that replace the item categories removed on 2026-10-30. Importers attach the
+/// one matching the source's category so the app can apply the right template.
+pub(crate) const TAG_LOGIN: &str = "login";
+pub(crate) const TAG_NOTE: &str = "note";
+pub(crate) const TAG_CARD: &str = "card";
+pub(crate) const TAG_IDENTITY: &str = "identity";
+
+/// Prepends `tag` to `item.tags` unless the item already carries it under any casing (the
+/// source's own spelling and position win). Used by every importer in place of the removed
+/// item kind.
+pub(crate) fn add_template_tag(item: &mut Item, tag: &str) {
+    let dup = item.tags.iter().any(|t| t.to_lowercase() == tag);
+    if !dup {
+        item.tags.insert(0, tag.to_owned());
+    }
+}
+
 /// Each row becomes a `login` item with a fresh id. Only non-empty mapped cells become fields.
 pub fn import_csv(
     bytes: &[u8],
@@ -120,12 +137,8 @@ pub fn import_csv(
     let mut items = Vec::new();
     for rec in rdr.records() {
         let rec = rec.map_err(|e| ImportError::Csv(e.to_string()))?;
-        let mut item = Item::new(
-            ItemKind::Login,
-            rec.get(title_col).unwrap_or(""),
-            device_id,
-            now,
-        );
+        let mut item = Item::new(rec.get(title_col).unwrap_or(""), device_id, now);
+        add_template_tag(&mut item, TAG_LOGIN);
         for (name, kind, col) in &parts {
             let value = col.and_then(|c| rec.get(c)).unwrap_or("");
             if !value.is_empty() {
@@ -262,17 +275,18 @@ fn section_value(
 fn convert_1pux_item(src: &serde_json::Value, device_id: Uuid, now: Millis) -> Item {
     let overview = src.get("overview").unwrap_or(&serde_json::Value::Null);
     let details = src.get("details").unwrap_or(&serde_json::Value::Null);
-    let kind = match str_of(src, "categoryUuid") {
-        "003" => ItemKind::Note,
-        "002" => ItemKind::Card,
-        "004" => ItemKind::Identity,
-        _ => ItemKind::Login,
+    // 1Password category -> template tag (item kinds were removed on 2026-10-30).
+    let template = match str_of(src, "categoryUuid") {
+        "003" => TAG_NOTE,
+        "002" => TAG_CARD,
+        "004" => TAG_IDENTITY,
+        _ => TAG_LOGIN,
     };
     let title = match str_of(overview, "title").trim() {
         "" => "Untitled",
         t => t,
     };
-    let mut item = Item::new(kind, title, device_id, now);
+    let mut item = Item::new(title, device_id, now);
     item.favorite = src.get("favIndex").and_then(|v| v.as_u64()).unwrap_or(0) > 0;
     item.tags = arr_of(overview, "tags")
         .iter()
@@ -280,6 +294,7 @@ fn convert_1pux_item(src: &serde_json::Value, device_id: Uuid, now: Millis) -> I
         .filter(|t| !t.is_empty())
         .map(str::to_owned)
         .collect();
+    add_template_tag(&mut item, template);
 
     for lf in arr_of(details, "loginFields") {
         let value = str_of(lf, "value");

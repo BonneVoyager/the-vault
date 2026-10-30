@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="512" height="512" viewBox="230 247 512 512">
+  <!-- The six spokes of vault.svg's wheel, centred on its hub (486, 503), outside the
+       hub's glow ring (r 146). gpui draws SVGs as a one-colour mask: the unlock screen
+       tints it steel and rotates it over vault-256-spokeless.png. -->
+  <path id="spoke" d="M459 359.5 V271 Q459 253 477 253 H495 Q513 253 513 271 V359.5 A146 146 0 0 0 459 359.5 Z"/>
+  <use xlink:href="#spoke" transform="rotate(60 486 503)"/>
+  <use xlink:href="#spoke" transform="rotate(120 486 503)"/>
+  <use xlink:href="#spoke" transform="rotate(180 486 503)"/>
+  <use xlink:href="#spoke" transform="rotate(240 486 503)"/>
+  <use xlink:href="#spoke" transform="rotate(300 486 503)"/>
+</svg>

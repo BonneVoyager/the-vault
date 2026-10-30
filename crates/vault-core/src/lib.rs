@@ -19,8 +19,7 @@ pub use attachment::AttachmentError;
 pub use error::{TamperKind, VaultError};
 pub use format::{FORMAT_VERSION, Header, KeySlot, MAGIC, OpaqueSlot, Slot, SlotKind};
 pub use item::{
-    AttachmentRef, AttachmentTombstone, Extras, Field, FieldKind, HistoryEntry, Item, ItemKind,
-    Millis,
+    AttachmentRef, AttachmentTombstone, Extras, Field, FieldKind, HistoryEntry, Item, Millis,
 };
 pub use kdf::KdfParams;
 #[cfg(feature = "sync")]

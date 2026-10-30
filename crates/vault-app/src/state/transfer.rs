@@ -219,7 +219,7 @@ mod tests {
     use std::sync::Arc;
 
     use gpui::{AppContext as _, Entity, TestAppContext};
-    use vault_core::{Field, FieldKind, Item, ItemKind, KdfParams, SecretString, Uuid};
+    use vault_core::{Field, FieldKind, Item, KdfParams, SecretString, Uuid};
     use vault_sync::{NoopHooks, SyncedVault};
 
     use super::*;
@@ -237,7 +237,7 @@ mod tests {
         vault
             .edit(|v| {
                 for t in titles {
-                    let mut item = Item::new(ItemKind::Login, *t, device, 10);
+                    let mut item = Item::new(*t, device, 10);
                     item.fields = vec![Field::new(
                         "password",
                         FieldKind::Password,

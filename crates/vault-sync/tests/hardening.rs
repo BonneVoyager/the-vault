@@ -13,11 +13,10 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use tempfile::TempDir;
 use vault_core::format::VaultFile;
-use vault_core::{
-    Item, ItemKind, KdfParams, LockedVault, SecretString, SecretVec, UnlockedVault, Uuid,
-};
+use vault_core::{Item, KdfParams, LockedVault, SecretString, SecretVec, UnlockedVault, Uuid};
 use vault_sync::{
     BackupKind, CloudError, CloudHooks, NoopHooks, SaveBlocked, SyncError, SyncEvent, SyncedVault,
+    VAULT_FILE_NAME,
 };
 
 const T0: u64 = 1_700_000_000_000;
@@ -28,12 +27,13 @@ fn pw() -> SecretString {
     SecretString::new("correct horse battery staple".to_owned())
 }
 
-/// A creates the vault with one item and saves; B opens and unlocks the same file. No watchers.
+/// A creates the vault with one item and saves; B opens and unlocks the same package. No
+/// watchers. The returned path is the package's `vault.bin` (see [`pkg`]).
 fn two_devices() -> (TempDir, PathBuf, SyncedVault, SyncedVault) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("test.vault");
+    let package = dir.path().join("test.vault");
     let mut a = SyncedVault::create(
-        &path,
+        &package,
         &pw(),
         KdfParams::for_tests(),
         DEV_A,
@@ -42,13 +42,18 @@ fn two_devices() -> (TempDir, PathBuf, SyncedVault, SyncedVault) {
     .unwrap();
     insert(&mut a, "mail");
     a.save().unwrap();
-    let mut b = SyncedVault::open(&path, DEV_B, Arc::new(NoopHooks)).unwrap();
+    let mut b = SyncedVault::open(&package, DEV_B, Arc::new(NoopHooks)).unwrap();
     b.unlock(&pw()).unwrap();
-    (dir, path, a, b)
+    (dir, package.join(VAULT_FILE_NAME), a, b)
+}
+
+/// The package directory holding the vault file `file`.
+fn pkg(file: &Path) -> &Path {
+    file.parent().unwrap()
 }
 
 fn insert(v: &mut SyncedVault, title: &str) {
-    v.edit(|vault| vault.insert(Item::new(ItemKind::Login, title, Uuid::nil(), T0), T0))
+    v.edit(|vault| vault.insert(Item::new(title, Uuid::nil(), T0), T0))
         .unwrap();
 }
 
@@ -156,7 +161,7 @@ fn foreign_vault_on_disk_blocks_save_and_lock_preserves_edits() {
     assert!(
         unsaved
             .path
-            .starts_with(dir.path().join("test.vault.backups"))
+            .starts_with(dir.path().join("test.vault").join("backups"))
     );
     let preserved = LockedVault::parse(&fs::read(&unsaved.path).unwrap())
         .unwrap()
@@ -187,7 +192,7 @@ fn newer_format_seen_while_locked_still_blocks_after_unlock() {
 #[test]
 fn key_mismatch_refuses_clean_save_kek_unlock_and_preserves_on_lock() {
     let (_dir, path, mut a, mut b) = two_devices();
-    let mut c = SyncedVault::open(&path, Uuid::from_u128(0xC), Arc::new(NoopHooks)).unwrap();
+    let mut c = SyncedVault::open(pkg(&path), Uuid::from_u128(0xC), Arc::new(NoopHooks)).unwrap();
     c.unlock(&pw()).unwrap();
     c.start_watching().unwrap();
     let rx_c = c.subscribe();
@@ -329,7 +334,7 @@ fn unsaved_files(v: &SyncedVault) -> Vec<PathBuf> {
 }
 
 fn latest_snapshot(path: &Path) -> PathBuf {
-    let v = SyncedVault::open(path, Uuid::nil(), Arc::new(NoopHooks)).unwrap();
+    let v = SyncedVault::open(pkg(path), Uuid::nil(), Arc::new(NoopHooks)).unwrap();
     v.backups()
         .unwrap()
         .into_iter()
@@ -386,7 +391,7 @@ impl CloudHooks for Flaky {
 fn save_does_not_overwrite_a_primary_it_cannot_download() {
     let (_dir, path, _a, mut b) = two_devices();
     let hooks = Arc::new(Flaky(AtomicBool::new(false)));
-    let mut c = SyncedVault::open(&path, Uuid::from_u128(0xC), hooks.clone()).unwrap();
+    let mut c = SyncedVault::open(pkg(&path), Uuid::from_u128(0xC), hooks.clone()).unwrap();
     c.unlock(&pw()).unwrap();
     insert(&mut b, "from b");
     b.save().unwrap();
@@ -434,8 +439,8 @@ fn repeated_locks_while_blocked_keep_one_unsaved_file_per_change() {
 fn future_dated_snapshot_does_not_force_a_snapshot_every_save() {
     let (dir, _path, mut a, _b) = two_devices();
     // The first save already took a fresh snapshot.
-    let backups = dir.path().join("test.vault.backups");
-    fs::write(backups.join("test-2099-01-01T00-00-00Z.vault"), b"x").unwrap();
+    let backups = dir.path().join("test.vault").join("backups");
+    fs::write(backups.join("test-2099-01-01T00-00-00Z.vault.bin"), b"x").unwrap();
     let before = a.backups().unwrap().len();
     insert(&mut a, "more");
     a.save().unwrap();
@@ -446,7 +451,7 @@ fn future_dated_snapshot_does_not_force_a_snapshot_every_save() {
 fn failed_snapshot_for_a_deletion_is_retried() {
     use std::os::unix::fs::PermissionsExt;
     let (dir, _path, mut a, _b) = two_devices();
-    let backups = dir.path().join("test.vault.backups");
+    let backups = dir.path().join("test.vault").join("backups");
     let count = |a: &SyncedVault| a.backups().unwrap().len();
     let before = count(&a);
     let id = a.vault().unwrap().items().next().unwrap().id;
@@ -469,7 +474,7 @@ struct EvictedBackups(std::sync::atomic::AtomicUsize);
 fn in_backups(path: &Path) -> bool {
     path.parent()
         .and_then(|p| p.file_name())
-        .is_some_and(|n| n.to_string_lossy().ends_with(".backups"))
+        .is_some_and(|n| n == "backups")
 }
 
 impl CloudHooks for EvictedBackups {
@@ -489,7 +494,7 @@ impl CloudHooks for EvictedBackups {
 fn lock_does_not_download_an_evicted_unsaved_copy() {
     let (_dir, path, _a, _b) = two_devices();
     let hooks = Arc::new(EvictedBackups::default());
-    let mut c = SyncedVault::open(&path, Uuid::from_u128(0xC), hooks.clone()).unwrap();
+    let mut c = SyncedVault::open(pkg(&path), Uuid::from_u128(0xC), hooks.clone()).unwrap();
     c.unlock(&pw()).unwrap();
     plant(&path, &foreign_vault_bytes());
     insert(&mut c, "from c");

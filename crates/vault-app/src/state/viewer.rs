@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use gpui::Context;
+use gpui::{AnyWindowHandle, App, Context};
 use vault_core::{Item, SecretString, Uuid};
 
 use super::AppState;
@@ -29,17 +29,31 @@ impl AppState {
         }
     }
 
-    /// Closes every backup viewer window and forgets the handles. Deferred, because
-    /// `lock` can run inside one of those windows' own updates.
+    /// Closes every backup viewer window and forgets the handles.
     pub(super) fn close_backup_windows(&mut self, cx: &mut Context<Self>) {
-        for handle in std::mem::take(&mut self.backup_windows) {
-            cx.defer(move |cx| {
-                // Already closed by the user: nothing to do.
-                handle
-                    .update(cx, |_, window, _| window.remove_window())
-                    .ok();
-            });
-        }
+        close_windows(std::mem::take(&mut self.backup_windows), cx);
+    }
+
+    /// The open item window pinned to `id`, if any. Forgets windows that are gone (closed
+    /// by the user, or by the window itself when its item was deleted).
+    pub fn item_window(&mut self, id: Uuid, cx: &App) -> Option<AnyWindowHandle> {
+        let live = cx.windows();
+        self.item_windows.retain(|(_, h)| live.contains(h));
+        self.item_windows
+            .iter()
+            .find(|(item, _)| *item == id)
+            .map(|(_, h)| *h)
+    }
+
+    /// Remembers a newly opened item window, so `lock` can close it.
+    pub fn track_item_window(&mut self, id: Uuid, handle: AnyWindowHandle) {
+        self.item_windows.push((id, handle));
+    }
+
+    /// Closes every item window and forgets the handles.
+    pub(super) fn close_item_windows(&mut self, cx: &mut Context<Self>) {
+        let handles = std::mem::take(&mut self.item_windows);
+        close_windows(handles.into_iter().map(|(_, h)| h), cx);
     }
 
     /// Copies a value shown in the backup window, with the usual clear timer.
@@ -75,5 +89,17 @@ impl AppState {
                 None
             }
         }
+    }
+}
+
+/// Closes `handles`. Deferred, because `lock` can run inside one of those windows' own
+/// updates; a window the user already closed is skipped.
+fn close_windows(handles: impl IntoIterator<Item = AnyWindowHandle>, cx: &mut App) {
+    for handle in handles {
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
+        });
     }
 }

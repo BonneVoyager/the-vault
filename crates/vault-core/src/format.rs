@@ -15,9 +15,12 @@
 //!
 //! Besides unknown keys, unknown *enum strings* are tolerated so an older build can open a file
 //! a newer one wrote: an unknown `slot.kind` becomes an [`OpaqueSlot`] (preserved, never used),
-//! an unknown `item.kind` / `field.kind` becomes `ItemKind::Other` / `FieldKind::Other` with the
-//! original string in `kind_raw`. Wrong CBOR types, missing required keys and bad lengths
-//! remain `Malformed`.
+//! an unknown `field.kind` becomes `FieldKind::Other` with the original string in `kind_raw`.
+//! Wrong CBOR types, missing required keys and bad lengths remain `Malformed`.
+//!
+//! `ItemPlain.kind` (item categories) was removed on 2026-10-30 without a version bump. The
+//! reader does not look for it, so an old file's `kind` entry is an ordinary unknown key that
+//! lands in `Item::extras` and is re-emitted verbatim; the writer never adds one.
 
 use std::collections::BTreeSet;
 
@@ -30,8 +33,7 @@ use crate::attachment::validate_ref;
 use crate::crypto::{KEY_LEN, NONCE_LEN, WRAPPED_KEY_LEN};
 use crate::error::VaultError;
 use crate::item::{
-    AttachmentRef, AttachmentTombstone, Extras, Field, FieldKind, HistoryEntry, Item, ItemKind,
-    Millis,
+    AttachmentRef, AttachmentTombstone, Extras, Field, FieldKind, HistoryEntry, Item, Millis,
 };
 use crate::kdf::KdfParams;
 
@@ -975,8 +977,8 @@ fn field_to_value(f: &Field) -> Value {
 fn field_from_value(value: Value) -> Result<Field, VaultError> {
     let mut m = MapReader::new("field", value)?;
     let name = as_text(m.required("name")?, "field.name")?;
-    // Unknown kind strings become `FieldKind::Other` + `kind_raw` (01 §9); only a non-text
-    // `kind` is structural damage.
+    // Unknown kind strings (including the removed `"number"`) become `FieldKind::Other` +
+    // `kind_raw` (01 §9); only a non-text `kind` is structural damage.
     let kind_str = as_text(m.required("kind")?, "field.kind")?;
     let kind = FieldKind::parse(&kind_str).unwrap_or(FieldKind::Other);
     let kind_raw = (kind == FieldKind::Other).then_some(kind_str);
@@ -1016,14 +1018,14 @@ fn history_from_value(value: Value) -> Result<HistoryEntry, VaultError> {
 /// `attachments` is always written (as `[]` when the item has none); `removed_attachments`
 /// (`[{ "id": bytes(16), "removed_at": u64 }]`) and `removed_history` (`[u64]`, stamps
 /// newest first) are optional keys written only when non-empty, so files without removals
-/// keep their v1 byte layout.
+/// keep their v1 byte layout. No `kind` key is written (removed 2026-10-30); one read from
+/// an older file is in `item.extras` and is re-emitted from there, unchanged.
 pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
     // NOTE: the `ciborium::Value` tree built here holds plaintext field values and attachment
     // keys as ordinary `String`s / `Vec<u8>`s and cannot be zeroized; only the encoded output
     // is. Known entries are moved, not cloned, and `encode` allocates once, to keep the number
     // of stray copies minimal.
     let mut known = vec![
-        ("kind", text(item.kind_str())),
         ("title", text(&item.title)),
         (
             "deleted_at",
@@ -1077,11 +1079,8 @@ pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
 pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<Item, VaultError> {
     // NOTE: same limitation as `encode_item_plain`: the decoded `Value` tree is not zeroized.
     let mut m = MapReader::new("item", decode_exact(plain, "item")?)?;
-    // Unknown kind strings become `ItemKind::Other` + `kind_raw` (01 §9); only a non-text
-    // `kind` is structural damage.
-    let kind_str = as_text(m.required("kind")?, "item.kind")?;
-    let kind = ItemKind::parse(&kind_str).unwrap_or(ItemKind::Other);
-    let kind_raw = (kind == ItemKind::Other).then_some(kind_str);
+    // `kind` is deliberately not taken: since 2026-10-30 it is an unknown key that stays in
+    // `extras` (whatever its CBOR type) and round-trips verbatim.
     let title = as_text(m.required("title")?, "item.title")?;
     let deleted_at = opt_u64(Some(m.required("deleted_at")?), "item.deleted_at")?;
     let device_id = as_uuid(m.required("device_id")?, "item.device_id")?;
@@ -1125,8 +1124,6 @@ pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<
     };
     Ok(Item {
         id,
-        kind,
-        kind_raw,
         title,
         deleted_at,
         device_id,

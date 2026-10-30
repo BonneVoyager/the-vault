@@ -13,6 +13,7 @@ mod persist;
 mod root;
 mod screens;
 mod state;
+mod templates;
 mod text;
 mod theme;
 mod ui;

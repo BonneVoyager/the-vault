@@ -5,3 +5,5 @@
 - [Forward-compat decisions](forward-compat-decisions.md) — Slot/OpaqueSlot, unit *Kind::Other + kind_raw, NoUsableSlot, fixture policy, what stays Malformed
 - [Attachment decisions](attachment-decisions.md) — v1.1: AttachmentRef, 42-byte chunk AAD bound to ATTACHMENT_VERSION=1 (not file version), seal by value, validate_ref everywhere, removal tombstones (cap 64) + merge rule, v1-attach fixture
 - [History tombstone decisions](history-tombstone-decisions.md) — removed_history [u64] optional key, cap 10 (HISTORY_CAP), remove-all-with-stamp, clear_history no-op when empty, merge drop after loser push, set_field stamp guard
+- [Item kind removal decisions](item-kind-removal-decisions.md) — 2026-10-30: ItemKind/Item.kind/FieldKind::Number removed, legacy `kind` = extras key, importers add template tags, export login gate dropped, fixtures unchanged
+- [KDBX import decisions](kdbx-import-decisions.md) — 2026-10-30: header pre-walk mirroring keepass-rs 0.17.0, KDF limits, Malformed (no Unsupported variant), history value-dedup, native TOTP mapping

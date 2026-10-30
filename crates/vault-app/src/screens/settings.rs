@@ -98,6 +98,9 @@ impl SettingsView {
     }
 }
 
+/// Toast for the "Move…" stub in Sync & Backup.
+const MOVE_PACKAGE_LATER: &str = "Moving the vault package is coming later. To move it now, quit Vault and drag the \u{201c}.vault\u{201d} package in Finder.";
+
 fn auto_lock_label(minutes: Option<u32>) -> SharedString {
     match minutes {
         None => "Never".into(),
@@ -322,7 +325,7 @@ impl SettingsView {
         Some(row("Launch at login", control))
     }
 
-    /// Sync & Backup (§2.5, 03 §4).
+    /// Sync & Backup (§2.5, 03 §4). The path shown and revealed is the `.vault` package.
     fn sync(&self, cx: &App) -> gpui::Div {
         let s = self.state.read(cx);
         let theme = cx.theme();
@@ -355,7 +358,7 @@ impl SettingsView {
         let location = ui::v_flex()
             .py(px(10.))
             .gap(px(6.))
-            .child(div().text_sm().child("Vault file"))
+            .child(div().text_sm().child("Vault package"))
             .child(
                 div()
                     .text_xs()
@@ -371,7 +374,7 @@ impl SettingsView {
                         "move-vault",
                         "Move\u{2026}",
                         &self.state,
-                        |s, cx| s.show_toast("Moving the vault is coming later", cx),
+                        |s, cx| s.show_toast(MOVE_PACKAGE_LATER, cx),
                     ))
                     .child(
                         Button::new("reveal-vault")
@@ -682,7 +685,7 @@ mod tests {
 
     use gpui::{TestAppContext, VisualTestContext};
     use gpui_component::Root;
-    use vault_core::{Item, ItemKind, KdfParams, SecretString, Uuid};
+    use vault_core::{Item, KdfParams, SecretString, Uuid};
     use vault_sync::{NoopHooks, SyncedVault};
 
     use super::*;
@@ -772,7 +775,7 @@ mod tests {
         for (n, title) in ["GitHub", "GitLab", "Codeberg"].into_iter().enumerate() {
             let at = n as u64 + 1;
             vault
-                .edit(|v| v.insert(Item::new(ItemKind::Login, title, device, at), at))
+                .edit(|v| v.insert(Item::new(title, device, at), at))
                 .unwrap();
             vault.save().unwrap();
             vault.backup_now().unwrap();

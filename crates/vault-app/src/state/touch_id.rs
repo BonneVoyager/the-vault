@@ -510,7 +510,7 @@ mod tests {
     use std::sync::Arc;
 
     use gpui::{AppContext as _, Entity, TestAppContext};
-    use vault_core::{Item, ItemKind, KdfParams, LockedVault};
+    use vault_core::{Item, KdfParams, LockedVault};
     use vault_sync::NoopHooks;
 
     use super::*;
@@ -535,7 +535,7 @@ mod tests {
         .unwrap();
         let device = vault.device_id();
         vault
-            .edit(|v| v.insert(Item::new(ItemKind::Login, "GitHub", device, 1), 1))
+            .edit(|v| v.insert(Item::new("GitHub", device, 1), 1))
             .unwrap();
         vault.save().unwrap();
         path
@@ -576,7 +576,7 @@ mod tests {
     }
 
     fn enclave_slots_on_disk(path: &Path) -> Vec<Uuid> {
-        LockedVault::parse(&std::fs::read(path).unwrap())
+        LockedVault::parse(&std::fs::read(path.join("vault.bin")).unwrap())
             .unwrap()
             .slots()
             .filter(|(_, k)| *k == SlotKind::Enclave)
@@ -848,9 +848,9 @@ mod tests {
         let settings = state.read_with(cx, |s, _| s.settings.clone());
         state.update(cx, |s, cx| s.close_vault(cx));
         // Flip the last byte (inside the final AEAD tag).
-        let mut bytes = std::fs::read(&path).unwrap();
+        let mut bytes = std::fs::read(path.join("vault.bin")).unwrap();
         *bytes.last_mut().unwrap() ^= 0x01;
-        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(path.join("vault.bin"), bytes).unwrap();
 
         let state = reopen_locked(&path, &bio, settings, cx);
         state.update(cx, |s, cx| s.touch_unlock(cx));

@@ -27,7 +27,7 @@ actions!(
         Quit,
         /// ⌘F: focus the search field.
         Search,
-        /// ⌘N: new item (kind picker).
+        /// ⌘N: new item (Templates menu).
         NewItem,
         /// ⌘E: edit the selected item.
         EditItem,
@@ -270,7 +270,7 @@ pub fn register(state: &Entity<AppState>, cx: &mut App) {
     on_main::<OpenUrl>(state, cx, |s, cx| s.open_url(None, cx));
     on_main::<ToggleFavorite>(state, cx, |s, cx| s.toggle_favorite(cx));
 
-    on_main::<NewItem>(state, cx, |s, cx| s.open_kind_picker(String::new(), cx));
+    on_main::<NewItem>(state, cx, |s, cx| s.open_template_picker(String::new(), cx));
     on_main::<EditItem>(state, cx, |s, cx| s.begin_edit(cx));
     on_main::<SaveItem>(state, cx, |s, cx| s.save_edit(cx));
     on_main::<CancelEdit>(state, cx, |s, cx| s.cancel_edit(cx));

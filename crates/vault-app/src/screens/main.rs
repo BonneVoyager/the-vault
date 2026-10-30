@@ -304,9 +304,7 @@ mod tests {
 
     use gpui::{Entity, Pixels, TestAppContext, VisualTestContext, size};
     use gpui_component::Root;
-    use vault_core::{
-        ExposeSecret as _, Field, FieldKind, Item, ItemKind, KdfParams, SecretString,
-    };
+    use vault_core::{ExposeSecret as _, Field, FieldKind, Item, KdfParams, SecretString};
     use vault_sync::{NoopHooks, SyncedVault};
 
     use super::*;
@@ -332,7 +330,7 @@ mod tests {
         if populated {
             let device = v.device_id();
             v.edit(|v| {
-                let mut gh = Item::new(ItemKind::Login, "GitHub", device, 1);
+                let mut gh = Item::new("GitHub", device, 1);
                 gh.tags = vec!["infra".into()];
                 gh.fields = vec![
                     field("username", FieldKind::Text, "chris"),
@@ -348,13 +346,14 @@ mod tests {
                 let id = v.insert(gh, 1);
                 v.set_field(id, "password", SecretString::new("new".into()), 2)
                     .unwrap();
-                let mut card = Item::new(ItemKind::Card, "Visa", device, 3);
+                let mut card =
+                    crate::templates::tagged(crate::templates::Template::Card, "Visa", device, 3);
                 card.fields = vec![
                     field("number", FieldKind::Text, "4242424242424242"),
                     field("expiry", FieldKind::MonthYear, "12/29"),
                 ];
                 v.insert(card, 3);
-                v.insert(Item::new(ItemKind::Identity, "", device, 4), 4);
+                v.insert(Item::new("", device, 4), 4);
             })
             .unwrap();
         }
@@ -439,7 +438,7 @@ mod tests {
             .expect("second window");
         let mut detail = VisualTestContext::from_window(detail_window, &vcx.cx);
         detail.run_until_parked();
-        assert_eq!(detail.window_title().as_deref(), Some("GitHub"));
+        assert_eq!(detail.window_title().as_deref(), Some("Item details"));
         assert!(detail.debug_bounds("detail-title GitHub").is_some());
         for selector in [
             "detail-header",
@@ -464,7 +463,7 @@ mod tests {
         });
         state.update(&mut vcx, |s, cx| s.select(visa, cx));
         detail.run_until_parked();
-        assert_eq!(detail.window_title().as_deref(), Some("GitHub"));
+        assert_eq!(detail.window_title().as_deref(), Some("Item details"));
         assert!(detail.debug_bounds("detail-title GitHub").is_some());
 
         // Value clicks copy from the pinned item, even with Visa selected in the main window.
@@ -749,14 +748,14 @@ mod tests {
             assert!(!s.is_editing());
             assert!(s.delete_confirm.is_none());
             assert_eq!(
-                s.kind_picker.as_deref(),
+                s.template_picker.as_deref(),
                 Some(""),
                 "⌘N opens the kind picker"
             );
         });
         // Pick Login, name it, save: the first item exists and is selected.
         state.update(&mut vcx, |s, cx| {
-            s.begin_new(ItemKind::Login, String::new(), cx)
+            s.begin_new(crate::templates::Template::Login, String::new(), cx)
         });
         vcx.run_until_parked();
         vcx.simulate_input("Hetzner");
@@ -843,7 +842,7 @@ mod tests {
 
         // ⌘N + Esc mid-new cancels; an empty title is rejected inline.
         state.update(&mut vcx, |s, cx| {
-            s.begin_new(ItemKind::Note, String::new(), cx)
+            s.begin_new(crate::templates::Template::Note, String::new(), cx)
         });
         vcx.run_until_parked();
         vcx.simulate_keystrokes("cmd-s");

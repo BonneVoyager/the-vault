@@ -47,7 +47,7 @@ fn full_flow() {
         PW,
         &[
             "add",
-            "--kind",
+            "--template",
             "login",
             "--title",
             "GitHub",
@@ -64,6 +64,18 @@ fn full_flow() {
     ));
     let list = ok(&vault(&f, PW, &["list"]));
     assert!(list.contains("GitHub") && list.contains("octo"), "{list}");
+    assert!(list.contains("dev") && list.contains("login"), "{list}");
+    let tagged = ok(&vault(&f, PW, &["list", "--tag", "dev"]));
+    assert!(tagged.contains("GitHub"), "{tagged}");
+    assert!(
+        !ok(&vault(&f, PW, &["list", "--tag", "card"])).contains("GitHub"),
+        "tag filter must exclude non-matching items"
+    );
+    let got = ok(&vault(&f, PW, &["get", "GitHub"]));
+    assert!(
+        got.contains("tags:  dev, login") && !got.contains("kind:"),
+        "{got}"
+    );
 
     let masked = ok(&vault(&f, PW, &["get", "github"]));
     assert!(masked.contains("********") && !masked.contains("s3cret-item-pw"));
@@ -92,7 +104,11 @@ fn full_flow() {
         PW,
         &["export", "--out", csv_s, "--yes", "--force"],
     ));
-    let vmode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+    let vmode = std::fs::metadata(f.join("vault.bin"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(vmode, 0o600);
     assert!(std::fs::read_to_string(&csv).unwrap().contains("GitHub"));
 
@@ -156,7 +172,7 @@ fn totp_field_via_env() {
             "--password-env",
             "VAULT_TEST_PW",
         ])
-        .args(["add", "--kind", "login", "--title", "X", "--totp-field"])
+        .args(["add", "--template", "login", "--title", "X", "--totp-field"])
         .env("VAULT_TEST_PW", PW)
         .env("VAULT_ITEM_TOTP", TOTP_URI)
         .env("VAULT_DEVICE_ID", "11111111-1111-4111-8111-111111111111")
@@ -197,22 +213,60 @@ fn unparsable_device_id_errors() {
 }
 
 #[test]
-fn forward_fixture_shows_real_kinds_and_masks_unknown_fields() {
+fn legacy_single_file_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("old.vault");
+    std::fs::write(&f, b"legacy").unwrap();
+    let o = vault(&f, PW, &["list"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("not a vault package"), "{err}");
+}
+
+#[test]
+fn add_templates_tag_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    ok(&vault(
+        &f,
+        PW,
+        &["add", "--template", "card", "--title", "Visa"],
+    ));
+    ok(&vault(&f, PW, &["add", "--title", "Plain"]));
+    let cards = ok(&vault(&f, PW, &["list", "--tag", "card"]));
+    assert!(
+        cards.contains("Visa") && !cards.contains("Plain"),
+        "{cards}"
+    );
+    let logins = ok(&vault(&f, PW, &["list", "--tag", "login"]));
+    assert!(
+        logins.contains("Plain") && !logins.contains("Visa"),
+        "{logins}"
+    );
+    assert!(
+        !vault(&f, PW, &["add", "--template", "bogus", "--title", "Z"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn forward_fixture_masks_unknown_fields() {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../vault-core/tests/fixtures/v1-forward.vault");
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("fwd.vault");
-    std::fs::copy(&fixture, &f).unwrap();
+    std::fs::create_dir(&f).unwrap();
+    std::fs::copy(&fixture, f.join("vault.bin")).unwrap();
 
     let list = ok(&vault(&f, PW, &["list"]));
     assert!(
-        list.lines()
-            .any(|l| l.contains("future-item-kind") && l.contains("Future thing")),
+        list.lines().any(|l| l.contains("Future thing")),
         "list: {list}"
     );
 
     let get = ok(&vault(&f, PW, &["get", "Future thing"]));
-    assert!(get.contains("kind:  future-item-kind"), "get: {get}");
     assert!(get.contains("future: ********"), "get: {get}");
     assert!(!get.contains("future-value"), "get: {get}");
 }
@@ -248,7 +302,7 @@ fn attach_setup() -> (tempfile::TempDir, std::path::PathBuf) {
     ok(&vault(
         &f,
         PW,
-        &["add", "--kind", "login", "--title", "Docs"],
+        &["add", "--template", "login", "--title", "Docs"],
     ));
     (dir, f)
 }

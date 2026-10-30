@@ -72,7 +72,7 @@ impl AppState {
         self.focus_request = None;
         self.discard_prompt = None;
         self.delete_confirm = None;
-        self.kind_picker = None;
+        self.template_picker = None;
         self.generator_target = None;
     }
 
@@ -379,7 +379,7 @@ mod tests {
     use std::sync::Arc;
 
     use gpui::{AppContext as _, Entity, TestAppContext};
-    use vault_core::{ItemKind, KdfParams};
+    use vault_core::KdfParams;
     use vault_sync::NoopHooks;
 
     use super::*;
@@ -398,7 +398,12 @@ mod tests {
         let device = vault.device_id();
         let ids = vault
             .edit(|v| {
-                let mut gh = Item::new(ItemKind::Login, "GitHub", device, 10);
+                let mut gh = crate::templates::tagged(
+                    crate::templates::Template::Login,
+                    "GitHub",
+                    device,
+                    10,
+                );
                 gh.fields.push(Field::new(
                     "username",
                     FieldKind::Text,
@@ -417,8 +422,9 @@ mod tests {
                     SecretString::new(TOTP_URI.into()),
                     10,
                 ));
-                let note = Item::new(ItemKind::Note, "Alarm code", device, 30);
-                let card = Item::new(ItemKind::Card, "Visa", device, 20);
+                let note = Item::new("Alarm code", device, 30);
+                let card =
+                    crate::templates::tagged(crate::templates::Template::Card, "Visa", device, 20);
                 [v.insert(gh, 10), v.insert(note, 30), v.insert(card, 20)]
             })
             .unwrap();
@@ -555,7 +561,7 @@ mod tests {
             assert_eq!(s.selection, None);
 
             s.set_query(String::new(), cx);
-            s.set_filter(Filter::Kind(ItemKind::Login), cx);
+            s.set_filter(Filter::Tag("login".into()), cx);
             assert_eq!(s.listing.items, [gh]);
             s.set_filter(Filter::Favorites, cx);
             assert!(s.listing.items.is_empty());

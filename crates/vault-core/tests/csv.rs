@@ -1,7 +1,6 @@
 use vault_core::import::{CsvMapping, ImportError, import_csv};
 use vault_core::{
-    ExposeSecret, Field, FieldKind, Item, ItemKind, KdfParams, SecretString, UnlockedVault, Uuid,
-    export_csv,
+    ExposeSecret, Field, FieldKind, Item, KdfParams, SecretString, UnlockedVault, Uuid, export_csv,
 };
 
 fn field(name: &str, kind: FieldKind, v: &str) -> Field {
@@ -9,7 +8,7 @@ fn field(name: &str, kind: FieldKind, v: &str) -> Field {
 }
 
 fn login(title: &str, user: &str, pw: &str) -> Item {
-    let mut i = Item::new(ItemKind::Login, title, Uuid::nil(), 1);
+    let mut i = Item::new(title, Uuid::nil(), 1);
     i.fields.push(field("username", FieldKind::Text, user));
     i.fields.push(field("password", FieldKind::Password, pw));
     i
@@ -48,7 +47,7 @@ fn export_then_import_round_trips() {
     let v = vault(vec![
         tricky,
         login("plain", "u", "p"),
-        Item::new(ItemKind::Note, "n", Uuid::nil(), 1),
+        Item::new("n", Uuid::nil(), 1),
     ]);
 
     let out = export_csv(&v);
@@ -62,7 +61,7 @@ fn export_then_import_round_trips() {
     got.sort_by(|a, b| a.title.cmp(&b.title));
     for (o, g) in orig.iter().zip(&got) {
         assert_eq!(o.title, g.title);
-        assert_eq!(g.kind, ItemKind::Login);
+        assert_eq!(g.tags, ["login"], "CSV rows get the login template tag");
         assert_eq!(g.device_id, dev);
         assert_eq!(g.modified_at, 99);
         for n in ["username", "password", "url", "notes", "totp"] {
@@ -76,16 +75,20 @@ fn export_then_import_round_trips() {
 }
 
 #[test]
-fn non_login_export_has_empty_credentials() {
-    let mut n = Item::new(ItemKind::Note, "n", Uuid::nil(), 1);
+fn export_has_no_category_gate_on_credentials() {
+    // Item kinds are gone (2026-10-30): a "note" (by template tag) that carries a password
+    // field exports it like any other item, and an item without one gets an empty cell.
+    let mut n = Item::new("n", Uuid::nil(), 1);
+    n.tags.push("note".into());
     n.fields
-        .push(field("password", FieldKind::Password, "leak"));
+        .push(field("password", FieldKind::Password, "exported-pw"));
     n.fields.push(field("notes", FieldKind::Notes, "body"));
-    let out = export_csv(&vault(vec![n]));
+    let bare = Item::new("bare", Uuid::nil(), 1);
+    let out = export_csv(&vault(vec![n, bare]));
     let text = String::from_utf8(out.0.clone()).unwrap();
-    assert!(!text.contains("leak"));
-    assert!(text.contains("body"));
     assert!(text.starts_with("title,username,password,url,notes,totp"));
+    assert!(text.contains("n,,exported-pw,,body,"));
+    assert!(text.contains("bare,,,,,"));
 }
 
 #[test]

@@ -486,7 +486,7 @@ mod tests {
 
     use gpui::{AppContext as _, TestAppContext, VisualTestContext};
     use gpui_component::Root;
-    use vault_core::{ItemKind, KdfParams, SecretString};
+    use vault_core::{KdfParams, SecretString};
     use vault_sync::{NoopHooks, SyncedVault};
 
     use super::super::MainScreen;
@@ -519,7 +519,7 @@ mod tests {
         let id = vault
             .edit(|v| {
                 let d = v.device_id();
-                v.insert(Item::new(ItemKind::Note, "Passport", d, 1), 1)
+                v.insert(Item::new("Passport", d, 1), 1)
             })
             .unwrap();
         let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));

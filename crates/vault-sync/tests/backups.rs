@@ -8,8 +8,10 @@ use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use tempfile::TempDir;
-use vault_core::{Item, ItemKind, KdfParams, SecretString, Uuid};
-use vault_sync::{CloudError, CloudHooks, NoopHooks, SyncError, SyncEvent, SyncedVault};
+use vault_core::{Item, KdfParams, SecretString, Uuid};
+use vault_sync::{
+    CloudError, CloudHooks, NoopHooks, SyncError, SyncEvent, SyncedVault, VAULT_FILE_NAME,
+};
 
 const NOW: u64 = 1_700_000_000_000;
 
@@ -32,7 +34,7 @@ fn setup() -> (TempDir, PathBuf, SyncedVault) {
 }
 
 fn insert_item(v: &mut SyncedVault, title: &str) -> Uuid {
-    v.edit(|vault| vault.insert(Item::new(ItemKind::Login, title, Uuid::nil(), NOW), NOW))
+    v.edit(|vault| vault.insert(Item::new(title, Uuid::nil(), NOW), NOW))
         .unwrap()
 }
 
@@ -56,8 +58,14 @@ fn backups_taken(rx: &Receiver<SyncEvent>) -> Vec<PathBuf> {
         .collect()
 }
 
+/// `<package>/backups` for the `test.vault` package in `dir`.
 fn backups_dir(dir: &Path) -> PathBuf {
-    dir.join("test.vault.backups")
+    dir.join("test.vault").join("backups")
+}
+
+/// `<package>/vault.bin`.
+fn bin(package: &Path) -> PathBuf {
+    package.join(VAULT_FILE_NAME)
 }
 
 #[test]
@@ -75,12 +83,12 @@ fn two_saves_in_a_second_take_one_snapshot() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].path, taken[0]);
     // The snapshot is the first save's bytes, not the second's.
-    assert_ne!(fs::read(&taken[0]).unwrap(), fs::read(&path).unwrap());
+    assert_ne!(fs::read(&taken[0]).unwrap(), fs::read(bin(&path)).unwrap());
     assert_eq!(list[0].size, fs::metadata(&taken[0]).unwrap().len());
 
     let name = taken[0].file_name().unwrap().to_str().unwrap().to_owned();
     assert!(
-        name.starts_with("test-") && name.ends_with("Z.vault"),
+        name.starts_with("test-") && name.ends_with("Z.vault.bin"),
         "{name}"
     );
     let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -106,7 +114,7 @@ fn deleting_an_item_takes_an_extra_snapshot() {
     let list = v.backups().unwrap();
     assert_eq!(list.len(), 2);
     assert_eq!(list[0].path, taken[1]);
-    assert_eq!(fs::read(&taken[1]).unwrap(), fs::read(&path).unwrap());
+    assert_eq!(fs::read(&taken[1]).unwrap(), fs::read(bin(&path)).unwrap());
 
     // An edit that does not reduce the count does not trigger another one.
     insert_item(&mut v, "c");
@@ -135,7 +143,7 @@ fn backup_now_copies_primary_even_while_locked() {
     v.lock();
     let rx = v.subscribe();
     let snap = v.backup_now().unwrap();
-    assert_eq!(fs::read(&snap).unwrap(), fs::read(&path).unwrap());
+    assert_eq!(fs::read(&snap).unwrap(), fs::read(bin(&path)).unwrap());
     assert_eq!(backups_taken(&rx), vec![snap.clone()]);
     assert_eq!(v.backups().unwrap()[0].path, snap);
 }
@@ -173,13 +181,13 @@ fn restore_replaces_primary_and_snapshots_old_state() {
 
     insert_item(&mut v, "b");
     v.save().unwrap();
-    let before = fs::read(&path).unwrap();
+    let before = fs::read(bin(&path)).unwrap();
     insert_item(&mut v, "unsaved");
     let rx = v.subscribe();
 
     v.restore_from(&snap, &pw()).unwrap();
 
-    assert_eq!(fs::read(&path).unwrap(), snap_bytes);
+    assert_eq!(fs::read(bin(&path)).unwrap(), snap_bytes);
     assert_eq!(titles(&v), ["a"]);
     assert!(!v.is_dirty());
     assert_eq!(v.vault().unwrap().device_id(), Uuid::from_u128(0xD0D0));
@@ -209,14 +217,14 @@ fn restore_with_wrong_password_changes_nothing() {
     insert_item(&mut v, "b");
     v.save().unwrap();
     insert_item(&mut v, "unsaved");
-    let before = fs::read(&path).unwrap();
+    let before = fs::read(bin(&path)).unwrap();
     let rx = v.subscribe();
 
     let err = v
         .restore_from(&snap, &SecretString::new("wrong".to_owned()))
         .unwrap_err();
     assert!(matches!(err, SyncError::Vault(_)), "{err:?}");
-    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read(bin(&path)).unwrap(), before);
     assert_eq!(titles(&v), ["a", "b", "unsaved"]);
     assert!(v.is_dirty());
     assert!(backups_taken(&rx).is_empty());
@@ -227,10 +235,10 @@ fn restore_with_wrong_password_changes_nothing() {
 fn restore_rejects_a_different_vault() {
     let (_dir, path, mut v) = setup();
     let (_dir2, other_path, _other) = setup();
-    let before = fs::read(&path).unwrap();
+    let before = fs::read(bin(&path)).unwrap();
     let err = v.restore_from(&other_path, &pw()).unwrap_err();
     assert!(matches!(err, SyncError::ForeignVault { .. }), "{err:?}");
-    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read(bin(&path)).unwrap(), before);
     assert!(v.backups().unwrap().is_empty());
 }
 
@@ -241,11 +249,11 @@ fn restore_works_from_locked_and_over_a_corrupt_primary() {
     v.save().unwrap();
     let snap = v.backups().unwrap()[0].path.clone();
     v.lock();
-    fs::write(&path, b"garbage").unwrap();
+    fs::write(bin(&path), b"garbage").unwrap();
 
     v.restore_from(&snap, &pw()).unwrap();
     assert_eq!(titles(&v), ["a"]);
-    assert_eq!(fs::read(&path).unwrap(), fs::read(&snap).unwrap());
+    assert_eq!(fs::read(bin(&path)).unwrap(), fs::read(&snap).unwrap());
     // The unparseable primary is kept raw (as an unsaved, never-pruned file).
     let list = v.backups().unwrap();
     assert_eq!(list.len(), 2);
@@ -262,9 +270,13 @@ fn conflict_files_are_listed_and_unknown_files_ignored() {
     insert_item(&mut v, "a");
     v.save().unwrap();
     let b = backups_dir(dir.path());
+    // An absorbed conflict is a whole package directory.
     let conflict = b.join("conflict-2026-10-28T14-03-11Z-test (Mac's conflicted copy).vault");
-    fs::write(&conflict, b"x").unwrap();
+    fs::create_dir(&conflict).unwrap();
+    fs::write(bin(&conflict), b"x").unwrap();
     fs::write(b.join("notes.txt"), b"x").unwrap();
+    // Directories that are not conflict packages are ignored, even with a snapshot-like name.
+    fs::create_dir(b.join("test-2026-10-28T14-03-11Z.vault.bin")).unwrap();
 
     let list = v.backups().unwrap();
     assert_eq!(list.len(), 2);
@@ -282,8 +294,8 @@ fn retention_runs_after_a_snapshot() {
     let b = backups_dir(dir.path());
     fs::create_dir(&b).unwrap();
     // Two old snapshots in the same month beyond the weekly window: only the newer survives.
-    let old_a = b.join("test-2020-01-05T00-00-00Z.vault");
-    let old_b = b.join("test-2020-01-20T00-00-00Z.vault");
+    let old_a = b.join("test-2020-01-05T00-00-00Z.vault.bin");
+    let old_b = b.join("test-2020-01-20T00-00-00Z.vault.bin");
     let stray = b.join("notes.txt");
     for p in [&old_a, &old_b, &stray] {
         fs::write(p, b"x").unwrap();
@@ -342,18 +354,18 @@ fn backup_and_restore_wait_for_cloud_download() {
     let snap = v.backups().unwrap()[0].path.clone();
     insert_item(&mut v, "b");
     v.save().unwrap();
-    let before = fs::read(&path).unwrap();
+    let before = fs::read(bin(&path)).unwrap();
     let is_timeout = |e: SyncError| matches!(e, SyncError::Cloud(CloudError::Timeout));
 
     // Primary evicted: backup_now and restore_from both fail before touching anything.
-    *hooks.0.lock().unwrap() = Some(path.clone());
+    *hooks.0.lock().unwrap() = Some(bin(&path));
     assert!(is_timeout(v.backup_now().unwrap_err()));
     assert!(is_timeout(v.restore_from(&snap, &pw()).unwrap_err()));
     // Backup evicted: restore_from fails too.
     *hooks.0.lock().unwrap() = Some(snap.clone());
     assert!(is_timeout(v.restore_from(&snap, &pw()).unwrap_err()));
 
-    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read(bin(&path)).unwrap(), before);
     assert_eq!(titles(&v), ["a", "b"]);
     assert_eq!(v.backups().unwrap().len(), 1);
 }
@@ -363,14 +375,15 @@ fn fresh_conflict_file_does_not_suppress_hourly_snapshot() {
     let (dir, _path, mut v) = setup();
     insert_item(&mut v, "a");
     v.save().unwrap();
-    // Turn our seconds-old snapshot into a just-absorbed conflict copy, leaving no snapshot of
-    // our own (as if the last one were over an hour old and pruned).
+    // Turn our seconds-old snapshot into a just-absorbed conflict package, leaving no snapshot
+    // of our own (as if the last one were over an hour old and pruned).
     let ours = v.backups().unwrap()[0].path.clone();
     let name = ours.file_name().unwrap().to_str().unwrap();
-    let stamp = &name["test-".len()..name.len() - ".vault".len()];
+    let stamp = &name["test-".len()..name.len() - ".vault.bin".len()];
     let conflict =
         backups_dir(dir.path()).join(format!("conflict-{stamp}-test (conflicted copy).vault"));
-    fs::rename(&ours, &conflict).unwrap();
+    fs::create_dir(&conflict).unwrap();
+    fs::rename(&ours, bin(&conflict)).unwrap();
     assert!(v.backups().unwrap()[0].is_conflict());
 
     let rx = v.subscribe();
@@ -410,4 +423,28 @@ fn failed_first_snapshot_is_retried_on_next_save() {
     insert_item(&mut v, "d");
     v.save().unwrap();
     assert!(backups_taken(&rx).is_empty());
+}
+
+#[test]
+fn restore_from_an_absorbed_conflict_package() {
+    let (dir, path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let snap = v.backups().unwrap()[0].path.clone();
+    let conflict = backups_dir(dir.path()).join("conflict-2026-10-28T14-03-11Z-test 2.vault");
+    fs::create_dir(&conflict).unwrap();
+    fs::copy(&snap, bin(&conflict)).unwrap();
+    insert_item(&mut v, "b");
+    v.save().unwrap();
+
+    let listed = v.backups().unwrap();
+    let c = listed.iter().find(|b| b.is_conflict()).unwrap();
+    assert_eq!(c.path, conflict);
+    assert_eq!(c.size, fs::metadata(&snap).unwrap().len());
+
+    v.restore_from(&conflict, &pw()).unwrap();
+    assert_eq!(titles(&v), ["a"]);
+    assert_eq!(fs::read(bin(&path)).unwrap(), fs::read(&snap).unwrap());
+    // The package itself is left in the backups directory.
+    assert!(bin(&conflict).exists());
 }

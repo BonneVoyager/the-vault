@@ -351,7 +351,7 @@ mod tests {
     use std::sync::Arc;
 
     use gpui::{AppContext as _, Entity, TestAppContext};
-    use vault_core::{Item, ItemKind, LockedVault};
+    use vault_core::{Item, LockedVault};
     use vault_sync::{NoopHooks, SyncedVault};
 
     use super::*;
@@ -377,7 +377,7 @@ mod tests {
         let device = vault.device_id();
         for title in ["GitHub", "Bank"] {
             vault
-                .edit(|v| v.insert(Item::new(ItemKind::Login, title, device, 1), 1))
+                .edit(|v| v.insert(Item::new(title, device, 1), 1))
                 .unwrap();
         }
         vault.save().unwrap();
@@ -404,7 +404,7 @@ mod tests {
     }
 
     fn on_disk_kdf(path: &Path) -> KdfParams {
-        LockedVault::parse(&std::fs::read(path).unwrap())
+        LockedVault::parse(&std::fs::read(path.join("vault.bin")).unwrap())
             .unwrap()
             .kdf_params()
             .clone()
@@ -478,7 +478,7 @@ mod tests {
     fn rotate_round_trip(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (state, path) = setup(dir.path(), cx);
-        let bytes_before = std::fs::read(&path).unwrap();
+        let bytes_before = std::fs::read(path.join("vault.bin")).unwrap();
         state.update(cx, |s, cx| s.rotate_key(secret("wrong"), cx));
         cx.run_until_parked();
         state.read_with(cx, |s, _| assert!(s.security.error.is_some()));
@@ -501,7 +501,7 @@ mod tests {
             .unwrap()
             .unlock(&secret(PW))
             .unwrap();
-        let now = LockedVault::parse(&std::fs::read(&path).unwrap()).unwrap();
+        let now = LockedVault::parse(&std::fs::read(path.join("vault.bin")).unwrap()).unwrap();
         assert!(matches!(
             now.unlock_with_key(&old.export_vault_key(), Uuid::new_v4()),
             Err(VaultError::WrongPassword)
@@ -542,7 +542,7 @@ mod tests {
             s.settings_open = true;
             s.settings_tab = SECURITY_TAB;
             let device = s.device_id();
-            let mut buffer = EditBuffer::new(Item::new(ItemKind::Note, "x", device, 1));
+            let mut buffer = EditBuffer::new(Item::new("x", device, 1));
             buffer.item.title = "changed".into();
             s.mode = Mode::Edit(buffer);
             s.rotate_key(secret(PW), cx);

@@ -39,8 +39,10 @@ as_key, as_key_mut, is_key_of}`.
   the only password slot to `enclave` now yields `NoUsableSlot`, not `WrongPassword`
   (tamper.rs updated).
 
-**Item/field kinds (lead's revised design, 2026-10-29):** `ItemKind::Other` and
-`FieldKind::Other` are UNIT variants so both enums stay `Copy` (serde derives kept; `Other`
+**Item/field kinds (lead's revised design, 2026-10-29; ITEM half superseded 2026-10-30 by
+[[item-kind-removal-decisions]] — `ItemKind`, `Item.kind`, `Item.kind_raw` no longer exist,
+a legacy item `kind` is just an extras key; the FIELD rules below still hold):**
+`ItemKind::Other` and `FieldKind::Other` are UNIT variants so both enums stay `Copy` (serde derives kept; `Other`
 serialises as `"other"`). The on-disk string lives on the owning struct: `Item.kind_raw:
 Option<String>` / `Field.kind_raw: Option<String>` — `None` for known kinds, `Some(original)`
 when kind == Other. Writer rule (`item::kind_str`): for `Other` emit `kind_raw` (fallback
@@ -53,7 +55,7 @@ known); `is_other()`; `ALL` lists known variants only. `FieldKind::is_sensitive(
 compare `kind_raw` too; `merge_live` copies the winner's `kind_raw`. CSV export has no kind
 column; CLI prints `item.kind.as_str()` (shows "other" — switch to `kind_str()` if wanted).
 
-**Downstream breakage this causes (vault-app only, lead to route):** exhaustive matches on
+**Downstream breakage this caused at the time (historical; vault-app only):** exhaustive matches on
 ItemKind/FieldKind need an `Other` arm: listing.rs:159, sidebar.rs:24/34, editor.rs:580,
 detail.rs:393, state/edit.rs:310/325. Struct-update literals (`Field { .., ..bf }`) compile
 unchanged. vault-cli, vault-sync, vault-macos compile unchanged. The first attempt used

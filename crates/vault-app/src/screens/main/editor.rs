@@ -9,8 +9,9 @@ use std::rc::Rc;
 
 use gpui::{
     Anchor, AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
+    IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Backspace, InputEvent, InputState, Textarea, TextareaState};
@@ -23,7 +24,6 @@ use vault_core::{ExposeSecret as _, FieldKind, strength_bits};
 use super::detail::history_disclosure;
 use super::generator::GeneratorView;
 use super::prompts;
-use super::sidebar::kind_singular;
 use crate::actions::{CancelEdit, SaveItem};
 use crate::state::{ADDABLE_KINDS, AppState, EditBuffer, GeneratorTarget, Mode, kind_name};
 use crate::text;
@@ -108,6 +108,10 @@ pub struct Editor {
     title: Entity<InputState>,
     /// "Add tag" input; Enter or a comma commits its text as a tag chip.
     tags: Entity<InputState>,
+    /// Sideways scroll of the chip strip; moved to the newest chip after an add.
+    tags_scroll: ScrollHandle,
+    /// Tag count last seen by `sync`, to notice an add.
+    tag_count: usize,
     rows: Vec<Row>,
     /// Row key whose grip started the current drag (dimmed while a drag is active).
     dragging: Rc<Cell<Option<u64>>>,
@@ -158,6 +162,8 @@ impl Editor {
             session: u64::MAX,
             title,
             tags,
+            tags_scroll: ScrollHandle::new(),
+            tag_count: 0,
             rows: Vec::new(),
             dragging: Rc::default(),
             _subscriptions: subscriptions,
@@ -185,7 +191,14 @@ impl Editor {
             ui::set_input(&self.title, &buffer.item.title, window, cx);
             ui::clear_input(&self.tags, window, cx);
             ui::focus_input(&self.title, window, cx);
+            self.tag_count = buffer.item.tags.len();
         }
+        let tag_count = buffer.item.tags.len();
+        if tag_count > self.tag_count {
+            // A new chip lands at the end of the strip: bring it into view.
+            self.tags_scroll.scroll_to_item(tag_count - 1);
+        }
+        self.tag_count = tag_count;
         self.reconcile(&buffer, window, cx);
         if !buffer.pushed.is_empty() {
             for key in &buffer.pushed {
@@ -388,6 +401,7 @@ impl Editor {
 
         ui::v_flex()
             .id(("edit-row", key))
+            .debug_selector(move || format!("edit-row {key}"))
             .py(px(8.))
             .gap(px(6.))
             .px(px(4.))
@@ -481,43 +495,75 @@ fn totp_hint(key: u64, buffer: &EditBuffer, cx: &App) -> Option<AnyElement> {
 }
 
 /// The tag chips with their remove buttons, then the "Add tag" input (§2.3 edit mode).
+/// Height of the edit-mode tags row at the default text size: fits a removable chip
+/// and the small input.
+const TAGS_ROW_HEIGHT: f32 = 28.;
+
 fn tags_row(
     tags: &[String],
     input: &Entity<InputState>,
+    scroll: &ScrollHandle,
     state: &Entity<AppState>,
     cx: &App,
 ) -> impl IntoElement {
     let theme = cx.theme();
     let chips = tags.iter().enumerate().map(|(ix, tag)| {
         let state = state.clone();
-        Tag::secondary().small().child(
-            ui::h_flex().gap(px(2.)).child(format!("#{tag}")).child(
-                ui::icon_button(
-                    ("remove-tag", ix),
-                    IconName::Close,
-                    &format!("Remove tag {tag}"),
-                )
-                .xsmall()
-                .on_click(move |_, _, cx| {
-                    state.update(cx, |s, cx| s.edit(cx, |b| b.remove_tag(ix)));
-                }),
-            ),
-        )
+        div()
+            .flex_none()
+            .debug_selector(move || format!("edit-tag-chip {ix}"))
+            .child(
+                Tag::secondary().small().flex_none().child(
+                    ui::h_flex().gap(px(2.)).child(format!("#{tag}")).child(
+                        ui::icon_button(
+                            ("remove-tag", ix),
+                            IconName::Close,
+                            &format!("Remove tag {tag}"),
+                        )
+                        .xsmall()
+                        .on_click(move |_, _, cx| {
+                            state.update(cx, |s, cx| s.edit(cx, |b| b.remove_tag(ix)));
+                        }),
+                    ),
+                ),
+            )
     });
     let (state, empty_check) = (state.clone(), input.clone());
+    // Fixed height, one line: adding the first chip (taller than the bare input) or many
+    // chips never moves the fields below (owner-reported jump). Only the chips scroll
+    // sideways; the input stays outside the strip so it is always visible, and `sync`
+    // scrolls the strip to the newest chip after an add.
     ui::h_flex()
         .id("edit-tags")
-        .flex_wrap()
+        .debug_selector(|| "edit-tags".into())
+        .flex_none()
+        .h(crate::theme::scaled(TAGS_ROW_HEIGHT, cx))
+        .w_full()
+        .items_center()
         .gap(px(6.))
         .child(
             Icon::new(IconName::Tag)
+                .flex_none()
                 .size_4()
                 .text_color(theme.muted_foreground),
         )
-        .children(chips)
+        .child(
+            ui::h_flex()
+                .id("edit-tag-chips")
+                .debug_selector(|| "edit-tag-chips".into())
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap(px(6.))
+                .overflow_x_scroll()
+                .track_scroll(scroll)
+                .children(chips),
+        )
         .child(
             div()
+                .flex_none()
                 .w(px(160.))
+                .debug_selector(|| "edit-tag-input".into())
                 // Backspace at the start of the input propagates here; in an empty input
                 // it removes the last chip.
                 .on_action(move |_: &Backspace, _, cx| {
@@ -551,7 +597,6 @@ fn value_placeholder(kind: FieldKind) -> &'static str {
         FieldKind::Email => "name@example.com",
         FieldKind::Date => "YYYY-MM-DD",
         FieldKind::MonthYear => "MM/YY",
-        FieldKind::Number => "Number",
         FieldKind::Text | FieldKind::Notes => "Value",
         // Unknown kind from a newer app version: treated as secret.
         FieldKind::Other => "Value",
@@ -658,13 +703,19 @@ impl Render for Editor {
             .pb(px(64.))
             .gap(px(10.))
             .when_some(new_kind, |col, kind| {
-                col.child(ui::muted(format!("New {}", kind_singular(kind)), cx))
+                col.child(ui::muted(format!("New {}", kind.label()), cx))
             })
             .child(header)
             .when(buffer.remote_title, |col| {
                 col.child(remote_badge("remote-title"))
             })
-            .child(tags_row(&buffer.item.tags, &self.tags, &self.state, cx))
+            .child(tags_row(
+                &buffer.item.tags,
+                &self.tags,
+                &self.tags_scroll,
+                &self.state,
+                cx,
+            ))
             .children(prompts::discard(s, &self.state, cx))
             .when_some(buffer.error.clone(), |col, error| {
                 col.child(div().text_sm().text_color(theme.danger).child(error))
@@ -692,386 +743,5 @@ mod drag_tests {
 }
 
 #[cfg(test)]
-mod tests {
-    //! Headless tests driving the real main screen: the editor's inputs, save, and the
-    //! detail column that renders the result.
-
-    use std::sync::Arc;
-
-    use gpui::{TestAppContext, VisualTestContext};
-    use gpui_component::Root;
-    use vault_core::{ItemKind, KdfParams, SecretString, Totp, Uuid};
-    use vault_sync::{NoopHooks, SyncedVault};
-
-    use super::super::MainScreen;
-    use super::*;
-    use crate::actions;
-
-    const PW: &str = "pw";
-    const URI: &str =
-        "otpauth://totp/Example:alice@google.com?secret=JBSWY3DPEHPK3PXP&issuer=Example";
-
-    /// The main screen over an empty unlocked vault.
-    pub(super) fn open(
-        dir: &std::path::Path,
-        cx: &mut TestAppContext,
-    ) -> (Entity<AppState>, Entity<MainScreen>, VisualTestContext) {
-        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
-        let mut v = SyncedVault::create(
-            &dir.join("t.vault"),
-            &SecretString::new(PW.into()),
-            KdfParams::for_tests(),
-            Uuid::new_v4(),
-            Arc::new(NoopHooks),
-        )
-        .unwrap();
-        v.save().unwrap();
-        let path = v.path().to_owned();
-        drop(v);
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            actions::bind_keys(cx);
-            actions::register(&state, cx);
-        });
-        state.update(cx, |s, cx| s.open_vault(path, cx));
-        cx.run_until_parked();
-        state.update(cx, |s, cx| s.unlock(SecretString::new(PW.into()), cx));
-        cx.run_until_parked();
-        let mut main = None;
-        let window = cx.add_window(|window, cx| {
-            crate::theme::apply(window, cx);
-            let view = cx.new(|cx| MainScreen::new(state.clone(), None, window, cx));
-            main = Some(view.clone());
-            Root::new(view, window, cx)
-        });
-        let mut vcx = VisualTestContext::from_window(window.into(), cx);
-        let main = main.unwrap();
-        vcx.update(|window, cx| main.update(cx, |m, cx| m.appear(window, cx)));
-        vcx.run_until_parked();
-        (state, main, vcx)
-    }
-
-    /// The single-line value input of row `key`.
-    pub(super) fn value_input(
-        main: &Entity<MainScreen>,
-        key: u64,
-        vcx: &mut VisualTestContext,
-    ) -> Entity<InputState> {
-        main.read_with(vcx, |m, cx| {
-            let editor = m.editor.read(cx);
-            match &editor
-                .rows
-                .iter()
-                .find(|r| r.key == key)
-                .expect("row")
-                .value
-            {
-                ValueInput::Line(i) => i.clone(),
-                ValueInput::Area(_) => panic!("not a line input"),
-            }
-        })
-    }
-
-    /// Types `text` into `input` like the user would.
-    fn type_into(input: &Entity<InputState>, text: &str, vcx: &mut VisualTestContext) {
-        vcx.update(|window, cx| ui::focus_input(input, window, cx));
-        vcx.simulate_input(text);
-        vcx.run_until_parked();
-    }
-
-    /// True when the detail column shows the current (or just-expired) code of `uri`.
-    pub(super) fn shows_code(uri: &str, vcx: &mut VisualTestContext) -> bool {
-        let totp = Totp::parse_uri(uri).unwrap();
-        let now = crate::text::now_millis() / 1000;
-        [now, now.saturating_sub(30)].into_iter().any(|t| {
-            let key = format!("totp-code {}", crate::text::group_code(&totp.code(t)));
-            vcx.debug_bounds(Box::leak(key.into_boxed_str())).is_some()
-        })
-    }
-
-    /// An unknown field kind (from a newer app version) edits in a masked input and is
-    /// never offered in "Add field".
-    #[gpui::test]
-    fn unknown_field_kind_uses_a_masked_input(cx: &mut TestAppContext) {
-        assert!(
-            !FieldKind::ALL.contains(&FieldKind::Other),
-            "not in Add field"
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let (state, main, mut vcx) = open(dir.path(), cx);
-        state.update(&mut vcx, |s, cx| {
-            s.begin_new(ItemKind::Login, "Example".into(), cx)
-        });
-        vcx.run_until_parked();
-        let (other, text) = state.update(&mut vcx, |s, cx| {
-            let mut keys = (0, 0);
-            s.edit(cx, |b| {
-                keys = (b.add_field(FieldKind::Other), b.add_field(FieldKind::Text))
-            });
-            keys
-        });
-        vcx.run_until_parked();
-        let other = value_input(&main, other, &mut vcx);
-        let text = value_input(&main, text, &mut vcx);
-        vcx.update(|_, cx| {
-            assert!(ui::input_is_masked(&other, cx), "Other is masked");
-            assert!(!ui::input_is_masked(&text, cx), "Text is not");
-        });
-    }
-
-    #[gpui::test]
-    fn typed_totp_uri_shows_a_code_after_save(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let (state, main, mut vcx) = open(dir.path(), cx);
-        state.update(&mut vcx, |s, cx| {
-            s.begin_new(ItemKind::Login, "Example".into(), cx)
-        });
-        vcx.run_until_parked();
-        // "Add field" ▸ one-time code.
-        let key = state.update(&mut vcx, |s, cx| {
-            let mut key = 0;
-            s.edit(cx, |b| key = b.add_field(FieldKind::Totp));
-            key
-        });
-        vcx.run_until_parked();
-        let input = value_input(&main, key, &mut vcx);
-        type_into(&input, URI, &mut vcx);
-        vcx.simulate_keystrokes("cmd-s");
-        vcx.run_until_parked();
-        state.read_with(&vcx, |s, _| {
-            assert!(
-                !s.is_editing(),
-                "{:?}",
-                s.edit_buffer().and_then(|b| b.error.clone())
-            );
-            let item = s.selected_item().expect("new item selected");
-            let f = item
-                .fields
-                .iter()
-                .find(|f| f.kind == FieldKind::Totp)
-                .unwrap();
-            assert_eq!(f.value.expose_secret(), URI);
-        });
-        vcx.run_until_parked();
-        assert!(
-            vcx.debug_bounds("totp-invalid").is_none(),
-            "shows the invalid line"
-        );
-        assert!(shows_code(URI, &mut vcx), "a 6-digit grouped code is shown");
-    }
-
-    #[gpui::test]
-    fn pasted_uri_in_an_existing_item_is_trimmed_and_works(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let (state, main, mut vcx) = open(dir.path(), cx);
-        state.update(&mut vcx, |s, cx| {
-            s.begin_new(ItemKind::Login, "Example".into(), cx)
-        });
-        vcx.run_until_parked();
-        vcx.simulate_keystrokes("cmd-s");
-        vcx.simulate_keystrokes("cmd-e");
-        vcx.run_until_parked();
-        let key = state.update(&mut vcx, |s, cx| {
-            let mut key = 0;
-            s.edit(cx, |b| key = b.add_field(FieldKind::Totp));
-            key
-        });
-        vcx.run_until_parked();
-        let input = value_input(&main, key, &mut vcx);
-        vcx.update(|window, cx| {
-            ui::focus_input(&input, window, cx);
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string(format!(" {URI}\n")));
-        });
-        vcx.simulate_keystrokes("cmd-v");
-        vcx.run_until_parked();
-        assert!(
-            vcx.debug_bounds("totp-hint Valid one-time code").is_some(),
-            "inline status while editing"
-        );
-        vcx.simulate_keystrokes("cmd-s");
-        vcx.run_until_parked();
-        state.read_with(&vcx, |s, _| {
-            let item = s.selected_item().unwrap();
-            let f = item
-                .fields
-                .iter()
-                .find(|f| f.kind == FieldKind::Totp)
-                .unwrap();
-            assert_eq!(f.value.expose_secret(), URI, "stored trimmed");
-        });
-        assert!(shows_code(URI, &mut vcx));
-    }
-
-    #[gpui::test]
-    fn invalid_value_is_flagged_at_edit_time_and_bare_secret_saves_as_uri(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let (state, main, mut vcx) = open(dir.path(), cx);
-        state.update(&mut vcx, |s, cx| {
-            s.begin_new(ItemKind::Login, "Bank".into(), cx)
-        });
-        vcx.run_until_parked();
-        let key = state.update(&mut vcx, |s, cx| {
-            let mut key = 0;
-            s.edit(cx, |b| key = b.add_field(FieldKind::Totp));
-            key
-        });
-        vcx.run_until_parked();
-        assert!(
-            vcx.debug_bounds("totp-hint Valid one-time code").is_none(),
-            "empty: no hint"
-        );
-        let input = value_input(&main, key, &mut vcx);
-        type_into(&input, "otpauth://totp/x?secret=1", &mut vcx);
-        assert!(
-            vcx.debug_bounds("totp-hint Not a valid otpauth URI or base32 secret")
-                .is_some()
-        );
-        vcx.update(|window, cx| ui::clear_input(&input, window, cx));
-        type_into(&input, "JBSWY3DPEHPK3PXP", &mut vcx);
-        assert!(
-            vcx.debug_bounds("totp-hint Valid one-time code secret (saved as an otpauth:// URI)")
-                .is_some()
-        );
-        vcx.simulate_keystrokes("cmd-s");
-        vcx.run_until_parked();
-        let stored = state.read_with(&vcx, |s, _| {
-            let item = s.selected_item().unwrap();
-            let f = item
-                .fields
-                .iter()
-                .find(|f| f.kind == FieldKind::Totp)
-                .unwrap();
-            f.value.expose_secret().to_owned()
-        });
-        assert!(
-            stored.starts_with("otpauth://totp/Bank?secret=JBSWY3DPEHPK3PXP"),
-            "{}",
-            stored.len()
-        );
-        assert!(shows_code(&stored, &mut vcx));
-    }
-
-    #[gpui::test]
-    fn tag_input_commits_on_enter_and_comma_and_backspace_removes(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let (state, main, mut vcx) = open(dir.path(), cx);
-        state.update(&mut vcx, |s, cx| {
-            s.begin_new(ItemKind::Login, "Example".into(), cx)
-        });
-        vcx.run_until_parked();
-        let tags = main.read_with(&vcx, |m, cx| m.editor.read(cx).tags.clone());
-        let buffer_tags = |vcx: &mut VisualTestContext| {
-            state.read_with(vcx, |s, _| s.edit_buffer().unwrap().item.tags.clone())
-        };
-
-        type_into(&tags, "work", &mut vcx);
-        vcx.simulate_keystrokes("enter");
-        vcx.run_until_parked();
-        assert_eq!(buffer_tags(&mut vcx), ["work"]);
-        assert!(ui::input_is_empty(&tags, &vcx.app.borrow()));
-
-        type_into(&tags, "#home,Work,", &mut vcx);
-        assert_eq!(
-            buffer_tags(&mut vcx),
-            ["work", "home"],
-            "comma commits, dupes dropped"
-        );
-        assert!(ui::input_is_empty(&tags, &vcx.app.borrow()));
-
-        // Backspace deletes typed text first; in an empty input it removes the last chip.
-        type_into(&tags, "x", &mut vcx);
-        vcx.simulate_keystrokes("backspace");
-        vcx.run_until_parked();
-        assert_eq!(buffer_tags(&mut vcx), ["work", "home"]);
-        vcx.simulate_keystrokes("backspace");
-        vcx.run_until_parked();
-        assert_eq!(buffer_tags(&mut vcx), ["work"]);
-
-        // An uncommitted draft is saved too.
-        type_into(&tags, "  #infra ", &mut vcx);
-        vcx.simulate_keystrokes("cmd-s");
-        vcx.run_until_parked();
-        state.read_with(&vcx, |s, _| {
-            assert!(!s.is_editing());
-            assert_eq!(s.selected_item().unwrap().tags, ["work", "infra"]);
-            let names: Vec<_> = s.counts.tags.iter().map(|t| t.0.as_str()).collect();
-            assert_eq!(names, ["infra", "work"]);
-        });
-
-        // Next edit starts with an empty tag input; the chip's × removes a tag.
-        vcx.simulate_keystrokes("cmd-e");
-        vcx.run_until_parked();
-        assert!(ui::input_is_empty(&tags, &vcx.app.borrow()));
-        state.update(&mut vcx, |s, cx| s.edit(cx, |b| b.remove_tag(0)));
-        vcx.simulate_keystrokes("cmd-s");
-        vcx.run_until_parked();
-        state.read_with(&vcx, |s, _| {
-            assert_eq!(s.selected_item().unwrap().tags, ["infra"])
-        });
-    }
-
-    /// Trash buttons appear on history entries in edit mode only; clicking one marks
-    /// just that entry, reveals nothing, and "Clear history" marks the rest.
-    #[gpui::test]
-    fn history_trash_buttons_only_in_edit_mode(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().unwrap();
-        let (state, _main, mut vcx) = open(dir.path(), cx);
-        let stamps = state.update(&mut vcx, |s, cx| {
-            let device = s.device_id();
-            let id = s
-                .vault
-                .as_mut()
-                .unwrap()
-                .edit(|v| {
-                    let mut it = vault_core::Item::new(ItemKind::Login, "GitHub", device, 10);
-                    it.fields = vec![vault_core::Field::new(
-                        "password",
-                        FieldKind::Password,
-                        SecretString::new("a".into()),
-                        10,
-                    )];
-                    let id = v.insert(it, 10);
-                    v.set_field(id, "password", SecretString::new("b".into()), 20)?;
-                    v.set_field(id, "password", SecretString::new("c".into()), 30)?;
-                    Ok::<_, vault_core::VaultError>(id)
-                })
-                .unwrap()
-                .unwrap();
-            s.vault_changed();
-            s.select(id, cx);
-            s.toggle_history(cx);
-            let item = s.selected_item().unwrap();
-            item.history
-                .iter()
-                .map(|h| h.replaced_at)
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(stamps.len(), 2);
-        vcx.run_until_parked();
-        assert!(vcx.debug_bounds("history-remove 0").is_none(), "read mode");
-        assert!(vcx.debug_bounds("history-clear").is_none(), "read mode");
-
-        state.update(&mut vcx, |s, cx| s.begin_edit(cx));
-        vcx.run_until_parked();
-        assert!(vcx.debug_bounds("history-remove 1").is_some());
-        let trash = vcx.debug_bounds("history-remove 0").expect("trash button");
-        vcx.simulate_click(trash.center(), gpui::Modifiers::none());
-        vcx.run_until_parked();
-        state.read_with(&vcx, |s, _| {
-            let b = s.edit_buffer().unwrap();
-            assert_eq!(b.removed_history, vec![stamps[0]]);
-            assert!(s.revealed.is_empty(), "removing reveals nothing");
-            assert_eq!(s.selected_item().unwrap().history.len(), 2, "not saved yet");
-        });
-        assert!(vcx.debug_bounds("history-remove 1").is_none(), "one left");
-
-        let clear = vcx.debug_bounds("history-clear").expect("clear button");
-        vcx.simulate_click(clear.center(), gpui::Modifiers::none());
-        vcx.run_until_parked();
-        state.read_with(&vcx, |s, _| {
-            assert_eq!(s.edit_buffer().unwrap().history().count(), 0);
-        });
-        assert!(vcx.debug_bounds("history-remove 0").is_none());
-        assert!(vcx.debug_bounds("history-clear").is_none());
-    }
-}
+#[path = "editor_tests.rs"]
+mod tests;

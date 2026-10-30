@@ -3,7 +3,7 @@
 use secrecy::ExposeSecret;
 use zeroize::Zeroize;
 
-use crate::item::{FieldKind, Item, ItemKind};
+use crate::item::{FieldKind, Item};
 use crate::vault::UnlockedVault;
 
 /// Unencrypted export bytes. A distinct type so they cannot be confused with vault file bytes.
@@ -26,29 +26,19 @@ fn value<'a>(item: &'a Item, name: &str, kind: FieldKind) -> &'a str {
         .map_or("", |f| f.value.expose_secret().as_str())
 }
 
-/// Columns: `title,username,password,url,notes,totp`. Non-login items are included with empty
-/// username and password.
+/// Columns: `title,username,password,url,notes,totp`. Every live item is one row; a column is
+/// empty when the item has no matching field. (Item categories were removed on 2026-10-30, so
+/// there is no longer a "non-login" gate on the credential columns.)
 pub fn export_csv(vault: &UnlockedVault) -> PlaintextExport {
     let mut w = csv::Writer::from_writer(Vec::new());
     // Writing to a Vec cannot fail.
     w.write_record(["title", "username", "password", "url", "notes", "totp"])
         .expect("write to Vec");
     for item in vault.items() {
-        let login = item.kind == ItemKind::Login;
-        let username = if login {
-            value(item, "username", FieldKind::Email)
-        } else {
-            ""
-        };
-        let password = if login {
-            value(item, "password", FieldKind::Password)
-        } else {
-            ""
-        };
         w.write_record([
             item.title.as_str(),
-            username,
-            password,
+            value(item, "username", FieldKind::Email),
+            value(item, "password", FieldKind::Password),
             value(item, "url", FieldKind::Url),
             value(item, "notes", FieldKind::Notes),
             value(item, "totp", FieldKind::Totp),

@@ -58,7 +58,7 @@ The app excludes its windows from screen capture. For screenshots in debug build
 ```sh
 export VAULT_FILE=~/Documents/personal.vault
 cargo run -p vault-cli -- init
-cargo run -p vault-cli -- add --kind login --title GitHub --username me --password-field --totp-field
+cargo run -p vault-cli -- add --template login --title GitHub --username me --password-field --totp-field
 cargo run -p vault-cli -- get GitHub --reveal
 cargo run -p vault-cli -- totp GitHub
 cargo run -p vault-cli -- attach add GitHub ./recovery-codes.txt

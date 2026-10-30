@@ -203,7 +203,6 @@ fn canonical_cbor_item_plain() {
     assert_eq!(
         keys,
         [
-            "kind",
             "tags",
             "title",
             "fields",

@@ -1,7 +1,10 @@
 //! Forward compatibility (01 §9): an older build must open a newer file that only *added*
 //! things — unknown map keys (already covered in roundtrip.rs) and unknown enum strings for
-//! `slot.kind`, `item.kind` and `field.kind` (covered here). Genuinely malformed data (wrong
-//! CBOR types, missing required keys, bad lengths) must still be rejected.
+//! `slot.kind` and `field.kind` (covered here). Genuinely malformed data (wrong CBOR types,
+//! missing required keys, bad lengths) must still be rejected.
+//!
+//! `item.kind` was removed on 2026-10-30: it is now an ordinary unknown key, so whatever an
+//! older (or newer) file holds there lands in `Item::extras` and is written back verbatim.
 
 mod common;
 
@@ -10,25 +13,9 @@ use common::*;
 use vault_core::format::{self, VaultFile};
 use vault_core::search::{Query, search};
 use vault_core::{
-    ExposeSecret, Field, FieldKind, Item, ItemKind, LockedVault, OpaqueSlot, SecretVec, Slot,
-    SlotKind, Uuid, VaultError, export_csv, merge,
+    ExposeSecret, Field, FieldKind, Item, LockedVault, OpaqueSlot, SecretVec, Slot, SlotKind, Uuid,
+    VaultError, export_csv, merge,
 };
-
-/// Rewrite `plain` so field `key` holds `v`.
-fn with_key(plain: &[u8], key: &str, v: Value) -> Vec<u8> {
-    let mut val: Value = ciborium::from_reader(plain).unwrap();
-    let Value::Map(entries) = &mut val else {
-        panic!()
-    };
-    for (k, vv) in entries.iter_mut() {
-        if k == &t(key) {
-            *vv = v.clone();
-        }
-    }
-    let mut out = Vec::new();
-    ciborium::into_writer(&val, &mut out).unwrap();
-    out
-}
 
 fn t(s: &str) -> Value {
     Value::Text(s.to_owned())
@@ -140,11 +127,10 @@ fn opaque_slot_can_be_removed_and_is_dropped_by_rotation() {
 }
 
 #[test]
-fn unknown_item_and_field_kinds_roundtrip_merge_search_and_export() {
+fn unknown_field_kinds_roundtrip_merge_search_and_export() {
     let mut v = new_vault();
     populate(&mut v, 1);
-    let mut item = Item::new(ItemKind::Other, "Hover car", device(), 10);
-    item.kind_raw = Some("future-item-kind".into());
+    let mut item = Item::new("Hover car", device(), 10);
     let mut licence = Field::new("licence", FieldKind::Other, secret("XYZ-123"), 10);
     licence.kind_raw = Some("future-field-kind".into());
     item.fields.push(licence);
@@ -159,10 +145,6 @@ fn unknown_item_and_field_kinds_roundtrip_merge_search_and_export() {
     let reopened = unlock(&v.serialize()).unwrap();
     assert_vaults_eq(&v, &reopened);
     let got = reopened.get(id).unwrap();
-    assert_eq!(
-        (got.kind, got.kind_str()),
-        (ItemKind::Other, "future-item-kind")
-    );
     assert_eq!(got.fields[0].kind, FieldKind::Other);
     assert_eq!(got.fields[0].kind_str(), "future-field-kind");
     assert!(reopened.items().any(|i| i.id == id), "items() includes it");
@@ -184,40 +166,29 @@ fn unknown_item_and_field_kinds_roundtrip_merge_search_and_export() {
     ));
     other.purge_tombstones_older_than(0);
 
-    // Search by title works, with and without a kind filter.
+    // Search by title works.
     let q = Query {
         text: "hover",
-        kind: None,
         tag: None,
         favorites_only: false,
     };
     assert_eq!(search(&reopened, &q).len(), 1);
-    let q = Query {
-        text: "",
-        kind: Some(ItemKind::Other),
-        tag: None,
-        favorites_only: false,
-    };
-    assert_eq!(search(&reopened, &q)[0].id, id);
 
-    // CSV export includes the item (as a non-login row: title present, no credentials).
+    // CSV export includes the item: title and password, but not the unknown-kind field.
     let csv = export_csv(&reopened);
     let text = String::from_utf8(csv.0.clone()).unwrap();
     assert!(text.contains("Hover car"));
     assert!(!text.contains("XYZ-123"), "unknown field is not exported");
 
-    // An `Other` built without `kind_raw` serializes as the "other" placeholder and comes
-    // back as Other with kind_raw = Some("other").
-    let mut bare = Item::new(ItemKind::Other, "Bare", device(), 40);
+    // An `Other` field built without `kind_raw` serializes as the "other" placeholder and
+    // comes back as Other with kind_raw = Some("other").
+    let mut bare = Item::new("Bare", device(), 40);
     bare.fields
         .push(Field::new("f", FieldKind::Other, secret("x"), 40));
     let bare_id = v.insert(bare, 40);
     let again = unlock(&v.serialize()).unwrap();
     let b = again.get(bare_id).unwrap();
-    assert_eq!(
-        (b.kind, b.kind_raw.as_deref()),
-        (ItemKind::Other, Some("other"))
-    );
+    assert_eq!(b.fields[0].kind, FieldKind::Other);
     assert_eq!(b.fields[0].kind_raw.as_deref(), Some("other"));
 
     // set_field on an unknown-kind field behaves like text: no history entry.
@@ -231,8 +202,10 @@ fn unknown_item_and_field_kinds_roundtrip_merge_search_and_export() {
 }
 
 #[test]
-fn malformed_kinds_are_still_rejected() {
-    let base = |kind: Value, field_kind: Option<Value>| -> Vec<u8> {
+fn malformed_field_kinds_are_still_rejected_and_item_kind_is_just_an_extra() {
+    // `kind` on the item is a plain unknown key since 2026-10-30: any value (or none) is
+    // accepted and preserved. `kind` on a field is still required text.
+    let base = |kind: Option<Value>, field_kind: Option<Value>| -> Vec<u8> {
         let mut field = vec![
             (t("name"), t("f")),
             (t("value"), t("v")),
@@ -242,8 +215,7 @@ fn malformed_kinds_are_still_rejected() {
         if let Some(fk) = field_kind {
             field.push((t("kind"), fk));
         }
-        let plain = Value::Map(vec![
-            (t("kind"), kind),
+        let mut plain = vec![
             (t("title"), t("x")),
             (t("deleted_at"), Value::Null),
             (t("device_id"), Value::Bytes(vec![0; 16])),
@@ -251,40 +223,93 @@ fn malformed_kinds_are_still_rejected() {
             (t("tags"), Value::Array(vec![])),
             (t("fields"), Value::Array(vec![Value::Map(field)])),
             (t("history"), Value::Array(vec![])),
-        ]);
+        ];
+        if let Some(k) = kind {
+            plain.insert(0, (t("kind"), k));
+        }
         let mut out = Vec::new();
-        ciborium::into_writer(&plain, &mut out).unwrap();
+        ciborium::into_writer(&Value::Map(plain), &mut out).unwrap();
         out
     };
     let decode = |b: &[u8]| format::decode_item_plain(b, Uuid::nil(), 1);
 
-    // Unknown strings are fine.
-    let item = decode(&base(t("future-item-kind"), Some(t("future-field-kind")))).unwrap();
-    assert_eq!(item.kind, ItemKind::Other);
-    assert_eq!(item.kind_raw.as_deref(), Some("future-item-kind"));
+    // Unknown field kind strings are fine; the item's `kind` string lands in extras.
+    let item = decode(&base(
+        Some(t("future-item-kind")),
+        Some(t("future-field-kind")),
+    ))
+    .unwrap();
+    assert_eq!(item.extras, vec![(t("kind"), t("future-item-kind"))]);
     assert_eq!(item.fields[0].kind, FieldKind::Other);
     assert_eq!(
         item.fields[0].kind_raw.as_deref(),
         Some("future-field-kind")
     );
-    // A known kind never carries a raw string, and the "other" placeholder is itself unknown.
-    let item = decode(&base(t("login"), Some(t("other")))).unwrap();
-    assert_eq!((item.kind, item.kind_raw.clone()), (ItemKind::Login, None));
+    // A formerly known item kind is preserved the same way; the removed "number" field kind
+    // and the "other" placeholder are unknown field kinds.
+    let item = decode(&base(Some(t("login")), Some(t("number")))).unwrap();
+    assert_eq!(item.extras, vec![(t("kind"), t("login"))]);
     assert_eq!(item.fields[0].kind, FieldKind::Other);
+    assert_eq!(item.fields[0].kind_raw.as_deref(), Some("number"));
+    let item = decode(&base(Some(t("login")), Some(t("other")))).unwrap();
     assert_eq!(item.fields[0].kind_raw.as_deref(), Some("other"));
-    // Wrong types and missing keys are not.
+    // No item kind at all, or a non-text one, is accepted (and the latter preserved).
+    let item = decode(&base(None, Some(t("text")))).unwrap();
+    assert!(item.extras.is_empty());
+    let item = decode(&base(Some(Value::Integer(1.into())), Some(t("text")))).unwrap();
+    assert_eq!(item.extras, vec![(t("kind"), Value::Integer(1.into()))]);
+    // A wrong-typed or missing field kind is still structural damage.
     assert!(matches!(
-        decode(&base(Value::Integer(1.into()), Some(t("text")))).unwrap_err(),
+        decode(&base(None, Some(Value::Bytes(vec![1])))).unwrap_err(),
         VaultError::Malformed(_)
     ));
     assert!(matches!(
-        decode(&base(t("login"), Some(Value::Bytes(vec![1])))).unwrap_err(),
+        decode(&base(None, None)).unwrap_err(),
         VaultError::Malformed(_)
     ));
-    assert!(matches!(
-        decode(&base(t("login"), None)).unwrap_err(),
-        VaultError::Malformed(_)
-    ));
+}
+
+/// An `ItemPlain` written by a pre-2026-10-30 build (with `"kind"`) decodes and re-encodes to
+/// exactly the same bytes: the key survives in `extras` and is sorted back into canonical
+/// position by the writer. A freshly built item never gains a `kind` key.
+#[test]
+fn legacy_item_kind_round_trips_byte_identically_and_is_never_written() {
+    let mut v = new_vault();
+    populate(&mut v, 1);
+    let item = v.items().next().unwrap();
+    let plain = format::encode_item_plain(item);
+    let decoded: Value = ciborium::from_reader(plain.as_slice()).unwrap();
+    let Value::Map(entries) = decoded else {
+        panic!()
+    };
+    assert!(
+        entries.iter().all(|(k, _)| k != &t("kind")),
+        "writer must not emit an item kind"
+    );
+
+    // Build the legacy layout: the same map plus `kind`, in canonical order (shortest encoded
+    // key first, then bytewise), exactly where the old writer put it.
+    for raw in ["login", "note", "card", "identity", "future-item-kind", ""] {
+        let mut legacy = entries.clone();
+        legacy.push((t("kind"), t(raw)));
+        legacy.sort_by_key(|(k, _)| {
+            let mut enc = Vec::new();
+            ciborium::into_writer(k, &mut enc).unwrap();
+            enc
+        });
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&Value::Map(legacy), &mut bytes).unwrap();
+
+        let got = format::decode_item_plain(&bytes, item.id, item.modified_at).unwrap();
+        assert_eq!(got.extras, vec![(t("kind"), t(raw))], "{raw:?}");
+        assert_eq!(got.title, item.title);
+        assert_eq!(got.tags, item.tags, "{raw:?}: tags untouched");
+        assert_eq!(
+            format::encode_item_plain(&got).as_slice(),
+            bytes.as_slice(),
+            "{raw:?}: byte-identical re-encode"
+        );
+    }
 }
 
 #[test]
@@ -354,14 +379,35 @@ fn unknown_kind_strings_are_exact_matches_only() {
     .unwrap();
     let item = v.items().next().unwrap();
     let plain = format::encode_item_plain(item);
-    for raw in ["", "Login", "login "] {
-        let got = format::decode_item_plain(&with_key(&plain, "kind", t(raw)), item.id, 1).unwrap();
-        assert_eq!(got.kind, ItemKind::Other, "{raw:?}");
-        assert_eq!(got.kind_raw.as_deref(), Some(raw));
+    let field = |raw: &str| -> Vec<u8> {
+        let mut val: Value = ciborium::from_reader(plain.as_slice()).unwrap();
+        let Value::Map(entries) = &mut val else {
+            panic!()
+        };
+        let fields = entries.iter_mut().find(|(k, _)| k == &t("fields")).unwrap();
+        let Value::Array(fields) = &mut fields.1 else {
+            panic!()
+        };
+        let Value::Map(first) = &mut fields[0] else {
+            panic!()
+        };
+        for (k, vv) in first.iter_mut() {
+            if k == &t("kind") {
+                *vv = t(raw);
+            }
+        }
+        let mut out = Vec::new();
+        ciborium::into_writer(&val, &mut out).unwrap();
+        out
+    };
+    for raw in ["", "Text", "text ", "number"] {
+        let got = format::decode_item_plain(&field(raw), item.id, 1).unwrap();
+        assert_eq!(got.fields[0].kind, FieldKind::Other, "{raw:?}");
+        assert_eq!(got.fields[0].kind_raw.as_deref(), Some(raw));
+        assert_eq!(got.fields[0].kind_str(), raw);
     }
-    for raw in ["", "Password", "password "] {
+    for raw in ["", "Password", "password ", "number"] {
         assert_eq!(FieldKind::parse(raw), None, "{raw:?}");
-        assert_eq!(ItemKind::parse(raw), None, "{raw:?}");
         assert_eq!(SlotKind::from_raw(raw), SlotKind::Other(raw.to_owned()));
     }
 }

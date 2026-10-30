@@ -469,7 +469,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use gpui::{AppContext as _, Entity, TestAppContext};
-    use vault_core::{ExposeSecret as _, Field, FieldKind, ItemKind, KdfParams, MergeReport, Uuid};
+    use vault_core::{ExposeSecret as _, Field, FieldKind, KdfParams, MergeReport, Uuid};
     use vault_sync::NoopHooks;
 
     use super::super::session::AUTOSAVE_DEBOUNCE;
@@ -497,7 +497,7 @@ mod tests {
         let device = vault.device_id();
         let id = vault
             .edit(|v| {
-                let mut gh = Item::new(ItemKind::Login, "GitHub", device, 10);
+                let mut gh = Item::new("GitHub", device, 10);
                 gh.fields = vec![
                     Field::new("username", FieldKind::Text, secret("chris"), 10),
                     Field::new("password", FieldKind::Password, secret("old"), 10),
@@ -625,7 +625,7 @@ mod tests {
 
             // During New: nothing to compare, nothing marked, no panic.
             s.cancel_edit(cx);
-            s.begin_new(ItemKind::Note, String::new(), cx);
+            s.begin_new(crate::templates::Template::Note, String::new(), cx);
             s.handle_sync_event(SyncEvent::Merged(changed), cx);
             assert!(s.edit_buffer().unwrap().remote_fields.is_empty());
         });
@@ -635,7 +635,7 @@ mod tests {
     fn corrupt_banner_shows_and_clears_on_next_save(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (state, _other, _) = two_devices(dir.path(), cx);
-        let path = dir.path().join("t.vault");
+        let path = dir.path().join("t.vault").join("vault.bin");
         // Rename in, so the watcher never sees a half-written file.
         let tmp = dir.path().join(".garbage.tmp");
         fs::write(&tmp, b"definitely not a vault").unwrap();
@@ -664,7 +664,7 @@ mod tests {
             .unwrap()
             .unwrap();
         other
-            .edit(|v| v.insert(Item::new(ItemKind::Note, "from b", Uuid::nil(), 40), 40))
+            .edit(|v| v.insert(Item::new("from b", Uuid::nil(), 40), 40))
             .unwrap();
         other.save().unwrap();
 
@@ -876,7 +876,7 @@ mod tests {
         let dir2 = tempfile::tempdir().unwrap();
         let (state, _other2, _) = two_devices(dir2.path(), cx);
         state.update(cx, |s, cx| {
-            s.begin_new(ItemKind::Login, String::new(), cx);
+            s.begin_new(crate::templates::Template::Login, String::new(), cx);
             for e in every(dir.path()) {
                 s.handle_sync_event(e, cx);
             }
@@ -918,7 +918,7 @@ mod tests {
         // Restore while editing with changes goes through the guard first.
         state.update(cx, |s, cx| {
             s.select(id, cx);
-            s.begin_new(ItemKind::Note, "draft".into(), cx);
+            s.begin_new(crate::templates::Template::Note, "draft".into(), cx);
             s.set_edit_title("draft 2".into(), cx);
             s.settings_open = true;
             s.request_restore(backup.clone(), cx);

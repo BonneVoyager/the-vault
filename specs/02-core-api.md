@@ -29,8 +29,7 @@ pub struct UnlockedVault { /* header, vault_key (Zeroizing), items: BTreeMap<Uui
 
 pub struct Item {
     pub id: Uuid,
-    pub kind: ItemKind,          // Copy; `Other` for a kind string this version does not know
-    pub kind_raw: Option<String>,// the on-disk string when kind == Other, else None; `kind_str()` returns the on-disk string
+    // no `kind`: categories were removed on 2026-10-30; templates add a tag (#login, #note, #card, #identity) instead
     pub title: String,
     pub deleted_at: Option<Millis>,
     pub device_id: Uuid,
@@ -162,7 +161,7 @@ Defaults: password 20 chars, all classes, exclude ambiguous. Passphrase 4 words,
 ## `search`
 
 ```rust
-pub struct Query<'a> { pub text: &'a str, pub kind: Option<ItemKind>, pub tag: Option<&'a str>, pub favorites_only: bool }
+pub struct Query<'a> { pub text: &'a str, pub tag: Option<&'a str>, pub favorites_only: bool }
 pub fn search<'a>(vault: &'a UnlockedVault, q: &Query) -> Vec<&'a Item>;   // ranked
 ```
 

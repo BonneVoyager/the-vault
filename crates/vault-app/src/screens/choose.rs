@@ -15,7 +15,7 @@ use gpui_component::{ActiveTheme as _, Disableable as _};
 
 use crate::cloud;
 use crate::persist;
-use crate::state::{AppState, Busy, ChooseIntent};
+use crate::state::{AppState, Busy, ChooseIntent, LEGACY_LAYOUT};
 use crate::ui::{self, Clickable as _};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,7 +129,7 @@ impl ChooseScreen {
     }
 
     fn open_existing(&mut self, cx: &mut Context<Self>) {
-        let pick = ui::pick_path(false, "Open Vault", cx);
+        let pick = ui::pick_vault_package(cx);
         let state = self.state.clone();
         cx.spawn(async move |_, cx| {
             if let Some(path) = pick.await {
@@ -202,6 +202,7 @@ impl ChooseScreen {
         let busy = state.busy;
         let error = state.error.clone();
         let recent = state.recent_vaults.clone();
+        let legacy = state.legacy_recents.clone();
         let theme = cx.theme();
         let mut card = ui::card(cx)
             .child(
@@ -242,21 +243,31 @@ impl ChooseScreen {
             let rows = recent.into_iter().enumerate().map(|(ix, path)| {
                 let name = persist::vault_name(&path);
                 let shown = path.display().to_string();
+                // A plain file is the old single-file layout: listed, never opened.
+                let legacy = legacy.contains(&path);
+                let openable = busy.is_none() && !legacy;
                 let state = self.state.clone();
                 div()
                     .id(("recent", ix))
+                    .debug_selector(move || {
+                        format!("recent {ix} {}", if legacy { "legacy" } else { "openable" })
+                    })
                     .px(px(10.))
                     .py(px(6.))
                     .rounded(cx.theme().radius)
-                    .clickable_when(busy.is_none())
-                    .hover(|s| s.bg(cx.theme().accent))
-                    .when(busy.is_none(), |row| {
-                        row.on_click(move |_, _, cx| {
-                            let path = path.clone();
-                            state.update(cx, |s, cx| s.open_vault(path, cx));
-                        })
+                    .clickable_when(openable)
+                    .when(openable, |row| {
+                        row.hover(|s| s.bg(cx.theme().accent))
+                            .on_click(move |_, _, cx| {
+                                let path = path.clone();
+                                state.update(cx, |s, cx| s.open_vault(path, cx));
+                            })
                     })
-                    .child(div().child(name))
+                    .child(
+                        div()
+                            .when(legacy, |d| d.text_color(cx.theme().muted_foreground))
+                            .child(name),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -265,6 +276,14 @@ impl ChooseScreen {
                             .text_ellipsis()
                             .child(shown),
                     )
+                    .when(legacy, |row| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .child(LEGACY_LAYOUT),
+                        )
+                    })
             });
             card = card
                 .child(div().h(px(1.)).bg(cx.theme().border))
@@ -406,8 +425,15 @@ mod tests {
     fn window(
         cx: &mut TestAppContext,
     ) -> (Entity<AppState>, Entity<ChooseScreen>, VisualTestContext) {
+        window_with_recents(Vec::new(), cx)
+    }
+
+    fn window_with_recents(
+        recent: Vec<PathBuf>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<AppState>, Entity<ChooseScreen>, VisualTestContext) {
         cx.update(gpui_component::init);
-        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), recent, false));
         let mut view = None;
         let window = cx.add_window(|window, cx| {
             theme::apply(window, cx);
@@ -506,6 +532,29 @@ mod tests {
         vcx.update(|_, cx| {
             assert!(ui::input_is_empty(&password, cx));
             assert!(ui::input_is_empty(&confirm, cx));
+        });
+    }
+
+    /// A recent vault in the old single-file layout is listed with the explanation and
+    /// clicking it opens nothing; a package next to it stays openable.
+    #[gpui::test]
+    fn legacy_recent_is_listed_but_not_opened(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("Old.vault");
+        std::fs::write(&old, b"old single-file vault").unwrap();
+        let package = dir.path().join("New.vault");
+        std::fs::create_dir(&package).unwrap();
+        let (state, _view, mut vcx) = window_with_recents(vec![old, package], cx);
+        vcx.run_until_parked();
+        assert!(shown("recent 0 legacy", &mut vcx));
+        assert!(shown("recent 1 openable", &mut vcx));
+        let row = vcx.debug_bounds("recent 0 legacy").unwrap();
+        vcx.simulate_click(row.center(), Modifiers::none());
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| {
+            assert!(s.busy.is_none());
+            assert!(s.error.is_none(), "nothing was attempted");
+            assert!(s.vault.is_none());
         });
     }
 }

@@ -1,4 +1,4 @@
-//! Atomic replace of the primary file (03 §2 steps 2-5) and of attachment blobs (03 §1.1).
+//! Atomic replace of the package's `vault.bin` (03 §2 steps 2-5) and of attachment blobs (03 §1.1).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -17,7 +17,7 @@ pub(crate) fn parent_dir(path: &Path) -> &Path {
     }
 }
 
-/// `<dir>/.<file name>.tmp-<8 hex>` (03 §1).
+/// `<dir>/.<file name>.tmp-<8 hex>`, e.g. `<name>.vault/.vault.bin.tmp-<8 hex>` (03 §1).
 fn tmp_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
@@ -171,10 +171,10 @@ mod tests {
 
     #[test]
     fn tmp_name_matches_layout() {
-        let tmp = tmp_path(Path::new("/x/My.vault"));
+        let tmp = tmp_path(Path::new("/x/My.vault/vault.bin"));
         let name = tmp.file_name().unwrap().to_str().unwrap();
-        assert_eq!(tmp.parent().unwrap(), Path::new("/x"));
-        let hex = name.strip_prefix(".My.vault.tmp-").unwrap();
+        assert_eq!(tmp.parent().unwrap(), Path::new("/x/My.vault"));
+        let hex = name.strip_prefix(".vault.bin.tmp-").unwrap();
         assert_eq!(hex.len(), 8);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
     }

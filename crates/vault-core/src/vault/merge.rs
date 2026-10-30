@@ -276,8 +276,6 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
 
     Item {
         id: ours.id,
-        kind: winner.kind,
-        kind_raw: winner.kind_raw.clone(),
         title: winner.title.clone(),
         deleted_at: None,
         device_id: winner.device_id,
@@ -362,8 +360,6 @@ fn attachment_eq(a: &AttachmentRef, b: &AttachmentRef) -> bool {
 /// secrets), so merge decides "unchanged" here.
 pub fn item_eq(a: &Item, b: &Item) -> bool {
     a.id == b.id
-        && a.kind == b.kind
-        && a.kind_raw == b.kind_raw
         && a.title == b.title
         && a.deleted_at == b.deleted_at
         && a.device_id == b.device_id

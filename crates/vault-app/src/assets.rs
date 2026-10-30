@@ -1,5 +1,5 @@
 //! Asset source: gpui-component's default icons, the few extra Lucide icons we use, and
-//! the app icon raster shown on the unlock screen.
+//! the app icon raster and unlock wheel shown on the unlock screen.
 
 use std::borrow::Cow;
 
@@ -26,22 +26,34 @@ gpui_kit_assets::icon_assets!(
 /// Asset path of the app icon raster (`img(APP_ICON)`): 256 px, drawn at 128 pt so it is
 /// sharp on Retina. Rendered from `assets/icon/vault.svg`.
 pub const APP_ICON: &str = "icon/vault-256.png";
-/// The 140 px centre of the icon, animated over the stationary PNG.
-pub const APP_ICON_WHEEL: &str = "icon/vault-wheel.webp";
+/// The same raster without the wheel's spokes, shown while an unlock runs.
+pub const APP_ICON_SPOKELESS: &str = "icon/vault-256-spokeless.png";
+/// The six spokes as an SVG mask (`svg().path(APP_ICON_WHEEL)`), rotated over
+/// [`APP_ICON_SPOKELESS`] while an unlock runs. Built by `assets/icon/build-unlock-wheel.sh`.
+pub const APP_ICON_WHEEL: &str = "icon/wheel.svg";
 
-static APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/icon/vault-256.png");
-static APP_ICON_WHEEL_BYTES: &[u8] = include_bytes!("../../../assets/icon/vault-wheel.webp");
+static EMBEDDED: [(&str, &[u8]); 3] = [
+    (
+        APP_ICON,
+        include_bytes!("../../../assets/icon/vault-256.png"),
+    ),
+    (
+        APP_ICON_SPOKELESS,
+        include_bytes!("../../../assets/icon/vault-256-spokeless.png"),
+    ),
+    (
+        APP_ICON_WHEEL,
+        include_bytes!("../../../assets/icon/wheel.svg"),
+    ),
+];
 
 /// The app icon, then our extra icons, then gpui-kit's default component icons.
 pub struct AppAssets;
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        if path == APP_ICON {
-            return Ok(Some(Cow::Borrowed(APP_ICON_PNG)));
-        }
-        if path == APP_ICON_WHEEL {
-            return Ok(Some(Cow::Borrowed(APP_ICON_WHEEL_BYTES)));
+        if let Some((_, bytes)) = EMBEDDED.iter().find(|(p, _)| *p == path) {
+            return Ok(Some(Cow::Borrowed(bytes)));
         }
         if let Some(bytes) = ExtraIcons.load(path)? {
             return Ok(Some(bytes));
@@ -52,12 +64,12 @@ impl AssetSource for AppAssets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut paths = gpui_kit_assets::Assets.list(path)?;
         paths.extend(ExtraIcons.list(path)?);
-        if APP_ICON.starts_with(path) {
-            paths.push(APP_ICON.into());
-        }
-        if APP_ICON_WHEEL.starts_with(path) {
-            paths.push(APP_ICON_WHEEL.into());
-        }
+        paths.extend(
+            EMBEDDED
+                .iter()
+                .filter(|(p, _)| p.starts_with(path))
+                .map(|(p, _)| SharedString::from(*p)),
+        );
         paths.sort();
         paths.dedup();
         Ok(paths)
@@ -86,18 +98,19 @@ mod tests {
             AppAssets.load("icons/lock.svg").unwrap().is_some(),
             "icons still load"
         );
-        let spin = AppAssets
-            .load(APP_ICON_WHEEL)
+        let spokeless = AppAssets
+            .load(APP_ICON_SPOKELESS)
             .unwrap()
-            .expect("spin embedded");
-        assert!(spin.starts_with(b"RIFF"));
-        assert_eq!(&spin[8..12], b"WEBP");
-        assert_eq!(&spin[12..16], b"VP8X");
-        assert_eq!(&spin[24..30], &[139, 0, 0, 139, 0, 0]); // 140 x 140 canvas
-        assert!(spin.windows(4).any(|chunk| chunk == b"ANIM"));
-        assert_eq!(
-            spin.windows(4).filter(|chunk| *chunk == b"ANMF").count(),
-            48
-        );
+            .expect("embedded");
+        assert_eq!(&spokeless[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(spokeless[16..24], bytes[16..24], "same size as the icon");
+        let wheel = AppAssets.load(APP_ICON_WHEEL).unwrap().expect("embedded");
+        let wheel = std::str::from_utf8(&wheel).unwrap();
+        assert!(wheel.starts_with("<svg"));
+        assert!(wheel.len() < 2048, "a small vector, not a frame animation");
+        let listed = AppAssets.list("icon/").unwrap();
+        for path in [APP_ICON_SPOKELESS, APP_ICON_WHEEL] {
+            assert!(listed.iter().any(|p| p == path), "{path} listed");
+        }
     }
 }

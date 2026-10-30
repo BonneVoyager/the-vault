@@ -1,5 +1,5 @@
-//! [`SyncedVault`]: a vault bound to a file path (03 §8): open, unlock, edit, atomic save,
-//! snapshots and restore. Watching and reconciling external changes live in [`reconcile`].
+//! [`SyncedVault`]: a vault bound to a package directory (03 §1, §8): open, unlock, edit,
+//! atomic save, snapshots and restore. Watching and reconciling external changes live in [`reconcile`].
 
 mod attachments;
 mod reconcile;
@@ -22,6 +22,7 @@ use crate::backup::{self, BackupInfo, BackupKind};
 use crate::cloud::CloudHooks;
 use crate::error::{SaveBlocked, SyncError};
 use crate::event::SyncEvent;
+use crate::package;
 use crate::watch::Watcher;
 
 /// How long `open` waits for the cloud provider to materialise the file (03 §7).
@@ -48,9 +49,12 @@ pub struct LockedSummary {
     pub slots: Vec<(Uuid, SlotKind)>,
 }
 
-/// A vault bound to a path on disk.
+/// A vault bound to a package directory on disk.
 pub struct SyncedVault {
+    /// The `<name>.vault/` package directory.
     path: PathBuf,
+    /// `<path>/vault.bin`, the primary file.
+    file: PathBuf,
     device_id: Uuid,
     hooks: Arc<dyn CloudHooks>,
     /// The on-disk version as of the last read or write. Unlock always starts from this.
@@ -108,8 +112,9 @@ impl fmt::Debug for SyncedVault {
 }
 
 impl SyncedVault {
-    /// Create a new vault at `path` and write it immediately. Refuses an existing path. The
-    /// returned vault is unlocked and clean.
+    /// Create a new vault package at `path` (a directory, conventionally `<name>.vault`, mode
+    /// 0700) and write its `vault.bin` (0600) immediately. Refuses an existing path; the parent
+    /// directory must exist. The returned vault is unlocked and clean.
     pub fn create(
         path: &Path,
         password: &SecretString,
@@ -126,8 +131,10 @@ impl SyncedVault {
         let vault = UnlockedVault::create(password, kdf, device_id);
         let bytes = vault.serialize();
         let locked = LockedVault::parse(&bytes)?;
+        package::create_new_dir(path)?;
         let mut this = Self {
             path: path.to_owned(),
+            file: package::vault_file(path),
             device_id,
             hooks,
             locked,
@@ -150,33 +157,73 @@ impl SyncedVault {
             sibling_reports: HashMap::new(),
             prune_clock_offset: Duration::ZERO,
         };
-        this.write(&bytes, Mode::NoReplace)?;
-        this.hooks.pin(&this.path);
+        if let Err(e) = this.write(&bytes, Mode::NoReplace) {
+            // Only our own empty directory; never anything that appeared inside it meanwhile.
+            if let Err(rm) = fs::remove_dir(&this.path) {
+                tracing::warn!(path = %this.path.display(), error = %rm, "could not remove package after failed create");
+            }
+            return Err(e);
+        }
+        this.hooks.pin(&this.file);
         tracing::info!(path = %this.path.display(), "created vault");
         Ok(this)
     }
 
-    /// Read and parse the vault at `path`; the result is locked. `device_id` identifies this
-    /// install and is stamped on the vault at every unlock (core cannot know it).
+    /// Read and parse the vault in the package directory `path`; the result is locked.
+    /// `device_id` identifies this install and is stamped on the vault at every unlock (core
+    /// cannot know it).
+    ///
+    /// [`SyncError::NoVault`] if `path` or its `vault.bin` does not exist;
+    /// [`SyncError::NotAPackage`] if `path` is a regular file (the pre-package single-file
+    /// layout, which is not migrated).
+    ///
+    /// A symlink to a package is resolved: the package's real location becomes [`path`], so
+    /// the watcher observes the directory the package actually lives in.
+    ///
+    /// [`path`]: SyncedVault::path
     pub fn open(
         path: &Path,
         device_id: Uuid,
         hooks: Arc<dyn CloudHooks>,
     ) -> Result<Self, SyncError> {
-        hooks.ensure_downloaded(path, DOWNLOAD_TIMEOUT)?;
-        let bytes = match fs::read(path) {
-            Ok(b) => b,
+        let resolved;
+        let path = match fs::symlink_metadata(path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                resolved = fs::canonicalize(path).map_err(|e| match e.kind() {
+                    ErrorKind::NotFound => SyncError::NoVault(path.to_owned()),
+                    _ => SyncError::io(path, e),
+                })?;
+                resolved.as_path()
+            }
+            _ => path,
+        };
+        match fs::metadata(path) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(SyncError::NotAPackage(path.to_owned())),
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 return Err(SyncError::NoVault(path.to_owned()));
             }
             Err(e) => return Err(SyncError::io(path, e)),
+        }
+        let file = package::vault_file(path);
+        if fs::symlink_metadata(&file).is_ok_and(|m| m.is_dir()) {
+            return Err(SyncError::NoVault(file));
+        }
+        hooks.ensure_downloaded(&file, DOWNLOAD_TIMEOUT)?;
+        let bytes = match fs::read(&file) {
+            Ok(b) => b,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(SyncError::NoVault(file));
+            }
+            Err(e) => return Err(SyncError::io(&file, e)),
         };
         let locked = LockedVault::parse(&bytes)?;
-        let last_written = Some(fingerprint(path, &bytes));
-        hooks.pin(path);
+        let last_written = Some(fingerprint(&file, &bytes));
+        hooks.pin(&file);
         tracing::info!(path = %path.display(), size = bytes.len(), "opened vault");
         Ok(Self {
             path: path.to_owned(),
+            file,
             device_id,
             hooks,
             locked,
@@ -264,7 +311,7 @@ impl SyncedVault {
             }
             return Ok(());
         }
-        self.refresh_locked_from_disk();
+        let disk_read = self.refresh_locked_from_disk();
         let vault = match open(&self.locked) {
             Ok(v) => v,
             Err(VaultError::Tampered(kind)) => {
@@ -292,6 +339,11 @@ impl SyncedVault {
         self.locked_fallback = None;
         self.install(vault);
         self.after_unlock();
+        // Orphan cleanup once per unlock, only when memory provably matches what is on disk:
+        // the primary was read, nothing is pending a write, saving is allowed.
+        if disk_read && !self.dirty && !self.key_mismatch && self.save_blocked.is_none() {
+            self.prune_orphan_attachments();
+        }
         Ok(())
     }
 
@@ -311,7 +363,7 @@ impl SyncedVault {
     /// When saving is impossible (a [`SyncEvent::KeyMismatch`] stands, or
     /// [`SyncError::SaveBlocked`] applies, dirty or not: our last saved state is then no longer
     /// on disk either), the in-memory vault is first written,
-    /// encrypted, to the backups directory as `<name>-<timestamp>-unsaved.vault`
+    /// encrypted, to the backups directory as `<name>-<timestamp>-unsaved.vault.bin`
     /// ([`BackupKind::Unsaved`], [`SyncEvent::BackupTaken`]) so nothing is lost. It opens with
     /// the password that unlocked this session.
     pub fn lock(&mut self) {
@@ -420,9 +472,9 @@ impl SyncedVault {
     /// Steps 2-6 of 03 §2. `create` uses [`Mode::NoReplace`] so a file that appeared after its
     /// existence check is never clobbered; `save` uses [`Mode::Replace`].
     fn write(&mut self, bytes: &[u8], mode: Mode) -> Result<(), SyncError> {
-        write_atomic(&self.path, bytes, mode)?;
-        self.last_written = Some(fingerprint(&self.path, bytes));
-        tracing::debug!(path = %self.path.display(), size = bytes.len(), "saved vault");
+        write_atomic(&self.file, bytes, mode)?;
+        self.last_written = Some(fingerprint(&self.file, bytes));
+        tracing::debug!(path = %self.file.display(), size = bytes.len(), "saved vault");
         Ok(())
     }
 
@@ -478,23 +530,26 @@ impl SyncedVault {
         Ok(path)
     }
 
-    /// Snapshots and conflict copies in `<name>.vault.backups/`, newest first.
+    /// Snapshots, unsaved copies and absorbed conflict packages in `<name>.vault/backups/`,
+    /// newest first.
     pub fn backups(&self) -> Result<Vec<BackupInfo>, SyncError> {
         backup::list_backups(&self.path)
     }
 
-    /// Snapshot the primary file as it is on disk now, regardless of policy or the enabled
+    /// Snapshot `vault.bin` as it is on disk now, regardless of policy or the enabled
     /// setting ("Back up now"). Works while locked. Unsaved edits are not included; the
     /// bytes must parse as a vault so every snapshot stays independently openable.
     pub fn backup_now(&mut self) -> Result<PathBuf, SyncError> {
         let read = self
-            .read_parsed(&self.path)?
-            .ok_or_else(|| not_found(&self.path))?;
+            .read_parsed(&self.file)?
+            .ok_or_else(|| not_found(&self.file))?;
         read.parsed?;
         self.snapshot(&read.bytes, SystemTime::now(), BackupKind::Snapshot)
     }
 
-    /// Replace the vault with the backup at `backup` (03 §4 "Restore").
+    /// Replace the vault with the backup at `backup` (03 §4 "Restore"): a `.vault.bin`
+    /// snapshot file, or a package directory (an absorbed `conflict-…` package), whose
+    /// `vault.bin` is used.
     ///
     /// `password` must unlock the backup (it may differ from the current password if that has
     /// since changed); the backup must be of this vault (same `vault_id`). The current primary
@@ -516,8 +571,14 @@ impl SyncedVault {
         backup: &Path,
         password: &SecretString,
     ) -> Result<(), SyncError> {
-        let ReadParsed { bytes, parsed } =
-            self.read_parsed(backup)?.ok_or_else(|| not_found(backup))?;
+        let source = if backup.is_dir() {
+            package::vault_file(backup)
+        } else {
+            backup.to_owned()
+        };
+        let ReadParsed { bytes, parsed } = self
+            .read_parsed(&source)?
+            .ok_or_else(|| not_found(&source))?;
         let locked = parsed?;
         let (expected, found) = (self.locked.vault_id(), locked.vault_id());
         if found != expected {
@@ -526,7 +587,7 @@ impl SyncedVault {
         let mut vault = locked.unlock(password)?;
         vault.set_device_id(self.device_id);
 
-        match self.read_parsed(&self.path)? {
+        match self.read_parsed(&self.file)? {
             Some(ReadParsed {
                 bytes: current,
                 parsed: Ok(_),
@@ -608,8 +669,14 @@ impl SyncedVault {
             .retain(|tx| tx.send(event.clone()).is_ok());
     }
 
+    /// The package directory (`<name>.vault/`).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The vault file inside the package (`<name>.vault/vault.bin`).
+    pub fn vault_file(&self) -> &Path {
+        &self.file
     }
 
     pub fn device_id(&self) -> Uuid {
@@ -624,7 +691,8 @@ impl SyncedVault {
         }
     }
 
-    /// Fingerprint of the last bytes this instance wrote or read. Exposed for tests.
+    /// Fingerprint of the last bytes this instance wrote to or read from `vault.bin`. Exposed
+    /// for tests.
     #[doc(hidden)]
     pub fn last_written(&self) -> Option<LastWritten> {
         self.last_written

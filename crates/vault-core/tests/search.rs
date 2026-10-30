@@ -1,5 +1,5 @@
 use vault_core::search::{Query, search};
-use vault_core::{Field, FieldKind, Item, ItemKind, KdfParams, SecretString, UnlockedVault, Uuid};
+use vault_core::{Field, FieldKind, Item, KdfParams, SecretString, UnlockedVault, Uuid};
 
 fn field(name: &str, kind: FieldKind, v: &str) -> Field {
     Field::new(name, kind, SecretString::new(v.to_owned()), 1)
@@ -14,8 +14,8 @@ fn vault_with(items: Vec<Item>) -> UnlockedVault {
     v
 }
 
-fn item(kind: ItemKind, title: &str) -> Item {
-    Item::new(kind, title, Uuid::nil(), 1)
+fn item(title: &str) -> Item {
+    Item::new(title, Uuid::nil(), 1)
 }
 
 fn titles(v: &[&Item]) -> Vec<String> {
@@ -25,7 +25,6 @@ fn titles(v: &[&Item]) -> Vec<String> {
 fn q(text: &str) -> Query<'_> {
     Query {
         text,
-        kind: None,
         tag: None,
         favorites_only: false,
     }
@@ -33,23 +32,23 @@ fn q(text: &str) -> Query<'_> {
 
 #[test]
 fn ranking_order() {
-    let mut by_notes = item(ItemKind::Login, "F notes");
+    let mut by_notes = item("F notes");
     by_notes
         .fields
         .push(field("notes", FieldKind::Notes, "see zed here"));
-    let mut by_tag = item(ItemKind::Login, "E tag");
+    let mut by_tag = item("E tag");
     by_tag.tags.push("zed".into());
-    let mut by_user = item(ItemKind::Login, "D user");
+    let mut by_user = item("D user");
     by_user
         .fields
         .push(field("username", FieldKind::Text, "zed@x.org"));
-    let mut by_host = item(ItemKind::Login, "C host");
+    let mut by_host = item("C host");
     by_host
         .fields
         .push(field("url", FieldKind::Url, "https://www.zed.dev/login"));
-    let by_sub = item(ItemKind::Login, "B my zed");
-    let by_prefix = item(ItemKind::Login, "Zed prefix");
-    let none = item(ItemKind::Login, "unrelated");
+    let by_sub = item("B my zed");
+    let by_prefix = item("Zed prefix");
+    let none = item("unrelated");
     let v = vault_with(vec![
         by_notes, by_tag, by_user, by_host, by_sub, by_prefix, none,
     ]);
@@ -69,7 +68,7 @@ fn ranking_order() {
 
 #[test]
 fn host_match_ignores_path_and_scheme() {
-    let mut a = item(ItemKind::Login, "a");
+    let mut a = item("a");
     a.fields
         .push(field("url", FieldKind::Url, "https://example.com/zed"));
     let v = vault_with(vec![a]);
@@ -79,19 +78,21 @@ fn host_match_ignores_path_and_scheme() {
 
 #[test]
 fn empty_text_returns_all_sorted_by_title() {
-    let v = vault_with(vec![item(ItemKind::Login, "b"), item(ItemKind::Note, "a")]);
+    let v = vault_with(vec![item("b"), item("a")]);
     assert_eq!(titles(&search(&v, &q(""))), ["a", "b"]);
 }
 
 #[test]
 fn filters() {
-    let mut fav = item(ItemKind::Login, "fav");
+    let mut fav = item("fav");
     fav.favorite = true;
     fav.tags.push("work".into());
-    let note = item(ItemKind::Note, "note");
+    let mut note = item("note");
+    // Template tags replaced item kinds (2026-10-30): a category filter is a tag filter.
+    note.tags.push("note".into());
     let v = vault_with(vec![fav, note]);
     let k = Query {
-        kind: Some(ItemKind::Note),
+        tag: Some("note"),
         ..q("")
     };
     assert_eq!(titles(&search(&v, &k)), ["note"]);
@@ -109,7 +110,7 @@ fn filters() {
 
 #[test]
 fn deleted_items_excluded() {
-    let a = item(ItemKind::Login, "gone");
+    let a = item("gone");
     let id = a.id;
     let mut v = vault_with(vec![a]);
     v.delete(id, 2).unwrap();
@@ -118,7 +119,7 @@ fn deleted_items_excluded() {
 
 #[test]
 fn unicode_and_case_insensitive() {
-    let v = vault_with(vec![item(ItemKind::Login, "caf\u{e9} Bar")]);
+    let v = vault_with(vec![item("caf\u{e9} Bar")]);
     assert_eq!(search(&v, &q("CAF\u{c9}")).len(), 1);
     // Decomposed e + combining acute normalises to the same text.
     assert_eq!(search(&v, &q("cafe\u{301}")).len(), 1);
