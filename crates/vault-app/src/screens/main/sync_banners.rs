@@ -17,6 +17,9 @@ use crate::ui::{self, Clickable as _};
 pub const CORRUPT: &str =
     "The vault file on disk is unreadable; your in-memory copy will be re-saved.";
 pub const WAITING_FOR_CLOUD: &str = "Waiting for iCloud to download the vault\u{2026}";
+pub const KEY_ROTATED: &str = "The vault key was rotated on another device. Enter your master password to continue. \
+     If you did not rotate the key on another device, the file may have been replaced by an \
+     older copy; check your backups before entering your password.";
 pub const KEY_MISMATCH: &str =
     "This vault was re-keyed on another device. Enter the master password to continue.";
 
@@ -42,7 +45,11 @@ pub fn render(
             .bg(theme.warning.opacity(0.10))
             .border_1()
             .border_color(theme.warning.opacity(0.40))
-            .child(div().text_sm().child(KEY_MISMATCH))
+            .child(div().text_sm().child(if s.sync.key_rotated {
+                KEY_ROTATED
+            } else {
+                KEY_MISMATCH
+            }))
             .child(
                 ui::h_flex()
                     .gap(px(8.))

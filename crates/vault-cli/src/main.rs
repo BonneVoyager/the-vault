@@ -165,6 +165,42 @@ fn create_private(path: &Path) -> Result<fs::File> {
         .with_context(|| format!("creating {}", path.display()))
 }
 
+/// Atomically replace `path` with `bytes`: write a fresh 0600 temp file in the same
+/// directory, fsync it, then rename over `path`. Refuses to replace a symlink.
+fn replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        bail!("refusing to overwrite a symlink: {}", path.display());
+    }
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = path.file_name().context("output path has no file name")?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}-{nanos}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let mut f = create_private(&tmp)?;
+    let result = f
+        .write_all(bytes)
+        .and_then(|()| f.sync_all())
+        .with_context(|| format!("writing {}", tmp.display()))
+        .and_then(|()| {
+            fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
+        });
+    if result.is_err() {
+        drop(f);
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// What `get` prints for a field: secrets are masked unless `reveal` is set.
 fn display_value(item: &Item, f: &Field, reveal: bool) -> String {
     let raw = f.value.expose_secret();
@@ -596,23 +632,14 @@ fn run(cli: Cli) -> Result<()> {
                 "WARNING: anyone who can read that file can read every secret. Delete it after use."
             );
             let export = export_csv(vault);
-            let mut f = if *force {
-                let f = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(out)
-                    .with_context(|| format!("opening {}", out.display()))?;
-                // `mode` only applies on creation; tighten a pre-existing file too.
-                fs::set_permissions(out, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-                    .with_context(|| format!("setting permissions on {}", out.display()))?;
-                f
+            if *force {
+                replace_private(out, &export.0)?;
             } else {
-                create_private(out).context("use --force to overwrite an existing file")?
-            };
-            f.write_all(&export.0)
-                .with_context(|| format!("writing {}", out.display()))?;
+                let mut f =
+                    create_private(out).context("use --force to overwrite an existing file")?;
+                f.write_all(&export.0)
+                    .with_context(|| format!("writing {}", out.display()))?;
+            }
             println!("exported to {}", out.display());
         }
         Cmd::Import { format, input } => {

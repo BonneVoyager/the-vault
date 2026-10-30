@@ -74,7 +74,7 @@ While the app holds unsaved edits (dirty, before `save`), step 6 still runs — 
 Policy, evaluated on every `save`:
 
 - Take a snapshot if no snapshot exists newer than **1 hour**, or if the item count decreased, or if this is the first save after unlock.
-- Snapshot = copy of the exact bytes just written, named `<name>-<UTC ISO8601 with - instead of :>.vault`.
+- Snapshot = copy of the exact bytes just written, named `<name>-<UTC ISO8601 with - instead of :>.vault.bin` inside `backups/` (`-2`, `-3` suffixes within the same second; `-unsaved` for Unsaved backups).
 - Retention (run after each snapshot):
   - keep all from the last 24 h
   - keep one per day for 30 days
@@ -178,6 +178,7 @@ impl SyncedVault {
     pub fn backups(&self) -> Result<Vec<BackupInfo>, SyncError>;
     pub fn backup_now(&mut self) -> Result<PathBuf, SyncError>;
     pub fn restore_from(&mut self, backup: &Path, password: &SecretString) -> Result<(), SyncError>;
+    pub fn delete_backup(&mut self, backup: &Path) -> Result<(), SyncError>;   // user-initiated; path must be inside backups/ (file or conflict package); refuses the primary; any kind incl. Unsaved/Conflict
 
     // attachments (v1.1) — streaming; the ref is added to / removed from the item by the caller via `edit`
     pub fn add_attachment(&mut self, item: Uuid, name: &str, data: impl Read, size: u64, now: Millis) -> Result<Uuid, SyncError>; // seals + writes blob, appends ref, marks dirty
@@ -194,9 +195,10 @@ pub enum SyncEvent {
     ForeignVault,
     CloudUnavailable,
     BackupTaken(PathBuf),
+    BackupDeleted(PathBuf),      // user-initiated delete_backup
     KeyMismatch,                 // on-disk file no longer opens with our cached key (password changed elsewhere); edits are kept, next unlock re-verifies
     KeyRotatedOnDisk,            // vault_key rotated elsewhere; must re-unlock with the password
-    SaveBlocked(SaveBlockReason), // NewerVersion | ForeignVault; in-memory state kept
+    SaveBlocked(SaveBlocked),     // NewerVersion | ForeignVault; in-memory state kept; emitted once at first detection and once per refused save
     Error(String),
 }
 

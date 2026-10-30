@@ -17,7 +17,7 @@ use std::time::SystemTime;
 
 use gpui::{Context, SharedString};
 use vault_core::{Item, SecretString};
-use vault_sync::{BackupInfo, SyncError, SyncEvent, SyncedVault};
+use vault_sync::{BackupInfo, SaveBlocked, SyncError, SyncEvent, SyncedVault};
 
 use super::{AppState, Busy, Mode, Navigation, Outcome, SyncStatus, TOAST_TTL, Toast, ToastPlace};
 use crate::text;
@@ -46,22 +46,28 @@ pub struct SyncUi {
     /// The on-disk vault was re-keyed elsewhere; the inline password prompt is up.
     pub key_mismatch: bool,
     pub key_mismatch_error: Option<SharedString>,
+    /// The prompt is for a key rotated elsewhere (`KeyRotatedOnDisk`): its own wording, and
+    /// the Merged after re-verifying says the new key is in use.
+    pub key_rotated: bool,
     /// Newest first, as `SyncedVault::backups` returns them.
     pub backups: Vec<BackupInfo>,
     pub backups_error: Option<SharedString>,
     pub restore: Option<RestorePrompt>,
+    /// The backup whose row shows the inline "Delete this backup?" confirm.
+    pub delete_confirm: Option<PathBuf>,
     /// Last successful save by this app.
     pub last_saved: Option<SystemTime>,
     /// The red "Export unencrypted?" confirm in Import / Export.
     pub export_confirm: bool,
     /// The last save attempt failed; the tick does not retry until something changes.
     pub save_failing: bool,
-    /// The re-key warning toast is up; the Merged right after it stays quiet.
-    pub rekey_toast_shown: bool,
     /// An autosave hit the save lock (`SaveLockTimeout`) and was retried once; the next
     /// failure is not retried. Reset by any other save outcome.
     pub busy_retried: bool,
 }
+
+/// Toast on the Merged that follows re-entering the password after a key rotation.
+pub const KEY_ROTATED_RESOLVED: &str = "Now using the vault's new key";
 
 /// Toast when another process held the vault's save lock for too long (03 §2).
 pub const SAVE_BUSY: &str = "Another process is writing this vault. Try again in a moment.";
@@ -193,9 +199,9 @@ impl AppState {
                 self.sync.key_mismatch_error = None;
                 self.vault_changed();
                 self.mark_remote_edits();
-                // The Merged that follows KeyRotatedOnDisk must not cover its warning.
-                let after_rekey = std::mem::take(&mut self.sync.rekey_toast_shown);
-                if report.changed() && !after_rekey {
+                if std::mem::take(&mut self.sync.key_rotated) {
+                    self.show_toast(KEY_ROTATED_RESOLVED, cx);
+                } else if report.changed() {
                     self.show_toast("Vault updated from another device", cx);
                 }
                 if self.recheck_touch_slot() {
@@ -239,23 +245,32 @@ impl AppState {
                 eprintln!("vault: backup taken: {}", path.display());
                 self.refresh_backups();
             }
-            SyncEvent::KeyMismatch => {
+            SyncEvent::BackupDeleted(_) => self.refresh_backups(),
+            // 03 §3: the file on disk must not be overwritten. vault-sync emits this when it
+            // first sees such a file and on refused saves; a refused save already toasted
+            // through `record_save`, so only the first sighting toasts. The status line
+            // keeps the reason until a save succeeds, and autosave stops retrying.
+            SyncEvent::SaveBlocked(blocked) => {
+                let message = save_blocked_message(&blocked);
+                self.sync_status = SyncStatus::Error(message.into());
+                if !self.sync.save_failing {
+                    self.show_toast(message, cx);
+                }
+                self.sync.save_failing = true;
+            }
+            // Both mean the cached key no longer opens the file on disk (a password change
+            // or a key rotation elsewhere, or a rollback, which looks the same). vault-sync
+            // keeps the in-memory edits and refuses to save; the inline prompt asks for the
+            // password, and `unlock` merges our edits into the on-disk vault. Locked: the
+            // next unlock re-reads the file anyway.
+            SyncEvent::KeyMismatch | SyncEvent::KeyRotatedOnDisk => {
                 if !self.locked {
                     self.sync.key_mismatch = true;
                     self.sync.key_mismatch_error = None;
+                    self.sync.key_rotated = event == SyncEvent::KeyRotatedOnDisk;
                 }
             }
-            SyncEvent::KeyRotatedOnDisk => {
-                self.sync.key_mismatch = false;
-                self.sync.key_mismatch_error = None;
-                self.sync.save_failing = false;
-                self.sync.rekey_toast_shown = true;
-                self.show_toast(
-                    "Now using the vault's new key from disk. If no other device changed \
-                     the password, the file may have been rolled back; check your backups.",
-                    cx,
-                );
-            }
+            // Fallback for errors without a typed event (watcher failures, a failed backup).
             SyncEvent::Error(message) => {
                 self.sync_status = SyncStatus::Error(message.clone().into());
                 self.show_toast(message, cx);
@@ -385,6 +400,7 @@ impl AppState {
         }
         self.settings_tab = SYNC_TAB;
         self.settings_open = true;
+        self.sync.delete_confirm = None;
         self.sync.restore = Some(RestorePrompt {
             backup,
             asking_password: false,
@@ -457,6 +473,63 @@ impl AppState {
         );
     }
 
+    /// The trash button on a backup row: show the row's inline confirm. Works while
+    /// locked (deleting a file needs no key); waits while the vault is in a task.
+    pub fn request_delete_backup(&mut self, backup: PathBuf, cx: &mut Context<Self>) {
+        if self.busy.is_some() || self.vault.is_none() {
+            return;
+        }
+        self.sync.restore = None;
+        self.sync.delete_confirm = Some(backup);
+        cx.notify();
+    }
+
+    pub fn cancel_delete_backup(&mut self, cx: &mut Context<Self>) {
+        if self.sync.delete_confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// "Delete" in the confirm: removes the snapshot file or conflict package (03 §8).
+    /// No undo. Runs as a task like the other vault operations, so a lock or close while
+    /// it runs discards the result.
+    pub fn confirm_delete_backup(&mut self, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(backup) = self.sync.delete_confirm.take() else {
+            return;
+        };
+        let Some(mut vault) = self.vault.take() else {
+            cx.notify();
+            return;
+        };
+        self.run_bg_cx(
+            Busy::DeletingBackup,
+            cx,
+            move || {
+                let result = vault.delete_backup(&backup);
+                (vault, backup, result)
+            },
+            |this, (mut vault, backup, result), outcome, cx| match outcome {
+                Outcome::Closed => vault.lock(),
+                Outcome::Locked => {
+                    vault.lock();
+                    this.vault = Some(vault);
+                    this.refresh_backups();
+                }
+                Outcome::Fresh => {
+                    this.vault = Some(vault);
+                    this.refresh_backups();
+                    if let Err(e) = result {
+                        let reason = delete_failure_reason(&e, &backup);
+                        this.show_toast(format!("Could not delete backup: {reason}"), cx);
+                    }
+                }
+            },
+        );
+    }
+
     /// After a successful restore: the vault is unlocked and clean, everything derived
     /// from it is stale.
     fn restored(&mut self, backup: &Path) {
@@ -473,6 +546,35 @@ impl AppState {
         self.vault_changed();
         self.refresh_backups();
         self.toast = Some(Toast::window(format!("Restored from {name}")));
+    }
+}
+
+/// Status line and toast text for a refused save (03 §3).
+fn save_blocked_message(blocked: &SaveBlocked) -> &'static str {
+    match blocked {
+        SaveBlocked::NewerVersion(_) => {
+            "Not saving: a newer version of Vault wrote this vault. Update Vault to keep editing."
+        }
+        SaveBlocked::ForeignVault => {
+            "Not saving: the vault file on disk now holds a different vault."
+        }
+    }
+}
+
+/// Why `delete_backup` failed, without the backup's path (05 §2.5).
+fn delete_failure_reason(e: &SyncError, backup: &Path) -> String {
+    match e {
+        SyncError::Io { source, .. } => source.to_string(),
+        SyncError::SaveLockTimeout(_) => SAVE_BUSY.into(),
+        other => {
+            let message = other.to_string();
+            let mut scrubbed =
+                message.replace(&backup.display().to_string(), &text::file_name(backup));
+            if let Some(dir) = backup.parent().filter(|d| !d.as_os_str().is_empty()) {
+                scrubbed = scrubbed.replace(&dir.display().to_string(), "backups");
+            }
+            scrubbed
+        }
     }
 }
 
@@ -877,15 +979,20 @@ mod tests {
             s.handle_sync_event(SyncEvent::ConflictAbsorbed(dir.path().join("c.vault")), cx);
             assert!(s.autosave_pending);
 
-            // The Merged right after a re-key keeps the re-key warning up.
+            // A re-key raises the password prompt; the Merged after re-verifying clears it
+            // and says the new key is in use. Later merges report changes as usual.
             s.handle_sync_event(SyncEvent::KeyRotatedOnDisk, cx);
-            let warning = s.toast.as_ref().unwrap().message.clone();
+            assert!(s.sync.key_mismatch);
             let changed = MergeReport {
                 added: 1,
                 ..MergeReport::default()
             };
             s.handle_sync_event(SyncEvent::Merged(changed), cx);
-            assert_eq!(s.toast.as_ref().unwrap().message, warning);
+            assert!(!s.sync.key_mismatch);
+            assert_eq!(
+                s.toast.as_ref().unwrap().message.as_ref(),
+                KEY_ROTATED_RESOLVED
+            );
             s.handle_sync_event(SyncEvent::Merged(changed), cx);
             assert_eq!(
                 s.toast.as_ref().unwrap().message.as_ref(),
@@ -930,6 +1037,10 @@ mod tests {
                 SyncEvent::Error("boom".into()),
                 SyncEvent::KeyMismatch,
                 SyncEvent::KeyRotatedOnDisk,
+                SyncEvent::SaveBlocked(SaveBlocked::NewerVersion(99)),
+                SyncEvent::SaveBlocked(SaveBlocked::ForeignVault),
+                SyncEvent::BackupDeleted(p.join("b.vault")),
+                SyncEvent::AttachmentsPruned(1),
             ]
         };
         // Choose screen: no vault at all.
@@ -1054,5 +1165,200 @@ mod tests {
             assert_eq!(s.settings.clipboard_clear_secs, 30);
             assert_eq!(s.vault.as_ref().unwrap().retention_multiplier(), 1.0);
         });
+    }
+
+    /// Takes a snapshot and returns its path, plus a conflict package of the same vault.
+    fn backups_with_conflict(
+        state: &Entity<AppState>,
+        cx: &mut TestAppContext,
+    ) -> (PathBuf, PathBuf) {
+        state.update(cx, |s, cx| s.backup_now(cx));
+        let snapshot = state.read_with(cx, |s, _| s.sync.backups[0].path.clone());
+        let file = text::file_name(&snapshot);
+        let stamp = &file["t-".len().."t-".len() + 20];
+        let conflict = snapshot
+            .parent()
+            .unwrap()
+            .join(format!("conflict-{stamp}-t (conflicted copy).vault"));
+        fs::create_dir(&conflict).unwrap();
+        fs::copy(&snapshot, conflict.join("vault.bin")).unwrap();
+        state.update(cx, |s, _| s.refresh_backups());
+        (snapshot, conflict)
+    }
+
+    fn listed(state: &Entity<AppState>, path: &Path, cx: &mut TestAppContext) -> bool {
+        state.read_with(cx, |s, _| s.sync.backups.iter().any(|b| b.path == path))
+    }
+
+    #[gpui::test]
+    fn delete_backup_removes_the_row_and_the_file_or_package(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        let (snapshot, conflict) = backups_with_conflict(&state, cx);
+        assert!(listed(&state, &conflict, cx), "conflict package listed");
+        for path in [&snapshot, &conflict] {
+            state.update(cx, |s, cx| {
+                s.toast = None;
+                s.request_delete_backup(path.clone(), cx);
+                assert_eq!(s.sync.delete_confirm.as_ref(), Some(path));
+                s.confirm_delete_backup(cx);
+                assert_eq!(s.busy, Some(Busy::DeletingBackup));
+            });
+            cx.run_until_parked();
+            state.read_with(cx, |s, _| {
+                assert!(s.busy.is_none() && s.vault.is_some() && s.sync.delete_confirm.is_none());
+                assert!(s.toast.is_none(), "no toast on success");
+            });
+            assert!(!path.exists(), "{} still on disk", path.display());
+            assert!(!listed(&state, path, cx));
+        }
+    }
+
+    #[gpui::test]
+    fn cancel_keeps_the_backup(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        let (snapshot, _) = backups_with_conflict(&state, cx);
+        state.update(cx, |s, cx| {
+            s.request_delete_backup(snapshot.clone(), cx);
+            s.cancel_delete_backup(cx);
+            assert!(s.sync.delete_confirm.is_none());
+            // Delete without a confirm up does nothing.
+            s.confirm_delete_backup(cx);
+            assert!(s.busy.is_none());
+        });
+        cx.run_until_parked();
+        assert!(snapshot.exists());
+        assert!(listed(&state, &snapshot, cx));
+    }
+
+    #[gpui::test]
+    fn delete_failure_toasts_without_the_path(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        // vault-sync refuses anything outside backups/.
+        let outside = dir.path().join("t-elsewhere.vault.bin");
+        fs::write(&outside, b"x").unwrap();
+        state.update(cx, |s, cx| {
+            s.toast = None;
+            s.request_delete_backup(outside.clone(), cx);
+            s.confirm_delete_backup(cx);
+        });
+        cx.run_until_parked();
+        let message = state.read_with(cx, |s, _| s.toast.as_ref().unwrap().message.to_string());
+        assert!(
+            message.starts_with("Could not delete backup: "),
+            "{message}"
+        );
+        let dir_text = dir.path().display().to_string();
+        assert!(!message.contains(&dir_text), "path leaked: {message}");
+        assert!(outside.exists());
+        state.read_with(cx, |s, _| assert!(s.vault.is_some() && s.busy.is_none()));
+    }
+
+    #[gpui::test]
+    fn lock_mid_delete_discards_the_result(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        let (snapshot, _) = backups_with_conflict(&state, cx);
+        state.update(cx, |s, cx| {
+            s.toast = None;
+            s.request_delete_backup(snapshot.clone(), cx);
+            s.confirm_delete_backup(cx);
+            // ⌘L lands while the vault is inside the task.
+            s.lock(cx);
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |s, _| {
+            assert!(s.locked && s.vault.is_some() && s.busy.is_none());
+            assert!(
+                s.vault.as_ref().unwrap().vault().is_none(),
+                "returned vault is locked"
+            );
+            assert!(s.sync.delete_confirm.is_none());
+            assert!(s.toast.is_none(), "no toast after the lock");
+        });
+        // The list matches the disk, whatever the task finished doing.
+        assert_eq!(listed(&state, &snapshot, cx), snapshot.exists());
+    }
+
+    #[gpui::test]
+    fn backup_deleted_event_refreshes_the_list(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        let (snapshot, _) = backups_with_conflict(&state, cx);
+        fs::remove_file(&snapshot).unwrap();
+        assert!(listed(&state, &snapshot, cx), "stale until the event");
+        state.update(cx, |s, cx| {
+            s.handle_sync_event(SyncEvent::BackupDeleted(snapshot.clone()), cx)
+        });
+        assert!(!listed(&state, &snapshot, cx));
+    }
+
+    /// The watcher reports a rotation elsewhere at detection time: the edit stays open, the
+    /// password prompt comes up, and saving is refused until it is resolved.
+    #[gpui::test]
+    fn key_rotated_on_disk_keeps_the_edit_and_prompts(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut other, _) = two_devices(dir.path(), cx);
+        state.update(cx, |s, cx| {
+            s.begin_edit(cx);
+            s.toast = None;
+        });
+        rotate_elsewhere(&state, &mut other, cx);
+        state.update(cx, |s, cx| {
+            assert!(s.is_editing(), "edit buffer kept");
+            assert!(s.sync.has_banner() && s.sync.key_mismatch_error.is_none());
+            assert!(
+                s.vault.as_mut().unwrap().save().is_err(),
+                "cached key refused"
+            );
+            assert!(s.sync.key_rotated, "rotation wording");
+            // A second report changes nothing and does not toast.
+            s.handle_sync_event(SyncEvent::KeyRotatedOnDisk, cx);
+            assert!(s.sync.key_mismatch && s.toast.is_none());
+            s.resolve_key_mismatch(secret(PW), cx);
+        });
+        cx.run_until_parked();
+        state.update(cx, |s, cx| s.tick(0.0, cx));
+        state.read_with(cx, |s, _| {
+            assert!(!s.sync.key_mismatch && !s.sync.key_rotated);
+            assert!(s.is_editing(), "edit survives the re-verify");
+            assert_eq!(
+                s.toast.as_ref().unwrap().message.as_ref(),
+                KEY_ROTATED_RESOLVED
+            );
+        });
+        // A plain mismatch keeps the generic wording.
+        state.update(cx, |s, cx| {
+            s.handle_sync_event(SyncEvent::KeyMismatch, cx);
+            assert!(s.sync.key_mismatch && !s.sync.key_rotated);
+        });
+    }
+
+    #[gpui::test]
+    fn save_blocked_shows_the_reason_once_and_stops_autosave(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        for blocked in [SaveBlocked::NewerVersion(99), SaveBlocked::ForeignVault] {
+            state.update(cx, |s, cx| {
+                s.sync.save_failing = false;
+                s.toast = None;
+                s.handle_sync_event(SyncEvent::SaveBlocked(blocked), cx);
+                let message = save_blocked_message(&blocked);
+                assert_eq!(s.toast.as_ref().unwrap().message.as_ref(), message);
+                assert_eq!(s.sync_status, SyncStatus::Error(message.into()));
+                assert!(s.sync.save_failing);
+                // Repeats (every refused save emits one) stay quiet.
+                s.toast = None;
+                s.handle_sync_event(SyncEvent::SaveBlocked(blocked), cx);
+                assert!(s.toast.is_none());
+                // Dirty, but a failing save is not retried by the tick.
+                s.toggle_favorite(cx);
+                s.autosave_pending = false;
+                s.poll_sync(cx);
+                assert!(!s.autosave_pending);
+            });
+        }
     }
 }

@@ -57,21 +57,28 @@ fn header_key(file: &VaultFile, key: &str) -> Option<Value> {
 }
 
 #[test]
-fn fresh_vault_has_no_stamp_and_every_slot_mutation_stamps_monotonically() {
-    let mut v = new_vault();
-    assert_eq!(v.header().slots_modified_at, None);
-    assert_eq!(v.header().slots_device_id, None);
-    assert_eq!(v.header().slots_stamp(), 0);
+fn fresh_vault_is_stamped_at_creation_and_every_slot_mutation_stamps_monotonically() {
+    // 01 §2: `create` stamps `created_at` (seconds) as millis and records the device, so the
+    // header is digest-bound from the first save. `create` (created_at 0) stamps 1, which
+    // still reads as "newer than never stamped" (0) in the merge.
+    let zero = UnlockedVault::create(&pw(), KdfParams::for_tests(), device());
+    assert_eq!(zero.header().slots_modified_at, Some(1));
+    assert_eq!(zero.header().slots_device_id, Some(device()));
+    let mut v = new_vault(); // created_at 1_700_000_000 s
+    assert_eq!(v.header().slots_modified_at, Some(T1));
+    assert_eq!(v.header().slots_device_id, Some(device()));
+    assert_eq!(v.header().slots_stamp(), T1);
 
+    // Same clock as the creation stamp: still strictly advances.
     v.change_password(&pw(), &new_pw(), KdfParams::for_tests(), T1)
         .unwrap();
-    assert_eq!(v.header().slots_modified_at, Some(T1));
+    assert_eq!(v.header().slots_modified_at, Some(T1 + 1));
     assert_eq!(v.header().slots_device_id, Some(device()));
 
     // A clock that went backwards still advances the stamp: max(now, prev + 1).
     let kek = random_kek();
     let id = v.add_enclave_slot(&kek, T1 - 500);
-    assert_eq!(v.header().slots_modified_at, Some(T1 + 1));
+    assert_eq!(v.header().slots_modified_at, Some(T1 + 2));
     v.remove_slot(id, T1 + 10).unwrap();
     assert_eq!(v.header().slots_modified_at, Some(T1 + 10));
     v.rotate_vault_key(&new_pw(), 0).unwrap();
@@ -101,7 +108,8 @@ fn fresh_vault_has_no_stamp_and_every_slot_mutation_stamps_monotonically() {
 
 #[test]
 fn stamp_key_is_written_only_once_set() {
-    let mut v = new_vault();
+    // A v1.0 (never-stamped) file saved by this build stays key-free ...
+    let mut v = unstamped_vault();
     populate(&mut v, 1);
     let file = VaultFile::parse(&v.serialize()).unwrap();
     assert_eq!(file.header.slots_modified_at, None);
@@ -111,6 +119,16 @@ fn stamp_key_is_written_only_once_set() {
         "never-stamped: no key"
     );
     assert_eq!(header_key(&file, "slots_device_id"), None);
+    // ... while a freshly created vault writes both keys from its very first save.
+    let fresh = VaultFile::parse(&new_vault().serialize()).unwrap();
+    assert_eq!(
+        header_key(&fresh, "slots_modified_at"),
+        Some(Value::from(T1))
+    );
+    assert_eq!(
+        header_key(&fresh, "slots_device_id"),
+        Some(Value::Bytes(device().as_bytes().to_vec()))
+    );
 
     v.change_password(&pw(), &new_pw(), KdfParams::for_tests(), T1)
         .unwrap();
@@ -129,7 +147,7 @@ fn stamp_key_is_written_only_once_set() {
 
 #[test]
 fn stamp_of_the_wrong_type_is_malformed_and_null_reads_as_missing() {
-    let v = new_vault();
+    let v = unstamped_vault();
     let key = t("slots_modified_at");
     // No stamp is set, so an extra with that name is emitted as-is by the writer.
     let bad = rewrite(&v.serialize(), |f| {
@@ -175,7 +193,8 @@ fn password_change_and_recalibration_on_b_survive_a_merge() {
     let report = a.merge_from(&b_disk).unwrap();
     assert!(report.header_updated, "{report:?}");
     assert!(report.changed());
-    assert_eq!(a.header().slots_modified_at, Some(T1));
+    // Created at T1 (creation stamp), changed at T1 -> max(T1, T1 + 1).
+    assert_eq!(a.header().slots_modified_at, Some(T1 + 1));
     assert_eq!(a.header().kdf, params);
     assert_eq!(a.header().slots, b.header().slots);
 
@@ -379,7 +398,11 @@ fn equal_stamps_are_broken_by_device_id_and_converge_both_ways() {
 
 #[test]
 fn opaque_slots_and_kdf_extras_travel_with_the_header() {
-    let (mut a, b) = two_devices();
+    // Both devices start from an unstamped (v1.0) file so the opaque slot and kdf extra can
+    // be spliced in by hand; a fresh vault's header is digest-bound (01 §4).
+    let mut a = unstamped_vault();
+    populate(&mut a, 3);
+    let b = unlock(&a.serialize()).unwrap();
     // B is a newer build: its file carries an opaque slot and an unknown key in `kdf`, and it
     // then adds an enclave slot (which stamps the header).
     let opaque = OpaqueSlot::new(
@@ -488,9 +511,9 @@ fn later_local_password_change_beats_remote_rotation() {
 /// old header with a raised stamp, strip the stamp, or swap slots without the vault key.
 #[test]
 fn stamped_header_is_bound_into_the_manifest() {
-    let mut v = new_vault();
+    let mut v = unstamped_vault();
     populate(&mut v, 2);
-    let old = v.serialize(); // unstamped: old AAD, still opens with the old password
+    let old = v.serialize(); // unstamped (v1.0): old AAD, still opens with the old password
     v.change_password(&pw(), &new_pw(), KdfParams::for_tests(), T1)
         .unwrap();
     let cur = v.serialize(); // stamped at T1 by `device()`
@@ -568,4 +591,61 @@ fn vault_id_mismatch_is_still_rejected_before_any_header_change() {
         Err(VaultError::Malformed(_))
     ));
     assert_eq!(a.header(), &before);
+}
+
+/// Why `create` stamps (01 §2): on an *unstamped* header a by-hand edit of a key slot is not
+/// bound into anything a key-holding device checks, so a device with the cached vault key
+/// keeps opening the file, never rewrites the slot, and only the next password unlock fails.
+/// A fresh vault is stamped from its first save, so the slot set is digest-bound into the
+/// manifest AAD (01 §4) and the edit fails at open on every path.
+#[test]
+fn fresh_vault_slot_tamper_is_caught_at_open() {
+    let manifest = VaultError::Tampered(TamperKind::Manifest);
+    let mut v = new_vault();
+    populate(&mut v, 2);
+    let bytes = v.serialize();
+    let header = LockedVault::parse(&bytes).unwrap().header().clone();
+    assert_eq!(header.slots_modified_at, Some(T1));
+    assert_eq!(header.slots_device_id, Some(device()));
+    assert!(header.digest().is_some(), "fresh vault is digest-bound");
+
+    // Password slot nonce flipped: the password path trips over the slot first (01 §7 says a
+    // slot tag failure on a cleanly parsed header is `WrongPassword`), so it is reported as
+    // such; the key-holding paths reach the manifest and report the tamper (sync_feature.rs
+    // covers `unlock_with_key`).
+    let nonce = rewrite(&bytes, |f| {
+        f.header.slots[0].as_key_mut().unwrap().nonce[0] ^= 1
+    });
+    assert_eq!(unlock(&nonce).unwrap_err(), VaultError::WrongPassword);
+    // A slot edit outside the slot AAD (`created_at`) still unwraps, then fails the manifest.
+    let created = rewrite(&bytes, |f| {
+        f.header.slots[0].as_key_mut().unwrap().created_at += 1
+    });
+    assert_eq!(unlock(&created).unwrap_err(), manifest);
+
+    // With a second slot, flipping the *other* slot's nonce is caught by the password path
+    // and by the enclave path alike.
+    let kek = random_kek();
+    let enclave = v.add_enclave_slot(&kek, T1 + 5);
+    let bytes = v.serialize();
+    let flip = |kind: SlotKind| {
+        rewrite(&bytes, |f| {
+            let slot = f
+                .header
+                .slots
+                .iter_mut()
+                .find(|s| s.is_key_of(kind.clone()));
+            slot.unwrap().as_key_mut().unwrap().nonce[0] ^= 1;
+        })
+    };
+    let enclave_flipped = flip(SlotKind::Enclave);
+    assert_eq!(unlock(&enclave_flipped).unwrap_err(), manifest);
+    let password_flipped = flip(SlotKind::Password);
+    assert_eq!(
+        LockedVault::parse(&password_flipped)
+            .unwrap()
+            .unlock_with_kek(enclave, &kek)
+            .unwrap_err(),
+        manifest
+    );
 }

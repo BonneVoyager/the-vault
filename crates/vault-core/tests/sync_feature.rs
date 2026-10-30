@@ -198,14 +198,22 @@ fn merge_through_unlock_with_key_adopts_newer_header() {
     let mut b = unlock(&a.serialize()).unwrap();
     b.set_device_id(Uuid::from_u128(0xB));
     let new_pw = secret("changed on B");
-    b.change_password(&pw(), &new_pw, vault_core::KdfParams::for_tests(), 5_000)
-        .unwrap();
+    // Later than the creation stamp (`new_vault` is created at 1_700_000_000 s), so the
+    // change is stamped with this clock rather than `creation + 1`.
+    let changed_at = 1_700_000_005_000;
+    b.change_password(
+        &pw(),
+        &new_pw,
+        vault_core::KdfParams::for_tests(),
+        changed_at,
+    )
+    .unwrap();
     let handle = a.export_vault_key();
     let b_disk = LockedVault::parse(&b.serialize())
         .unwrap()
         .unlock_with_key(&handle, device())
         .unwrap();
-    assert_eq!(b_disk.header().slots_modified_at, Some(5_000));
+    assert_eq!(b_disk.header().slots_modified_at, Some(changed_at));
     assert_eq!(b_disk.header().slots_device_id, Some(Uuid::from_u128(0xB)));
 
     let report = a.merge_from(&b_disk).unwrap();
@@ -273,4 +281,56 @@ fn handle_survives_change_password_but_not_rotation() {
     );
     let fresh = v.export_vault_key();
     assert_vaults_eq(&v, &after_rotate.unlock_with_key(&fresh, device()).unwrap());
+}
+
+/// Why `create` stamps the header (01 §2): a device holding the cached vault key must not keep
+/// opening a file whose password slot was edited by hand. On an unstamped (v1.0) header the
+/// slot is bound into nothing this path checks, so the tampered file still opens; a fresh
+/// vault is digest-bound (01 §4) and the same edit is `Tampered(Manifest)` at open.
+#[test]
+fn flipped_slot_nonce_on_a_fresh_vault_fails_unlock_with_key() {
+    let flip = |bytes: &[u8]| {
+        rewrite(bytes, |f| {
+            f.header.slots[0].as_key_mut().unwrap().nonce[0] ^= 1;
+        })
+    };
+
+    let mut v = new_vault();
+    populate(&mut v, 2);
+    let handle = v.export_vault_key();
+    let bytes = v.serialize();
+    assert!(
+        LockedVault::parse(&bytes)
+            .unwrap()
+            .header()
+            .slots_modified_at
+            .is_some()
+    );
+    let tampered = flip(&bytes);
+    let locked = LockedVault::parse(&tampered).unwrap();
+    assert_eq!(
+        locked.unlock_with_key(&handle, device()).unwrap_err(),
+        VaultError::Tampered(TamperKind::Manifest)
+    );
+    assert_eq!(locked.unlock(&pw()).unwrap_err(), VaultError::WrongPassword);
+
+    // The same edit on a never-stamped file is invisible to the key path: this is the gap
+    // that stamping at creation closes. (Existing v1.0 files stay this way until a slot
+    // mutation stamps them.)
+    let mut old = unstamped_vault();
+    populate(&mut old, 2);
+    let handle = old.export_vault_key();
+    let locked = LockedVault::parse(&flip(&old.serialize())).unwrap();
+    assert!(locked.unlock_with_key(&handle, device()).is_ok());
+    assert_eq!(locked.unlock(&pw()).unwrap_err(), VaultError::WrongPassword);
+
+    // Empty fresh vault: the manifest is the first tag check on this path, so the tamper is
+    // reported as `WrongPassword` (first-failure rule) but still fails at open.
+    let empty = new_vault();
+    let handle = empty.export_vault_key();
+    let locked = LockedVault::parse(&flip(&empty.serialize())).unwrap();
+    assert_eq!(
+        locked.unlock_with_key(&handle, device()).unwrap_err(),
+        VaultError::WrongPassword
+    );
 }

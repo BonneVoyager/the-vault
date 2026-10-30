@@ -38,7 +38,7 @@ cargo run -p vault-cli -- --help
 cargo run -p vault-app
 ```
 
-Toolchain: Rust pinned in `rust-toolchain.toml` (gpui-pre needs it), edition 2024. macOS 15+ target. No CI yet; run the four checks above before declaring a task done.
+Toolchain: Rust pinned in `rust-toolchain.toml` (gpui-pre needs it), edition 2024. macOS 15+ target. No CI yet (see the testing roadmap in `specs/00-overview.md`); run the four checks above before declaring a task done.
 
 ## Phases (see 00-overview.md)
 

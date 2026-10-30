@@ -555,3 +555,65 @@ fn concurrent_adds_lose_nothing() {
         assert_eq!(list.lines().count(), expected, "{list}");
     }
 }
+
+#[test]
+fn export_force_is_atomic_and_refuses_symlink() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    ok(&vault(
+        &f,
+        PW,
+        &["add", "--template", "login", "--title", "GitHub"],
+    ));
+
+    let out_dir = dir.path().join("o");
+    std::fs::create_dir(&out_dir).unwrap();
+    let target = out_dir.join("target.txt");
+    std::fs::write(&target, "original").unwrap();
+    let link = out_dir.join("link.csv");
+    symlink(&target, &link).unwrap();
+    let r = vault(
+        &f,
+        PW,
+        &[
+            "export",
+            "--out",
+            link.to_str().unwrap(),
+            "--yes",
+            "--force",
+        ],
+    );
+    assert!(!r.status.success());
+    assert!(String::from_utf8_lossy(&r.stderr).contains("refusing to overwrite a symlink"));
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    let reg = out_dir.join("reg.csv");
+    std::fs::write(&reg, "old").unwrap();
+    std::fs::set_permissions(&reg, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let held = std::fs::File::open(&reg).unwrap();
+    ok(&vault(
+        &f,
+        PW,
+        &["export", "--out", reg.to_str().unwrap(), "--yes", "--force"],
+    ));
+    assert_eq!(
+        std::fs::metadata(&reg).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(std::fs::read_to_string(&reg).unwrap().contains("GitHub"));
+    // The previously opened handle still sees the old inode, not the new contents.
+    assert_eq!(std::io::read_to_string(held).unwrap(), "old");
+    let names: Vec<_> = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 3, "no temp left: {names:?}");
+}

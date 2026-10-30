@@ -104,3 +104,15 @@ Rules of dependency: `vault-core` depends on nothing in the workspace. `vault-sy
 
 ### Phase 5 — polish
 - Empty states, animations, drag-to-reorder, icons/favicons (bundled, no network), onboarding
+
+## Testing roadmap (future considerations, noted 2026-10-30, not scheduled)
+
+Unit tests plus diff-based code and security review missed two cross-device defects that an independent spec-derived bug hunt found. Beyond the manual `bug-hunter` agent, the following would add independent lenses, in order of value:
+
+1. **Continuous integration**: a macOS job on every push running `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, plus a nightly long job for the items below. Nothing runs today unless someone runs it.
+2. **Property tests for the merge laws** (`proptest` in vault-core): commutativity, idempotence, convergence within two rounds for N devices, monotone stamps, over random edit scripts. Both high-severity external findings were violations of these laws.
+3. **Fuzzing the parsers** (`cargo-fuzz`): file format, KDBX outer header walk, CSV and 1PUX importers, TOTP URI; fixed time budget per wave, corpus checked in.
+4. **Multi-device simulation** in vault-sync: randomised interleavings of edits, saves, locks and conflict copies of both shapes, compared against a reference model.
+5. **Mutation testing** (`cargo-mutants`) on vault-core and vault-sync per wave, listing tests that do not bite.
+6. **Spec traceability**: a table mapping every guarantee in 02 and 03 to a named test.
+7. **Golden screenshots**: compare headless renders of each screen against stored images to catch visual regressions.

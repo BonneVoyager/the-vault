@@ -1,6 +1,6 @@
 ---
 name: header-merge-decisions
-description: 2026-10-30 bug-hunt fixes in vault-core — slots_modified_at/slots_device_id header stamp + merge_from header LWW with author tie-break (V-01/V-03), keys travel with the header, MergeReport.header_updated, slot mutators take `now`, t_cost cap 16 (V-08), generator clamps + min_length (V-07), v1-forward eight unknown-key sites (V-09), CSV formula guard bijection
+description: 2026-10-30 bug-hunt fixes in vault-core — slots_modified_at/slots_device_id header stamp (also set at creation; unstamped_vault() test helper) + merge_from header LWW with author tie-break (V-01/V-03), keys travel with the header, MergeReport.header_updated, slot mutators take `now`, t_cost cap 16 (V-08), generator clamps + min_length (V-07), v1-forward eight unknown-key sites (V-09), CSV formula guard bijection
 metadata:
   type: project
 ---
@@ -13,7 +13,21 @@ Decisions settled on 2026-10-30 while fixing the external bug-hunt findings in
 `Header::slots_stamp()` reads missing as 0. Parser: missing or `null` -> `None`; any other
 non-u64 -> `Malformed`. Writer emits the key ONLY when `Some`, so every pre-existing fixture
 stays byte-identical (asserted in `every_fixture_in_the_directory_opens`, both on the committed
-bytes and after unlock+serialize). `create` leaves it `None`.
+bytes and after unlock+serialize). **`create` STAMPS (01 §2 amendment, 2026-10-30 later the same
+day):** `create_with_created_at` sets `slots_modified_at = max(created_at_secs * 1000, 1)` and
+`slots_device_id = device_id`, so every new vault is digest-bound from its first serialize
+(`create()` with created_at 0 stamps 1). Reason: on an unstamped header a flipped password-slot
+nonce was invisible to a device holding the cached key (unlock_with_key opened, the watcher
+merged, nothing rewrote the slot, only the next password unlock failed). Only pre-v1.1 files
+and the committed fixtures are unstamped now. Test consequence: NO fresh vault can be spliced
+by hand any more; tests that need a by-hand header edit start from
+`common::unstamped_vault()` (unlocks the committed `v1-empty.vault`, sets `device()`), and
+`new_vault()` (created_at 1_700_000_000 s) has creation stamp T1 = 1_700_000_000_000, so a
+mutation with `now <= T1` stamps `T1 + 1`. Password path on a flipped password-slot nonce is
+still `WrongPassword` (01 §7 slot-first order); `unlock_with_key`/`unlock_with_kek` report
+`Tampered(Manifest)`; an edit outside the slot AAD (slot `created_at`) is `Tampered(Manifest)`
+on the password path too. vault-sync's `flipped_slot_nonce_is_merged_silently_and_the_password_then_fails`
+(watch.rs) documented the old gap and now fails; it is the sync owner's to rewrite.
 
 **Stamping:** `UnlockedVault::bump_slots_stamp(now)` = `stamp(now, prev)` = `max(now, prev+1)`,
 called on success only by `change_password(old, new, kdf, now)` (also the re-calibration path;

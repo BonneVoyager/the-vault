@@ -49,6 +49,11 @@ pub enum SyncError {
     /// file of this vault in a supported format is next seen on disk.
     #[error("{0}")]
     SaveBlocked(SaveBlocked),
+    /// `delete_backup` was given a path that is not one of this vault's backups (an entry of
+    /// `backups()`, resolved through symlinks, directly inside `<name>.vault/backups/`). The
+    /// primary, the package itself and anything outside `backups/` are always refused.
+    #[error("{} is not a backup of this vault", .0.display())]
+    NotABackup(PathBuf),
     /// Another process (or another `SyncedVault` on the same package) held the package's
     /// advisory lock (`<name>.vault/.lock`, 03 §2) for longer than 10 s. Nothing was written;
     /// retry.

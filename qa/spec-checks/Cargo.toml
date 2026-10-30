@@ -1,0 +1,28 @@
+[package]
+name = "spec-checks"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone: not part of the project workspace.
+[workspace]
+
+[dependencies]
+vault-core = { path = "../../crates/vault-core", features = ["sync", "kdbx"] }
+vault-sync = { path = "../../crates/vault-sync", features = ["test-support"] }
+secrecy = "0.8"
+uuid = { version = "1", features = ["v4"] }
+# Independent re-implementations for cross-checking the spec'd crypto and CBOR layout.
+ciborium = "0.2"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+tempfile = "3"
+argon2_rs = { package = "rust-argon2", version = "3" }
+crossbeam-channel = "0.5"
+keepass = { version = "0.17", default-features = false, features = ["save_kdbx4"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -105,6 +105,8 @@ pub enum Busy {
     ReadingAttachment,
     /// Decrypting and importing a KeePass database.
     Importing,
+    /// Deleting a backup file or conflict package (Settings ▸ Sync & Backup).
+    DeletingBackup,
 }
 
 impl Busy {
@@ -126,6 +128,7 @@ impl Busy {
                 | Self::DisablingTouchId
                 | Self::Attaching
                 | Self::ReadingAttachment
+                | Self::DeletingBackup
         )
     }
 }
@@ -915,7 +918,9 @@ impl AppState {
         self.autosave_pending = false;
         self.sync.key_mismatch = false;
         self.sync.key_mismatch_error = None;
+        self.sync.key_rotated = false;
         self.sync.restore = None;
+        self.sync.delete_confirm = None;
         self.sync.export_confirm = false;
         self.reset_security_forms();
         self.clear_session();

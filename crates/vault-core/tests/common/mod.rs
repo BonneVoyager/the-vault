@@ -20,6 +20,22 @@ pub fn new_vault() -> UnlockedVault {
     UnlockedVault::create_with_created_at(&pw(), KdfParams::for_tests(), device(), 1_700_000_000)
 }
 
+/// An empty vault whose header carries **no** `slots_modified_at` (a v1.0 file). `create`
+/// stamps every new vault (01 §2), so the only way to get one is the committed, unstamped
+/// `v1-empty.vault` fixture (same password and KDF as `new_vault`). Tests that splice slots
+/// or header keys into a file by hand must start here: a stamped header is digest-bound into
+/// the manifest AAD (01 §4) and any by-hand edit of it is `Tampered(Manifest)`.
+pub fn unstamped_vault() -> UnlockedVault {
+    const EMPTY: &[u8] = include_bytes!("../fixtures/v1-empty.vault");
+    let mut v = LockedVault::parse(EMPTY)
+        .expect("v1-empty fixture parses")
+        .unlock(&pw())
+        .expect("v1-empty fixture opens");
+    assert_eq!(v.header().slots_modified_at, None, "fixture is unstamped");
+    v.set_device_id(device());
+    v
+}
+
 pub fn secret(s: impl Into<String>) -> SecretString {
     SecretString::new(s.into())
 }

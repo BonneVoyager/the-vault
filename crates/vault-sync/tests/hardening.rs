@@ -133,9 +133,18 @@ fn newer_format_on_disk_blocks_save_until_a_valid_file_returns() {
         newer,
         "newer file was overwritten"
     );
-    assert!(events(&rx).iter().any(|e| matches!(e, SyncEvent::Error(_))));
-    // Still blocked on retry.
+    // Reported as the 03 §3 event, once, and not as a generic error.
+    let blocked = SyncEvent::SaveBlocked(SaveBlocked::NewerVersion(0xFFFF));
+    let seen = events(&rx);
+    assert_eq!(
+        seen.iter().filter(|e| **e == blocked).count(),
+        1,
+        "{seen:?}"
+    );
+    assert!(!seen.iter().any(|e| matches!(e, SyncEvent::Error(_))));
+    // Still blocked on retry, and each refused save is reported.
     assert!(matches!(a.save(), Err(SyncError::SaveBlocked(_))));
+    assert_eq!(events(&rx), [blocked]);
 
     // A valid file of this vault comes back: the block lifts and the save merges into it.
     plant(&path, &valid);
@@ -156,7 +165,20 @@ fn foreign_vault_on_disk_blocks_save_and_lock_preserves_edits() {
         Err(SyncError::SaveBlocked(SaveBlocked::ForeignVault))
     ));
     assert_eq!(fs::read(&path).unwrap(), foreign);
-    assert!(events(&rx).contains(&SyncEvent::ForeignVault));
+    let blocked = SyncEvent::SaveBlocked(SaveBlocked::ForeignVault);
+    let seen = events(&rx);
+    assert!(seen.contains(&SyncEvent::ForeignVault));
+    assert_eq!(
+        seen.iter().filter(|e| **e == blocked).count(),
+        1,
+        "{seen:?}"
+    );
+    // A clean retry (no pre-write read) still reports the refusal.
+    assert!(matches!(
+        a.save(),
+        Err(SyncError::SaveBlocked(SaveBlocked::ForeignVault))
+    ));
+    assert_eq!(events(&rx), [blocked]);
 
     // Locking cannot save, so the dirty vault is preserved in the backups directory.
     a.lock();
@@ -218,15 +240,18 @@ fn key_mismatch_refuses_clean_save_kek_unlock_and_preserves_on_lock() {
     assert!(matches!(a.save(), Err(SyncError::KeyMismatch)));
     assert_eq!(fs::read(&path).unwrap(), rotated);
 
-    // C (watching, clean) is told by the watcher; even a clean save is refused.
+    // C (watching, clean) is told by the watcher that the key was rotated (not that the
+    // password changed); even a clean save is refused.
     let start = Instant::now();
     let mut seen = Vec::new();
-    while !seen.contains(&SyncEvent::KeyMismatch) && start.elapsed() < Duration::from_secs(20) {
+    while !seen.contains(&SyncEvent::KeyRotatedOnDisk) && start.elapsed() < Duration::from_secs(20)
+    {
         c.poll();
         seen.extend(rx_c.try_iter());
         thread::sleep(Duration::from_millis(25));
     }
-    assert!(seen.contains(&SyncEvent::KeyMismatch));
+    assert!(seen.contains(&SyncEvent::KeyRotatedOnDisk));
+    assert!(!seen.contains(&SyncEvent::KeyMismatch));
     assert!(!c.is_dirty());
     assert!(matches!(c.save(), Err(SyncError::KeyMismatch)));
     // Touch ID cannot resolve it.
@@ -234,17 +259,15 @@ fn key_mismatch_refuses_clean_save_kek_unlock_and_preserves_on_lock() {
         c.unlock_with_kek(Uuid::nil(), &SecretVec::new(vec![0; 32])),
         Err(SyncError::KeyMismatch)
     ));
-    // The password does: adopt the rotated vault, with a distinct event before Merged.
+    // The password does: adopt the rotated vault and merge (no second rotation event).
     c.unlock(&pw()).unwrap();
     let after: Vec<SyncEvent> = rx_c.try_iter().collect();
-    let rotated_at = after
-        .iter()
-        .position(|e| *e == SyncEvent::KeyRotatedOnDisk)
-        .expect("KeyRotatedOnDisk");
-    assert!(matches!(
-        after.get(rotated_at + 1),
-        Some(SyncEvent::Merged(_))
-    ));
+    assert!(
+        matches!(after.as_slice(), [SyncEvent::Merged(_), ..]),
+        "{after:?}"
+    );
+    assert!(!after.contains(&SyncEvent::KeyRotatedOnDisk));
+    c.save().unwrap();
     assert_eq!(titles(&c), ["from b", "mail"]);
 
     // A locks while the mismatch stands: its unsaved item is preserved, encrypted.

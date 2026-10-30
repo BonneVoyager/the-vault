@@ -23,7 +23,8 @@
 //! re-encrypted on the next `serialize` because every item/manifest key derives from
 //! `vault_key` (01 §3). Each of them also stamps `header.slots_modified_at` with
 //! `max(now, previous + 1)` so the header merge (03 §5, [`UnlockedVault::merge_from`]) can
-//! tell which device's slot set is newer; the stamp is only ever written once it is set.
+//! tell which device's slot set is newer. `create` stamps too (01 §2), so only files written
+//! before v1.1 lack the stamp; the key is only ever written once it is set.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -388,6 +389,11 @@ impl UnlockedVault {
     /// slot. `created_at` is set to 0 because the core never reads the clock; use
     /// [`UnlockedVault::create_with_created_at`] to record a real timestamp.
     ///
+    /// The header is stamped at creation (01 §2): `slots_modified_at = max(created_at * 1000,
+    /// 1)` and `slots_device_id = device_id`, so every new vault carries the `header_digest`
+    /// binding (01 §4) from its first `serialize` and a by-hand edit of its slots or KDF is
+    /// `Tampered(Manifest)` on every unlock path. Only files written before v1.1 are unstamped.
+    ///
     /// # Panics
     ///
     /// If `kdf` fails [`KdfParams::validate`] or is rejected by Argon2 (e.g.
@@ -431,8 +437,12 @@ impl UnlockedVault {
                 kdf,
                 kdf_extras: Vec::new(),
                 slots: vec![slot],
-                slots_modified_at: None,
-                slots_device_id: None,
+                // 01 §2: stamped at creation so the header is digest-bound into the manifest
+                // AAD (01 §4) from the very first `serialize`. `created_at` is seconds; the
+                // stamp is millis; `max(.., 1)` keeps `create` (created_at 0) distinguishable
+                // from a never-stamped v1.0 header (`slots_stamp()` reads missing as 0).
+                slots_modified_at: Some(created_at.saturating_mul(1000).max(1)),
+                slots_device_id: Some(device_id),
                 extras: Vec::new(),
             },
             keys: Keys::from_vault_key(vault_key, vault_id),

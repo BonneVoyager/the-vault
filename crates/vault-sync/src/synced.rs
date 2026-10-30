@@ -144,7 +144,8 @@ impl fmt::Debug for SyncedVault {
 impl SyncedVault {
     /// Create a new vault package at `path` (a directory, conventionally `<name>.vault`, mode
     /// 0700) and write its `vault.bin` (0600) immediately. Refuses an existing path; the parent
-    /// directory must exist. The returned vault is unlocked and clean.
+    /// directory must exist. The returned vault is unlocked and clean. The header and the
+    /// password slot record the current time as `created_at` (unix seconds, 01 §2).
     pub fn create(
         path: &Path,
         password: &SecretString,
@@ -158,7 +159,10 @@ impl SyncedVault {
             Err(e) => return Err(SyncError::io(path, e)),
         }
         kdf.validate()?;
-        let vault = UnlockedVault::create(password, kdf, device_id);
+        let created_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let vault = UnlockedVault::create_with_created_at(password, kdf, device_id, created_at);
         let bytes = vault.serialize();
         let locked = LockedVault::parse(&bytes)?;
         package::create_new_dir(path)?;
@@ -292,10 +296,10 @@ impl SyncedVault {
     /// returns (03 §6 step 2).
     ///
     /// If already unlocked, the password is verified against the on-disk vault and the
-    /// in-memory vault (with unsaved edits) is kept, except after [`SyncEvent::KeyMismatch`]:
-    /// then the on-disk vault opened with this password becomes the in-memory vault, with the
-    /// previous in-memory items merged into it ([`SyncEvent::KeyRotatedOnDisk`], then
-    /// [`SyncEvent::Merged`]), and saving is allowed again. If the on-disk vault instead fails
+    /// in-memory vault (with unsaved edits) is kept, except after [`SyncEvent::KeyMismatch`] or
+    /// [`SyncEvent::KeyRotatedOnDisk`]: then the on-disk vault opened with this password
+    /// becomes the in-memory vault, with the previous in-memory items merged into it
+    /// ([`SyncEvent::Merged`]), and saving is allowed again. If the on-disk vault instead fails
     /// its integrity check (a tampered first record looks like a key mismatch to the cached
     /// key), the in-memory vault wins: [`SyncEvent::CorruptOnDisk`], dirty, rewritten on the
     /// next save.
@@ -470,7 +474,9 @@ impl SyncedVault {
     /// Before writing, the primary is compared with what we last wrote or read; a version that
     /// landed since (with or without a watcher) is reconciled first (03 §3), so a peer's write
     /// is merged rather than overwritten. Refuses with [`SyncError::KeyMismatch`] or
-    /// [`SyncError::SaveBlocked`] while either applies, even when clean.
+    /// [`SyncError::SaveBlocked`] while either applies, even when clean; a refused save emits
+    /// [`SyncEvent::SaveBlocked`] (once: if this save's own pre-write read just found the
+    /// blocking file, that report is the one).
     ///
     /// A dirty save holds the package's exclusive advisory lock (`<name>.vault/.lock`, 03 §2)
     /// from the pre-write read through the rename, the backup and the cleanup, so another
@@ -491,6 +497,7 @@ impl SyncedVault {
         };
         // A primary we cannot read (cloud timeout, I/O) may hold a peer's unmerged version:
         // fail rather than overwrite it.
+        let blocked_before = self.save_blocked;
         if self.dirty {
             self.reconcile_primary()?;
         }
@@ -498,6 +505,10 @@ impl SyncedVault {
             return Err(SyncError::KeyMismatch);
         }
         if let Some(blocked) = self.save_blocked {
+            // `vet_primary` reports a block when it first sees it; do not repeat that here.
+            if blocked_before == Some(blocked) {
+                self.emit(SyncEvent::SaveBlocked(blocked));
+            }
             return Err(SyncError::SaveBlocked(blocked));
         }
         if !self.dirty {
@@ -601,6 +612,85 @@ impl SyncedVault {
     /// newest first.
     pub fn backups(&self) -> Result<Vec<BackupInfo>, SyncError> {
         backup::list_backups(&self.path)
+    }
+
+    /// Delete one backup (user-initiated, 03 §8): a snapshot or unsaved file, or an absorbed
+    /// conflict package directory (removed recursively; symlinks inside are removed, not
+    /// followed). Any [`BackupKind`] may be deleted, including `Unsaved` and `Conflict`, which
+    /// retention never prunes. Works while locked.
+    ///
+    /// `backup`'s parent directory is resolved through symlinks and must be
+    /// `<name>.vault/backups/`; the entry itself must be one of [`backups`] and must not be a
+    /// symlink (never followed, so it cannot redirect the delete to another file). Anything
+    /// else (the primary, the package, a file outside `backups/`, any symlink, an unrecognised
+    /// name, a missing path) is refused with [`SyncError::NotABackup`] and nothing is
+    /// deleted. If the entry vanishes between that check and the removal (retention in another
+    /// process), the delete still succeeds. Emits
+    /// [`SyncEvent::BackupDeleted`] with the path as [`backups`] lists it.
+    ///
+    /// [`backups`]: SyncedVault::backups
+    pub fn delete_backup(&mut self, backup: &Path) -> Result<(), SyncError> {
+        self.delete_backup_hooked(backup, || {})
+    }
+
+    /// [`SyncedVault::delete_backup`] with `between` run after the checks and before the
+    /// removal (tests delete the entry there, as another process's retention could).
+    fn delete_backup_hooked(
+        &mut self,
+        backup: &Path,
+        between: impl FnOnce(),
+    ) -> Result<(), SyncError> {
+        let refuse = || SyncError::NotABackup(backup.to_owned());
+        // Resolve only the directory: the entry itself is never followed, so a symlink named
+        // like a backup cannot redirect the delete to another file (another backup included).
+        let name = backup.file_name().ok_or_else(refuse)?;
+        let parent = match backup.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let canonical_parent = fs::canonicalize(parent).map_err(|e| match e.kind() {
+            ErrorKind::NotFound => refuse(),
+            _ => SyncError::io(parent, e),
+        })?;
+        let backups_dir = package::backups_dir(&self.path);
+        let canonical_dir = match fs::canonicalize(&backups_dir) {
+            Ok(d) => d,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Err(refuse()),
+            Err(e) => return Err(SyncError::io(&backups_dir, e)),
+        };
+        if canonical_parent != canonical_dir {
+            return Err(refuse());
+        }
+        let target = canonical_dir.join(name);
+        let meta = match fs::symlink_metadata(&target) {
+            Ok(m) => m,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Err(refuse()),
+            Err(e) => return Err(SyncError::io(&target, e)),
+        };
+        if meta.file_type().is_symlink() {
+            return Err(refuse());
+        }
+        let info = backup::list_backups(&self.path)?
+            .into_iter()
+            .find(|b| b.path.file_name() == Some(name))
+            .ok_or_else(refuse)?;
+        between();
+        let removed = if meta.is_dir() {
+            fs::remove_dir_all(&target)
+        } else {
+            fs::remove_file(&target)
+        };
+        match removed {
+            Ok(()) => {}
+            // Already gone (retention or the user in another process): the outcome asked for.
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                tracing::debug!(path = %target.display(), "backup vanished before deletion");
+            }
+            Err(e) => return Err(SyncError::io(&target, e)),
+        }
+        tracing::info!(path = %info.path.display(), kind = ?info.kind, "deleted backup");
+        self.emit(SyncEvent::BackupDeleted(info.path));
+        Ok(())
     }
 
     /// Snapshot `vault.bin` as it is on disk now, regardless of policy or the enabled
@@ -912,6 +1002,28 @@ mod tests {
         assert_eq!(&lw.hash, blake3::hash(&ours).as_bytes());
     }
     use crate::cloud::NoopHooks;
+
+    /// Another process removes the backup between our checks and our removal: still `Ok`,
+    /// still reported.
+    #[test]
+    fn delete_backup_of_a_vanished_entry_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let pw = SecretString::new("pw".to_owned());
+        let mut v = SyncedVault::create(
+            &dir.path().join("a.vault"),
+            &pw,
+            KdfParams::for_tests(),
+            Uuid::from_u128(1),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let snap = v.backup_now().unwrap();
+        let rx = v.subscribe();
+        v.delete_backup_hooked(&snap, || fs::remove_file(&snap).unwrap())
+            .unwrap();
+        assert!(!snap.exists());
+        assert_eq!(rx.try_recv().unwrap(), SyncEvent::BackupDeleted(snap));
+    }
 
     #[test]
     fn emit_reaches_every_live_subscriber() {

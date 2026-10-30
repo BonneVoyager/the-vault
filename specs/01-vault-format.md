@@ -1,6 +1,6 @@
 # 01 — Vault file format & cryptography
 
-File extension: `.vault`. One vault = one file. Attachments (v1.1) live in a sibling directory `<name>.vault.attachments/`.
+File extension: `.vault`. Since 2026-10-30 a vault is a macOS package directory `<name>.vault/` (03 §1) whose `vault.bin` is the file described here; attachments (v1.1) live in `<name>.vault/attachments/` and backups in `<name>.vault/backups/`.
 
 All integers big-endian. All CBOR is canonical (RFC 8949 §4.2.1) so byte-equality means content-equality.
 
@@ -31,7 +31,7 @@ Parsers reject: wrong magic, `format_version > SUPPORTED`, `header_len` beyond E
     "salt":      bytes(32)     random
   }
   "slots": [ KeySlot, ... ]   at least one
-  "slots_modified_at": u64     optional (v1.1); unix millis of the last change to slots or kdf (password change, add/remove slot, re-calibrate, key rotation); merge takes the newer header (03 §5)
+  "slots_modified_at": u64     optional (v1.1); unix millis of the last change to slots or kdf; SET AT CREATION too (so every new vault has a digest-bound header, §4); merge takes the newer header (03 §5)
   "slots_device_id": bytes(16)  optional (v1.1); device that made that change; merge tie-break (03 §5)
 }
 ```

@@ -371,3 +371,33 @@ fn non_ascii_package_name_with_spaces() {
     w.unlock(&pw()).unwrap();
     assert_eq!(w.vault().unwrap().items().count(), 1);
 }
+
+/// 01 §2: the header and the password slot record the creation time (unix seconds), not 0.
+#[test]
+fn create_stamps_created_at_in_header_and_slot() {
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (_dir, path, _v) = setup();
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let locked = LockedVault::parse(&fs::read(bin(&path)).unwrap()).unwrap();
+    let header = locked.header();
+    assert!(
+        (before..=after).contains(&header.created_at),
+        "{}",
+        header.created_at
+    );
+    let slots: Vec<u64> = header
+        .slots
+        .iter()
+        .map(|s| match s {
+            vault_core::Slot::Key(k) => k.created_at,
+            vault_core::Slot::Opaque(_) => panic!("unexpected opaque slot"),
+        })
+        .collect();
+    assert_eq!(slots, [header.created_at]);
+}

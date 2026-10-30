@@ -448,3 +448,154 @@ fn restore_from_an_absorbed_conflict_package() {
     // The package itself is left in the backups directory.
     assert!(bin(&conflict).exists());
 }
+
+fn deleted(rx: &Receiver<SyncEvent>) -> Vec<PathBuf> {
+    rx.try_iter()
+        .filter_map(|e| match e {
+            SyncEvent::BackupDeleted(p) => Some(p),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn delete_backup_removes_a_snapshot() {
+    let (_dir, _path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let snap = v.backups().unwrap()[0].path.clone();
+    assert!(snap.is_file());
+    let rx = v.subscribe();
+
+    v.delete_backup(&snap).unwrap();
+    assert!(!snap.exists());
+    assert!(v.backups().unwrap().iter().all(|b| b.path != snap));
+    assert_eq!(deleted(&rx), std::slice::from_ref(&snap));
+    // Gone now: a second delete is refused, not an I/O error.
+    assert!(matches!(
+        v.delete_backup(&snap),
+        Err(SyncError::NotABackup(_))
+    ));
+}
+
+#[test]
+fn delete_backup_removes_unsaved_and_conflict_packages_while_locked() {
+    let (dir, _path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let snap = v.backups().unwrap()[0].path.clone();
+    let conflict = backups_dir(dir.path()).join("conflict-2026-10-28T14-03-11Z-test 2.vault");
+    fs::create_dir(&conflict).unwrap();
+    fs::copy(&snap, bin(&conflict)).unwrap();
+    fs::create_dir(conflict.join("attachments")).unwrap();
+    fs::write(conflict.join("attachments").join("x.bin"), b"blob").unwrap();
+    // A symlink inside the package is removed, never followed.
+    let outside = dir.path().join("keep.txt");
+    fs::write(&outside, b"keep").unwrap();
+    std::os::unix::fs::symlink(&outside, conflict.join("link")).unwrap();
+    insert_item(&mut v, "unsaved");
+    v.lock();
+    let unsaved = v
+        .backups()
+        .unwrap()
+        .into_iter()
+        .find(|b| b.kind == vault_sync::BackupKind::Unsaved)
+        .unwrap()
+        .path;
+    let rx = v.subscribe();
+
+    v.delete_backup(&conflict).unwrap();
+    v.delete_backup(&unsaved).unwrap();
+    assert!(!conflict.exists());
+    assert!(!unsaved.exists());
+    assert_eq!(fs::read(&outside).unwrap(), b"keep");
+    assert_eq!(deleted(&rx), [conflict, unsaved]);
+    let left = v.backups().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].path, snap);
+}
+
+#[test]
+fn delete_backup_refuses_anything_that_is_not_a_backup() {
+    let (dir, path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let snap = v.backups().unwrap()[0].path.clone();
+    let b = backups_dir(dir.path());
+    let rx = v.subscribe();
+    let refused = |v: &mut SyncedVault, p: &Path| {
+        assert!(
+            matches!(v.delete_backup(p), Err(SyncError::NotABackup(_))),
+            "{} was not refused",
+            p.display()
+        );
+    };
+
+    // The primary, the package, the backups directory itself and the lock file.
+    refused(&mut v, &bin(&path));
+    refused(&mut v, &path);
+    refused(&mut v, &b);
+    refused(&mut v, &path.join(".lock"));
+    // A file outside the package, and a symlink in backups/ pointing at it or at the primary.
+    let outside = dir.path().join("test-2026-10-28T14-03-11Z.vault.bin");
+    fs::copy(&snap, &outside).unwrap();
+    refused(&mut v, &outside);
+    let link = b.join("test-2026-10-27T14-03-11Z.vault.bin");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    refused(&mut v, &link);
+    let link_primary = b.join("test-2026-10-26T14-03-11Z.vault.bin");
+    std::os::unix::fs::symlink(bin(&path), &link_primary).unwrap();
+    refused(&mut v, &link_primary);
+    // `..` escapes are resolved before the check.
+    refused(&mut v, &b.join("..").join(VAULT_FILE_NAME));
+    // A file in backups/ without a backup name, and a file inside a conflict package.
+    let stray = b.join("notes.txt");
+    fs::write(&stray, b"x").unwrap();
+    refused(&mut v, &stray);
+    let conflict = b.join("conflict-2026-10-28T14-03-11Z-test 2.vault");
+    fs::create_dir(&conflict).unwrap();
+    fs::copy(&snap, bin(&conflict)).unwrap();
+    refused(&mut v, &bin(&conflict));
+    // A missing path.
+    refused(&mut v, &b.join("test-2020-01-01T00-00-00Z.vault.bin"));
+
+    assert!(outside.exists() && stray.exists() && bin(&conflict).exists());
+    assert!(bin(&path).exists() && snap.exists());
+    assert!(deleted(&rx).is_empty());
+    v.lock();
+    v.unlock(&pw()).unwrap();
+    assert_eq!(titles(&v), ["a"]);
+}
+
+/// A symlink in backups/ named like a backup and pointing at another listed backup is refused
+/// (never followed), and both files survive.
+#[test]
+fn delete_backup_refuses_a_symlink_to_another_backup() {
+    let (dir, _path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let snap = v.backups().unwrap()[0].path.clone();
+    let link = backups_dir(dir.path()).join("test-2026-10-27T14-03-11Z.vault.bin");
+    std::os::unix::fs::symlink(&snap, &link).unwrap();
+    let rx = v.subscribe();
+
+    assert!(matches!(
+        v.delete_backup(&link),
+        Err(SyncError::NotABackup(_))
+    ));
+    assert!(snap.is_file());
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(deleted(&rx).is_empty());
+    // A path through a symlinked directory to the real backups/ is still accepted.
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(backups_dir(dir.path()), &alias).unwrap();
+    v.delete_backup(&alias.join(snap.file_name().unwrap()))
+        .unwrap();
+    assert!(!snap.exists());
+    assert_eq!(deleted(&rx), std::slice::from_ref(&snap));
+}

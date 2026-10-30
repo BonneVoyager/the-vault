@@ -14,7 +14,7 @@ use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use vault_core::{LockedVault, UnlockedVault, Uuid, VaultError};
+use vault_core::{Header, LockedVault, Slot, SlotKind, UnlockedVault, Uuid, VaultError};
 
 use super::{DOWNLOAD_TIMEOUT, SyncedVault, fingerprint};
 use crate::attachments;
@@ -126,11 +126,19 @@ impl SyncedVault {
                 self.merge_in(opened)
             }
             Err(VaultError::WrongPassword) => {
-                tracing::warn!(path = %self.file.display(), "on-disk vault does not open with our key");
+                let rotated = self
+                    .unlocked
+                    .as_ref()
+                    .is_some_and(|ours| looks_rotated(ours.header(), theirs.header()));
+                tracing::warn!(path = %self.file.display(), rotated, "on-disk vault does not open with our key");
                 // `unlock(password)` re-opens exactly this version.
                 self.replace_locked_unverified(theirs);
                 self.key_mismatch = true;
-                self.emit(SyncEvent::KeyMismatch);
+                self.emit(if rotated {
+                    SyncEvent::KeyRotatedOnDisk
+                } else {
+                    SyncEvent::KeyMismatch
+                });
                 false
             }
             // Tampered, or anything else that fails after the parse (e.g. a malformed
@@ -208,9 +216,7 @@ impl SyncedVault {
                 // Written by a newer build: never overwrite it (that would downgrade the
                 // other device's file), and unlike corruption do not schedule a rewrite.
                 tracing::warn!(version = v, "primary written by a newer format version");
-                let blocked = SaveBlocked::NewerVersion(v);
-                self.save_blocked = Some(blocked);
-                self.emit(SyncEvent::Error(blocked.to_string()));
+                self.set_save_blocked(SaveBlocked::NewerVersion(v));
                 None
             }
             Err(e) => {
@@ -220,8 +226,8 @@ impl SyncedVault {
             }
             Ok(v) if v.vault_id() != self.locked.vault_id() => {
                 tracing::warn!(path = %self.file.display(), "primary now holds a different vault");
-                self.save_blocked = Some(SaveBlocked::ForeignVault);
                 self.emit(SyncEvent::ForeignVault);
+                self.set_save_blocked(SaveBlocked::ForeignVault);
                 None
             }
             Ok(v) => {
@@ -230,6 +236,14 @@ impl SyncedVault {
                 }
                 Some(v)
             }
+        }
+    }
+
+    /// Record a save block and report it as [`SyncEvent::SaveBlocked`] when it is new (03 §3),
+    /// so a file that keeps firing watcher events is reported once.
+    fn set_save_blocked(&mut self, blocked: SaveBlocked) {
+        if self.save_blocked.replace(blocked) != Some(blocked) {
+            self.emit(SyncEvent::SaveBlocked(blocked));
         }
     }
 
@@ -522,7 +536,7 @@ impl SyncedVault {
         }
     }
 
-    /// After `KeyMismatch`, the user re-entered a credential that opens the on-disk vault:
+    /// After `KeyMismatch` / `KeyRotatedOnDisk`, the user re-entered a credential that opens the on-disk vault:
     /// make that vault (its header, slots and key) ours, folding the old in-memory items in.
     pub(super) fn adopt_reverified(&mut self, mut theirs: UnlockedVault) {
         let Some(ours) = self.unlocked.take() else {
@@ -542,7 +556,6 @@ impl SyncedVault {
         // Our items that the disk lacked still need writing.
         self.dirty = was_dirty || report.changed();
         tracing::warn!("adopted the on-disk vault's keys after a key mismatch");
-        self.emit(SyncEvent::KeyRotatedOnDisk);
         self.emit(SyncEvent::Merged(report));
     }
 
@@ -580,4 +593,53 @@ impl SyncedVault {
         tracing::warn!(error = %e, "sync error");
         self.emit(SyncEvent::Error(e.to_string()));
     }
+}
+
+/// Whether `theirs` (an on-disk header whose vault no longer opens with our vault key) looks
+/// like another device ran `rotate_vault_key` rather than changed the password (03 §8,
+/// `KeyRotatedOnDisk` vs `KeyMismatch`). Decided from plaintext header facts alone, before any
+/// password is entered:
+///
+/// - A rotation keeps every password slot's id and the KDF parameters (salt included) and
+///   rewraps the new key in each (fresh nonce and wrapped key); it drops enclave slots.
+/// - A password change replaces the password slots (new ids) and the KDF parameters. It keeps
+///   the vault key, so on its own it never causes a mismatch; combined with a rotation it is
+///   reported as `KeyMismatch`.
+/// - Identical password slots cannot wrap a different key under the same KEK, so a failure
+///   with unchanged slots is tampering or a foreign rewrite: `KeyMismatch`, and the password
+///   unlock then reports `CorruptOnDisk` for tampering.
+///
+/// So: rotated iff we hold at least one password slot, each is on disk under the same id and
+/// kind, the KDF parameters are equal, and at least one of them was rewrapped. A rollback to a
+/// pre-rotation file matches too (indistinguishable by design). Either event leads to the same
+/// handling; only the wording shown to the user differs.
+fn looks_rotated(ours: &Header, theirs: &Header) -> bool {
+    if ours.kdf != theirs.kdf {
+        return false;
+    }
+    let mut ours_pw = ours
+        .slots
+        .iter()
+        .filter_map(|s| match s {
+            Slot::Key(k) if k.kind == SlotKind::Password => Some(k),
+            _ => None,
+        })
+        .peekable();
+    if ours_pw.peek().is_none() {
+        return false;
+    }
+    let mut rewrapped = false;
+    for mine in ours_pw {
+        let Some(disk) = theirs.slots.iter().find_map(|s| match s {
+            Slot::Key(k) if k.id == mine.id => Some(k),
+            _ => None,
+        }) else {
+            return false;
+        };
+        if disk.kind != SlotKind::Password {
+            return false;
+        }
+        rewrapped |= disk.nonce != mine.nonce || disk.wrapped_key != mine.wrapped_key;
+    }
+    rewrapped
 }

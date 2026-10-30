@@ -423,7 +423,7 @@ fn change_while_locked_is_seen_at_unlock() {
 }
 
 #[test]
-fn key_rotation_elsewhere_reports_mismatch_and_reverify_merges() {
+fn key_rotation_elsewhere_reports_rotation_and_reverify_merges() {
     let (_dir, path, mut a, mut b, _id) = two_devices();
     a.start_watching().unwrap();
     b.start_watching().unwrap();
@@ -439,8 +439,9 @@ fn key_rotation_elsewhere_reports_mismatch_and_reverify_merges() {
     assert!(wait_until(|| {
         a.poll();
         ea.pump();
-        ea.any(|e| *e == SyncEvent::KeyMismatch)
+        ea.any(|e| *e == SyncEvent::KeyRotatedOnDisk)
     }));
+    assert!(!ea.any(|e| *e == SyncEvent::KeyMismatch));
     // In-memory untouched, disk untouched, saving refused.
     assert_eq!(titles(&a), ["mail"]);
     a.edit(|v| v.insert(Item::new("from a", Uuid::nil(), T0), T0))
@@ -501,7 +502,7 @@ fn newer_format_primary_is_reported_and_never_overwritten() {
     assert!(wait_until(|| {
         a.poll();
         ea.pump();
-        ea.any(|e| matches!(e, SyncEvent::Error(_)))
+        ea.any(|e| *e == SyncEvent::SaveBlocked(SaveBlocked::NewerVersion(0xFFFF)))
     }));
     assert_eq!(titles(&a), ["mail"]);
     assert!(
@@ -555,7 +556,7 @@ fn key_mismatch_then_lock_preserves_a_clean_vault() {
     assert!(wait_until(|| {
         a.poll();
         ea.pump();
-        ea.any(|e| *e == SyncEvent::KeyMismatch)
+        ea.any(|e| *e == SyncEvent::KeyRotatedOnDisk)
     }));
     assert!(!a.is_dirty());
 
@@ -873,4 +874,106 @@ fn symlinked_package_is_resolved_and_watched() {
         c.poll();
         titles(&c) == ["from b", "mail"]
     }));
+}
+
+/// Another device changed the password and then rotated the key: the password slots were
+/// replaced (new ids, new KDF salt), so this is reported as `KeyMismatch`, not as a rotation.
+/// The new password re-opens and merges.
+#[test]
+fn password_change_with_rotation_elsewhere_reports_key_mismatch() {
+    let (_dir, path, mut a, mut b, _id) = two_devices();
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+    let new_pw = secret("a brand new password");
+    b.edit(|v| {
+        v.change_password(&pw(), &new_pw, KdfParams::for_tests(), wall_ms())
+            .unwrap();
+        v.rotate_vault_key(&new_pw, wall_ms()).unwrap();
+        v.insert(Item::new("from b", Uuid::nil(), T0), T0)
+    })
+    .unwrap();
+    b.save().unwrap();
+    let written = fs::read(&path).unwrap();
+
+    assert!(wait_until(|| {
+        a.poll();
+        ea.pump();
+        ea.any(|e| *e == SyncEvent::KeyMismatch)
+    }));
+    assert!(!ea.any(|e| *e == SyncEvent::KeyRotatedOnDisk));
+    assert!(matches!(a.save(), Err(SyncError::KeyMismatch)));
+    assert_eq!(fs::read(&path).unwrap(), written);
+    assert!(a.unlock(&pw()).is_err());
+    a.unlock(&new_pw).unwrap();
+    assert_eq!(titles(&a), ["from b", "mail"]);
+}
+
+/// A tampered first item record fails with the cached key exactly like a key change, but the
+/// slots are unchanged: identical slots cannot wrap another key, so it is not a rotation.
+#[test]
+fn tampered_first_record_with_unchanged_slots_is_not_a_rotation() {
+    let (_dir, path, mut a, _b, _id) = two_devices();
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+    let mut file = VaultFile::parse(&fs::read(&path).unwrap()).unwrap();
+    file.items[0].ct[0] ^= 0x01;
+    plant(&path, &file.to_bytes());
+
+    assert!(wait_until(|| {
+        a.poll();
+        ea.pump();
+        ea.any(|e| *e == SyncEvent::KeyMismatch)
+    }));
+    assert!(!ea.any(|e| *e == SyncEvent::KeyRotatedOnDisk));
+    // The password unlock tells tampering apart and keeps ours.
+    a.unlock(&pw()).unwrap();
+    ea.pump();
+    assert!(ea.any(|e| *e == SyncEvent::CorruptOnDisk));
+    assert_eq!(titles(&a), ["mail"]);
+}
+
+/// A flipped nonce in our password slot on disk. The header is bound into the manifest digest
+/// (core stamps every vault at creation), so opening the file with the cached key fails as
+/// tampering: `CorruptOnDisk`, never a key event, the in-memory vault is kept and nothing is
+/// adopted. The vault is marked dirty, and the next save writes our intact slots back so the
+/// password opens the file again.
+#[test]
+fn flipped_slot_nonce_is_detected_as_tamper() {
+    let (_dir, path, mut a, _b, _id) = two_devices();
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+    let mut file = VaultFile::parse(&fs::read(&path).unwrap()).unwrap();
+    match &mut file.header.slots[0] {
+        vault_core::Slot::Key(k) => k.nonce[0] ^= 0x01,
+        vault_core::Slot::Opaque(_) => unreachable!("create makes a password slot"),
+    }
+    let tampered = file.to_bytes();
+    plant(&path, &tampered);
+
+    assert!(wait_until(|| {
+        a.poll();
+        ea.pump();
+        ea.any(|e| *e == SyncEvent::CorruptOnDisk)
+    }));
+    assert!(!ea.any(|e| matches!(
+        e,
+        SyncEvent::KeyMismatch | SyncEvent::KeyRotatedOnDisk | SyncEvent::Merged(_)
+    )));
+    // In-memory kept, nothing adopted, disk untouched until the rewrite.
+    assert_eq!(titles(&a), ["mail"]);
+    assert!(a.is_dirty());
+    assert_eq!(fs::read(&path).unwrap(), tampered);
+
+    // The next save repairs the file: the password opens it again.
+    a.edit(|v| v.insert(Item::new("from a", Uuid::nil(), T0), T0))
+        .unwrap();
+    a.save().unwrap();
+    let disk = LockedVault::parse(&fs::read(&path).unwrap())
+        .unwrap()
+        .unlock(&pw())
+        .unwrap();
+    assert_eq!(disk.items().count(), 2);
+    a.lock();
+    a.unlock(&pw()).unwrap();
+    assert_eq!(titles(&a), ["from a", "mail"]);
 }

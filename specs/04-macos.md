@@ -122,7 +122,7 @@ Only needed if the app is sandboxed. v1 ships outside the App Store, unsandboxed
 ## 7. Packaging — `scripts/package.sh`
 
 1. `cargo build --release -p vault-app`
-2. Assemble `Vault.app/Contents/{MacOS,Resources,Info.plist}`; Info.plist sets `LSMinimumSystemVersion 14.0`, `NSFaceIDUsageDescription` (required even for Touch ID), `CFBundleIdentifier`, `NSHighResolutionCapable`.
+2. Assemble `Vault.app/Contents/{MacOS,Resources,Info.plist}`; Info.plist sets `LSMinimumSystemVersion 15.0`, `NSFaceIDUsageDescription` (required even for Touch ID), `CFBundleIdentifier`, `NSHighResolutionCapable`.
 3. `codesign --deep --options runtime --entitlements entitlements.plist --sign "Developer ID Application: …"`. Entitlements: `com.apple.security.cs.allow-jit` **not** needed; keep the list empty except what gpui requires (check at integration time).
 3b. `scripts/check-entitlements.sh <app>` runs on the signed bundle and fails the build if the signature lacks the hardened-runtime flag or if any of these is set: `com.apple.security.get-task-allow`, `cs.disable-library-validation`, `cs.allow-dyld-environment-variables`, `cs.allow-unsigned-executable-memory`, `cs.allow-jit`, `cs.debugger`. `--skip-sign` skips it; `--dry-run` prints it.
 4. `xcrun notarytool submit … --wait`, `xcrun stapler staple`. Credentials: a notarytool keychain profile is preferred over env vars so no password appears on argv.

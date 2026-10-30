@@ -491,7 +491,7 @@ fn settings_general(cx: &mut TestAppContext) {
 #[gpui::test]
 fn settings_sync(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let (_, mut vcx) = settings(crate::state::SYNC_TAB, dir.path(), cx);
+    let (state, mut vcx) = settings(crate::state::SYNC_TAB, dir.path(), cx);
     let targets = [
         SETTINGS,
         &[
@@ -501,6 +501,7 @@ fn settings_sync(cx: &mut TestAppContext) {
             "backup-now",
             "open-backup",
             "restore-backup",
+            "delete-backup",
         ],
     ]
     .concat();
@@ -512,6 +513,24 @@ fn settings_sync(cx: &mut TestAppContext) {
         },
         &mut vcx,
     );
+    click("delete-backup", &mut vcx);
+    audit(
+        Case {
+            label: "backup delete confirm",
+            targets: &["backup-delete-cancel", "backup-delete-ok"],
+            disabled: &[],
+        },
+        &mut vcx,
+    );
+    let backup = state.read_with(&vcx, |s, _| s.sync.backups[0].path.clone());
+    click("backup-delete-ok", &mut vcx);
+    state.read_with(&vcx, |s, _| {
+        assert!(
+            s.sync.backups.iter().all(|b| b.path != backup),
+            "row still listed"
+        );
+    });
+    assert!(!backup.exists());
 }
 
 #[gpui::test]

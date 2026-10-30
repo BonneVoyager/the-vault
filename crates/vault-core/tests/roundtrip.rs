@@ -219,7 +219,9 @@ fn canonical_cbor_item_plain() {
 
 #[test]
 fn unknown_keys_survive_roundtrip() {
-    let mut v = new_vault();
+    // The file-layer splices below edit the header by hand, which only an unstamped (v1.0)
+    // header tolerates: a fresh vault is stamped and digest-bound into the manifest (01 §4).
+    let mut v = unstamped_vault();
     let mut item = sample_item(1, 10);
     item.extras
         .push((Value::Text("x_future".into()), Value::Integer(7.into())));

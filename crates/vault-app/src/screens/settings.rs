@@ -470,36 +470,81 @@ impl SettingsView {
 
     fn backup_row(&self, ix: usize, b: &BackupInfo, s: &AppState, cx: &App) -> gpui::Div {
         let restore = s.sync.restore.as_ref().filter(|r| r.backup == b.path);
-        let path = b.path.clone();
+        let confirming = s.sync.delete_confirm.as_ref() == Some(&b.path);
+        let date = text::date_time(b.taken_at);
         let line = ui::h_flex()
             .py(px(6.))
             .gap(px(8.))
-            .child(div().text_sm().child(text::date_time(b.taken_at)))
+            .child(div().text_sm().child(date.clone()))
             .map(|row| match b.kind {
                 BackupKind::Snapshot => row,
                 BackupKind::Conflict => row.child(Tag::warning().small().child("Conflict copy")),
                 BackupKind::Unsaved => row.child(Tag::info().small().child("Unsaved edits")),
             })
             .child(div().flex_1())
-            .child(ui::muted(text::file_size(b.size), cx))
-            .child(state_button(("open-backup", ix), "Open", &self.state, {
-                let path = b.path.clone();
-                move |s, cx| s.open_backup(path.clone(), cx)
-            }))
-            .child(
-                state_button(
-                    ("restore-backup", ix),
-                    "Restore\u{2026}",
-                    &self.state,
-                    move |s, cx| s.request_restore(path.clone(), cx),
-                )
-                .disabled(s.locked || s.busy.is_some())
-                .clickable_when(!s.locked && s.busy.is_none())
-                .when(s.locked, |b| b.tooltip("Unlock the vault to restore")),
-            );
+            .child(ui::muted(text::file_size(b.size), cx));
+        let line = if confirming {
+            self.delete_confirm(line, cx)
+        } else {
+            self.backup_actions(line, ix, b, date, s)
+        };
         ui::v_flex()
             .child(line)
             .children(restore.map(|r| self.restore_prompt(r, s, cx)))
+    }
+
+    /// Open, Restore… and the trash button at the right of a backup row.
+    fn backup_actions(
+        &self,
+        line: gpui::Div,
+        ix: usize,
+        b: &BackupInfo,
+        date: impl std::fmt::Display,
+        s: &AppState,
+    ) -> gpui::Div {
+        let busy = s.busy.is_some();
+        line.child(state_button(("open-backup", ix), "Open", &self.state, {
+            let path = b.path.clone();
+            move |s, cx| s.open_backup(path.clone(), cx)
+        }))
+        .child(
+            state_button(("restore-backup", ix), "Restore\u{2026}", &self.state, {
+                let path = b.path.clone();
+                move |s, cx| s.request_restore(path.clone(), cx)
+            })
+            .disabled(s.locked || busy)
+            .clickable_when(!s.locked && !busy)
+            .when(s.locked, |b| b.tooltip("Unlock the vault to restore")),
+        )
+        .child({
+            let state = self.state.clone();
+            let path = b.path.clone();
+            ui::icon_button(("delete-backup", ix), IconName::Trash, "Delete backup")
+                .accessibility_label(format!("Delete backup from {date}"))
+                .disabled(busy)
+                .clickable_when(!busy)
+                .on_click(move |_, _, cx| {
+                    state.update(cx, |s, cx| s.request_delete_backup(path.clone(), cx))
+                })
+        })
+    }
+
+    /// The row's actions replaced by "Delete this backup?" with Cancel / Delete.
+    fn delete_confirm(&self, line: gpui::Div, cx: &App) -> gpui::Div {
+        line.debug_selector(|| "backup-delete-confirm".into())
+            .child(ui::muted("Delete this backup?", cx))
+            .child(
+                state_button("backup-delete-cancel", "Cancel", &self.state, |s, cx| {
+                    s.cancel_delete_backup(cx)
+                })
+                .ghost(),
+            )
+            .child(
+                state_button("backup-delete-ok", "Delete", &self.state, |s, cx| {
+                    s.confirm_delete_backup(cx)
+                })
+                .danger(),
+            )
     }
 
     fn restore_prompt(&self, r: &RestorePrompt, s: &AppState, cx: &App) -> gpui::Div {

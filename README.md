@@ -77,9 +77,10 @@ Output goes to `target/package/` as `Vault.app` and a `.dmg`. A signed build nee
 
 ## Vault file layout
 
-- `<name>.vault`: the encrypted vault file
-- `<name>.vault.backups/`: rotating snapshots of the vault file
-- `<name>.vault.attachments/`: encrypted attachment blobs
+- `<name>.vault/`: a macOS package (one Finder item) containing:
+  - `vault.bin`: the encrypted vault file
+  - `backups/`: rotating snapshots of `vault.bin` and absorbed conflict copies
+  - `attachments/`: encrypted attachment blobs, one immutable file each
 
 ## Known limitations
 

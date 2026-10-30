@@ -65,7 +65,7 @@ impl LockedVault {
     pub fn unlock(&self, password: &SecretString) -> Result<UnlockedVault, VaultError>;
     pub fn unlock_with_kek(&self, slot_id: Uuid, kek: &SecretVec<u8>) -> Result<UnlockedVault, VaultError>; // enclave or passkey slot
     #[cfg(feature = "sync")]
-    pub fn unlock_with_key(&self, key: &VaultKeyHandle) -> Result<UnlockedVault, VaultError>;             // vault-sync only; first tag failure → WrongPassword
+    pub fn unlock_with_key(&self, key: &VaultKeyHandle, device_id: Uuid) -> Result<UnlockedVault, VaultError>;  // vault-sync only; first tag failure → WrongPassword
 }
 ```
 
@@ -91,11 +91,11 @@ impl UnlockedVault {
     pub fn purge_tombstones_older_than(&mut self, cutoff: Millis) -> usize;
 
     // keys
-    pub fn change_password(&mut self, old: &SecretString, new: &SecretString, kdf: KdfParams) -> Result<(), VaultError>;
-    pub fn add_enclave_slot(&mut self, kek: &SecretVec<u8>) -> Uuid;
+    pub fn change_password(&mut self, old: &SecretString, new: &SecretString, kdf: KdfParams, now: Millis) -> Result<(), VaultError>;   // stamps the header (01 §2)
+    pub fn add_enclave_slot(&mut self, kek: &SecretVec<u8>, now: Millis) -> Uuid;
     pub fn add_passkey_slot(&mut self, kek: &SecretVec<u8>, credential_id: Vec<u8>, prf_salt: [u8; 32], rp_id: String) -> Uuid; // 01 §2; not yet implemented
-    pub fn remove_slot(&mut self, id: Uuid) -> Result<(), VaultError>;   // refuses to remove last password slot
-    pub fn rotate_vault_key(&mut self, password: &SecretString) -> Result<(), VaultError>;
+    pub fn remove_slot(&mut self, id: Uuid, now: Millis) -> Result<(), VaultError>;   // refuses to remove last password slot
+    pub fn rotate_vault_key(&mut self, password: &SecretString, now: Millis) -> Result<(), VaultError>;
 
     // attachments (01 §4 "Attachments"); refs only — blobs are sealed/opened by `attachment::{seal, open}` and stored by vault-sync
     pub fn add_attachment_ref(&mut self, item: Uuid, r: AttachmentRef, now: Millis) -> Result<(), VaultError>;
@@ -103,14 +103,14 @@ impl UnlockedVault {
     pub fn attachment_ids(&self) -> impl Iterator<Item = Uuid>;     // all items incl. tombstones, for orphan cleanup
 
     // merge (03-sync.md)
-    pub fn merge_from(&mut self, other: &UnlockedVault) -> MergeReport;
+    pub fn merge_from(&mut self, other: &UnlockedVault) -> Result<MergeReport, VaultError>;   // Err on a different vault_id
 
     // out
     pub fn serialize(&self) -> Vec<u8>;    // fresh nonces every call; never fails
     pub fn device_id(&self) -> Uuid;
 }
 
-pub struct MergeReport { pub added: usize, pub updated: usize, pub deleted: usize, pub unchanged: usize }
+pub struct MergeReport { pub added: usize, pub updated: usize, pub deleted: usize, pub unchanged: usize, pub header_updated: bool }
 ```
 
 `now` is always passed in — the core never calls the clock. Tests pass fixed values.

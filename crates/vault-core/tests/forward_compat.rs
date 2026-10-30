@@ -32,7 +32,7 @@ fn opaque(id: u128) -> OpaqueSlot {
 
 /// A populated vault whose header has an opaque slot *before* its password slot.
 fn with_opaque_first() -> (Vec<u8>, Uuid) {
-    let mut v = new_vault();
+    let mut v = unstamped_vault();
     populate(&mut v, 2);
     let bytes = rewrite(&v.serialize(), |f| {
         f.header.slots.insert(0, Slot::Opaque(opaque(0x55)));
@@ -369,7 +369,7 @@ fn duplicate_slot_ids_are_malformed() {
     // ahead of it. The opaque slot is spliced into the *unstamped* file before the enclave
     // slot is added, so the stamped header's digest covers it (splicing it into the stamped
     // file would be a tamper, 01 §4).
-    let v = new_vault();
+    let v = unstamped_vault();
     let with_opaque = rewrite(&v.serialize(), |f| {
         f.header.slots.insert(0, Slot::Opaque(opaque(0x77)));
     });
@@ -436,7 +436,8 @@ fn unknown_kind_strings_are_exact_matches_only() {
 
 #[test]
 fn opaque_slots_survive_slot_management_and_keep_order() {
-    let mut v = new_vault();
+    // Spliced into an unstamped file: a fresh vault is stamped and digest-bound (01 §4).
+    let mut v = unstamped_vault();
     populate(&mut v, 1);
     let nested = OpaqueSlot::new(
         Uuid::from_u128(0xA1),
