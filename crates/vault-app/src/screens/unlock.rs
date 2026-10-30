@@ -3,7 +3,7 @@
 //! vault was opened, and on the next window activation after a lock.
 //!
 //! While a password or Touch ID unlock is being verified the controls are hidden (kept
-//! in the layout so the card does not change size) under a spinner and "Unlocking…".
+//! in the layout so the card does not change size) while the icon spins.
 
 use std::f32::consts::PI;
 use std::time::Duration;
@@ -15,12 +15,15 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{InputEvent, InputState};
-use gpui_component::spinner::Spinner;
 use gpui_component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 
 /// Side of the app icon on the unlock card, in points (the raster is 2x this).
 const APP_ICON_SIZE: f32 = 128.;
+/// Centre crop of the 256 px source, at half scale in the 128 pt icon slot.
+const WHEEL_SIZE: f32 = 70.;
+const WHEEL_LEFT: f32 = 26.;
+const WHEEL_TOP: f32 = 28.;
 
 use crate::state::{AppState, Busy, ChooseIntent, Screen, TouchDenied};
 use crate::ui::{self, Clickable as _};
@@ -39,6 +42,10 @@ pub struct UnlockScreen {
 
 impl UnlockScreen {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // Decode the wheel while the user is choosing a vault or entering a password.
+        // `get_asset` starts the load without requiring a render pass.
+        let wheel = gpui::Resource::Embedded(crate::assets::APP_ICON_WHEEL.into());
+        let _ = window.get_asset::<gpui::ImgResourceLoader>(&wheel, cx);
         let password = ui::password_input("Master password", window, cx);
         let subscriptions = vec![
             cx.observe_in(&state, window, |this, state, window, cx| {
@@ -99,20 +106,16 @@ fn is_unlocking(busy: Option<Busy>) -> bool {
     matches!(busy, Some(Busy::Unlocking | Busy::TouchUnlocking))
 }
 
-/// Spinner and "Unlocking…", centred over the hidden controls.
+/// Status text centred over the hidden controls.
 fn unlocking_overlay(cx: &gpui::App) -> impl IntoElement {
     ui::v_flex()
         .absolute()
         .inset_0()
         .items_center()
         .justify_center()
-        .gap(px(10.))
         .id("unlocking")
         .debug_selector(|| "unlocking".into())
         .aria_label("Unlocking")
-        // Static glyph under Reduce Motion: `Spinner` follows gpui's flag, which
-        // `AppState::set_reduce_motion` keeps in step.
-        .child(Spinner::new().large().color(cx.theme().muted_foreground))
         .child(
             div()
                 .text_sm()
@@ -142,6 +145,25 @@ impl Render for UnlockScreen {
         let failures = state.unlock_failures;
         let reduce_motion = state.reduce_motion;
         let theme = cx.theme();
+        let icon = div()
+            .relative()
+            .size_full()
+            .child(
+                img(crate::assets::APP_ICON)
+                    .size_full()
+                    .debug_selector(|| "unlock-icon-still".into()),
+            )
+            .when(unlocking && !reduce_motion, |icon| {
+                icon.child(
+                    img(crate::assets::APP_ICON_WHEEL)
+                        .id("unlock-wheel-animation")
+                        .debug_selector(|| "unlock-wheel-animation".into())
+                        .absolute()
+                        .left(px(WHEEL_LEFT))
+                        .top(px(WHEEL_TOP))
+                        .size(px(WHEEL_SIZE)),
+                )
+            });
 
         let mut controls = ui::v_flex().w_full().gap(px(14.)).child(
             div()
@@ -219,9 +241,10 @@ impl Render for UnlockScreen {
             .child(
                 div()
                     .size(px(APP_ICON_SIZE))
+                    .relative()
                     .flex_shrink_0()
                     .debug_selector(|| "unlock-icon".into())
-                    .child(img(crate::assets::APP_ICON).size_full()),
+                    .child(icon),
             )
             .child(
                 div()
@@ -305,6 +328,13 @@ mod tests {
             Root::new(view, window, cx)
         });
         let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|_, cx| {
+            let source = gpui::ImageSource::from(crate::assets::APP_ICON_WHEEL);
+            assert!(
+                source.is_asset_cached(cx),
+                "wheel load starts at view creation"
+            );
+        });
         let screen = screen.unwrap();
         vcx.update(|window, cx| screen.update(cx, |u, cx| u.appear(window, cx)));
         vcx.run_until_parked();
@@ -319,7 +349,17 @@ mod tests {
     }
 
     #[gpui::test]
-    fn unlocking_shows_a_spinner_in_place_of_the_controls(cx: &mut TestAppContext) {
+    fn wheel_load_starts_at_view_creation(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, mut vcx) = open(dir.path(), cx);
+        vcx.update(|_, cx| {
+            let source = gpui::ImageSource::from(crate::assets::APP_ICON_WHEEL);
+            assert!(source.is_asset_cached(cx));
+        });
+    }
+
+    #[gpui::test]
+    fn unlocking_spins_icon_in_place_of_the_controls(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (state, screen, mut vcx) = open(dir.path(), cx);
         assert_eq!(state.read_with(&vcx, |s, _| s.screen), Screen::Unlock);
@@ -339,18 +379,29 @@ mod tests {
                 cx.notify();
             });
             vcx.run_until_parked();
-            let spinner = vcx
+            let status = vcx
                 .debug_bounds("unlocking")
-                .expect("spinner while unlocking");
+                .expect("status while unlocking");
             assert!(
                 vcx.debug_bounds("unlock-password").is_none(),
                 "no field while unlocking"
             );
             // The overlay covers the controls, starting at the field's top edge.
-            assert_eq!(spinner.top(), field.top());
+            assert_eq!(status.top(), field.top());
             // Nothing jumps: the card keeps its size and place.
             assert_eq!(vcx.debug_bounds("unlock-card"), Some(card));
             assert_eq!(vcx.debug_bounds("unlock-icon"), Some(icon), "icon stays");
+            assert_eq!(
+                vcx.debug_bounds("unlock-icon-still"),
+                Some(icon),
+                "still icon remains behind the animation"
+            );
+            let wheel = vcx
+                .debug_bounds("unlock-wheel-animation")
+                .expect("animated wheel over the still icon");
+            assert_eq!(wheel.size, gpui::size(px(WHEEL_SIZE), px(WHEEL_SIZE)));
+            assert_eq!(wheel.left(), icon.left() + px(WHEEL_LEFT));
+            assert_eq!(wheel.top(), icon.top() + px(WHEEL_TOP));
 
             // Esc does nothing while unlocking.
             vcx.simulate_keystrokes("escape");
