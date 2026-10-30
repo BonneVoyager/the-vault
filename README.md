@@ -18,6 +18,7 @@ Pre-release and not yet signed or notarized. It is built and reviewed by an agen
 - File attachments, encrypted per file, up to 100 MB each
 - Sync through any folder (iCloud Drive, Dropbox, NAS) with field-level merge and conflict-copy absorption
 - Rotating encrypted backups
+- Import from CSV, 1Password (1PUX), and KeePass (KDBX 3/4, with optional key file)
 - Forward-compatible file format: unknown slot, item, and field kinds are preserved
 - Command-line tool for scripting and debugging
 
@@ -26,7 +27,7 @@ Pre-release and not yet signed or notarized. It is built and reviewed by an agen
 - Master password goes through Argon2id, calibrated to at least 500 ms on your machine
 - Each item is encrypted with XChaCha20-Poly1305 and authenticated metadata, so swapped or rolled-back items are detected
 - The manifest is encrypted, and subkeys are derived with HKDF
-- Only RustCrypto crates are used, with no custom primitives
+- Vault encryption uses RustCrypto crates, with no custom primitives; KeePass import uses the `keepass` parser
 - The file leaks only the item count, item UUIDs, last-modified times, and creation time
 
 Not protected: malware or physical access on an unlocked session, and a weak master password. Unlock factors protect the file at rest only.
@@ -85,7 +86,8 @@ Output goes to `target/package/` as `Vault.app` and a `.dmg`. A signed build nee
 - Attachments are not backed up. A restored backup may reference blobs that no longer exist, and the app shows them as missing.
 - HEIC images have no in-app preview.
 - No leaked-password checks, because the app never uses the network.
-- No YubiKey, hardware key, or key file support.
+- No YubiKey, hardware key, or key file support for unlocking a Vault file.
+- KeePass import transfers entries and password history, but not attachments, custom icons, or auto-type settings.
 - Passkey unlock needs macOS 15 and is planned but not implemented yet.
 
 ## Project layout

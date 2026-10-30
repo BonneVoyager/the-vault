@@ -40,6 +40,8 @@ pub mod totp;
 
 pub use export::{PlaintextExport, export_csv};
 pub use generator::{PassphraseSpec, PasswordSpec, passphrase, password, strength_bits};
+#[cfg(feature = "kdbx")]
+pub use import::import_kdbx;
 pub use import::{CsvMapping, ImportError, import_1pux, import_csv};
 pub use search::{Query, search};
 pub use totp::{Totp, TotpError};

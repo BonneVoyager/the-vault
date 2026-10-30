@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-vault-core = { path = "../vault-core" }
+vault-core = { path = "../vault-core", features = ["kdbx"] }
 vault-sync = { path = "../vault-sync" }
 vault-macos = { path = "../vault-macos" }
 

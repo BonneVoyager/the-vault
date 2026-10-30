@@ -173,13 +173,15 @@ Ranking: title prefix match > title substring > url host match > username match 
 ```rust
 pub fn import_csv(bytes: &[u8], mapping: &CsvMapping, device_id: Uuid, now: Millis) -> Result<Vec<Item>, ImportError>;
 pub fn import_1pux(bytes: &[u8], device_id: Uuid, now: Millis) -> Result<Vec<Item>, ImportError>;        // zip + JSON
-#[cfg(feature = "kdbx")] pub fn import_kdbx(bytes: &[u8], password: &SecretString) -> Result<Vec<Item>, ImportError>;
+#[cfg(feature = "kdbx")] pub fn import_kdbx(bytes: &[u8], password: &SecretString, keyfile: Option<&[u8]>, device_id: Uuid, now: Millis) -> Result<Vec<Item>, ImportError>;
 
 pub struct PlaintextExport(pub Vec<u8>);   // newtype so callers can't confuse it with vault bytes
 pub fn export_csv(vault: &UnlockedVault) -> PlaintextExport;
 ```
 
 Imported items get fresh ids, `modified_at = now` supplied by caller, `device_id` of the importer.
+
+KeePass import uses the optional `keepass` dependency with its default features disabled. It accepts KDBX 3/4, a password, and optional raw key-file bytes (empty password with a key file means key-file-only authentication). Each entry becomes a login; standard fields map to username/password/website/notes, `otp` to TOTP, and protected custom fields remain concealed. Custom-name collisions receive numeric suffixes. Entry tags and nested group paths are retained as tags; recycle-bin entries are skipped; up to ten password-history values are retained. Attachments, custom icons and auto-type settings are not transferred. Input limits: database 100 MiB, key file 1 MiB. Error text never includes dependency parser errors or secret values. The dependency wipes credentials and protected fields; its transient XML and unprotected allocations are not guaranteed to be zeroized, like the existing 1PUX parser.
 
 ## Behavioural guarantees (write tests for each)
 

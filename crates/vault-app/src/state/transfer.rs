@@ -182,7 +182,7 @@ impl AppState {
     }
 
     /// Inserts imported items as new items, autosaves and toasts the count.
-    fn insert_imported(
+    pub(super) fn insert_imported(
         &mut self,
         items: Vec<vault_core::Item>,
         now: vault_core::Millis,

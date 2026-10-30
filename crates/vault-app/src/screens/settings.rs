@@ -45,6 +45,7 @@ pub struct SettingsView {
     /// Master password for restoring a backup.
     restore_input: Entity<InputState>,
     security: Entity<SecurityView>,
+    kdbx: Entity<super::kdbx_import::KdbxImportView>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -52,6 +53,7 @@ impl SettingsView {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let restore_input = ui::password_input("Master password of the backup", window, cx);
         let security = cx.new(|cx| SecurityView::new(state.clone(), window, cx));
+        let kdbx = cx.new(|cx| super::kdbx_import::KdbxImportView::new(state.clone(), window, cx));
         let subscriptions = vec![
             cx.subscribe_in(
                 &restore_input,
@@ -80,6 +82,7 @@ impl SettingsView {
             state,
             restore_input,
             security,
+            kdbx,
             _subscriptions: subscriptions,
         }
     }
@@ -564,11 +567,6 @@ impl SettingsView {
                 .py(px(10.))
                 .child(ui::muted("Unlock the vault to import or export items.", cx));
         }
-        let not_yet = |id: &'static str| {
-            state_button(id, "Import\u{2026}", &self.state, |s, cx| {
-                s.show_toast("This import format is not supported yet", cx)
-            })
-        };
         let export = if s.sync.export_confirm {
             confirm_strip(true, cx)
                 .mt(px(10.))
@@ -612,13 +610,19 @@ impl SettingsView {
                     |s, cx| s.choose_import_1pux(cx),
                 ),
             ),
-            row("Import from KeePass (KDBX)", not_yet("import-kdbx")),
+            row(
+                "Import from KeePass (KDBX)",
+                state_button("import-kdbx", "Import KDBX…", &self.state, |s, cx| {
+                    s.choose_import_kdbx(cx)
+                })
+                .disabled(s.busy.is_some())
+                .clickable_when(s.busy.is_none()),
+            ),
             row(
                 "Export to CSV (unencrypted)",
                 state_button("export-csv", "Export CSV\u{2026}", &self.state, |s, cx| {
                     s.set_export_confirm(true, cx)
-                })
-                .danger(),
+                }),
             ),
         ];
         section(
@@ -627,6 +631,7 @@ impl SettingsView {
             cx,
         )
         .child(export)
+        .child(self.kdbx.clone())
     }
 
     fn about(&self, cx: &App) -> gpui::Div {

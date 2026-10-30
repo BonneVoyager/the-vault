@@ -27,6 +27,7 @@ use crate::{cloud, persist};
 mod attachments;
 mod edit;
 mod generator;
+mod kdbx;
 mod prefs;
 mod qr;
 mod security;
@@ -43,6 +44,7 @@ pub use edit::{ADDABLE_KINDS, EditBuffer, Navigation, kind_name};
 pub use generator::{
     CharClass, GenTab, Generator, GeneratorTarget, LENGTH_RANGE, SEPARATORS, WORDS_RANGE,
 };
+pub use kdbx::KdbxImportUi;
 pub use prefs::LoginRow;
 pub use qr::QrScanner;
 pub use security::{SECURITY_TAB, SecurityForm, SecurityUi};
@@ -98,6 +100,8 @@ pub enum Busy {
     Attaching,
     /// Decrypting an attachment whose blob first has to download.
     ReadingAttachment,
+    /// Decrypting and importing a KeePass database.
+    Importing,
 }
 
 impl Busy {
@@ -353,6 +357,7 @@ pub struct AppState {
     pub sync: SyncUi,
     /// Settings ▸ Security forms and the KDF timing.
     pub security: SecurityUi,
+    pub kdbx_import: Option<KdbxImportUi>,
     pub touch: TouchUi,
     /// Header vault id of the open vault (known while locked).
     pub vault_id: Option<Uuid>,
@@ -444,6 +449,7 @@ impl AppState {
             settings_tab: 0,
             sync: SyncUi::default(),
             security: SecurityUi::default(),
+            kdbx_import: None,
             touch: TouchUi::default(),
             vault_id: None,
             unlocked_with_password_at: None,

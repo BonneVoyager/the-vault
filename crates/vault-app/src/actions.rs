@@ -75,6 +75,8 @@ actions!(
         Import,
         /// File ▸ Import 1Password (1PUX)…: a `.1pux` export via the open panel.
         Import1Pux,
+        /// File ▸ Import KeePass (KDBX)…
+        ImportKdbx,
         /// File ▸ Export…: Settings ▸ Import / Export with the red confirm showing.
         Export,
     ]
@@ -132,6 +134,7 @@ pub fn set_menus(sort: Sort, cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Import CSV\u{2026}", Import),
             MenuItem::action("Import 1Password (1PUX)\u{2026}", Import1Pux),
+            MenuItem::action("Import KeePass (KDBX)…", ImportKdbx),
             MenuItem::action("Export…", Export),
             MenuItem::separator(),
             MenuItem::action("Lock", Lock),
@@ -247,6 +250,7 @@ pub fn register(state: &Entity<AppState>, cx: &mut App) {
     });
     on::<Import>(state, cx, |s, cx| s.choose_import_path(cx));
     on::<Import1Pux>(state, cx, |s, cx| s.choose_import_1pux(cx));
+    on::<ImportKdbx>(state, cx, |s, cx| s.choose_import_kdbx(cx));
     on::<Export>(state, cx, |s, cx| s.request_export(cx));
     cx.on_action(|_: &Quit, cx| cx.quit());
 

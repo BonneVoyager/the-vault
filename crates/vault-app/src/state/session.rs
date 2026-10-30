@@ -60,6 +60,7 @@ fn totp_code(field: &Field) -> Option<SecretString> {
 impl AppState {
     /// Resets everything tied to the unlocked session (lock, vault switch).
     pub(super) fn clear_session(&mut self) {
+        self.kdbx_import = None;
         self.selection = None;
         self.mode = Mode::View;
         self.revealed.clear();

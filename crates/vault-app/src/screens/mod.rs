@@ -3,6 +3,7 @@
 mod backup;
 mod choose;
 mod item_window;
+mod kdbx_import;
 mod main;
 mod security;
 mod settings;

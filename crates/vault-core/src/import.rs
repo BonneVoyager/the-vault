@@ -1,4 +1,9 @@
-//! CSV and 1PUX import (`02-core-api.md` "import / export"). KeePass is out of scope.
+//! CSV, 1PUX and optional KeePass import (`02-core-api.md` "import / export").
+
+#[cfg(feature = "kdbx")]
+mod kdbx;
+#[cfg(feature = "kdbx")]
+pub use kdbx::import_kdbx;
 
 use secrecy::SecretString;
 use thiserror::Error;
@@ -16,6 +21,10 @@ pub enum ImportError {
     /// Unreadable archive or JSON. Never contains secret values.
     #[error("malformed import: {0}")]
     Malformed(String),
+    #[error(
+        "Could not open the KeePass database. Check its password and key file. The file may be damaged or use unsupported encryption."
+    )]
+    KdbxCredentials,
 }
 
 /// Column names (matched case-insensitively against the header) for each item part.
