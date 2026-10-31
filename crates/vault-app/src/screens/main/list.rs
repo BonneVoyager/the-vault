@@ -532,18 +532,7 @@ impl MainScreen {
                     .min_h_0()
                     .mx(px(2.))
                     .rounded(theme.radius)
-                    // Ring only when focus came from the keyboard (see `list_ring`); a
-                    // click in the list turns it off again.
-                    .map(|el| ui::ring_when(el, list_focused && self.list_ring, cx))
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
-                            if this.list_ring {
-                                this.list_ring = false;
-                                cx.notify();
-                            }
-                        }),
-                    )
+                    .map(|el| ui::focus_ring(el, cx))
                     .child(body),
             )
             .child(footer)

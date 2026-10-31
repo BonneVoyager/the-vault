@@ -557,7 +557,8 @@ fn kind_labels_are_capitalised_and_number_is_not_offered() {
             "Notes",
             "Email",
             "Date",
-            "Month/year"
+            "Month/year",
+            "Section"
         ]
     );
     // `number` was removed: it parses as an unknown kind, which is never offered.

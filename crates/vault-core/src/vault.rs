@@ -613,7 +613,9 @@ impl UnlockedVault {
     /// Replace the value of an existing field and stamp it `stamp(now, field.modified_at)`
     /// (strictly advancing, see [`stamp`]). For a [`FieldKind::Password`] field the previous value is
     /// pushed onto `history` as `(value, replaced_at = that stamp)`; history is kept
-    /// newest-first and capped at [`HISTORY_CAP`]. If that stamp is in the item's
+    /// newest-first and capped at [`HISTORY_CAP`]. Every other kind, including a
+    /// [`FieldKind::Section`] heading (allowed, though its value is ignored), writes nothing
+    /// to history. If that stamp is in the item's
     /// `removed_history` (a deleted entry's stamp, 03 §5) the stamp is advanced past it so
     /// the new entry is not dropped by the next merge; under the monotone stamp rule this
     /// never triggers (every removed stamp is an earlier password stamp of this item and

@@ -89,6 +89,8 @@ pub fn open_item_window(
         })?
         .into();
     state.update(cx, |s, _| s.track_item_window(id, handle));
+    // Its focus-ring entry goes when it closes (any close path).
+    ui::forget_closed_windows(cx);
     Ok(handle)
 }
 
@@ -224,13 +226,13 @@ impl ItemWindow {
                 return;
             };
             match target {
-                CopyTarget::Field(ix) => item.fields.get(ix).and_then(|field| {
-                    if field.kind == FieldKind::Totp {
-                        parse_totp(&field.value)
-                            .map(|totp| SecretString::new(totp.code(text::now_millis() / 1000)))
-                    } else {
-                        Some(field.value.clone())
-                    }
+                CopyTarget::Field(ix) => item.fields.get(ix).and_then(|field| match field.kind {
+                    FieldKind::Totp => parse_totp(&field.value)
+                        .map(|totp| SecretString::new(totp.code(text::now_millis() / 1000))),
+                    // A heading has nothing to copy; its stored value never leaves the
+                    // vault (a stale index or a crafted vault must not reach it).
+                    FieldKind::Section => None,
+                    _ => Some(field.value.clone()),
                 }),
                 CopyTarget::History(ix) => item.history.get(ix).map(|h| h.value.clone()),
                 _ => None,
@@ -264,6 +266,8 @@ impl Render for ItemWindow {
         if window.rem_size() != rem {
             window.set_rem_size(rem);
         }
+        // Focus rings follow keyboard focus moves only (`ui::update_focus_ring`).
+        ui::update_focus_ring(window, cx);
         let weak = cx.entity().downgrade();
         let actions = DetailActions(std::rc::Rc::new(move |action, cx| {
             weak.update(cx, |this, cx| this.act(action, cx)).ok();
@@ -284,7 +288,7 @@ impl Render for ItemWindow {
                 }
                 .render_item(item, s, cx)
             });
-        div()
+        ui::clear_focus_ring_on_click(div())
             .id("item-window")
             .debug_selector(|| "item-window".into())
             .size_full()
@@ -460,6 +464,57 @@ mod tests {
             "a".repeat(120),
             "120 fits"
         );
+    }
+
+    /// The item window's copy-by-index skips a section, even with a planted value.
+    #[gpui::test]
+    fn copying_a_section_by_index_copies_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, _) = setup(dir.path(), cx);
+        let board = crate::clipboard::fake::FakePasteboard::default();
+        state.update(cx, |s, _| {
+            s.set_pasteboard(Box::new(board.clone()));
+            s.vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| {
+                    v.update(plain, 20, |it| {
+                        it.fields.insert(
+                            0,
+                            Field::new(
+                                "Username",
+                                FieldKind::Section,
+                                SecretString::new("SHOULD-NOT-SHOW".into()),
+                                20,
+                            ),
+                        );
+                    })
+                })
+                .unwrap()
+                .unwrap();
+            s.vault_changed();
+        });
+        let handle = open(&state, plain, cx);
+        let root = handle.downcast::<Root>().unwrap();
+        cx.update(|cx| {
+            let view = root.read(cx).unwrap().view().clone();
+            let window = view.downcast::<ItemWindow>().unwrap();
+            window.update(cx, |w, cx| w.copy(CopyTarget::Field(0), cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            board.contents(),
+            None,
+            "the planted value never reaches the pasteboard"
+        );
+        // The field after it still copies normally.
+        cx.update(|cx| {
+            let view = root.read(cx).unwrap().view().clone();
+            let window = view.downcast::<ItemWindow>().unwrap();
+            window.update(cx, |w, cx| w.copy(CopyTarget::Field(1), cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(board.contents().as_deref(), Some("hunter2"));
     }
 
     #[gpui::test]

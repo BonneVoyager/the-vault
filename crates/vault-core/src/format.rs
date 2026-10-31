@@ -1123,9 +1123,10 @@ fn history_from_value(value: Value) -> Result<HistoryEntry, VaultError> {
 /// `attachments` is always written (as `[]` when the item has none); `removed_attachments`
 /// (`[{ "id": bytes(16), "removed_at": u64 }]`) and `removed_history` (`[u64]`, stamps
 /// newest first) are optional keys written only when non-empty, so files without removals
-/// keep their v1 byte layout. `icon` (v1.2, `{ "kind", "value", "color"? }` plus extras) is
-/// likewise written only when `Some`. No `kind` key is written (removed 2026-10-30); one read
-/// from an older file is in `item.extras` and is re-emitted from there, unchanged.
+/// keep their v1 byte layout. `icon` (v1.2, `{ "kind", "value", "color"? }` plus extras) and
+/// `created_at` (v1.3, `u64` unix millis) are likewise written only when `Some`. No `kind`
+/// key is written (removed 2026-10-30); one read from an older file is in `item.extras` and
+/// is re-emitted from there, unchanged.
 pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
     // NOTE: the `ciborium::Value` tree built here holds plaintext field values and attachment
     // keys as ordinary `String`s / `Vec<u8>`s and cannot be zeroized; only the encoded output
@@ -1158,6 +1159,9 @@ pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
     ];
     if let Some(icon) = &item.icon {
         known.push(("icon", icon_to_value(icon)));
+    }
+    if let Some(created_at) = item.created_at {
+        known.push(("created_at", Value::from(created_at)));
     }
     if !item.removed_attachments.is_empty() {
         known.push((
@@ -1237,6 +1241,9 @@ pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<
         None | Some(Value::Null) => None,
         Some(v) => Some(icon_from_value(v)?),
     };
+    // Optional (v1.3): missing or null is "unknown"; anything but an unsigned integer is
+    // Malformed, the same arms as `icon`.
+    let created_at = opt_u64(m.take("created_at"), "item.created_at")?;
     Ok(Item {
         id,
         title,
@@ -1245,6 +1252,7 @@ pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<
         favorite,
         tags,
         icon,
+        created_at,
         fields,
         history,
         attachments,

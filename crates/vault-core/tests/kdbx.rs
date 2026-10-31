@@ -102,6 +102,12 @@ fn maps_fields_groups_history_and_skips_recycle_bin() {
         FieldKind::Totp
     );
     assert_eq!(item.history[0].value.expose_secret(), "old-password");
+    // The committed fixture's entries carry a real KeePass CreationTime, which is kept.
+    assert!(
+        item.created_at.is_some_and(|c| c != NOW),
+        "created_at comes from CreationTime, not now: {:?}",
+        item.created_at
+    );
     let again = import_kdbx(bytes, &password(PASSWORD), None, device, NOW).unwrap();
     assert!(
         items
@@ -186,6 +192,54 @@ fn supports_argon2_chacha_and_empty_database() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn created_at_comes_from_the_entry_creation_time_or_now() {
+    use keepass::db::Times;
+    let mut db = Database::new();
+    db.config.kdf_config = KdfConfig::Aes { rounds: 10 };
+    let dated_at = Times::now();
+    {
+        let mut root = db.root_mut();
+        let mut dated = root.add_entry();
+        dated.set_unprotected("Title", "Dated");
+        dated.times.creation = Some(dated_at);
+    }
+    {
+        let mut root = db.root_mut();
+        let mut epoch = root.add_entry();
+        epoch.set_unprotected("Title", "Epoch");
+        epoch.times.creation = Some(Times::epoch());
+    }
+    {
+        let mut root = db.root_mut();
+        let mut undated = root.add_entry();
+        undated.set_unprotected("Title", "Undated");
+        undated.times.creation = None;
+    }
+    let bytes = encoded(&db, Some(PASSWORD), None);
+    let items = import_kdbx(&bytes, &password(PASSWORD), None, Uuid::nil(), NOW).unwrap();
+    let by_title = |t: &str| items.iter().find(|i| i.title == t).unwrap();
+    let expected = u64::try_from(dated_at.and_utc().timestamp_millis()).unwrap();
+    assert_eq!(by_title("Dated").created_at, Some(expected));
+    assert_ne!(expected, NOW);
+    assert_eq!(
+        by_title("Epoch").created_at,
+        Some(NOW),
+        "a CreationTime at the Unix epoch is \"unknown\": now"
+    );
+    assert_eq!(
+        by_title("Undated").created_at,
+        Some(NOW),
+        "no CreationTime: now"
+    );
+    for item in &items {
+        assert_eq!(
+            item.modified_at, NOW,
+            "modified_at is always the import stamp"
+        );
+    }
 }
 
 fn small_db() -> Database {

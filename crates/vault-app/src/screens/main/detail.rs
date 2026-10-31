@@ -205,6 +205,51 @@ pub(crate) fn field_row(
         )
 }
 
+/// A section heading row (01 §4 `"section"`), shared like [`field_row`]: the name
+/// upper-cased, bold and small in the muted foreground (a macOS grouped-table section
+/// header), spanning the row, with no value, actions, click-to-copy or pointer. Its
+/// rule is 2 px instead of the 1 px hairline. A heading below other rows gets extra
+/// space above it; as the first row it sits under the tags rule like any first row.
+pub(crate) fn section_row(ix: usize, name: &str, cx: &App) -> gpui::Div {
+    let theme = cx.theme();
+    let heading = name.trim().to_uppercase();
+    let selector = format!("section-row {ix} {heading}");
+    let top = if ix == 0 {
+        FIELD_ROW_PAD_Y
+    } else {
+        FIELD_ROW_PAD_Y + SECTION_GAP
+    };
+    div()
+        .debug_selector(move || selector.clone())
+        .w_full()
+        .pt(px(top))
+        .pb(px(FIELD_ROW_PAD_Y))
+        .border_b_2()
+        .border_color(theme.border)
+        .text_xs()
+        .font_weight(FontWeight::BOLD)
+        .text_color(theme.muted_foreground)
+        .whitespace_normal()
+        .child(heading)
+}
+
+/// Extra space above a section heading that follows other rows.
+pub(crate) const SECTION_GAP: f32 = 12.;
+
+/// The footer line: "created <date> · modified <date> · <device>", or without the
+/// created part when the item's creation time is unknown (older vaults). Both dates use
+/// the same rule: relative within 30 days ("37m ago"), else the UTC date (2021-10-03).
+pub(crate) fn footer_text(item: &Item, now: u64, device: &str) -> String {
+    let modified = text::relative(now, item.modified_at);
+    match item.created_at {
+        Some(created) => format!(
+            "created {} · modified {modified} · {device}",
+            text::relative(now, created)
+        ),
+        None => format!("modified {modified} · {device}"),
+    }
+}
+
 /// Value text in the monospace font (passwords, codes, card numbers).
 fn mono(text: impl Into<SharedString>, cx: &App) -> gpui::Div {
     div()
@@ -596,14 +641,8 @@ impl ReadDetail<'_> {
                 .map(|a| ui::no_window_drag(div()).child(a)),
             )
             .child(
-                ui::muted(
-                    format!(
-                        "modified {} · {device}",
-                        text::relative(now, item.modified_at)
-                    ),
-                    cx,
-                )
-                .debug_selector(|| "detail-footer".into()),
+                ui::muted(footer_text(item, now, &device), cx)
+                    .debug_selector(|| "detail-footer".into()),
             )
     }
 
@@ -615,6 +654,9 @@ impl ReadDetail<'_> {
         now: u64,
         cx: &App,
     ) -> AnyElement {
+        if field.kind == FieldKind::Section {
+            return section_row(ix, &field.name, cx).into_any_element();
+        }
         let theme = cx.theme();
         let revealed = self.revealed.contains(&field.name);
         let value = field.value.expose_secret();
@@ -684,6 +726,8 @@ impl ReadDetail<'_> {
                 .whitespace_normal()
                 .child(value.to_string())
                 .into_any_element(),
+            // Rendered as a heading before this match (see `render_field`); unreachable.
+            FieldKind::Section => div().into_any_element(),
             FieldKind::Text | FieldKind::Email | FieldKind::Date | FieldKind::MonthYear => {
                 div().truncate().child(value.to_string()).into_any_element()
             }

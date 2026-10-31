@@ -256,6 +256,8 @@ impl AppState {
             CopyTarget::Field(i) => (
                 item.fields.get(i).and_then(|f| match f.kind {
                     FieldKind::Totp => totp_code(f),
+                    // A heading has nothing to copy.
+                    FieldKind::Section => None,
                     _ => Some(f.value.clone()),
                 }),
                 "value",

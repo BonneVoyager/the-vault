@@ -208,6 +208,9 @@ impl BackupWindow {
         else {
             return;
         };
+        if field.kind == FieldKind::Section {
+            return;
+        }
         let value = if field.kind == FieldKind::Totp {
             match parse_totp(&field.value) {
                 Some(totp) => SecretString::new(totp.code(text::now_millis() / 1000)),
@@ -330,6 +333,9 @@ impl BackupWindow {
                 .into_any_element();
         };
         let fields = item.fields.iter().enumerate().map(|(ix, field)| {
+            if field.kind == FieldKind::Section {
+                return super::main::detail::section_row(ix, &field.name, cx);
+            }
             // Passwords, unknown kinds from newer versions and card numbers start hidden.
             // TOTP has its own rendering below (the code, never the secret).
             let concealed = (field.kind.is_sensitive() && field.kind != FieldKind::Totp)
@@ -569,6 +575,13 @@ mod tests {
                 item.fields = vec![
                     Field::new("user", FieldKind::Text, SecretString::new("al".into()), 1),
                     pin,
+                    // A crafted value on a heading: never shown or copied.
+                    Field::new(
+                        "Extras",
+                        FieldKind::Section,
+                        SecretString::new("SHOULD-NOT-SHOW".into()),
+                        1,
+                    ),
                 ];
                 v.insert(item, 1);
             })
@@ -611,6 +624,14 @@ mod tests {
         // Stored "user" and "pin": shown with a capital, like the main detail.
         assert!(vcx.debug_bounds("field-label-text 0 User").is_some());
         assert!(vcx.debug_bounds("field-label-text 1 Pin").is_some());
+        // A section heading renders through the shared heading row, without actions.
+        assert!(vcx.debug_bounds("section-row 2 EXTRAS").is_some());
+        assert!(vcx.debug_bounds("backup-value 2 shown").is_none());
+        assert!(vcx.debug_bounds("backup-value 2 masked").is_none());
+        let board = crate::clipboard::fake::FakePasteboard::default();
+        state.update(&mut vcx, |s, _| s.set_pasteboard(Box::new(board.clone())));
+        view.update(&mut vcx, |w, cx| w.copy_field(2, cx));
+        assert_eq!(board.contents(), None, "a heading copies nothing");
     }
 
     #[gpui::test]

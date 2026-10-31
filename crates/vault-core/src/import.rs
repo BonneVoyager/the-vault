@@ -323,6 +323,15 @@ fn convert_1pux_item(src: &serde_json::Value, device_id: Uuid, now: Millis) -> I
         t => t,
     };
     let mut item = Item::new(title, device_id, now);
+    // 1PUX `createdAt` is unix seconds; keep it as the creation time when present, else
+    // `Item::new`'s `now`. A zero or missing value means "unknown".
+    if let Some(created) = src
+        .get("createdAt")
+        .and_then(|v| v.as_u64())
+        .filter(|s| *s > 0)
+    {
+        item.created_at = Some(created.saturating_mul(1000));
+    }
     item.favorite = src.get("favIndex").and_then(|v| v.as_u64()).unwrap_or(0) > 0;
     item.tags = arr_of(overview, "tags")
         .iter()
@@ -416,8 +425,9 @@ fn convert_1pux_item(src: &serde_json::Value, device_id: Uuid, now: Millis) -> I
 /// Imports a 1Password `.1pux` archive (zip containing `export.data` JSON).
 ///
 /// Archived items (`state != "active"`) are skipped. Imported items get fresh ids and
-/// `modified_at = now` on the item and every field. Unknown keys are ignored. Errors never
-/// contain item values.
+/// `modified_at = now` on the item and every field; `created_at` is the source's `createdAt`
+/// (seconds, converted to millis) when present, else `now`. Unknown keys are ignored. Errors
+/// never contain item values.
 pub fn import_1pux(bytes: &[u8], device_id: Uuid, now: Millis) -> Result<Vec<Item>, ImportError> {
     use std::io::Read;
 

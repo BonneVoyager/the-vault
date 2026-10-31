@@ -150,6 +150,36 @@ fn formula_cells_are_neutralised_on_export_and_restored_on_import() {
 }
 
 #[test]
+fn imported_rows_are_created_now_and_section_headings_are_not_exported() {
+    let items = import_csv(
+        b"title,username,password,url,notes,totp\nA,u,p,,,\n",
+        &CsvMapping::default(),
+        Uuid::nil(),
+        77,
+    )
+    .unwrap();
+    assert_eq!(
+        items[0].created_at,
+        Some(77),
+        "CSV has no creation time: now"
+    );
+
+    // A section heading is skipped by both lookups: by name (`notes`) and by kind.
+    let mut i = Item::new("s", Uuid::nil(), 1);
+    i.fields
+        .push(field("notes", FieldKind::Section, "heading-value"));
+    i.fields.push(field("Username", FieldKind::Section, ""));
+    i.fields.push(field("login", FieldKind::Text, "alice"));
+    let out = export_csv(&vault(vec![i]));
+    let text = String::from_utf8(out.0.clone()).unwrap();
+    assert!(
+        text.contains("\ns,,,,,\n"),
+        "section heading never fills a column: {text:?}"
+    );
+    assert!(!text.contains("heading-value"));
+}
+
+#[test]
 fn export_has_no_category_gate_on_credentials() {
     // Item kinds are gone (2026-10-30): a "note" (by template tag) that carries a password
     // field exports it like any other item, and an item without one gets an empty cell.

@@ -40,6 +40,12 @@
 //! stamp-at-create, so its header carries `slots_modified_at`, and after the item-kind
 //! removal, so its items carry no legacy `kind` extra. Password: `correct horse battery
 //! staple` (`PASSWORD`), KDF `KdfParams::for_tests()`.
+//!
+//! `v1-meta.vault` (01 §4 `ItemPlain.created_at` and `Field.kind = "section"`, v1.3, no
+//! version bump) holds two items written by a post-2026-10-31 build: one with `created_at`
+//! and a `section` heading field followed by two text fields, and one with no `created_at`
+//! key at all. Stamped header, no legacy `kind` extra (same vintage as `v1-icon`). Password
+//! `correct horse battery staple` (`PASSWORD`), KDF `KdfParams::for_tests()`.
 
 use std::io::Cursor;
 
@@ -92,6 +98,13 @@ const ICON_SYMBOL_ID: [u8; 16] = [0x08; 16];
 const ICON_LOGO_ID: [u8; 16] = [0x09; 16];
 const ICON_NONE_ID: [u8; 16] = [0x0C; 16];
 const ICON_AT: u64 = T0 + 60;
+
+/// `v1-meta.vault`: the two items, in insertion order.
+const META_DATED_ID: [u8; 16] = [0x0D; 16];
+const META_UNDATED_ID: [u8; 16] = [0x0E; 16];
+const META_AT: u64 = T0 + 70;
+/// The dated item's `created_at`: earlier than its stamp, as a real item's would be.
+const META_CREATED_AT: u64 = T0 - 86_400_000;
 
 fn icon_symbol() -> ItemIcon {
     ItemIcon {
@@ -500,6 +513,97 @@ fn v1_icon_opens_with_all_three_shapes() {
     }
 }
 
+/// Builds `v1-meta.vault` (see the module docs). Separate from the other regenerators so
+/// their bytes are not churned.
+#[test]
+#[ignore]
+fn regenerate_meta_fixture() {
+    let mut vault = new_vault();
+
+    let mut dated = Item::new("Dated with section", device(), META_AT);
+    dated.id = Uuid::from_bytes(META_DATED_ID);
+    dated.created_at = Some(META_CREATED_AT);
+    dated.tags = vec!["login".into()];
+    dated.fields = vec![
+        field("Account", FieldKind::Section, "", META_AT),
+        field("username", FieldKind::Text, "someone@example.com", META_AT),
+        field("employee id", FieldKind::Text, "E-1234", META_AT),
+    ];
+    vault.insert(dated, META_AT);
+
+    let mut undated = Item::new("Undated", device(), META_AT);
+    undated.id = Uuid::from_bytes(META_UNDATED_ID);
+    undated.created_at = None;
+    undated.tags = vec!["note".into()];
+    undated.fields = vec![field(
+        "notes",
+        FieldKind::Notes,
+        "no created_at key",
+        META_AT,
+    )];
+    vault.insert(undated, META_AT);
+
+    std::fs::write(format!("{FIXTURE_DIR}/v1-meta.vault"), vault.serialize()).unwrap();
+}
+
+#[test]
+fn v1_meta_opens_with_created_at_and_section_heading() {
+    let bytes = std::fs::read(format!("{FIXTURE_DIR}/v1-meta.vault")).unwrap();
+    let locked = LockedVault::parse(&bytes).unwrap();
+    check_kdf(&locked);
+    let vault = locked.unlock(&pw()).unwrap();
+    assert_eq!(vault.items().count(), 2);
+
+    let dated = vault.get(Uuid::from_bytes(META_DATED_ID)).unwrap();
+    assert_eq!(dated.title, "Dated with section");
+    assert_eq!(dated.created_at, Some(META_CREATED_AT));
+    assert_eq!(dated.modified_at, META_AT);
+    assert!(dated.extras.is_empty(), "written after the kind removal");
+    assert_fields(
+        dated,
+        &[
+            ("Account", FieldKind::Section, ""),
+            ("username", FieldKind::Text, "someone@example.com"),
+            ("employee id", FieldKind::Text, "E-1234"),
+        ],
+    );
+    let heading = &dated.fields[0];
+    assert_eq!(heading.kind, FieldKind::Section, "heading comes first");
+    assert_eq!(heading.kind_raw, None, "a known kind carries no raw string");
+    assert_eq!(heading.kind_str(), "section");
+    assert!(!heading.kind.is_sensitive());
+
+    let undated = vault.get(Uuid::from_bytes(META_UNDATED_ID)).unwrap();
+    assert_eq!(undated.title, "Undated");
+    assert_eq!(undated.created_at, None, "no key on disk reads as None");
+    assert_eq!(undated.modified_at, META_AT);
+    assert_fields(undated, &[("notes", FieldKind::Notes, "no created_at key")]);
+
+    // A save by this build keeps both exactly: the dated stamp and the absent key.
+    let again = LockedVault::parse(&vault.serialize())
+        .unwrap()
+        .unlock(&pw())
+        .unwrap();
+    assert_eq!(
+        again
+            .get(Uuid::from_bytes(META_DATED_ID))
+            .unwrap()
+            .created_at,
+        Some(META_CREATED_AT)
+    );
+    assert_eq!(
+        again
+            .get(Uuid::from_bytes(META_UNDATED_ID))
+            .unwrap()
+            .created_at,
+        None
+    );
+    assert_eq!(
+        again.get(Uuid::from_bytes(META_DATED_ID)).unwrap().fields[0].kind,
+        FieldKind::Section
+    );
+}
+
 fn check_kdf(locked: &LockedVault) {
     let k = locked.kdf_params();
     assert_eq!((k.m_cost_kib, k.t_cost, k.p_cost), (8192, 1, 1));
@@ -753,12 +857,13 @@ fn every_fixture_in_the_directory_opens() {
         .collect();
     names.sort();
     assert!(
-        names.len() >= 6,
-        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-icon, v1-stamped; found {names:?}"
+        names.len() >= 7,
+        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-icon, v1-meta, v1-stamped; found {names:?}"
     );
     // Written after the item-kind removal (no legacy `kind` extra) and after stamp-at-create
     // (header carries `slots_modified_at`).
-    let post_removal = |name: &str| matches!(name, "v1-stamped.vault" | "v1-icon.vault");
+    let post_removal =
+        |name: &str| matches!(name, "v1-stamped.vault" | "v1-icon.vault" | "v1-meta.vault");
     for name in &names {
         let bytes = std::fs::read(format!("{FIXTURE_DIR}/{name}")).unwrap();
         assert!(

@@ -727,20 +727,95 @@ pub fn popover<T: Selectable + IntoElement + 'static>(
         .content(move |_, window, cx| content(window, cx))
 }
 
-/// Like [`focus_ring`], but drawn when `on` (the caller decides when focus is visible).
-pub fn ring_when<E: gpui::Styled>(el: E, on: bool, cx: &App) -> E {
-    let ring = cx.theme().ring;
-    el.border_1()
-        .border_color(if on { ring } else { gpui::transparent_black() })
+thread_local! {
+    /// Per window: the focus seen at its last render and whether that focus may draw
+    /// a ring (it arrived from the keyboard, and no click since).
+    /// Weak, so a removed element's focus is not kept alive (`focused()` would keep
+    /// returning it); entries go when their window closes (`forget_closed_windows`).
+    static FOCUS_RINGS: std::cell::RefCell<
+        std::collections::HashMap<gpui::WindowId, (Option<gpui::WeakFocusHandle>, bool)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// The window-closed observer is registered (once per app thread).
+    static WATCHING_CLOSES: Cell<bool> = const { Cell::new(false) };
+    /// `FOCUS_RINGS` for the window being rendered, read by `focus_ring`.
+    static RING_ALLOWED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Keyboard focus ring (§6): a transparent 1 px border that takes the ring colour on
-/// `:focus-visible`, so layout does not shift. The element must be focusable.
+/// Call at the top of a window's root render, before any `focus_ring`. When focus has
+/// moved since the last render, the new focus may draw a ring only if the keyboard
+/// moved it (Tab, ⌘1/⌘2, Enter). gpui's own `focus_visible` instead turns on whenever
+/// the last input was any key press, so a click-focused column showed a ring after
+/// any shortcut (⌃⌘S, ⌘⇧C, a window-tiling key).
+pub fn update_focus_ring(window: &Window, cx: &App) {
+    let focused = window.focused(cx);
+    let id = window.window_handle().window_id();
+    let allowed = FOCUS_RINGS.with_borrow_mut(|rings| {
+        let entry = rings.entry(id).or_insert((None, false));
+        let same = match (&entry.0, &focused) {
+            (Some(seen), Some(now)) => seen == now,
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            entry.1 = focused.is_some() && window.last_input_was_keyboard();
+            entry.0 = focused.as_ref().map(gpui::FocusHandle::downgrade);
+        }
+        entry.1
+    });
+    RING_ALLOWED.set(allowed);
+}
+
+/// Drops a window's ring entry when it closes (item windows on close, lock, vault switch
+/// or item deletion). Registers one app-wide observer; later calls do nothing.
+pub fn forget_closed_windows(cx: &mut App) {
+    if WATCHING_CLOSES.replace(true) {
+        return;
+    }
+    cx.on_window_closed(|_, id| {
+        FOCUS_RINGS.with_borrow_mut(|rings| rings.remove(&id));
+    })
+    .detach();
+}
+
+/// Windows that have a ring entry (tests only).
+#[cfg(test)]
+pub fn focus_ring_windows() -> Vec<gpui::WindowId> {
+    FOCUS_RINGS.with_borrow(|rings| rings.keys().copied().collect())
+}
+
+/// A click anywhere in the window hides the ring until focus next moves by keyboard.
+/// Put on the window's root element (capture phase, so no control can swallow it).
+pub fn clear_focus_ring_on_click<E: gpui::InteractiveElement>(el: E) -> E {
+    el.capture_any_mouse_down(|_, window, _| {
+        let id = window.window_handle().window_id();
+        let changed = FOCUS_RINGS.with_borrow_mut(|rings| {
+            rings
+                .get_mut(&id)
+                .is_some_and(|entry| std::mem::replace(&mut entry.1, false))
+        });
+        if changed {
+            window.refresh();
+        }
+    })
+}
+
+/// Whether the focused element of the window last rendered may draw its ring.
+#[cfg(test)]
+pub fn focus_ring_allowed() -> bool {
+    RING_ALLOWED.get()
+}
+
+/// Keyboard focus ring (§6): a transparent 1 px border that takes the ring colour while
+/// the element is focused, if focus reached it from the keyboard (`update_focus_ring`).
+/// Layout does not shift. The element must be focusable.
 pub fn focus_ring<E: gpui::InteractiveElement + gpui::Styled>(el: E, cx: &App) -> E {
     let ring = cx.theme().ring;
-    el.border_1()
-        .border_color(gpui::transparent_black())
-        .focus_visible(move |style| style.border_color(ring))
+    let el = el.border_1().border_color(gpui::transparent_black());
+    if RING_ALLOWED.get() {
+        el.focus(move |style| style.border_color(ring))
+    } else {
+        el
+    }
 }
 
 /// Shared copyable value area for the main detail view and item windows.

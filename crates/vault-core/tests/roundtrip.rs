@@ -209,6 +209,7 @@ fn canonical_cbor_item_plain() {
             "history",
             "favorite",
             "device_id",
+            "created_at",
             "deleted_at",
             "attachments"
         ]

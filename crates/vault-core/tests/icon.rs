@@ -132,10 +132,11 @@ fn absent_icon_reads_as_none_and_emits_no_key() {
             "history",
             "favorite",
             "device_id",
+            "created_at",
             "deleted_at",
             "attachments"
         ],
-        "key set of an icon-less item is exactly the v1 set"
+        "key set of an icon-less item is exactly the v1 set plus created_at (v1.3)"
     );
 
     // Missing and null both decode as None.

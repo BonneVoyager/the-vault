@@ -18,11 +18,15 @@ impl Drop for PlaintextExport {
     }
 }
 
+/// The value of the first field named `name` (ASCII case-insensitive), else the first field
+/// of `kind`, else empty. [`FieldKind::Section`] headings are skipped on both lookups: a
+/// section named `notes` is a heading, not the notes.
 fn value<'a>(item: &'a Item, name: &str, kind: FieldKind) -> &'a str {
-    item.fields
-        .iter()
+    let mut fields = item.fields.iter().filter(|f| f.kind != FieldKind::Section);
+    fields
+        .clone()
         .find(|f| f.name.eq_ignore_ascii_case(name))
-        .or_else(|| item.fields.iter().find(|f| f.kind == kind))
+        .or_else(|| fields.find(|f| f.kind == kind))
         .map_or("", |f| f.value.expose_secret().as_str())
 }
 
@@ -56,7 +60,8 @@ fn neutralise(cell: &str) -> Zeroizing<String> {
 
 /// Columns: `title,username,password,url,notes,totp`. Every live item is one row; a column is
 /// empty when the item has no matching field. (Item categories were removed on 2026-10-30, so
-/// there is no longer a "non-login" gate on the credential columns.)
+/// there is no longer a "non-login" gate on the credential columns.) Section headings
+/// ([`FieldKind::Section`]) are never exported.
 ///
 /// Every cell whose first character is `=`, `+`, `-`, `@`, tab or carriage return is written
 /// with a leading `'` so a spreadsheet opening the export cannot execute it as a formula

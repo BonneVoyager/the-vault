@@ -241,6 +241,44 @@ fn main_read(cx: &mut TestAppContext) {
     );
 }
 
+/// A section heading first and between fields: plain content, never the pointer (its
+/// row has no id, so the audit names it after its non-clickable ancestor, which must
+/// not show the pointer); the fields around it keep theirs.
+#[gpui::test]
+fn main_read_with_sections(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mut vcx) = main_window(dir.path(), TALL, cx);
+    state.update(&mut vcx, |s, cx| {
+        let id = s.selection.unwrap();
+        s.vault
+            .as_mut()
+            .unwrap()
+            .edit(|v| {
+                v.update(id, 5, |it| {
+                    it.fields
+                        .insert(0, field("Account", FieldKind::Section, ""));
+                    it.fields
+                        .insert(3, field("Security", FieldKind::Section, ""));
+                })
+            })
+            .unwrap()
+            .unwrap();
+        s.vault_changed();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("section-row 0 ACCOUNT").is_some());
+    assert!(vcx.debug_bounds("section-row 3 SECURITY").is_some());
+    audit(
+        Case {
+            label: "main, sections",
+            targets: &[MAIN, &["field-value", "copy", "reveal"]].concat(),
+            disabled: &[],
+        },
+        &mut vcx,
+    );
+}
+
 /// Sidebar collapsed (⌃⌘S): the toggle and the list footer's Lock keep the pointer.
 #[gpui::test]
 fn main_sidebar_collapsed(cx: &mut TestAppContext) {

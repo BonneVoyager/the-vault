@@ -176,7 +176,9 @@ pub fn subtitle(item: &Item) -> String {
 /// masked as `•••• 4242` until revealed (main detail and the backup viewer share this
 /// rule).
 pub fn is_card_number(item: &Item, field: &Field) -> bool {
-    field.name.eq_ignore_ascii_case("number") && crate::templates::is_card(item)
+    field.kind != FieldKind::Section
+        && field.name.eq_ignore_ascii_case("number")
+        && crate::templates::is_card(item)
 }
 
 /// The field ⌘⇧U copies and the list subtitle shows: the first field named `username`
@@ -186,7 +188,8 @@ pub fn is_card_number(item: &Item, field: &Field) -> bool {
 pub fn username_field(item: &Item) -> Option<&Field> {
     item.fields
         .iter()
-        .find(|f| f.name.eq_ignore_ascii_case("username"))
+        // A section heading named "Username" is a heading, not the username.
+        .find(|f| f.kind != FieldKind::Section && f.name.eq_ignore_ascii_case("username"))
         .filter(|f| !f.kind.is_sensitive())
         .or_else(|| item.fields.iter().find(|f| f.kind == FieldKind::Email))
 }
@@ -242,6 +245,13 @@ mod tests {
                 "{name}"
             );
         }
+        // A section heading named "Username" is not the username (⌘⇧U, subtitle).
+        let mut item = Item::new("x", d, 1);
+        item.fields = vec![
+            field("Username", FieldKind::Section, ""),
+            field("mail", FieldKind::Email, "a@b.c"),
+        ];
+        assert_eq!(subtitle(&item), "a@b.c");
         // A sensitive "Username" still never leaks; the email is used instead.
         let mut item = Item::new("x", d, 1);
         item.fields = vec![

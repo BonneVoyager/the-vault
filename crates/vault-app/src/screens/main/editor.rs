@@ -32,6 +32,8 @@ use crate::ui::{self, Clickable as _};
 enum ValueInput {
     Line(Entity<InputState>),
     Area(Entity<TextareaState>),
+    /// A section heading: a name only, no value input (01 §4 `"section"`).
+    None,
 }
 
 // `capitalize_first`: shared with the read-only field labels.
@@ -221,6 +223,7 @@ impl Editor {
                     match &row.value {
                         ValueInput::Line(i) => ui::set_input(i, value, window, cx),
                         ValueInput::Area(a) => ui::set_textarea(a, value, window, cx),
+                        ValueInput::None => {}
                     }
                 }
             }
@@ -261,7 +264,16 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Row {
-        let name = ui::text_input("Field name", window, cx);
+        let section = field.kind == FieldKind::Section;
+        let name = ui::text_input(
+            if section {
+                "Section name"
+            } else {
+                "Field name"
+            },
+            window,
+            cx,
+        );
         ui::set_input(&name, &field.name, window, cx);
         // New fields only: the first time the name's first character is typed, it is
         // capitalised; after that the user's edits stand (they can lowercase it again).
@@ -290,6 +302,8 @@ impl Editor {
         )];
         let current = field.value.expose_secret();
         let value = match field.kind {
+            // A heading: no value input; its (empty) value is written as it is.
+            FieldKind::Section => ValueInput::None,
             FieldKind::Notes => {
                 let area = ui::textarea(window, cx);
                 ui::set_textarea(&area, current, window, cx);
@@ -388,15 +402,18 @@ impl Editor {
                 },
             );
 
-        let value: AnyElement = match &row.value {
+        let value: Option<AnyElement> = match &row.value {
             ValueInput::Line(input) => {
                 let masked = matches!(field.kind, FieldKind::Password | FieldKind::Totp);
-                ui::input(input)
-                    .small()
-                    .when(masked, |i| i.mask_toggle())
-                    .into_any_element()
+                Some(
+                    ui::input(input)
+                        .small()
+                        .when(masked, |i| i.mask_toggle())
+                        .into_any_element(),
+                )
             }
-            ValueInput::Area(area) => Textarea::new(area).into_any_element(),
+            ValueInput::Area(area) => Some(Textarea::new(area).into_any_element()),
+            ValueInput::None => None,
         };
         let scan_file = (field.kind == FieldKind::Totp).then(|| {
             let state = self.state.clone();
@@ -488,14 +505,16 @@ impl Editor {
                     ))
                     .child(remove),
             )
-            .child(
-                ui::h_flex()
-                    .gap(px(4.))
-                    .pl(px(22.))
-                    .child(div().flex_1().min_w_0().child(value))
-                    .children(generate)
-                    .children(scan_file),
-            )
+            .when_some(value, |row, value| {
+                row.child(
+                    ui::h_flex()
+                        .gap(px(4.))
+                        .pl(px(22.))
+                        .child(div().flex_1().min_w_0().child(value))
+                        .children(generate)
+                        .children(scan_file),
+                )
+            })
             .children(totp_hint(key, buffer, cx))
             .when(field.kind == FieldKind::Password, |col| {
                 col.child(div().pl(px(22.)).child(ui::strength_meter(
@@ -634,6 +653,8 @@ fn value_placeholder(kind: FieldKind) -> &'static str {
         FieldKind::Date => "YYYY-MM-DD",
         FieldKind::MonthYear => "MM/YY",
         FieldKind::Text | FieldKind::Notes => "Value",
+        // A heading has no value input; never shown.
+        FieldKind::Section => "",
         // Unknown kind from a newer app version: treated as secret.
         FieldKind::Other => "Value",
     }

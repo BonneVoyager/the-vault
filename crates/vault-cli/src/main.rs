@@ -232,14 +232,70 @@ fn sanitize_for_terminal(s: &str) -> String {
     out
 }
 
-/// The username shown in the `list` column: a non-sensitive field named "username" in any ASCII case.
-fn list_username(item: &Item) -> Option<String> {
+/// First non-section field whose name matches `name` in ASCII case. Sections are headings,
+/// never data, so a crafted section name must not shadow or stand in for a real field.
+fn named_field<'a>(item: &'a Item, name: &str) -> Option<&'a Field> {
     item.fields
         .iter()
-        .find(|f| f.name.eq_ignore_ascii_case("username"))
+        .find(|f| f.kind != FieldKind::Section && f.name.eq_ignore_ascii_case(name))
+}
+
+/// The field the `totp` command reads: one named "totp", else the first of kind Totp.
+fn totp_field(item: &Item) -> Option<&Field> {
+    named_field(item, "totp").or_else(|| item.fields.iter().find(|f| f.kind == FieldKind::Totp))
+}
+
+/// The username shown in the `list` column: a non-sensitive field named "username" in any ASCII case.
+fn list_username(item: &Item) -> Option<String> {
+    named_field(item, "username")
         .filter(|f| !f.kind.is_sensitive())
         .map(|f| sanitize_for_terminal(f.value.expose_secret()))
         .filter(|u| !u.is_empty())
+}
+
+/// Unix milliseconds as `YYYY-MM-DD HH:MM:SS UTC` (Hinnant's civil-from-days; no dependency).
+/// Every `u64` input is representable, so nothing can overflow.
+fn format_utc(millis: u64) -> String {
+    let secs = millis / 1000;
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + u64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// The trailing `get` lines: `Created:` (when known) above `Modified:`.
+fn stamp_lines(item: &Item) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(c) = item.created_at {
+        lines.push(format!("Created: {}", format_utc(c)));
+    }
+    lines.push(format!("Modified: {}", format_utc(item.modified_at)));
+    lines
+}
+
+/// One `get` output line for a field. A section is a bare uppercased heading with no value.
+fn field_line(item: &Item, f: &Field, reveal: bool) -> String {
+    if f.kind == FieldKind::Section {
+        return sanitize_for_terminal(&f.name.to_uppercase());
+    }
+    format!(
+        "{}: {}",
+        sanitize_for_terminal(&f.name),
+        display_value(item, f, reveal)
+    )
 }
 
 /// What `get` prints for a field: secrets are masked unless `reveal` is set.
@@ -665,11 +721,10 @@ fn run(cli: Cli) -> Result<()> {
                 println!("Icon: {}", sanitize_for_terminal(&icon_summary(item, icon)));
             }
             for f in &item.fields {
-                println!(
-                    "{}: {}",
-                    sanitize_for_terminal(&f.name),
-                    display_value(item, f, *reveal)
-                );
+                println!("{}", field_line(item, f, *reveal));
+            }
+            for line in stamp_lines(item) {
+                println!("{line}");
             }
         }
         Cmd::List {
@@ -710,12 +765,7 @@ fn run(cli: Cli) -> Result<()> {
             let item = vault
                 .get(find_item(vault, id_or_title)?)
                 .context("item vanished")?;
-            let field = item
-                .fields
-                .iter()
-                .find(|f| f.name.eq_ignore_ascii_case("totp"))
-                .or_else(|| item.fields.iter().find(|f| f.kind == FieldKind::Totp))
-                .context("item has no totp field")?;
+            let field = totp_field(item).context("item has no totp field")?;
             let raw = field.value.expose_secret();
             let totp = if raw.starts_with("otpauth://") {
                 Totp::parse_uri(raw)
@@ -984,5 +1034,65 @@ mod tests {
         assert!(!display_value(&t, &t.fields[0], false).contains("4111"));
         let u = item(false, "Username", FieldKind::Text, "octo");
         assert_eq!(list_username(&u).as_deref(), Some("octo"));
+    }
+
+    #[test]
+    fn section_renders_as_heading() {
+        let i = item(false, "Login \u{1b}[31mdetails", FieldKind::Section, "");
+        let line = field_line(&i, &i.fields[0], true);
+        assert_eq!(line, "LOGIN \\u{1b}[31MDETAILS");
+        assert!(!line.contains(':') && !line.contains("hidden"));
+        let plain = item(false, "Work", FieldKind::Section, "");
+        assert_eq!(field_line(&plain, &plain.fields[0], false), "WORK");
+    }
+
+    #[test]
+    fn format_utc_known_values() {
+        assert_eq!(format_utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(format_utc(86_399_999), "1970-01-01 23:59:59 UTC");
+        assert_eq!(format_utc(951_782_400_000), "2000-02-29 00:00:00 UTC");
+        assert_eq!(format_utc(1_700_000_000_000), "2023-11-14 22:13:20 UTC");
+        assert!(format_utc(u64::MAX).ends_with(" UTC"));
+    }
+
+    #[test]
+    fn stamp_lines_order_and_presence() {
+        let mut i = Item::new("t", Uuid::nil(), 1_700_000_000_000);
+        i.created_at = Some(0);
+        assert_eq!(
+            stamp_lines(&i),
+            [
+                "Created: 1970-01-01 00:00:00 UTC",
+                "Modified: 2023-11-14 22:13:20 UTC"
+            ]
+        );
+        i.created_at = None;
+        assert_eq!(stamp_lines(&i), ["Modified: 2023-11-14 22:13:20 UTC"]);
+    }
+
+    #[test]
+    fn sections_never_satisfy_name_lookups() {
+        let mut i = item(false, "Username", FieldKind::Section, "SHOULD-NOT-SHOW");
+        assert_eq!(list_username(&i), None);
+        i.fields.push(Field::new(
+            "username",
+            FieldKind::Text,
+            SecretString::new("octo".to_owned()),
+            0,
+        ));
+        assert_eq!(list_username(&i).as_deref(), Some("octo"));
+
+        let uri = "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP";
+        let mut t = item(false, "totp", FieldKind::Section, "junk");
+        t.fields.push(Field::new(
+            "Authenticator",
+            FieldKind::Totp,
+            SecretString::new(uri.to_owned()),
+            0,
+        ));
+        let f = totp_field(&t).unwrap();
+        assert_eq!(f.kind, FieldKind::Totp);
+        assert_eq!(f.value.expose_secret(), uri);
+        assert!(totp_field(&item(false, "totp", FieldKind::Section, "x")).is_none());
     }
 }

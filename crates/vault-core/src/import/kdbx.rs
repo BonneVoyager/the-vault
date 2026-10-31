@@ -63,8 +63,9 @@ const NATIVE_TOTP_FIELDS: [&str; 6] = [
     "TOTP Settings",
 ];
 
-/// Import entries with fresh IDs and importer-supplied stamps. Group paths become
-/// tags; recycle-bin entries are excluded. Attachments, icons and auto-type settings
+/// Import entries with fresh IDs and importer-supplied stamps (`created_at` keeps the entry's
+/// KeePass creation time when it has one). Group paths become tags; recycle-bin entries are
+/// excluded. Attachments, icons and auto-type settings
 /// are not imported. `keyfile` is raw key-file content, never a filesystem path.
 pub fn import_kdbx(
     bytes: &[u8],
@@ -298,6 +299,16 @@ fn check_kdf_parameters(buf: &[u8]) -> Result<(), ImportError> {
 fn convert(entry: &Entry, device_id: Uuid, now: Millis) -> Item {
     let title = entry.get_title().unwrap_or("Untitled");
     let mut item = Item::new(title, device_id, now);
+    // KeePass `CreationTime` when the entry has one (representable and after the Unix
+    // epoch; a zero stamp means "unknown", as in the 1PUX path), else `Item::new`'s `now`.
+    if let Some(created) = entry
+        .times
+        .creation
+        .and_then(|time| u64::try_from(time.and_utc().timestamp_millis()).ok())
+        .filter(|ms| *ms > 0)
+    {
+        item.created_at = Some(created);
+    }
     item.tags = entry.tags.clone();
     // Every KeePass entry is a login (item kinds were removed on 2026-10-30; the template tag
     // replaces them).

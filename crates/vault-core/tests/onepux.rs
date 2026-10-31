@@ -100,6 +100,36 @@ fn imports_active_items() {
     );
     assert!(items.iter().all(|i| i.title != "Old"));
     assert_eq!(items[3].title, "Untitled");
+    // `createdAt` (seconds) becomes `created_at` (millis); an item without one gets `now`.
+    assert_eq!(
+        items.iter().map(|i| i.created_at).collect::<Vec<_>>(),
+        [Some(1_000), Some(NOW), Some(NOW), Some(NOW)],
+        "a carries createdAt: 1; b, c and d have none"
+    );
+}
+
+#[test]
+fn created_at_ignores_unusable_values() {
+    let items = import_1pux(
+        &archive(&export(vec![
+            json!({"uuid": "z", "state": "active", "categoryUuid": "001", "createdAt": 0,
+                   "details": {}, "overview": {"title": "Zero"}}),
+            json!({"uuid": "s", "state": "active", "categoryUuid": "001", "createdAt": "1700000000",
+                   "details": {}, "overview": {"title": "String"}}),
+            json!({"uuid": "n", "state": "active", "categoryUuid": "001", "createdAt": -5,
+                   "details": {}, "overview": {"title": "Negative"}}),
+            json!({"uuid": "r", "state": "active", "categoryUuid": "001", "createdAt": 1_700_000_000,
+                   "details": {}, "overview": {"title": "Real"}}),
+        ])),
+        Uuid::nil(),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(
+        items.iter().map(|i| i.created_at).collect::<Vec<_>>(),
+        [Some(NOW), Some(NOW), Some(NOW), Some(1_700_000_000_000)],
+        "zero, text and negative fall back to now; a real stamp is kept"
+    );
 }
 
 #[test]

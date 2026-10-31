@@ -71,7 +71,7 @@ pub(super) fn value_input(
             .value
         {
             ValueInput::Line(i) => i.clone(),
-            ValueInput::Area(_) => panic!("not a line input"),
+            ValueInput::Area(_) | ValueInput::None => panic!("not a line input"),
         }
     })
 }
@@ -1146,4 +1146,157 @@ fn non_image_files_are_refused_on_drop(cx: &mut TestAppContext) {
                 .is_empty()
         );
     });
+}
+
+#[gpui::test]
+fn adding_a_section_writes_a_heading_with_no_value(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    let id = insert_and_select(&state, vault_core::Item::new("Bank", device, 10), &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    assert!(
+        ADDABLE_KINDS.contains(&FieldKind::Section),
+        "offered by Add field"
+    );
+    let key = state.update(&mut vcx, |s, cx| {
+        let mut key = 0;
+        s.edit(cx, |b| key = b.add_field(FieldKind::Section));
+        key
+    });
+    vcx.run_until_parked();
+    // Name pre-filled "Section", placeholder "Section name", chip "Section", no value.
+    let name = name_input(&main, key, &mut vcx);
+    assert_eq!(vcx.update(|_, cx| ui::input_text(&name, cx)), "Section");
+    let placeholder = vcx.update(|_, cx| name.read(cx).presentation().placeholder().to_string());
+    assert_eq!(placeholder, "Section name");
+    assert_eq!(kind_name(FieldKind::Section), "Section");
+    main.read_with(&vcx, |m, cx| {
+        let editor = m.editor.read(cx);
+        let row = editor.rows.iter().find(|r| r.key == key).unwrap();
+        assert!(matches!(row.value, ValueInput::None), "no value input");
+    });
+    retype(&name, "login details", &mut vcx);
+    vcx.simulate_keystrokes("cmd-s");
+    vcx.run_until_parked();
+    let field = state.read_with(&vcx, |s, _| {
+        s.unlocked_vault().unwrap().get(id).unwrap().fields[0].clone()
+    });
+    assert_eq!(field.kind, FieldKind::Section);
+    assert_eq!(
+        field.name, "Login details",
+        "auto-capitalised like any new field"
+    );
+    assert_eq!(field.value.expose_secret(), "");
+    assert!(vcx.debug_bounds("section-row 0 LOGIN DETAILS").is_some());
+}
+
+/// A crafted vault can store any value on a Section (core keeps it as given, and a
+/// Section is never sensitive). It must never be drawn, copied, revealed or picked by a
+/// name lookup. gpui test windows expose no text dump, so this checks every element
+/// that draws a field value (value cells, masked cells, editor inputs) plus the copy,
+/// subtitle, card-masking and logo paths.
+#[gpui::test]
+fn section_values_never_surface(cx: &mut TestAppContext) {
+    const SECRET: &str = "SHOULD-NOT-SHOW";
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let board = crate::clipboard::fake::FakePasteboard::default();
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    state.update(&mut vcx, |s, _| s.set_pasteboard(Box::new(board.clone())));
+    let section = |name: &str, value: &str| {
+        vault_core::Field::new(
+            name,
+            FieldKind::Section,
+            SecretString::new(value.into()),
+            10,
+        )
+    };
+    let mut crafted = vault_core::Item::new("Crafted", device, 10);
+    crafted.fields = vec![
+        section("Username", SECRET),
+        section("Website", "https://github.com"),
+        vault_core::Field::new(
+            "note",
+            FieldKind::Text,
+            SecretString::new("visible".into()),
+            10,
+        ),
+    ];
+    let mut card = crate::templates::tagged(crate::templates::Template::Card, "Visa", device, 10);
+    card.fields = vec![section("Number", "4242424242424242")];
+    let card_id = insert_and_select(&state, card, &mut vcx);
+    let id = insert_and_select(&state, crafted, &mut vcx);
+
+    // Read mode: headings only; no value cell for either section.
+    assert!(vcx.debug_bounds("section-row 0 USERNAME").is_some());
+    assert!(vcx.debug_bounds("section-row 1 WEBSITE").is_some());
+    for ix in 0..2 {
+        for what in ["field-value", "field-masked", "field-row", "copy", "reveal"] {
+            let key: &'static str = Box::leak(format!("{what} {ix}").into_boxed_str());
+            assert!(vcx.debug_bounds(key).is_none(), "{key}");
+        }
+    }
+    assert!(
+        vcx.debug_bounds("field-value 2").is_some(),
+        "the real field shows"
+    );
+
+    state.update(&mut vcx, |s, cx| {
+        let item = s.selected_item().unwrap().clone();
+        // Name lookups skip sections: not the subtitle or ⌘⇧U, not the logo's website.
+        assert_eq!(crate::listing::subtitle(&item), "");
+        assert!(crate::listing::username_field(&item).is_none());
+        assert!(!matches!(
+            crate::icon::automatic(&item),
+            crate::icon::IconSpec::Logo { .. }
+        ));
+        // Copy targets: ⌘⇧U and copy-by-index copy nothing.
+        s.copy(crate::state::CopyTarget::Username, cx);
+        s.copy(crate::state::CopyTarget::Field(0), cx);
+        // A section named "Number" on a card is not masked as a card number.
+        let card = s.unlocked_vault().unwrap().get(card_id).unwrap().clone();
+        assert!(!crate::listing::is_card_number(&card, &card.fields[0]));
+        assert_ne!(
+            crate::listing::subtitle(&card),
+            "\u{2022}\u{2022}\u{2022}\u{2022} 4242"
+        );
+    });
+    assert_eq!(board.contents(), None, "nothing copied");
+
+    // Item window: same rows.
+    let handle = vcx
+        .cx
+        .update(|cx| crate::screens::open_item_window(state.clone(), id, cx))
+        .unwrap();
+    let mut win = VisualTestContext::from_window(handle, &vcx.cx);
+    win.run_until_parked();
+    assert!(win.debug_bounds("section-row 0 USERNAME").is_some());
+    assert!(win.debug_bounds("field-value 0").is_none());
+    assert!(win.debug_bounds("field-value 2").is_some());
+
+    // Edit mode: no editor input holds the value.
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let texts: Vec<String> = main.read_with(&vcx, |m, cx| {
+        let editor = m.editor.read(cx);
+        editor
+            .rows
+            .iter()
+            .flat_map(|r| {
+                let mut t = vec![ui::input_text(&r.name, cx)];
+                match &r.value {
+                    ValueInput::Line(i) => t.push(ui::input_text(i, cx)),
+                    ValueInput::Area(a) => {
+                        t.push(ui::textarea_secret(a, cx).expose_secret().to_owned())
+                    }
+                    ValueInput::None => {}
+                }
+                t
+            })
+            .collect()
+    });
+    assert_eq!(texts.len(), 4, "two names, one name, one name + value");
+    assert!(texts.iter().all(|t| !t.contains(SECRET)), "{texts:?}");
 }

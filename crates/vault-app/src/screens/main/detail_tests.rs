@@ -497,3 +497,89 @@ fn labels_show_a_capital_but_stored_names_stay(cx: &mut TestAppContext) {
         assert_eq!(s.edit_buffer().unwrap().item.fields[0].name, "username");
     });
 }
+
+#[test]
+fn footer_with_and_without_created_at() {
+    let now = 1_700_000_000_000u64;
+    let mut item = Item::new("x", Uuid::new_v4(), now - 37 * 60_000);
+    item.created_at = None;
+    assert_eq!(
+        footer_text(&item, now, "this Mac"),
+        "modified 37m ago · this Mac"
+    );
+    // 2021-10-03 12:00 UTC: older than 30 days, so the date.
+    item.created_at = Some(1_633_262_400_000);
+    assert_eq!(
+        footer_text(&item, now, "this Mac"),
+        "created 2021-10-03 · modified 37m ago · this Mac"
+    );
+    // Recent creation reads relative, like the modified date.
+    item.created_at = Some(now - 2 * 3_600_000);
+    assert_eq!(
+        footer_text(&item, now, "a1b2c3d4"),
+        "created 2h ago · modified 37m ago · a1b2c3d4"
+    );
+}
+
+fn with_section_first(device: Uuid) -> Vec<Item> {
+    let mut plain = login("Plain", STRONG, device);
+    plain.fields.insert(
+        0,
+        Field::new(
+            "Website",
+            FieldKind::Url,
+            SecretString::new("x.com".into()),
+            1,
+        ),
+    );
+    let mut sectioned = login("Sectioned", STRONG, device);
+    sectioned.fields.insert(
+        0,
+        Field::new(
+            "account",
+            FieldKind::Section,
+            SecretString::new(String::new()),
+            1,
+        ),
+    );
+    sectioned.fields.push(Field::new(
+        "Other stuff",
+        FieldKind::Section,
+        SecretString::new(String::new()),
+        1,
+    ));
+    vec![plain, sectioned]
+}
+
+#[gpui::test]
+fn section_rows_are_headings_without_actions(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open_items(dir.path(), with_section_first, cx);
+    select(&state, ids[0], &mut vcx);
+    let first_field_top = vcx.debug_bounds("field-row 0").unwrap().top();
+
+    select(&state, ids[1], &mut vcx);
+    // Upper-cased heading; no field row, value, copy or reveal for it.
+    let heading = vcx.debug_bounds("section-row 0 ACCOUNT").expect("heading");
+    for none in [
+        "field-row 0",
+        "field-value 0",
+        "field-label 0",
+        "field-masked 0",
+    ] {
+        assert!(vcx.debug_bounds(none).is_none(), "{none}");
+    }
+    // First in the list: it sits directly under the tags rule like a first field.
+    assert_eq!(heading.top(), first_field_top);
+    // The fields after it are ordinary rows, and the trailing heading renders too.
+    assert!(vcx.debug_bounds("field-row 1").is_some());
+    assert!(vcx.debug_bounds("section-row 3 OTHER STUFF").is_some());
+    // Copying it by index copies nothing (no toast claims a copy).
+    state.update(&mut vcx, |s, cx| {
+        s.copy(crate::state::CopyTarget::Field(0), cx)
+    });
+    state.read_with(&vcx, |s, _| {
+        let toast = s.toast.as_ref().map(|t| t.message.to_string());
+        assert_eq!(toast.as_deref(), Some("This item has no value"));
+    });
+}

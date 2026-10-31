@@ -32,6 +32,8 @@ fn host_of(url: &str) -> Zeroizing<String> {
     Zeroizing::new(host.strip_prefix("www.").unwrap_or(&host).to_owned())
 }
 
+/// Section headings ([`FieldKind::Section`]) are not searched: neither their name nor their
+/// (ignored) value takes part, even when the heading is named `username`.
 fn rank(item: &Item, q: &str) -> Option<u8> {
     if q.is_empty() {
         return Some(0);
@@ -43,14 +45,11 @@ fn rank(item: &Item, q: &str) -> Option<u8> {
     if title.contains(q) {
         return Some(1);
     }
-    if item
-        .fields
-        .iter()
-        .any(|f| f.kind == FieldKind::Url && host_of(f.value.expose_secret()).contains(q))
-    {
+    let fields = || item.fields.iter().filter(|f| f.kind != FieldKind::Section);
+    if fields().any(|f| f.kind == FieldKind::Url && host_of(f.value.expose_secret()).contains(q)) {
         return Some(2);
     }
-    if item.fields.iter().any(|f| {
+    if fields().any(|f| {
         (f.name.eq_ignore_ascii_case("username") || f.kind == FieldKind::Email)
             && fold(f.value.expose_secret()).contains(q)
     }) {
@@ -59,11 +58,7 @@ fn rank(item: &Item, q: &str) -> Option<u8> {
     if item.tags.iter().any(|t| fold(t).contains(q)) {
         return Some(4);
     }
-    if item
-        .fields
-        .iter()
-        .any(|f| f.kind == FieldKind::Notes && fold(f.value.expose_secret()).contains(q))
-    {
+    if fields().any(|f| f.kind == FieldKind::Notes && fold(f.value.expose_secret()).contains(q)) {
         return Some(5);
     }
     None

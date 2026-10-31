@@ -170,12 +170,6 @@ pub struct MainScreen {
     editor: Entity<Editor>,
     generator: Entity<GeneratorView>,
     list_focus: FocusHandle,
-    /// The list draws its focus ring: it gained focus from the keyboard (Tab, ⌘1, Enter
-    /// in search). Not gpui's `focus_visible`, which turns on with any key press while
-    /// focused, so a shortcut such as ⌃⌘S outlined a list focused by a click.
-    list_ring: bool,
-    /// The list had focus at the last render (focus arrival is detected there).
-    list_had_focus: bool,
     /// Tracks focus inside the sidebar, so collapsing it can move that focus on.
     sidebar_focus: FocusHandle,
     detail_focus: FocusHandle,
@@ -255,8 +249,6 @@ impl MainScreen {
             editor,
             generator,
             list_focus,
-            list_ring: false,
-            list_had_focus: false,
             sidebar_focus: cx.focus_handle(),
             detail_focus: cx.focus_handle(),
             list_state: ListState::new(0, ListAlignment::Top, px(200.)),
@@ -460,12 +452,9 @@ impl Render for MainScreen {
         if window.rem_size() != rem {
             window.set_rem_size(rem);
         }
-        // The list just gained focus: ring if the keyboard moved it there. Lost: no ring.
-        let list_focused = self.list_focus.is_focused(window);
-        if list_focused != self.list_had_focus {
-            self.list_had_focus = list_focused;
-            self.list_ring = list_focused && window.last_input_was_keyboard();
-        }
+        // Focus rings in this window (sidebar, list, detail, editor) follow keyboard focus
+        // moves only; see `ui::update_focus_ring`.
+        ui::update_focus_ring(window, cx);
         let slide = self.slide.clone();
         // Fit before rendering the list: its header follows the fitted sidebar width.
         // The sidebar takes room while it shows or slides.
@@ -565,7 +554,7 @@ impl Render for MainScreen {
 
         // The window claims its titlebar, so it moves only by this band; it paints first
         // (underneath), and the controls in it opt out with `ui::no_window_drag`.
-        gpui::div()
+        ui::clear_focus_ring_on_click(gpui::div())
             .size_full()
             .text_size(cx.theme().font_size)
             .relative()

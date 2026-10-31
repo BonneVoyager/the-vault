@@ -27,6 +27,14 @@ pub type Extras = Vec<(Value, Value)>;
 /// is secret; see [`FieldKind::is_sensitive`]. Everything else (merge, search, timestamps)
 /// treats it as `text`. `Other` is never produced for a known string and is not part of
 /// [`FieldKind::ALL`].
+///
+/// [`FieldKind::Section`] (on-disk `"section"`, added 2026-10-31 as a new enum string, no
+/// version bump) is a visual heading, not a value: the field's `name` is the heading text and
+/// its `value` is empty and ignored. The core does not enforce the empty value (it stores
+/// whatever it is given); the app writes `""`. A section is never sensitive, is skipped by
+/// the CSV export, is ignored by search, and `set_field` on one writes nothing to history.
+/// It merges like any other field, by name and stamp. A build older than the variant reads
+/// it as `Other` with `kind_raw = "section"` and preserves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FieldKind {
@@ -38,6 +46,9 @@ pub enum FieldKind {
     Email,
     Date,
     MonthYear,
+    /// A visual heading; `name` is the heading, `value` is empty and ignored. See the type
+    /// docs.
+    Section,
     /// A kind this build does not know; the on-disk string is in [`Field::kind_raw`]. Its
     /// value must be masked in any UI (`is_sensitive() == true`).
     Other,
@@ -45,7 +56,7 @@ pub enum FieldKind {
 
 impl FieldKind {
     /// Every *known* variant, in declaration order. [`FieldKind::Other`] is not listed.
-    pub const ALL: [FieldKind; 8] = [
+    pub const ALL: [FieldKind; 9] = [
         FieldKind::Text,
         FieldKind::Password,
         FieldKind::Totp,
@@ -54,6 +65,7 @@ impl FieldKind {
         FieldKind::Email,
         FieldKind::Date,
         FieldKind::MonthYear,
+        FieldKind::Section,
     ];
 
     /// The on-disk string of a known kind. For [`FieldKind::Other`] this is the placeholder
@@ -68,6 +80,7 @@ impl FieldKind {
             FieldKind::Email => "email",
             FieldKind::Date => "date",
             FieldKind::MonthYear => "month_year",
+            FieldKind::Section => "section",
             FieldKind::Other => "other",
         }
     }
@@ -87,6 +100,7 @@ impl FieldKind {
     /// Whether a UI must mask this field's value by default: `password`, `totp`, and every
     /// unknown kind (a newer version may have added a secret kind; masking is the safe
     /// default). Card numbers are an item-level rule, not a field kind, and are not covered.
+    /// A [`FieldKind::Section`] heading is never sensitive.
     pub fn is_sensitive(self) -> bool {
         matches!(
             self,
@@ -294,6 +308,13 @@ pub struct Item {
     /// Optional icon choice (v1.2). `None` for every file written before it existed; the
     /// writer emits the key only when `Some`. Interpreted by the app, see [`ItemIcon`].
     pub icon: Option<ItemIcon>,
+    /// When the item was created (unix millis; v1.3, optional, no version bump).
+    /// [`Item::new`] sets `Some(now)`; every file written before the key existed reads as
+    /// `None`, and the writer emits the key only when `Some`. Immutable metadata: a merge
+    /// keeps the minimum of the two sides (or whichever is `Some`), and a differing
+    /// `created_at` alone is not a change (it never bumps `modified_at`). Importers set it
+    /// from the source's creation time when it has one, else `now`.
+    pub created_at: Option<Millis>,
     pub fields: Vec<Field>,
     pub history: Vec<HistoryEntry>,
     /// Attachment references (01 §4, v1.1). Empty for every v1 file. Add and remove through
@@ -316,7 +337,7 @@ pub struct Item {
 }
 
 impl Item {
-    /// A fresh item with a random id, no fields, `modified_at = now`.
+    /// A fresh item with a random id, no fields, `modified_at = now`, `created_at = Some(now)`.
     pub fn new(title: impl Into<String>, device_id: Uuid, now: Millis) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -326,6 +347,7 @@ impl Item {
             favorite: false,
             tags: Vec::new(),
             icon: None,
+            created_at: Some(now),
             fields: Vec::new(),
             history: Vec::new(),
             attachments: Vec::new(),
@@ -361,6 +383,7 @@ impl fmt::Debug for Item {
             .field("favorite", &self.favorite)
             .field("tags", &self.tags)
             .field("icon", &self.icon)
+            .field("created_at", &self.created_at)
             .field(
                 "fields",
                 &format_args!("[{} fields redacted]", self.fields.len()),
@@ -407,6 +430,19 @@ mod tests {
         assert!(!FieldKind::ALL.iter().any(|k| k.as_str() == "number"));
         assert!(FieldKind::Other.is_sensitive() && FieldKind::Password.is_sensitive());
         assert!(!FieldKind::Text.is_sensitive());
+        assert_eq!(FieldKind::parse("section"), Some(FieldKind::Section));
+        assert_eq!(FieldKind::Section.as_str(), "section");
+        assert!(
+            !FieldKind::Section.is_sensitive(),
+            "a heading is never masked"
+        );
+    }
+
+    #[test]
+    fn new_item_is_stamped_created_at_now() {
+        let item = Item::new("t", Uuid::nil(), 1_234);
+        assert_eq!(item.created_at, Some(1_234));
+        assert_eq!(item.modified_at, 1_234);
     }
 
     #[test]

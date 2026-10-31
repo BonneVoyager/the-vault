@@ -751,10 +751,10 @@ fn columns_keep_their_identity_under_reduce_motion(cx: &mut TestAppContext) {
 
 /// Whether the list is focused and draws its focus ring.
 fn list_ring(main: &gpui::Entity<MainScreen>, vcx: &mut VisualTestContext) -> (bool, bool) {
+    frame(vcx);
     vcx.update(|window, cx| {
-        let m = main.read(cx);
-        let focused = m.list_focus.is_focused(window);
-        (focused, focused && m.list_ring)
+        let focused = main.read(cx).list_focus.is_focused(window);
+        (focused, focused && ui::focus_ring_allowed())
     })
 }
 
@@ -878,4 +878,234 @@ fn first_frame_after_unlock_is_at_rest_when_collapsed(cx: &mut TestAppContext) {
         assert!(bounds("list-search", &mut vcx).left() > toggle.right());
         frame(&mut vcx);
     }
+}
+
+/// Whether a quad in the ring colour with a border is painted at `selector`'s bounds.
+fn ring_painted(selector: &'static str, vcx: &mut VisualTestContext) -> bool {
+    let area = bounds(selector, vcx);
+    vcx.update(|window, cx| {
+        let ring = gpui_component::ActiveTheme::theme(cx).ring;
+        let scaled = area.scale(window.scale_factor());
+        let near = |a: gpui::ScaledPixels, b: gpui::ScaledPixels| (a.0 - b.0).abs() < 1.;
+        window.painted_quads().iter().any(|q| {
+            near(q.bounds.origin.x, scaled.origin.x)
+                && near(q.bounds.origin.y, scaled.origin.y)
+                && near(q.bounds.size.width, scaled.size.width)
+                && q.border_widths.left.0 > 0.
+                && q.border_color == ring
+        })
+    })
+}
+
+/// Whether `handle` is focused and may draw its ring, as of a fresh frame.
+fn ring_on(handle: &gpui::FocusHandle, vcx: &mut VisualTestContext) -> (bool, bool) {
+    frame(vcx);
+    vcx.update(|window, _| {
+        let focused = handle.is_focused(window);
+        (focused, focused && ui::focus_ring_allowed())
+    })
+}
+
+/// The detail column: clicked into, then the window narrowed and a shortcut pressed,
+/// it shows no ring (the reported outline). Focused from the keyboard (⌘2, or Tab on
+/// to a value), it does.
+#[gpui::test]
+fn detail_ring_only_after_keyboard_focus(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(true, dir.path(), cx);
+    state.update(&mut vcx, |s, cx| {
+        let id = s.listing.items[1];
+        s.select(id, cx);
+    });
+    vcx.run_until_parked();
+    let detail = main.read_with(&vcx, |m, _| m.detail_focus.clone());
+    let footer = bounds("detail-footer", &mut vcx).center();
+    vcx.simulate_click(footer, Modifiers::none());
+    assert_eq!(
+        ring_on(&detail, &mut vcx),
+        (true, false),
+        "click focuses, no ring"
+    );
+    vcx.simulate_resize(gpui::size(px(860.), px(640.)));
+    assert_eq!(ring_on(&detail, &mut vcx), (true, false), "after a resize");
+    vcx.simulate_keystrokes("cmd-shift-c");
+    assert_eq!(
+        ring_on(&detail, &mut vcx),
+        (true, false),
+        "after a shortcut"
+    );
+    assert!(
+        !ring_painted("detail-column", &mut vcx),
+        "ring painted after a shortcut"
+    );
+
+    // Keyboard: ⌘1 then ⌘2 moves focus back by key: ring.
+    vcx.simulate_keystrokes("cmd-1");
+    frame(&mut vcx);
+    vcx.simulate_keystrokes("cmd-2");
+    assert_eq!(ring_on(&detail, &mut vcx), (true, true), "⌘2");
+    assert!(
+        ring_painted("detail-column", &mut vcx),
+        "ring painted after ⌘2"
+    );
+    // A click inside clears it again (the footer moved with the resize).
+    let footer = bounds("detail-footer", &mut vcx).center();
+    vcx.simulate_click(footer, Modifiers::none());
+    assert_eq!(ring_on(&detail, &mut vcx), (true, false), "click clears");
+    // Tab on to the first value: that value takes focus with a ring.
+    vcx.simulate_keystrokes("tab");
+    frame(&mut vcx);
+    let moved = vcx.update(|window, cx| window.focused(cx));
+    assert!(
+        moved.is_some() && moved.as_ref() != Some(&detail),
+        "Tab moved focus"
+    );
+    assert!(
+        vcx.update(|_, _| ui::focus_ring_allowed()),
+        "Tab shows the ring"
+    );
+}
+
+/// A sidebar row focused by a click shows no ring, even after a key press.
+#[gpui::test]
+fn sidebar_row_ring_only_after_keyboard_focus(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, mut vcx) = open(true, dir.path(), cx);
+    let all = bounds("nav All Items icon=LayoutList", &mut vcx).center();
+    vcx.simulate_click(all, Modifiers::none());
+    frame(&mut vcx);
+    let row = vcx
+        .update(|window, cx| window.focused(cx))
+        .expect("row focused");
+    assert_eq!(ring_on(&row, &mut vcx), (true, false));
+    vcx.simulate_keystrokes("cmd-d");
+    assert_eq!(ring_on(&row, &mut vcx), (true, false), "after a shortcut");
+}
+
+/// Whether any border in the ring colour is painted in the window.
+fn any_ring_painted(vcx: &mut VisualTestContext) -> bool {
+    frame(vcx);
+    vcx.update(|window, cx| {
+        let ring = gpui_component::ActiveTheme::theme(cx).ring;
+        window
+            .painted_quads()
+            .iter()
+            .any(|q| q.border_widths.left.0 > 0. && q.border_color == ring)
+    })
+}
+
+/// A window with one focusable element the test can remove.
+struct FocusTarget(Option<gpui::FocusHandle>);
+
+impl gpui::Render for FocusTarget {
+    fn render(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{InteractiveElement as _, ParentElement as _, Styled as _};
+        ui::update_focus_ring(window, cx);
+        gpui::div().size_full().children(
+            self.0
+                .as_ref()
+                .map(|h| gpui::div().id("target").track_focus(h).size(px(20.))),
+        )
+    }
+}
+
+/// The ring map holds focus weakly: a keyboard-focused element that is removed leaves
+/// the window with no focus and no ring (a strong handle kept it "focused").
+#[gpui::test]
+fn removed_keyboard_focus_leaves_no_stale_focus_or_ring(cx: &mut TestAppContext) {
+    let mut weak = None;
+    let mut view = None;
+    let window = cx.add_window(|_, cx| {
+        let handle = cx.focus_handle();
+        weak = Some(handle.downgrade());
+        let v = FocusTarget(Some(handle));
+        view = Some(cx.entity());
+        v
+    });
+    let view = view.unwrap();
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    vcx.simulate_keystrokes("a");
+    let handle = weak.as_ref().unwrap().upgrade().unwrap();
+    vcx.update(|window, cx| window.focus(&handle, cx));
+    drop(handle);
+    frame(&mut vcx);
+    assert!(vcx.update(|window, cx| window.focused(cx).is_some()));
+    assert!(ui::focus_ring_allowed(), "keyboard focus shows the ring");
+
+    view.update(&mut vcx, |v, cx| {
+        v.0 = None;
+        cx.notify();
+    });
+    frame(&mut vcx);
+    frame(&mut vcx);
+    assert!(
+        weak.unwrap().upgrade().is_none(),
+        "the handle is not kept alive"
+    );
+    assert!(
+        vcx.update(|window, cx| window.focused(cx).is_none()),
+        "stale focus"
+    );
+    assert!(!ui::focus_ring_allowed(), "stale ring");
+}
+
+/// In an item window, Tab draws the ring and a click clears it; closing the window
+/// removes its ring entry.
+#[gpui::test]
+fn item_window_ring_and_its_entry_on_close(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, mut vcx) = open(true, dir.path(), cx);
+    let board = crate::clipboard::fake::FakePasteboard::default();
+    state.update(&mut vcx, |s, _| s.set_pasteboard(Box::new(board)));
+    let id = state.read_with(&vcx, |s, _| {
+        s.listing
+            .items
+            .iter()
+            .copied()
+            .find(|id| s.unlocked_vault().unwrap().get(*id).unwrap().title == "GitHub")
+            .unwrap()
+    });
+    let handle = vcx
+        .update(|_, cx| crate::screens::open_item_window(state.clone(), id, cx))
+        .unwrap();
+    let mut item = VisualTestContext::from_window(handle, &vcx.cx);
+    frame(&mut item);
+    let window_id = handle.window_id();
+    assert!(ui::focus_ring_windows().contains(&window_id));
+    assert!(!any_ring_painted(&mut item), "no ring before any focus");
+
+    // A click focuses the first value (Tab needs a focus to move from): no ring.
+    let value = item.debug_bounds("field-value 0").expect("value").center();
+    item.simulate_click(value, Modifiers::none());
+    let clicked = item.update(|window, cx| window.focused(cx));
+    assert!(clicked.is_some());
+    assert!(!any_ring_painted(&mut item), "a click shows no ring");
+    // Tab moves on (past the value's Copy button, a gpui-component Button with its
+    // own focus line) to the next value area: ring.
+    let mut ringed = false;
+    for _ in 0..4 {
+        item.simulate_keystrokes("tab");
+        let tabbed = item.update(|window, cx| window.focused(cx));
+        assert!(tabbed.is_some() && tabbed != clicked, "Tab moved focus");
+        assert!(ui::focus_ring_allowed(), "keyboard focus may draw its ring");
+        if any_ring_painted(&mut item) {
+            ringed = true;
+            break;
+        }
+    }
+    assert!(ringed, "Tab shows the ring on the next value");
+    // A click clears it.
+    item.simulate_click(value, Modifiers::none());
+    assert!(!any_ring_painted(&mut item), "a click clears it");
+
+    item.update(|window, _| window.remove_window());
+    vcx.run_until_parked();
+    assert!(
+        !ui::focus_ring_windows().contains(&window_id),
+        "entry left behind"
+    );
 }

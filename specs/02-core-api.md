@@ -36,6 +36,7 @@ pub struct Item {
     pub favorite: bool,
     pub tags: Vec<String>,
     pub icon: Option<ItemIcon>,  // v1.2; app-interpreted, set through `update` (which restamps)
+    pub created_at: Option<Millis>,  // v1.3; Item::new sets Some(now); merge keeps the minimum; not part of "changed"
     pub fields: Vec<Field>,
     pub history: Vec<HistoryEntry>,
     pub modified_at: Millis,
@@ -45,7 +46,7 @@ pub struct ItemIcon { pub kind: String, pub value: String, pub color: Option<Str
 
 pub struct Field {
     pub name: String,
-    pub kind: FieldKind,         // Copy; `Other` for unknown; `is_sensitive()` = Password | Totp | Other
+    pub kind: FieldKind,         // Copy; `Other` for unknown; `is_sensitive()` = Password | Totp | Other (Section is never sensitive); ALL has 9 entries incl. Section
     pub kind_raw: Option<String>,// as on Item
     pub value: SecretString,     // secrecy; Display is redacted
     pub modified_at: Millis,
@@ -181,7 +182,7 @@ pub struct PlaintextExport(pub Vec<u8>);   // newtype so callers can't confuse i
 pub fn export_csv(vault: &UnlockedVault) -> PlaintextExport;
 ```
 
-Imported items get fresh ids, `modified_at = now` supplied by caller, `device_id` of the importer.
+Imported items get fresh ids, `modified_at = now` supplied by caller, `device_id` of the importer. `created_at` is the source's creation time when it has one (1PUX createdAt seconds, KeePass CreationTime; zero, negative or non-numeric → now), else now; CSV always now.
 
 KeePass import uses the optional `keepass` dependency with its default features disabled. It accepts KDBX 3/4, a password, and optional raw key-file bytes (empty password with a key file means key-file-only authentication). Each entry becomes a login; standard fields map to username/password/website/notes, `otp` to TOTP, and protected custom fields remain concealed. Custom-name collisions receive numeric suffixes. Entry tags and nested group paths are retained as tags; recycle-bin entries are skipped; up to ten password-history values are retained. Attachments, custom icons and auto-type settings are not transferred. Input limits: database 100 MiB, key file 1 MiB. Error text never includes dependency parser errors or secret values. The dependency wipes credentials and protected fields; its transient XML and unprotected allocations are not guaranteed to be zeroized, like the existing 1PUX parser.
 

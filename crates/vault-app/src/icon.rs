@@ -387,7 +387,12 @@ fn website(item: &Item) -> Option<String> {
         .or_else(|| {
             item.fields
                 .iter()
-                .find(|f| f.name.eq_ignore_ascii_case("website") && !f.kind.is_sensitive())
+                // A section heading named "Website" is a heading: its value never counts.
+                .find(|f| {
+                    f.kind != FieldKind::Section
+                        && f.name.eq_ignore_ascii_case("website")
+                        && !f.kind.is_sensitive()
+                })
         })
         .map(|f| f.value.expose_secret().to_owned())
 }

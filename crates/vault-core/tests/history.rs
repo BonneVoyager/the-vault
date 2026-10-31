@@ -214,6 +214,7 @@ fn removed_history_cbor_shape_and_absent_when_empty() {
             "history",
             "favorite",
             "device_id",
+            "created_at",
             "deleted_at",
             "attachments",
             "removed_history"

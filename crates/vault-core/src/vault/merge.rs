@@ -11,7 +11,9 @@
 //! | both tombstones | — | the side with greater `(modified_at, device_id)`; tie -> ours |
 //! | both live | — | field-level merge, see [`merge_items`] |
 //!
-//! The result's `modified_at` is always `max(ours, theirs)`.
+//! The result's `modified_at` is always `max(ours, theirs)`, and its `created_at` (v1.3) is
+//! always the minimum of the two known values (see [`merge_created_at`]); a differing
+//! `created_at` alone is not a change.
 //!
 //! The merge is idempotent (folding the same `theirs` twice changes nothing the second time)
 //! and commutative in content. Field *order* follows the metadata winner, so it is also
@@ -152,6 +154,17 @@ impl UnlockedVault {
                 Some(ours) => {
                     let mut merged = merge_items(ours, theirs);
                     if item_eq(ours, &merged) {
+                        // `created_at` is immutable metadata outside the "changed" decision
+                        // (see `item_eq`): carry the merged minimum without a restamp, a
+                        // report entry, or a `changed()` signal. It is persisted with the
+                        // next save made for any other reason, and both sides re-derive the
+                        // same minimum on every merge, so a copy that missed it converges.
+                        if merged.created_at != ours.created_at {
+                            // The borrow of `ours` ends here; re-fetch mutably.
+                            if let Some(item) = self.items.get_mut(id) {
+                                item.created_at = merged.created_at;
+                            }
+                        }
                         report.unchanged += 1;
                     } else {
                         if merged.modified_at == ours.modified_at {
@@ -205,7 +218,19 @@ pub fn merge_items(ours: &Item, theirs: &Item) -> Item {
         (None, None) => merge_live(ours, theirs),
     };
     result.modified_at = modified_at;
+    result.created_at = merge_created_at(ours.created_at, theirs.created_at);
     result
+}
+
+/// `created_at` is immutable metadata (v1.3): the earliest known creation time wins. Both
+/// `Some` -> the minimum; one `Some` -> that one; neither -> `None`. Applied to every merge
+/// outcome (live, tombstone, both tombstones), independent of which side won the metadata.
+pub(crate) fn merge_created_at(ours: Option<Millis>, theirs: Option<Millis>) -> Option<Millis> {
+    match (ours, theirs) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
 }
 
 /// `true` if ours supplies the metadata: greater `modified_at`, tie -> greater `device_id`
@@ -331,6 +356,7 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
         favorite: winner.favorite,
         tags: winner.tags.clone(),
         icon: winner.icon.clone(),
+        created_at: merge_created_at(ours.created_at, theirs.created_at),
         fields,
         history,
         attachments,
@@ -408,6 +434,10 @@ fn attachment_eq(a: &AttachmentRef, b: &AttachmentRef) -> bool {
 
 /// Full structural equality including secrets and order. `Item` has no `PartialEq` (it holds
 /// secrets), so merge decides "unchanged" here.
+///
+/// `created_at` is deliberately **not** compared: it is immutable metadata whose merged value
+/// (the minimum) must never count as an update or bump `modified_at`. `merge_from` carries
+/// the minimum separately. Test helpers that need exact equality compare it themselves.
 pub fn item_eq(a: &Item, b: &Item) -> bool {
     a.id == b.id
         && a.title == b.title

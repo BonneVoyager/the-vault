@@ -405,12 +405,13 @@ pub fn kind_name(kind: FieldKind) -> &'static str {
         FieldKind::Email => "Email",
         FieldKind::Date => "Date",
         FieldKind::MonthYear => "Month/year",
+        FieldKind::Section => "Section",
         FieldKind::Other => FieldKind::Other.as_str(),
     }
 }
 
 /// The kinds the "Add field" menu offers, in menu order. Unknown kinds are never offered.
-pub const ADDABLE_KINDS: [FieldKind; 8] = [
+pub const ADDABLE_KINDS: [FieldKind; 9] = [
     FieldKind::Text,
     FieldKind::Password,
     FieldKind::Totp,
@@ -419,6 +420,8 @@ pub const ADDABLE_KINDS: [FieldKind; 8] = [
     FieldKind::Email,
     FieldKind::Date,
     FieldKind::MonthYear,
+    // A heading row (01 §4 `"section"`): a name and no value.
+    FieldKind::Section,
 ];
 
 /// Where the user was going when the unsaved-changes guard stopped them.

@@ -105,6 +105,7 @@ AAD = `vault_id || item.id || modified_at_be64 || format_version_be16`.
   "favorite":    bool
   "tags":        [tstr]
   "icon":        { "kind": tstr, "value": tstr, "color": tstr (optional) }   (v1.2, optional, no version bump; app-interpreted icon choice, e.g. kind "symbol" | "logo" | "image"; core validates types only; unknown keys inside the map are preserved; writers omit the key when there is no icon, readers treat missing or null as none; merge treats it as item metadata that travels with the metadata winner)
+  "created_at":  u64   (v1.3, optional, no version bump; unix millis the item was created; writers omit the key when unknown, readers treat missing or null as unknown and any other non-integer as Malformed; immutable metadata: a merge keeps the minimum of the two known values, or whichever side has one, and a differing created_at alone is not a change and never bumps modified_at)
   "fields":      [Field]
   "attachments": [AttachmentRef]   (v1.1, empty in v1)
   "removed_attachments": [{ "id": bytes(16), "removed_at": u64 }]   (v1.1, optional; tombstones so a removal survives merge, cap 64 newest, purged with item tombstones)
@@ -114,7 +115,7 @@ AAD = `vault_id || item.id || modified_at_be64 || format_version_be16`.
 
 Field = {
   "name":        tstr           unique within item, e.g. "username", "password", "totp", "url", "notes", or user-defined
-  "kind":        "text" | "password" | "totp" | "url" | "notes" | "email" | "date" | "month_year"   ("number" removed 2026-10-30; an old "number" reads as an unknown kind and is preserved)
+  "kind":        "text" | "password" | "totp" | "url" | "notes" | "email" | "date" | "month_year" | "section"   ("number" removed 2026-10-30; an old "number" reads as an unknown kind and is preserved. "section" added 2026-10-31, new enum string, no bump: a visual heading; name is the heading text, value is empty and ignored (core stores it as given); never sensitive; skipped by CSV export and search; set_field on it writes no history; merges by name and stamp like any field; older readers keep it as an unknown kind)
   "value":       tstr           for "totp": full otpauth:// URI
   "modified_at": u64            unix millis
   "section":     tstr | null    optional grouping label
@@ -198,7 +199,7 @@ Phase 1 must commit:
 
 `FORMAT_VERSION` bumps only on incompatible layout changes. Adding optional CBOR map keys is **not** a bump; readers ignore unknown keys, writers preserve unknown keys they read (store them as `Vec<(Value, Value)>` extras on each struct). This is how v1.1 adds attachments without a bump. New enum strings (slot kind, item kind, field kind) are also **not** a bump: readers preserve them as described in §2 and §4.
 
-Every `FORMAT_VERSION` keeps its fixtures under `tests/fixtures/` forever, and a test opens every fixture in that directory with the current reader. `v1-forward.vault` carries an opaque slot, an unknown item kind, an unknown field kind, and unknown keys at every level. `v1-icon.vault` carries a symbol icon with a colour, a logo icon without one, and an icon-less item.
+Every `FORMAT_VERSION` keeps its fixtures under `tests/fixtures/` forever, and a test opens every fixture in that directory with the current reader. `v1-forward.vault` carries an opaque slot, an unknown item kind, an unknown field kind, and unknown keys at every level. `v1-icon.vault` carries a symbol icon with a colour, a logo icon without one, and an icon-less item. `v1-meta.vault` carries one item with `created_at` and a section heading followed by two text fields, and one item with no `created_at` key.
 
 ## 10. Non-goals of the format
 
