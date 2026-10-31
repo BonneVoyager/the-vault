@@ -545,7 +545,26 @@ impl UnlockedVault {
             floor = floor.max(existing.modified_at.saturating_add(1));
             self.record_extras.remove(&id);
         }
+        // Per-attribute stamps (01 §4): a caller-built item carries none; they start at the
+        // final item stamp. Explicit ones (e.g. a clone of a stored item) are kept.
+        let unset = [
+            item.title_modified_at.is_none(),
+            item.favorite_modified_at.is_none(),
+            item.tags_modified_at.is_none(),
+            item.icon_modified_at.is_none(),
+        ];
         restamp(&mut item, floor, self.device_id);
+        let at = item.modified_at;
+        for (was_unset, stamp) in unset.into_iter().zip([
+            &mut item.title_modified_at,
+            &mut item.favorite_modified_at,
+            &mut item.tags_modified_at,
+            &mut item.icon_modified_at,
+        ]) {
+            if was_unset {
+                *stamp = Some(at);
+            }
+        }
         self.items.insert(id, item);
         Ok(id)
     }
@@ -567,8 +586,13 @@ impl UnlockedVault {
     ///   undo) wins: it is stamped `stamp(now, marker.removed_at)` if it was not already past
     ///   the marker, and the marker is dropped. Only a strictly newer stamp makes the field
     ///   survive on every peer.
-    /// - `item.modified_at = max(stamp(now, previous), all field.modified_at, deleted_at,
-    ///   new markers)`.
+    /// - `title`, `favorite`, `tags` and `icon` are diffed too (01 §4 per-attribute stamps):
+    ///   a changed attribute whose stamp `f` left untouched gets `stamp(now, its previous
+    ///   effective stamp)`; an unchanged one keeps its stamp, except that an unset (legacy)
+    ///   one is pinned at the previous item stamp, as by every mutation (see [`restamp`]);
+    ///   a stamp `f` explicitly cleared stays cleared.
+    /// - `item.modified_at = max(stamp(now, previous), all field.modified_at, attribute
+    ///   stamps, deleted_at, new markers)`.
     ///
     /// where `stamp(now, prev) = max(now, prev + 1)` (see [`stamp`]). The spec formula is
     /// `max(fields, deleted_at, now)`; the strictly-advancing floor is added so a mutation
@@ -635,7 +659,43 @@ impl UnlockedVault {
         }
         reconcile_field_tombstones(item, now);
         merge::normalize_field_tombstones(&mut item.removed_fields);
+        // Per-attribute stamps (01 §4): an attribute `f` changed without moving its own
+        // stamp is stamped `stamp(now, its previous effective stamp)`; an unchanged one
+        // keeps its stamp. A stamp `f` explicitly cleared (`Some` -> `None`) stays `None`
+        // (`restamp` would pin it, so it is cleared again afterwards); the attribute then
+        // reads as the item's `modified_at`, the pre-stamp shape.
+        let changed = [
+            (item.title != before.title, before.title_stamp()),
+            (item.favorite != before.favorite, before.favorite_stamp()),
+            (item.tags != before.tags, before.tags_stamp()),
+            (item.icon != before.icon, before.icon_stamp()),
+        ];
+        let stamps = [
+            (&mut item.title_modified_at, before.title_modified_at),
+            (&mut item.favorite_modified_at, before.favorite_modified_at),
+            (&mut item.tags_modified_at, before.tags_modified_at),
+            (&mut item.icon_modified_at, before.icon_modified_at),
+        ];
+        let mut cleared = [false; 4];
+        for (i, ((was_changed, prev_effective), (current, prev))) in
+            changed.into_iter().zip(stamps).enumerate()
+        {
+            if was_changed && *current == prev {
+                *current = Some(stamp(now, prev_effective));
+            }
+            cleared[i] = prev.is_some() && current.is_none();
+        }
         restamp(item, floor, device_id);
+        for (was_cleared, stamp) in cleared.into_iter().zip([
+            &mut item.title_modified_at,
+            &mut item.favorite_modified_at,
+            &mut item.tags_modified_at,
+            &mut item.icon_modified_at,
+        ]) {
+            if was_cleared {
+                *stamp = None;
+            }
+        }
         Ok(())
     }
 
@@ -1339,14 +1399,39 @@ fn stamp(now: Millis, previous: Millis) -> Millis {
     now.max(previous.saturating_add(1))
 }
 
-/// Recompute `item.modified_at = max(item.modified_at, floor, all field.modified_at,
-/// deleted_at)` and stamp `device_id`. `floor` is the smallest acceptable value (callers pass
+/// Pin any unset attribute stamp at the pre-mutation item stamp, then recompute
+/// `item.modified_at = max(item.modified_at, floor, all field.modified_at, the four
+/// attribute stamps, deleted_at)` and stamp `device_id`. `floor` is the smallest acceptable value (callers pass
 /// `stamp(now, previous)`). Shared by every mutation so the record timestamp (which is bound
 /// into the item AAD and the manifest) is always the newest timestamp inside the item.
 fn restamp(item: &mut Item, floor: Millis, device_id: Uuid) {
+    // Pin a legacy item's unstamped attributes (01 §4) at the stamp they implicitly had,
+    // the pre-mutation item stamp, before this mutation moves `modified_at`: otherwise every
+    // later mutation of the item (a field edit, say) would make its untouched title,
+    // favorite, tags and icon look freshly edited to the merge and beat a peer's real edit.
+    let previous = item.modified_at;
+    for stamp in [
+        &mut item.title_modified_at,
+        &mut item.favorite_modified_at,
+        &mut item.tags_modified_at,
+        &mut item.icon_modified_at,
+    ] {
+        stamp.get_or_insert(previous);
+    }
     let mut latest = item.modified_at.max(floor);
     for field in &item.fields {
         latest = latest.max(field.modified_at);
+    }
+    for stamp in [
+        item.title_modified_at,
+        item.favorite_modified_at,
+        item.tags_modified_at,
+        item.icon_modified_at,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        latest = latest.max(stamp);
     }
     if let Some(deleted_at) = item.deleted_at {
         latest = latest.max(deleted_at);

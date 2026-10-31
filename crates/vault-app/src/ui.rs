@@ -890,33 +890,6 @@ pub fn illustration(icon: IconName, badge: Option<IconName>, cx: &App) -> Div {
     art
 }
 
-/// Panel transitions (05 §5): 120-180 ms ease-out. Never used on list scrolling.
-pub const PANEL_MOTION: std::time::Duration = std::time::Duration::from_millis(150);
-
-/// Fades `el` in while sliding it `slide` px from the left, keyed by `id` (change the id
-/// to replay). With Reduce Motion the element appears at once.
-pub fn panel_in<E>(
-    el: E,
-    id: impl Into<gpui::ElementId>,
-    slide: f32,
-    reduce_motion: bool,
-) -> AnyElement
-where
-    E: IntoElement + gpui::Styled + 'static,
-{
-    use gpui::AnimationExt as _;
-    if reduce_motion {
-        return el.into_any_element();
-    }
-    el.relative()
-        .with_animation(
-            id,
-            gpui::Animation::new(PANEL_MOTION).with_easing(gpui::ease_out_quint()),
-            move |el, t| el.opacity(t).left(px(-slide * (1. - t))),
-        )
-        .into_any_element()
-}
-
 /// A zero-sized [`probe::Probe`] in test builds; nothing otherwise.
 pub fn test_probe(name: &'static str) -> Option<AnyElement> {
     #[cfg(test)]

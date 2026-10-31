@@ -200,11 +200,11 @@ fn open_dev(pkg: &std::path::Path, password: &str) -> Dev {
 /// 03 §3 pre-write merge + 01 §9 through vault-sync: two handles on one package; A optionally
 /// upgrades and saves; B (same build, holding the old state) edits the title and saves. The
 /// upgrade must survive, B's edit must land, and the file must open with the password. Then A
-/// edits `favorite` on its stale copy (title still the original) and saves.
-/// Ported 2026-10-31 to 03 §5 "metadata (title, kind, favorite, tags) taken from whichever item
-/// has the greater modified_at": item metadata merges as one block, so A's later favorite edit
-/// wins whole and B's title edit is replaced by A's stale title. The `upgraded = false` variant
-/// shows the same outcome without any upgrade, so the loss is the metadata rule, not the upgrade.
+/// edits `favorite` on its stale copy (title still the original) and saves, and B merges back.
+/// Updated 2026-10-31 (second time) to 03 §5 "title, favorite, tags (as one set) and icon are
+/// each merged by their own stamp" (01 §4 per-attribute stamps, incl. pinning for items without
+/// stamps): both edits survive, on both handles and in the file. The `upgraded = false` variant
+/// (u06b) runs the same steps on a version 2 vault with no upgrade.
 fn metadata_block_case(upgraded: bool) {
     let d = tempdir();
     let fx = if upgraded { "v1-basic.vault" } else { "v2-basic.vault" };
@@ -212,7 +212,6 @@ fn metadata_block_case(upgraded: bool) {
     let mut a = open_dev(&pkg, FPW);
     let mut b = open_dev(&pkg, FPW);
     let id = b.v().items().next().unwrap().id;
-    let original = b.v().get(id).unwrap().title.clone();
     if upgraded {
         a.s.edit(|v| v.upgrade_format(&pw(FPW), now_ms())).unwrap().unwrap();
         a.s.save().unwrap();
@@ -229,10 +228,18 @@ fn metadata_block_case(upgraded: bool) {
     std::thread::sleep(std::time::Duration::from_millis(5));
     a.s.edit(|v| v.update(id, now_ms(), |it| it.favorite = true)).unwrap().unwrap();
     a.s.save().unwrap();
+    b.s.edit(|_| ()).unwrap();
+    b.s.save().unwrap(); // pre-write merge: B reads A's file
     let u = LockedVault::parse(&std::fs::read(primary(&pkg)).unwrap()).unwrap().unlock(&pw(FPW)).unwrap();
-    let it = u.get(id).unwrap();
-    assert!(it.favorite, "later metadata edit (favorite) wins (upgraded={upgraded})");
-    assert_eq!(it.title, original, "metadata wins as one block: A's stale title replaces B's earlier edit (upgraded={upgraded})");
+    for (who, v) in [("A", a.v()), ("B", b.v()), ("file", &u)] {
+        let it = v.get(id).unwrap();
+        assert!(
+            it.favorite && it.title == "edited on B",
+            "{who} (upgraded={upgraded}): favorite={} title={:?}; both attribute edits should survive",
+            it.favorite,
+            it.title
+        );
+    }
 }
 
 #[test]
@@ -330,6 +337,102 @@ fn u09_conflict_copy_from_upgraded_device() {
                 }
             }
             Err(e) => bad.push(format!("{shape}: primary version {} no longer opens with the password: {e:?}; events {:?}", version_of(&disk), a.seen)),
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// 03 §5 "title, favorite, tags (as one set) and icon are each merged by their own stamp" through
+/// two SyncedVault handles: A renames the item, B sets favorite, both before any sync. After one
+/// round each way (one save per side, then one pre-write merge back) both handles and the file
+/// hold both edits and identical content; item modified_at may still differ by the +1 merge
+/// bump, and is identical after a second round (03 §5 "within two merge rounds"). Both orders.
+#[test]
+fn u10_rename_and_favorite_converge_in_one_round() {
+    let mut bad = vec![];
+    for a_first in [true, false] {
+        let d = tempdir();
+        let pkg = d.path().join("pa.vault");
+        let mut a = Dev::create(&pkg);
+        let id = a.add_login("Original", now_ms());
+        a.s.save().unwrap();
+        let mut b = Dev::open(&pkg);
+        let t = now_ms() + 1;
+        a.s.edit(|v| v.update(id, t, |it| it.title = "Renamed on A".into())).unwrap().unwrap();
+        b.s.edit(|v| v.update(id, t + 1, |it| it.favorite = true)).unwrap().unwrap();
+        let (first, second) = if a_first { (&mut a, &mut b) } else { (&mut b, &mut a) };
+        first.s.save().unwrap();
+        second.s.save().unwrap(); // merges first's file
+        first.s.edit(|_| ()).unwrap();
+        first.s.save().unwrap(); // merges second's file: one round each way
+        let file = read_vault(&pkg);
+        for (who, v) in [("A", a.v()), ("B", b.v()), ("file", &file)] {
+            let it = v.get(id).unwrap();
+            if !(it.favorite && it.title == "Renamed on A") {
+                bad.push(format!("a_first={a_first} {who}: favorite={} title={:?}", it.favorite, it.title));
+            }
+        }
+        // one round each way: identical content (titles, favorites, tags, icons, fields, markers)
+        let no_ma = |v: &UnlockedVault| -> Vec<String> {
+            snap_vault(v).into_iter().map(|l| {
+                let i = l.find("|ma=").unwrap();
+                let j = l[i..].find("|order=").unwrap() + i;
+                format!("{}{}", &l[..i], &l[j..])
+            }).collect()
+        };
+        if no_ma(a.v()) != no_ma(b.v()) {
+            bad.push(format!("a_first={a_first}: content differs after one round each way"));
+        }
+        // 03 §5 "Two devices converge within two merge rounds": the merge's +1 modified_at bump
+        // settles on the second round, after which the full state (stamps included) is identical.
+        let (first, second) = if a_first { (&mut a, &mut b) } else { (&mut b, &mut a) };
+        second.s.edit(|_| ()).unwrap();
+        second.s.save().unwrap();
+        first.s.edit(|_| ()).unwrap();
+        first.s.save().unwrap();
+        if snap_vault(a.v()) != snap_vault(b.v()) {
+            bad.push(format!("a_first={a_first}: handles differ after two rounds:\n  A {:?}\n  B {:?}", snap_vault(a.v()), snap_vault(b.v())));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// 01 §4 "a missing stamp reads as the item's modified_at" + 03 §5: two copies of a v1-basic
+/// item that both lack per-attribute stamps (legacy items, never mutated by a stamping build)
+/// merge exactly as before PA-1: title, favorite and tags come together from the item with the
+/// greater modified_at; on equal modified_at from the greater device_id. Both merge directions.
+#[test]
+fn u11_legacy_items_without_stamps_merge_as_a_block() {
+    let b = fixture("v1-basic.vault");
+    let raw = split(&b);
+    let o = indep::open_file(&b, FPW);
+    let (iid, _, pt) = o.items[0].clone();
+    for k in ["title_modified_at", "favorite_modified_at", "tags_modified_at", "icon_modified_at"] {
+        assert!(get(&pt, k).is_none(), "fixture item has no {k}");
+    }
+    let iid16: [u8; 16] = iid.as_slice().try_into().unwrap();
+    let variant = |title: &str, fav: bool, tag: &str, dev: u8| {
+        let mut p = pt.clone();
+        set(&mut p, "title", t(title));
+        set(&mut p, "favorite", Value::Bool(fav));
+        set(&mut p, "tags", Value::Array(vec![t(tag)]));
+        set(&mut p, "device_id", Value::Bytes(vec![dev; 16]));
+        p
+    };
+    let open = |bytes: Vec<u8>| LockedVault::parse(&bytes).unwrap().unlock(&pw(FPW)).unwrap();
+    let mut bad = vec![];
+    // (x: older, A-ish values), (y: newer or tie-winning values); expected winner is always y
+    for (label, ma_x, dev_x, ma_y, dev_y) in [("newer modified_at", 5_000u64, 0x90u8, 6_000u64, 0x10u8), ("tie, greater device_id", 5_000, 0x10, 5_000, 0x90)] {
+        let x = build_file(raw.version, &raw.header, &o.vault_key, &[(iid16, ma_x, variant("X title", true, "x", dev_x))]);
+        let y = build_file(raw.version, &raw.header, &o.vault_key, &[(iid16, ma_y, variant("Y title", false, "y", dev_y))]);
+        for dir in ["x<-y", "y<-x"] {
+            let (mut ours, theirs) = if dir == "x<-y" { (open(x.clone()), open(y.clone())) } else { (open(y.clone()), open(x.clone())) };
+            ours.merge_from(&theirs).unwrap();
+            let it = ours.get(Uuid::from_slice(&iid).unwrap()).unwrap();
+            let got = (it.title.clone(), it.favorite, it.tags.clone());
+            if got != ("Y title".to_string(), false, vec!["y".to_string()]) {
+                bad.push(format!("{label} {dir}: got {got:?}, want the whole block from Y"));
+            }
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));

@@ -131,6 +131,14 @@ pub fn assert_item_eq(a: &Item, b: &Item) {
     assert_eq!(a.tags, b.tags);
     assert_eq!(a.icon, b.icon);
     assert_eq!(a.created_at, b.created_at, "created_at of {}", a.title);
+    assert_eq!(
+        a.title_modified_at, b.title_modified_at,
+        "title stamp of {}",
+        a.title
+    );
+    assert_eq!(a.favorite_modified_at, b.favorite_modified_at);
+    assert_eq!(a.tags_modified_at, b.tags_modified_at);
+    assert_eq!(a.icon_modified_at, b.icon_modified_at);
     assert_eq!(a.modified_at, b.modified_at);
     assert_eq!(a.extras, b.extras);
     assert_eq!(a.fields.len(), b.fields.len());

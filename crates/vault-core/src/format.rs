@@ -1062,7 +1062,7 @@ fn attachment_tombstone_from_value(value: Value) -> Result<AttachmentTombstone, 
 
 /// `ItemPlain.icon` (01 §4, v1.2): `{ "kind": tstr, "value": tstr, "color": tstr }` plus
 /// preserved unknown keys. `color` is emitted only when `Some`.
-fn icon_to_value(i: &ItemIcon) -> Value {
+pub(crate) fn icon_to_value(i: &ItemIcon) -> Value {
     let mut known = vec![("kind", text(&i.kind)), ("value", text(&i.value))];
     if let Some(c) = &i.color {
         known.push(("color", text(c)));
@@ -1107,6 +1107,11 @@ fn field_to_value(f: &Field) -> Value {
 /// the same field (03 §5). Holds the plaintext value, hence zeroizing.
 pub(crate) fn field_canonical_bytes(f: &Field) -> Zeroizing<Vec<u8>> {
     Zeroizing::new(encode(&canonicalize(field_to_value(f))))
+}
+
+/// Canonical CBOR bytes of any value; the merge's symmetric tie-break for item attributes.
+pub(crate) fn canonical_bytes(v: Value) -> Vec<u8> {
+    encode(&canonicalize(v))
 }
 
 /// Decode one field. The returned `bool` is `true` when the map carried an `id`; otherwise
@@ -1233,7 +1238,9 @@ fn field_tombstone_from_value(value: Value) -> Result<FieldTombstone, VaultError
 /// version 2) and `removed_history` (`[u64]`, stamps newest first) are optional keys written
 /// only when non-empty, so files without removals keep their v1 byte layout. `icon` (v1.2,
 /// `{ "kind", "value", "color"? }` plus extras) and `created_at` (v1.3, `u64` unix millis)
-/// are likewise written only when `Some`. Every field carries its `id` and every history
+/// are likewise written only when `Some`, as are the four per-attribute stamps
+/// `title_modified_at`, `favorite_modified_at`, `tags_modified_at`, `icon_modified_at`
+/// (`u64`, 2026-10-31). Every field carries its `id` and every history
 /// entry with a known field carries `field_id`, whatever the file's version. No `kind` key
 /// is written (removed 2026-10-30); one read from an older file is in `item.extras` and is
 /// re-emitted from there, unchanged.
@@ -1272,6 +1279,16 @@ pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
     }
     if let Some(created_at) = item.created_at {
         known.push(("created_at", Value::from(created_at)));
+    }
+    for (key, stamp) in [
+        ("title_modified_at", item.title_modified_at),
+        ("favorite_modified_at", item.favorite_modified_at),
+        ("tags_modified_at", item.tags_modified_at),
+        ("icon_modified_at", item.icon_modified_at),
+    ] {
+        if let Some(stamp) = stamp {
+            known.push((key, Value::from(stamp)));
+        }
     }
     if !item.removed_attachments.is_empty() {
         known.push((
@@ -1379,6 +1396,12 @@ pub fn decode_item_plain(
     // Optional (v1.3): missing or null is "unknown"; anything but an unsigned integer is
     // Malformed, the same arms as `icon`.
     let created_at = opt_u64(m.take("created_at"), "item.created_at")?;
+    // Optional per-attribute stamps (2026-10-31): same arms as `created_at`.
+    let title_modified_at = opt_u64(m.take("title_modified_at"), "item.title_modified_at")?;
+    let favorite_modified_at =
+        opt_u64(m.take("favorite_modified_at"), "item.favorite_modified_at")?;
+    let tags_modified_at = opt_u64(m.take("tags_modified_at"), "item.tags_modified_at")?;
+    let icon_modified_at = opt_u64(m.take("icon_modified_at"), "item.icon_modified_at")?;
     Ok(Item {
         id,
         title,
@@ -1388,6 +1411,10 @@ pub fn decode_item_plain(
         tags,
         icon,
         created_at,
+        title_modified_at,
+        favorite_modified_at,
+        tags_modified_at,
+        icon_modified_at,
         fields,
         history,
         attachments,

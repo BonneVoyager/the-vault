@@ -495,8 +495,8 @@ fn columns_keep_their_identity_across_a_slide(cx: &mut TestAppContext) {
     let names = ["detail-probe", "detail-content-probe", "list-probe"];
     let paths: Vec<String> = names.iter().map(|n| path_of(&before, n)).collect();
     assert!(
-        paths[1].contains("detail-in"),
-        "inside the fade: {}",
+        paths[1].contains(".detail."),
+        "inside the detail column: {}",
         paths[1]
     );
 

@@ -220,7 +220,11 @@ fn removed_history_cbor_shape_and_absent_when_empty() {
             "created_at",
             "deleted_at",
             "attachments",
-            "removed_history"
+            "removed_history",
+            "icon_modified_at",
+            "tags_modified_at",
+            "title_modified_at",
+            "favorite_modified_at"
         ],
         "canonical key order"
     );

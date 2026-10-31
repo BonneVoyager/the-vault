@@ -392,86 +392,49 @@ fn content_probe(vcx: &mut VisualTestContext) -> crate::ui::probe::Seen {
         .expect("detail content rendered")
 }
 
-/// Edit and Cancel keep the detail content (inside the fade-in) at the same element
-/// path with its state, so the fade does not replay (the edit blink). Selecting
-/// another item still restarts it.
+/// No fade anywhere in the detail column (owner 2026-10-31): switching items, Edit and
+/// Cancel keep the content at one element path with its state, with no animation
+/// element around it, and the new item is on screen in the first frame.
 #[gpui::test]
-fn edit_and_cancel_do_not_replay_the_detail_fade(cx: &mut TestAppContext) {
+fn switching_items_and_edit_paint_at_once_without_a_fade(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (state, ids, mut vcx) = open(dir.path(), &[("GitHub", "a"), ("Mail", "b")], cx);
     select(&state, ids[0], &mut vcx);
     let read = content_probe(&mut vcx);
-    assert!(read.path.contains("detail-in"), "{}", read.path);
+    assert!(read.path.contains(".detail."), "{}", read.path);
+    assert!(
+        !read.path.contains("detail-in"),
+        "no fade element: {}",
+        read.path
+    );
 
     vcx.update(|_, cx| state.update(cx, |s, cx| s.begin_edit(cx)));
     vcx.run_until_parked();
     assert!(state.read_with(&vcx, |s, _| s.is_editing()));
     let editing = content_probe(&mut vcx);
-    assert_eq!(editing.path, read.path, "Edit changed the faded container");
-    assert!(!editing.fresh, "Edit restarted the fade");
+    assert_eq!(editing.path, read.path, "Edit changed the container");
+    assert!(!editing.fresh, "Edit remounted it");
 
     vcx.update(|_, cx| state.update(cx, |s, cx| s.cancel_edit(cx)));
     vcx.run_until_parked();
     assert!(!state.read_with(&vcx, |s, _| s.is_editing()));
     let cancelled = content_probe(&mut vcx);
-    assert_eq!(
-        cancelled.path, read.path,
-        "Cancel changed the faded container"
-    );
-    assert!(!cancelled.fresh, "Cancel restarted the fade");
+    assert_eq!(cancelled.path, read.path, "Cancel changed the container");
+    assert!(!cancelled.fresh, "Cancel remounted it");
 
-    // A different item does fade in: its first frame has a fresh fade state.
+    // Another item: same container, kept state, and its title in the very first frame.
     crate::ui::probe::take();
     select(&state, ids[1], &mut vcx);
-    vcx.update(|window, _| window.refresh());
-    vcx.run_until_parked();
-    let other = crate::ui::probe::take()
+    let first = crate::ui::probe::take()
         .into_iter()
         .find(|s| s.name == "detail-content-probe")
-        .expect("detail content rendered");
-    assert_ne!(other.path, read.path);
-    assert!(other.fresh, "a new selection restarts the fade");
-}
-
-/// The rule under the tags sits as far above the first row's content as each row's
-/// bottom border sits above the next row's content: the row's own top padding only.
-/// Same in the item window, which uses the same renderer.
-#[gpui::test]
-fn first_field_row_sits_under_the_rule_like_the_others(cx: &mut TestAppContext) {
-    let dir = tempfile::tempdir().unwrap();
-    let (state, ids, mut vcx) = open(dir.path(), &[("GitHub", "a")], cx);
-    select(&state, ids[0], &mut vcx);
-    let spacing = |vcx: &mut VisualTestContext| {
-        let b = |key: &'static str, vcx: &mut VisualTestContext| {
-            vcx.debug_bounds(key)
-                .unwrap_or_else(|| panic!("{key} not rendered"))
-        };
-        let rule = b("detail-fields-rule", vcx);
-        let row0 = b("field-row 0", vcx);
-        let first = b("field-content 0", vcx).top() - rule.bottom();
-        let between = b("field-content 1", vcx).top() - row0.bottom();
-        (first, between)
-    };
-    let (first, between) = spacing(&mut vcx);
-    assert_eq!(first, between, "main window");
-    assert_eq!(first, gpui::px(FIELD_ROW_PAD_Y));
-
-    let main_window = vcx.cx.update(|cx| cx.windows()[0]);
-    vcx.update(|_, cx| {
-        crate::screens::open_item_window(state.clone(), ids[0], cx).unwrap();
-    });
-    vcx.run_until_parked();
-    let item_window = vcx
-        .cx
-        .update(|cx| cx.windows())
-        .into_iter()
-        .find(|w| w.window_id() != main_window.window_id())
-        .expect("item window");
-    let mut item = VisualTestContext::from_window(item_window, &vcx.cx);
-    item.run_until_parked();
-    let (first, between) = spacing(&mut item);
-    assert_eq!(first, between, "item window");
-    assert_eq!(first, gpui::px(FIELD_ROW_PAD_Y));
+        .expect("a frame was drawn on selection");
+    assert_eq!(first.path, read.path, "selection changed the container");
+    assert!(!first.fresh, "selection remounted it");
+    assert!(
+        vcx.debug_bounds("detail-title Mail").is_some(),
+        "Mail painted at once"
+    );
 }
 
 #[gpui::test]

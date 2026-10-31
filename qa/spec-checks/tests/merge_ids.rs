@@ -274,8 +274,10 @@ fn mi06_created_at_minimum_not_a_change() {
     assert_eq!((it.title.as_str(), it.created_at), ("B title", Some(7)), "minimum survives losing metadata");
 }
 
-/// 03 §5 metadata "taken from whichever item has the greater modified_at"; 01 §4 icon "merge treats
-/// it as item metadata that travels with the metadata winner".
+/// 03 §5 "both live" (amended 2026-10-31): "title, favorite, tags (as one set) and icon are each
+/// merged by their own stamp ... greater stamp wins". Ported from the earlier block rule (where
+/// B's later favorite carried B's missing icon over A's): A's icon and B's later favorite now both
+/// survive; when both set an icon, the later icon wins whatever else changed.
 #[test]
 fn mi07_icon_travels_with_metadata() {
     let mut n = Net::new(2);
@@ -285,20 +287,23 @@ fn mi07_icon_travels_with_metadata() {
     n.all_pairs(2);
     for d in &n.devs {
         let it = d.get(id).unwrap();
-        assert!(it.favorite);
-        assert!(it.icon.is_none(), "B's later metadata wins as a whole, icon included (B had no icon)");
+        assert!(it.favorite, "B's favorite survives");
+        assert_eq!(it.icon.as_ref().map(|c| c.value.as_str()), Some("star"), "A's icon survives B's later, unrelated edit");
     }
     n.assert_converged();
+    // concurrent icon edits: greater icon stamp wins; B's later title edit does not drag its older icon along
     let mut n = Net::new(2);
     let (id, _, _) = seeded(&mut n, 100);
-    n.devs[1].update(id, 300, |it| it.favorite = true).unwrap();
+    n.devs[1].update(id, 300, |it| it.icon = Some(ItemIcon::new("symbol", "old"))).unwrap();
     let mut ic = ItemIcon::new("letter", "");
     ic.color = Some("#00ff00".into());
     n.devs[0].update(id, 400, |it| it.icon = Some(ic.clone())).unwrap();
+    n.devs[1].update(id, 500, |it| it.title = "B title".into()).unwrap();
     n.all_pairs(2);
     for d in &n.devs {
         let it = d.get(id).unwrap();
-        assert_eq!(it.icon.as_ref().map(|c| (c.kind.as_str(), c.color.as_deref())), Some(("letter", Some("#00ff00"))));
+        assert_eq!(it.icon.as_ref().map(|c| (c.kind.as_str(), c.color.as_deref())), Some(("letter", Some("#00ff00"))), "later icon wins");
+        assert_eq!(it.title, "B title");
     }
     n.assert_converged();
 }

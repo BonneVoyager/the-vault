@@ -243,8 +243,13 @@ fn field_map_has_id_first_and_item_keys_gain_removed_fields_only_when_present() 
             "device_id",
             "created_at",
             "deleted_at",
-            "attachments"
-        ]
+            "attachments",
+            "icon_modified_at",
+            "tags_modified_at",
+            "title_modified_at",
+            "favorite_modified_at"
+        ],
+        "insert filled the four attribute stamps"
     );
 
     let pin = fid(&v, id, "notes");
@@ -271,7 +276,11 @@ fn field_map_has_id_first_and_item_keys_gain_removed_fields_only_when_present() 
             "created_at",
             "deleted_at",
             "attachments",
-            "removed_fields"
+            "removed_fields",
+            "icon_modified_at",
+            "tags_modified_at",
+            "title_modified_at",
+            "favorite_modified_at"
         ],
         "sorts between attachments and removed_history"
     );

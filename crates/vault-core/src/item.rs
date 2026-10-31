@@ -371,6 +371,18 @@ pub struct Item {
     /// `created_at` alone is not a change (it never bumps `modified_at`). Importers set it
     /// from the source's creation time when it has one, else `now`.
     pub created_at: Option<Millis>,
+    /// Per-attribute stamps (01 §4, 2026-10-31, optional keys, no bump): unix millis of the
+    /// last change to `title`, `favorite`, `tags` (as one set) and `icon`, so that concurrent
+    /// edits of *different* attributes on two devices both survive a merge (03 §5). Set by
+    /// [`crate::UnlockedVault::update`] when the attribute changes (monotone, like field
+    /// stamps) and filled by `insert` with the item stamp; `None` for items written before
+    /// the keys existed, which the merge reads as the item's `modified_at`; the first
+    /// mutation of such an item pins the unset stamps at the item stamp they implicitly had.
+    /// `modified_at` is at least every one of them.
+    pub title_modified_at: Option<Millis>,
+    pub favorite_modified_at: Option<Millis>,
+    pub tags_modified_at: Option<Millis>,
+    pub icon_modified_at: Option<Millis>,
     pub fields: Vec<Field>,
     pub history: Vec<HistoryEntry>,
     /// Attachment references (01 §4, v1.1). Empty for every v1 file. Add and remove through
@@ -410,6 +422,10 @@ impl Item {
             tags: Vec::new(),
             icon: None,
             created_at: Some(now),
+            title_modified_at: None,
+            favorite_modified_at: None,
+            tags_modified_at: None,
+            icon_modified_at: None,
             fields: Vec::new(),
             history: Vec::new(),
             attachments: Vec::new(),
@@ -423,6 +439,21 @@ impl Item {
 
     pub fn is_deleted(&self) -> bool {
         self.deleted_at.is_some()
+    }
+
+    /// The effective stamp of each attribute for the merge (03 §5): the stored stamp, or
+    /// the item's `modified_at` when the item carries none.
+    pub fn title_stamp(&self) -> Millis {
+        self.title_modified_at.unwrap_or(self.modified_at)
+    }
+    pub fn favorite_stamp(&self) -> Millis {
+        self.favorite_modified_at.unwrap_or(self.modified_at)
+    }
+    pub fn tags_stamp(&self) -> Millis {
+        self.tags_modified_at.unwrap_or(self.modified_at)
+    }
+    pub fn icon_stamp(&self) -> Millis {
+        self.icon_modified_at.unwrap_or(self.modified_at)
     }
 
     /// The first non-section field whose name equals `name` ASCII case-insensitively, if
@@ -462,6 +493,10 @@ impl fmt::Debug for Item {
             .field("tags", &self.tags)
             .field("icon", &self.icon)
             .field("created_at", &self.created_at)
+            .field("title_modified_at", &self.title_modified_at)
+            .field("favorite_modified_at", &self.favorite_modified_at)
+            .field("tags_modified_at", &self.tags_modified_at)
+            .field("icon_modified_at", &self.icon_modified_at)
             .field(
                 "fields",
                 &format_args!("[{} fields redacted]", self.fields.len()),

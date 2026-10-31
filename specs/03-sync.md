@@ -98,7 +98,7 @@ Per item id in `ours ∪ theirs`:
 | absent | present | take theirs (including tombstones) |
 | present | absent | keep ours |
 | both, one is tombstone | — | tombstone wins **if** `deleted_at ≥ other.modified_at`; otherwise the live item wins (edit after delete resurrects) |
-| both live | — | field-level merge below; metadata (title, kind, favorite, tags) taken from whichever item has the greater `modified_at`; tie → greater `device_id` bytes |
+| both live | — | field-level merge below; title, favorite, tags (as one ordered list; a reorder counts as a change) and icon are each merged by their own stamp (2026-10-31; 01 §4 per-attribute stamps): greater stamp wins, tie → greater `device_id` of the owning item, tie → greater canonical CBOR bytes of that attribute (tags as one array); `created_at` keeps the minimum; unknown extras and anything without a stamp follow whichever item has the greater `modified_at`, tie → greater `device_id` bytes, tie → item payload bytes |
 
 Field-level merge, keyed by `field.id` (2026-10-31; never by name):
 

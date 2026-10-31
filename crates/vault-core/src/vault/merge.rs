@@ -35,6 +35,7 @@
 
 use std::cmp::Ordering;
 
+use ciborium::Value;
 use uuid::Uuid;
 
 use secrecy::ExposeSecret;
@@ -286,9 +287,9 @@ fn ours_wins_metadata(ours: &Item, theirs: &Item) -> bool {
     }
 }
 
-/// Both sides live. Metadata (`title`, `favorite`, `tags`, `icon`, `extras`, `device_id`)
-/// comes from the winner per [`ours_wins_metadata`]; the icon (v1.2) is never merged at a
-/// finer grain. Fields are keyed by **id**: a field on one side only is taken; a field on
+/// Both sides live. `title`, `favorite`, `tags` (as one set) and `icon` are each merged by
+/// their own stamp ([`pick_attr`]); `extras` and `device_id` (and field order, below) come
+/// from the item winner per [`ours_wins_metadata`]. Fields are keyed by **id**: a field on one side only is taken; a field on
 /// both sides is taken whole (name, kind, kind_raw, value, section, extras) from the greater
 /// field `modified_at`, tie -> greater owning-item `device_id`, tie -> greater canonical CBOR bytes of the
 /// field (symmetric, so both devices pick the same one). Field order is
@@ -434,15 +435,50 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
     }
     attachments.sort_by(|a, b| a.added_at.cmp(&b.added_at).then_with(|| a.id.cmp(&b.id)));
 
+    // Per-attribute merge (03 §5, 01 §4 per-attribute stamps): each of title, favorite,
+    // tags (as one set) and icon follows its own effective stamp; see `pick_attr`.
+    let title = pick_attr(
+        ours,
+        theirs,
+        |i| i.title_stamp(),
+        |i| i.title_modified_at,
+        |i| Value::Text(i.title.clone()),
+    );
+    let favorite = pick_attr(
+        ours,
+        theirs,
+        |i| i.favorite_stamp(),
+        |i| i.favorite_modified_at,
+        |i| Value::Bool(i.favorite),
+    );
+    let tags = pick_attr(
+        ours,
+        theirs,
+        |i| i.tags_stamp(),
+        |i| i.tags_modified_at,
+        |i| Value::Array(i.tags.iter().map(|t| Value::Text(t.clone())).collect()),
+    );
+    let icon = pick_attr(
+        ours,
+        theirs,
+        |i| i.icon_stamp(),
+        |i| i.icon_modified_at,
+        |i| i.icon.as_ref().map_or(Value::Null, format::icon_to_value),
+    );
+
     Item {
         id: ours.id,
-        title: winner.title.clone(),
+        title: title.title.to_owned(),
         deleted_at: None,
         device_id: winner.device_id,
-        favorite: winner.favorite,
-        tags: winner.tags.clone(),
-        icon: winner.icon.clone(),
+        favorite: favorite.favorite,
+        tags: tags.tags.to_vec(),
+        icon: icon.icon.clone(),
         created_at: merge_created_at(ours.created_at, theirs.created_at),
+        title_modified_at: title.stamp,
+        favorite_modified_at: favorite.stamp,
+        tags_modified_at: tags.stamp,
+        icon_modified_at: icon.stamp,
         fields,
         history,
         attachments,
@@ -451,6 +487,58 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
         removed_fields,
         modified_at: ours.modified_at.max(theirs.modified_at),
         extras: winner.extras.clone(),
+    }
+}
+
+/// The side an attribute is taken from, with the stamp the merged item records for it.
+struct AttrPick<'a> {
+    title: &'a str,
+    favorite: bool,
+    tags: &'a [String],
+    icon: &'a Option<crate::item::ItemIcon>,
+    stamp: Option<Millis>,
+}
+
+/// Per-attribute last-writer-wins (03 §5): the greater *effective* stamp (the stored stamp,
+/// or the item's `modified_at` when the item has none) wins; tie -> greater owning-item
+/// `device_id`; tie -> greater canonical CBOR bytes of the attribute value (symmetric). The
+/// merged stamp is the winner's stored stamp; when the winner has none but the loser has
+/// one, the winner's effective stamp is materialised so the merged item's later, larger
+/// `modified_at` cannot inflate it; when neither side has one it stays `None`, so two
+/// legacy items merge exactly as before.
+fn pick_attr<'a>(
+    ours: &'a Item,
+    theirs: &'a Item,
+    effective: impl Fn(&Item) -> Millis,
+    stored: impl Fn(&Item) -> Option<Millis>,
+    value: impl Fn(&Item) -> Value,
+) -> AttrPick<'a> {
+    let take_ours = match effective(ours)
+        .cmp(&effective(theirs))
+        .then_with(|| ours.device_id.cmp(&theirs.device_id))
+    {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => {
+            format::canonical_bytes(value(ours)) >= format::canonical_bytes(value(theirs))
+        }
+    };
+    let (winner, loser) = if take_ours {
+        (ours, theirs)
+    } else {
+        (theirs, ours)
+    };
+    let stamp = match (stored(winner), stored(loser)) {
+        (Some(s), _) => Some(s),
+        (None, Some(_)) => Some(effective(winner)),
+        (None, None) => None,
+    };
+    AttrPick {
+        title: &winner.title,
+        favorite: winner.favorite,
+        tags: &winner.tags,
+        icon: &winner.icon,
+        stamp,
     }
 }
 
@@ -580,6 +668,10 @@ pub fn item_eq(a: &Item, b: &Item) -> bool {
         && a.favorite == b.favorite
         && a.tags == b.tags
         && a.icon == b.icon
+        && a.title_modified_at == b.title_modified_at
+        && a.favorite_modified_at == b.favorite_modified_at
+        && a.tags_modified_at == b.tags_modified_at
+        && a.icon_modified_at == b.icon_modified_at
         && a.modified_at == b.modified_at
         && a.extras == b.extras
         && a.fields.len() == b.fields.len()

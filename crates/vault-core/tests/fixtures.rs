@@ -62,6 +62,11 @@
 //! entry with `field_id`; the other is a plain note. Stamped header (created at version 2),
 //! no legacy `kind` extra. Password `correct horse battery staple` (`PASSWORD`), KDF
 //! `KdfParams::for_tests()`. Built by `regenerate_v2_basic_fixture`.
+//!
+//! `v2-meta.vault` (01 §4 per-attribute stamps, 2026-10-31, optional keys) holds one item
+//! whose title, favorite, tags and icon were each edited at a distinct stamp (all four
+//! `*_modified_at` keys present) and one item without any of the keys (the pre-stamp
+//! shape). Same password and KDF. Built by `regenerate_v2_meta_fixture`.
 
 use std::io::Cursor;
 
@@ -133,6 +138,11 @@ const V2_PASSWORD: [u8; 16] = [0x24; 16];
 const V2_PIN: [u8; 16] = [0x25; 16];
 const V2_NOTES: [u8; 16] = [0x26; 16];
 const V2_AT: u64 = T0 + 80;
+
+/// `v2-meta.vault`: one item with all four per-attribute stamps, one without any.
+const V2M_STAMPED_ID: [u8; 16] = [0x11; 16];
+const V2M_LEGACY_ID: [u8; 16] = [0x12; 16];
+const V2M_AT: u64 = T0 + 90;
 
 /// Every `v1-*.vault` is frozen (see the module docs): `new_vault()` creates a version 2
 /// vault now, so a v1 regenerator must never run again. Each one calls this first.
@@ -788,6 +798,111 @@ fn v2_basic_opens_with_ids_duplicates_empty_name_marker_and_history_id() {
     assert_eq!(d2.removed_fields, dupes.removed_fields);
 }
 
+/// Builds `v2-meta.vault` (01 §4 per-attribute stamps, 2026-10-31): item 0x11 has its
+/// title, favorite, tags and icon each edited at a distinct later stamp; item 0x12 was
+/// inserted and then had its four stamps cleared through `update` (the shape of an item
+/// written before the keys existed).
+#[test]
+#[ignore]
+fn regenerate_v2_meta_fixture() {
+    let mut vault = new_vault();
+    let mut stamped = Item::new("Stamped attributes", device(), V2M_AT);
+    stamped.id = Uuid::from_bytes(V2M_STAMPED_ID);
+    stamped.tags = vec!["login".into()];
+    stamped.fields = vec![field(
+        "username",
+        FieldKind::Text,
+        "someone@example.com",
+        V2M_AT,
+    )];
+    let id = vault.insert(stamped, V2M_AT);
+    vault
+        .update(id, V2M_AT + 1, |i| i.title = "Renamed".into())
+        .unwrap();
+    vault.update(id, V2M_AT + 2, |i| i.favorite = true).unwrap();
+    vault
+        .update(id, V2M_AT + 3, |i| i.tags.push("work".into()))
+        .unwrap();
+    vault
+        .update(id, V2M_AT + 4, |i| i.icon = Some(icon_logo()))
+        .unwrap();
+
+    let mut legacy = Item::new("No attribute stamps", device(), V2M_AT);
+    legacy.id = Uuid::from_bytes(V2M_LEGACY_ID);
+    legacy.tags = vec!["note".into()];
+    legacy.fields = vec![field("notes", FieldKind::Notes, "pre-stamp shape", V2M_AT)];
+    let id = vault.insert(legacy, V2M_AT);
+    vault
+        .update(id, V2M_AT, |i| {
+            i.title_modified_at = None;
+            i.favorite_modified_at = None;
+            i.tags_modified_at = None;
+            i.icon_modified_at = None;
+        })
+        .unwrap();
+    std::fs::write(format!("{FIXTURE_DIR}/v2-meta.vault"), vault.serialize()).unwrap();
+}
+
+#[test]
+fn v2_meta_opens_with_and_without_attribute_stamps() {
+    let bytes = std::fs::read(format!("{FIXTURE_DIR}/v2-meta.vault")).unwrap();
+    assert_eq!(&bytes[4..6], &[0, 2]);
+    let locked = LockedVault::parse(&bytes).unwrap();
+    check_kdf(&locked);
+    let vault = locked.unlock(&pw()).unwrap();
+    assert_eq!(vault.items().count(), 2);
+
+    let s = vault.get(Uuid::from_bytes(V2M_STAMPED_ID)).unwrap();
+    assert_eq!(s.title, "Renamed");
+    assert!(s.favorite);
+    assert_eq!(s.tags, ["login", "work"]);
+    assert_eq!(s.icon, Some(icon_logo()));
+    assert_eq!(s.title_modified_at, Some(V2M_AT + 1));
+    assert_eq!(s.favorite_modified_at, Some(V2M_AT + 2));
+    assert_eq!(s.tags_modified_at, Some(V2M_AT + 3));
+    assert_eq!(s.icon_modified_at, Some(V2M_AT + 4));
+    assert_eq!(s.modified_at, V2M_AT + 4);
+    assert_eq!(
+        s.fields[0].modified_at, V2M_AT,
+        "fields untouched by attribute edits"
+    );
+
+    let l = vault.get(Uuid::from_bytes(V2M_LEGACY_ID)).unwrap();
+    assert_eq!(l.title, "No attribute stamps");
+    assert_eq!(
+        (
+            l.title_modified_at,
+            l.favorite_modified_at,
+            l.tags_modified_at,
+            l.icon_modified_at
+        ),
+        (None, None, None, None),
+        "no keys on disk read as None"
+    );
+    assert_eq!(
+        l.title_stamp(),
+        l.modified_at,
+        "effective stamp = item stamp"
+    );
+    assert_eq!(
+        l.modified_at,
+        V2M_AT + 1,
+        "the clearing update restamped it"
+    );
+
+    // A save keeps both shapes exactly.
+    let again = LockedVault::parse(&vault.serialize())
+        .unwrap()
+        .unlock(&pw())
+        .unwrap();
+    let s2 = again.get(Uuid::from_bytes(V2M_STAMPED_ID)).unwrap();
+    assert_eq!(s2.icon_modified_at, Some(V2M_AT + 4));
+    assert_eq!(s2.title_modified_at, Some(V2M_AT + 1));
+    let l2 = again.get(Uuid::from_bytes(V2M_LEGACY_ID)).unwrap();
+    assert_eq!(l2.title_modified_at, None);
+    assert_eq!(l2.tags_modified_at, None);
+}
+
 fn check_kdf(locked: &LockedVault) {
     let k = locked.kdf_params();
     assert_eq!((k.m_cost_kib, k.t_cost, k.p_cost), (8192, 1, 1));
@@ -1044,8 +1159,8 @@ fn every_fixture_in_the_directory_opens() {
         .collect();
     names.sort();
     assert!(
-        names.len() >= 8,
-        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-icon, v1-meta, v1-stamped, v2-basic; found {names:?}"
+        names.len() >= 9,
+        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-icon, v1-meta, v1-stamped, v2-basic, v2-meta; found {names:?}"
     );
     assert!(names.iter().any(|n| n.starts_with("v1-")));
     assert!(names.iter().any(|n| n.starts_with("v2-")));
@@ -1054,7 +1169,11 @@ fn every_fixture_in_the_directory_opens() {
     let post_removal = |name: &str| {
         matches!(
             name,
-            "v1-stamped.vault" | "v1-icon.vault" | "v1-meta.vault" | "v2-basic.vault"
+            "v1-stamped.vault"
+                | "v1-icon.vault"
+                | "v1-meta.vault"
+                | "v2-basic.vault"
+                | "v2-meta.vault"
         )
     };
     for name in &names {

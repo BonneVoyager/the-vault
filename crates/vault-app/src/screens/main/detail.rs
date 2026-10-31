@@ -378,10 +378,9 @@ impl MainScreen {
             .filter(|t| t.place == ToastPlace::Detail)
             .map(|t| t.message.clone());
 
-        // Selecting another item fades the column in (05 §5). Entering or leaving edit
-        // mode does not: keying on the mode replayed the fade from transparent (a blink).
-        let motion_key = s.selection.map_or(0, |id| id.as_u128() as usize);
-        let reduce_motion = s.reduce_motion || s.selection.is_none();
+        // No fade on a selection change or on Edit/Cancel (owner 2026-10-31): the new
+        // content paints on the next frame. A fade keyed on the selection (or the mode)
+        // showed as a blink.
         let content: AnyElement = match s.shown_item() {
             // Edit mode and onboarding are controls throughout, including in the band.
             _ if s.is_editing() => ui::no_window_drag(div().size_full())
@@ -448,17 +447,14 @@ impl MainScreen {
                     .into_iter()
                     .map(|b| ui::no_window_drag(div()).child(b)),
             )
-            .child(ui::panel_in(
+            .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .child(content)
                     // Records this content's identity per frame (tests only).
                     .children(ui::test_probe("detail-content-probe")),
-                ("detail-in", motion_key),
-                0.,
-                reduce_motion,
-            ))
+            )
             .when_some(toast, |col, message| {
                 col.child(ui::detail_copy_feedback(message, cx))
             })

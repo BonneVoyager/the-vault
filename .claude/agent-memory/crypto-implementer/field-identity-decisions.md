@@ -99,3 +99,18 @@ only path that changes `format_version`.
   `merge_live` and drops (oldest first) only markers whose field is absent on BOTH input
   sides, leaving the list over the cap otherwise. Residual limit: a third device that never
   saw a capped-away marker can resurrect that field. `removed_attachments` keeps its plain cap.
+
+**PA-1 per-attribute stamps (2026-10-31, owner-approved):** `Item.{title,favorite,tags,icon}_modified_at:
+Option<Millis>`, optional item keys written only when Some (canonical order after
+`removed_history`: icon_, tags_, title_, then removed_attachments, favorite_modified_at),
+null/missing -> None, bad -> Malformed. `Item::new` -> None; `try_insert` fills unset ones
+with the FINAL item stamp; `update` stamps a changed attribute `stamp(now, prev effective)`
+(effective = stored or item.modified_at via `Item::*_stamp()`), tags compared as one Vec
+(order counts); `restamp` PINS unset stamps at the pre-mutation item stamp on EVERY
+mutation (otherwise a field edit inflates a legacy item's attributes and beats a peer's real
+rename, the QA u06 shape); an explicit `Some -> None` clear inside `update`'s closure is
+kept (the only way to build a legacy-shaped item; `v2-meta.vault` item 0x12 uses it).
+Merge `pick_attr`: effective stamp, device id, canonical CBOR bytes of the attribute; merged
+stamp = winner's stored stamp, or Some(winner effective) when only the loser had one, None
+when neither (legacy/legacy merges exactly as before: item winner wholesale). `item_eq`
+compares the four. QA u06/u06b now need the opposite expectation (title AND favorite survive).
