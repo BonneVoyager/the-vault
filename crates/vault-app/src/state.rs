@@ -215,6 +215,10 @@ pub struct Settings {
     pub text_size: TextSize,
     /// The first-run tips card was dismissed.
     pub onboarding_dismissed: bool,
+    /// The main window's sidebar is collapsed (⌃⌘S). Per app, not per vault; the
+    /// default (missing key) is expanded. An unknown value falls back to the default alone.
+    #[serde(deserialize_with = "lenient")]
+    pub sidebar_hidden: bool,
 }
 
 /// Deserializes `T`, or its default if the value does not parse: one bad key in a
@@ -316,6 +320,7 @@ impl Default for Settings {
             appearance: Appearance::System,
             text_size: TextSize::Default,
             onboarding_dismissed: false,
+            sidebar_hidden: false,
         }
     }
 }
@@ -347,8 +352,8 @@ pub struct AppState {
     pub revealed: HashSet<String>,
     /// Password history disclosure of the selected item.
     pub history_open: bool,
-    pub sidebar_visible: bool,
-    /// Bumped on every sidebar toggle; keys its slide-in.
+    /// Bumped on every sidebar toggle; keys its slide. Visibility itself is
+    /// `settings.sidebar_hidden`, see [`AppState::sidebar_visible`].
     pub sidebar_toggles: usize,
     pub tags_open: bool,
     /// Focus move requested by a global action; the main screen applies and clears it.
@@ -465,7 +470,6 @@ impl AppState {
             listing_version: 0,
             revealed: HashSet::new(),
             history_open: false,
-            sidebar_visible: true,
             sidebar_toggles: 0,
             tags_open: true,
             focus_request: None,
@@ -565,7 +569,7 @@ impl AppState {
         }
     }
 
-    /// ⌘, and the sidebar's Settings row.
+    /// ⌘, and the app menu's "Settings…" item (the sidebar has no Settings row).
     /// Always notifies on open, so the root re-checks the dialog even if the flag is stale.
     pub fn open_settings(&mut self, open: bool, cx: &mut Context<Self>) {
         if open && !self.settings_open {

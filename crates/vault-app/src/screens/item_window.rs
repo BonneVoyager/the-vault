@@ -18,8 +18,42 @@ use super::main::detail::{DetailAction, DetailActions, ReadDetail};
 use crate::state::{AppState, CopyTarget, parse_totp};
 use crate::{text, theme, ui};
 
-/// Window title. Fixed, so the item's name never reaches Mission Control or the Window menu.
-const TITLE: &str = "Item details";
+/// Longest window title, in characters (an ellipsis included), so a huge item title
+/// cannot stretch the title bar or the Window menu.
+const TITLE_MAX_CHARS: usize = 120;
+/// Window title for an item whose title is blank.
+const UNTITLED: &str = "Untitled";
+
+/// The window title for an item titled `title` (owner decision 2026-10-31: the item's
+/// name, following renames): trimmed, control characters (newlines, tabs) shown as
+/// spaces, "Untitled" when blank, cut to [`TITLE_MAX_CHARS`] with a trailing ellipsis.
+fn window_title_for(title: &str) -> String {
+    let clean: String = title
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let clean = clean.trim();
+    if clean.is_empty() {
+        return UNTITLED.to_owned();
+    }
+    if clean.chars().count() <= TITLE_MAX_CHARS {
+        return clean.to_owned();
+    }
+    let mut cut: String = clean.chars().take(TITLE_MAX_CHARS - 1).collect();
+    cut.truncate(cut.trim_end().len());
+    cut.push('\u{2026}');
+    cut
+}
+
+/// The window title for item `id` as it is now in `s`.
+fn item_title(s: &AppState, id: Uuid) -> String {
+    let title = s
+        .unlocked_vault()
+        .and_then(|vault| vault.get(id))
+        .map_or("", |item| item.title.as_str());
+    window_title_for(title)
+}
 
 /// Opens the window pinned to `id`, or brings its existing window to the front.
 pub fn open_item_window(
@@ -31,6 +65,7 @@ pub fn open_item_window(
         handle.update(cx, |_, window, _| window.activate_window())?;
         return Ok(handle);
     }
+    let title = item_title(state.read(cx), id);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
@@ -39,7 +74,7 @@ pub fn open_item_window(
         ))),
         window_min_size: Some(size(px(360.), px(360.))),
         titlebar: Some(TitlebarOptions {
-            title: Some(TITLE.into()),
+            title: Some(title.clone().into()),
             ..Default::default()
         }),
         ..Default::default()
@@ -47,9 +82,9 @@ pub fn open_item_window(
     let view_state = state.clone();
     let handle: AnyWindowHandle = cx
         .open_window(options, |window, cx| {
-            window.set_window_title(TITLE);
+            window.set_window_title(&title);
             theme::apply(window, cx);
-            let view = cx.new(|cx| ItemWindow::new(view_state, id, window, cx));
+            let view = cx.new(|cx| ItemWindow::new(view_state, id, title, window, cx));
             cx.new(|cx| Root::new(view, window, cx))
         })?
         .into();
@@ -76,11 +111,19 @@ struct ItemWindow {
     status: Option<String>,
     /// Re-renders every wall-clock second; only while the item has a TOTP field.
     ticker: Option<Task<()>>,
+    /// The window title last set (the item's title, see [`window_title_for`]).
+    title: String,
     _subscription: Subscription,
 }
 
 impl ItemWindow {
-    fn new(state: Entity<AppState>, id: Uuid, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        state: Entity<AppState>,
+        id: Uuid,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let subscription = cx.observe_in(&state, window, move |this, state, window, cx| {
             let s = state.read(cx);
             let exists = s
@@ -90,6 +133,12 @@ impl ItemWindow {
             if !s.main_active() || !exists {
                 window.remove_window();
             } else {
+                // A rename (here or merged from another device) retitles the window.
+                let title = item_title(s, id);
+                if title != this.title {
+                    window.set_window_title(&title);
+                    this.title = title;
+                }
                 this.sync_ticker(cx);
                 cx.notify();
             }
@@ -102,6 +151,7 @@ impl ItemWindow {
             status_clear: None,
             status: None,
             ticker: None,
+            title,
             _subscription: subscription,
         };
         this.sync_ticker(cx);
@@ -355,6 +405,63 @@ mod tests {
         assert!(vcx.debug_bounds("reference-attachment icon.png").is_none());
     }
 
+    fn title_of(handle: AnyWindowHandle, cx: &mut TestAppContext) -> Option<String> {
+        gpui::VisualTestContext::from_window(handle, cx).window_title()
+    }
+
+    fn rename(state: &Entity<AppState>, id: Uuid, title: &str, cx: &mut TestAppContext) {
+        let title = title.to_owned();
+        state.update(cx, |s, cx| {
+            s.vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| v.update(id, 20, move |it| it.title = title))
+                .unwrap()
+                .unwrap();
+            s.vault_changed();
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn title_follows_renames_live(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, _) = setup(dir.path(), cx);
+        let handle = open(&state, plain, cx);
+        assert_eq!(title_of(handle, cx).as_deref(), Some("Plain"));
+        rename(&state, plain, "  Bank of Mars \n login ", cx);
+        assert_eq!(
+            title_of(handle, cx).as_deref(),
+            Some("Bank of Mars   login"),
+            "trimmed, newline shown as a space"
+        );
+        // A huge title is cut to 120 characters, ellipsis included.
+        rename(&state, plain, &"é".repeat(500), cx);
+        let long = title_of(handle, cx).unwrap();
+        assert_eq!(long.chars().count(), TITLE_MAX_CHARS);
+        assert!(long.ends_with('\u{2026}'));
+    }
+
+    #[gpui::test]
+    fn blank_title_shows_untitled(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, _) = setup(dir.path(), cx);
+        rename(&state, plain, "   ", cx);
+        let handle = open(&state, plain, cx);
+        assert_eq!(title_of(handle, cx).as_deref(), Some(UNTITLED));
+        rename(&state, plain, "Back again", cx);
+        assert_eq!(title_of(handle, cx).as_deref(), Some("Back again"));
+        rename(&state, plain, "", cx);
+        assert_eq!(title_of(handle, cx).as_deref(), Some(UNTITLED));
+        assert_eq!(window_title_for("\t\n"), UNTITLED);
+        assert_eq!(
+            window_title_for(&"a".repeat(120)),
+            "a".repeat(120),
+            "120 fits"
+        );
+    }
+
     #[gpui::test]
     fn second_open_focuses_the_existing_window(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -378,8 +485,8 @@ mod tests {
         let title = gpui::VisualTestContext::from_window(first, cx).window_title();
         assert_eq!(
             title.as_deref(),
-            Some(TITLE),
-            "the item name stays out of the title"
+            Some("Plain"),
+            "titled with the item's name"
         );
 
         // Closed by the user, then reopened: a fresh window, the dead handle forgotten.

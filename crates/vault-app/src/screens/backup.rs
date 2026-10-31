@@ -364,37 +364,30 @@ impl BackupWindow {
                     cx.notify();
                 }))
             });
-            ui::v_flex()
-                .py(px(8.))
-                .border_b_1()
-                .border_color(theme.border)
-                .child(ui::muted(field.name.clone(), cx).text_xs())
-                .child(
-                    ui::h_flex()
-                        .gap(px(4.))
-                        .child(
-                            div()
-                                // Records only whether the value is hidden, never the value.
-                                .debug_selector(move || {
-                                    format!(
-                                        "backup-value {ix} {}",
-                                        if masked { "masked" } else { "shown" }
-                                    )
-                                })
-                                .flex_1()
-                                .min_w_0()
-                                .font_family(theme.mono_font_family.clone())
-                                .text_sm()
-                                .whitespace_normal()
-                                .child(shown),
-                        )
-                        .children(reveal)
-                        .child(
-                            ui::icon_button(("backup-copy", ix), IconName::Copy, "Copy").on_click(
-                                cx.listener(move |this, _, _, cx| this.copy_field(ix, cx)),
-                            ),
-                        ),
-                )
+            let value = div()
+                // Records only whether the value is hidden, never the value.
+                .debug_selector(move || {
+                    format!(
+                        "backup-value {ix} {}",
+                        if masked { "masked" } else { "shown" }
+                    )
+                })
+                .flex_1()
+                .min_w_0()
+                .pt(px(3.))
+                .font_family(theme.mono_font_family.clone())
+                .text_sm()
+                .whitespace_normal()
+                .child(shown);
+            let mut buttons: Vec<AnyElement> =
+                reveal.into_iter().map(|b| b.into_any_element()).collect();
+            buttons.push(
+                ui::icon_button(("backup-copy", ix), IconName::Copy, "Copy")
+                    .on_click(cx.listener(move |this, _, _, cx| this.copy_field(ix, cx)))
+                    .into_any_element(),
+            );
+            // The same row as the main detail and item windows.
+            super::main::detail::field_row(ix, field.name.clone().into(), value, buttons, cx)
         });
         let live = self.state.read(cx).main_active();
         ui::v_flex()
@@ -606,6 +599,18 @@ mod tests {
             vcx.debug_bounds("backup-value 1 shown").is_some(),
             "Reveal works"
         );
+        // The shared field row: label beside the value, 7 px padding like the detail.
+        let row = vcx.debug_bounds("field-row 0").expect("shared row");
+        let label = vcx.debug_bounds("field-label 0").unwrap();
+        let content = vcx.debug_bounds("field-content 0").unwrap();
+        assert_eq!(
+            content.top() - row.top(),
+            px(crate::screens::main::detail::FIELD_ROW_PAD_Y)
+        );
+        assert!(label.right() < content.left(), "label beside its value");
+        // Stored "user" and "pin": shown with a capital, like the main detail.
+        assert!(vcx.debug_bounds("field-label-text 0 User").is_some());
+        assert!(vcx.debug_bounds("field-label-text 1 Pin").is_some());
     }
 
     #[gpui::test]

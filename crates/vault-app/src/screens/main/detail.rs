@@ -136,6 +136,75 @@ fn copy_on_click(
         .child(shown)
 }
 
+/// Top and bottom padding of a field row (owner 2026-10-31: was 12 px in the detail
+/// column and item window, 8 px in the backup viewer; now 7 px everywhere).
+pub(crate) const FIELD_ROW_PAD_Y: f32 = 7.;
+
+/// Label and value text colours of a field row, Apple Passwords style (owner
+/// 2026-10-31): the label in the foreground colour, the value (revealed or masked
+/// secrets and notes included) in the muted foreground. Links, the urgent one-time
+/// code and the copy/reveal buttons keep their own colours.
+pub(crate) fn field_row_colors(cx: &App) -> (gpui::Hsla, gpui::Hsla) {
+    let theme = cx.theme();
+    (theme.foreground, theme.muted_foreground)
+}
+
+/// One field row, shared by the detail column, item windows and the backup viewer: the
+/// label column, then the value (filling the width) and its buttons.
+pub(crate) fn field_row(
+    ix: usize,
+    label: SharedString,
+    value: impl IntoElement,
+    buttons: Vec<AnyElement>,
+    cx: &App,
+) -> gpui::Div {
+    let theme = cx.theme();
+    let (label_color, value_color) = field_row_colors(cx);
+    ui::h_flex()
+        .debug_selector(move || format!("field-row {ix}"))
+        .w_full()
+        .items_start()
+        .py(px(FIELD_ROW_PAD_Y))
+        .gap(px(16.))
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .debug_selector(move || format!("field-label {ix}"))
+                .w(relative(0.26))
+                .min_w(px(80.))
+                .max_w(px(140.))
+                .flex_shrink_0()
+                .pt(px(3.))
+                .whitespace_normal()
+                .text_color(label_color)
+                // Display only: the stored name keeps its spelling ("username" shows
+                // "Username"; the editor's name inputs show it as stored).
+                .child({
+                    let shown = text::capitalize_first(&label);
+                    let selector = format!("field-label-text {ix} {shown}");
+                    div().debug_selector(move || selector.clone()).child(shown)
+                }),
+        )
+        .child(
+            ui::h_flex()
+                .debug_selector(move || format!("field-content {ix}"))
+                .flex_1()
+                .min_w_0()
+                .items_start()
+                .gap(px(4.))
+                .min_h(px(28.))
+                .child(
+                    ui::h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(value_color)
+                        .child(value),
+                )
+                .child(ui::h_flex().flex_none().gap(px(4.)).children(buttons)),
+        )
+}
+
 /// Value text in the monospace font (passwords, codes, card numbers).
 fn mono(text: impl Into<SharedString>, cx: &App) -> gpui::Div {
     div()
@@ -264,9 +333,9 @@ impl MainScreen {
             .filter(|t| t.place == ToastPlace::Detail)
             .map(|t| t.message.clone());
 
-        // Selecting another item (or entering edit mode) fades the column in (05 §5).
-        let motion_key =
-            s.selection.map_or(0, |id| id.as_u128() as usize) ^ usize::from(s.is_editing());
+        // Selecting another item fades the column in (05 §5). Entering or leaving edit
+        // mode does not: keying on the mode replayed the fade from transparent (a blink).
+        let motion_key = s.selection.map_or(0, |id| id.as_u128() as usize);
         let reduce_motion = s.reduce_motion || s.selection.is_none();
         let content: AnyElement = match s.shown_item() {
             // Edit mode and onboarding are controls throughout, including in the band.
@@ -335,7 +404,12 @@ impl MainScreen {
                     .map(|b| ui::no_window_drag(div()).child(b)),
             )
             .child(ui::panel_in(
-                div().flex_1().min_h_0().child(content),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(content)
+                    // Records this content's identity per frame (tests only).
+                    .children(ui::test_probe("detail-content-probe")),
                 ("detail-in", motion_key),
                 0.,
                 reduce_motion,
@@ -498,15 +572,21 @@ impl ReadDetail<'_> {
                     .iter()
                     .map(|issue| ui::no_window_drag(div()).child(issue_banner(issue, cx))),
             )
-            .child(ui::divider(cx))
-            // Every field row (and the history disclosure) draws its own bottom border, so
-            // the last row's border already closes the group above the footer. Only the
-            // no-fields message needs a rule of its own.
-            .when(item.fields.is_empty(), |col| {
-                col.child(ui::muted("This item has no fields.", cx))
-                    .child(ui::divider(cx))
-            })
-            .child(ui::no_window_drag(ui::v_flex()).children(fields))
+            // The rule and the rows form one group without the column's gap, so the
+            // first row sits under the rule exactly as each row sits under the one above:
+            // only its own `FIELD_ROW_PAD_Y` top padding. Every field row (and the history
+            // disclosure) draws its own bottom border, so the last row's border already
+            // closes the group above the footer. Only the no-fields message needs a rule
+            // of its own.
+            .child(
+                ui::v_flex()
+                    .child(ui::divider(cx).debug_selector(|| "detail-fields-rule".into()))
+                    .when(item.fields.is_empty(), |col| {
+                        col.child(ui::muted("This item has no fields.", cx).py(px(FIELD_ROW_PAD_Y)))
+                            .child(ui::divider(cx))
+                    })
+                    .child(ui::no_window_drag(ui::v_flex()).children(fields)),
+            )
             .children(
                 (if self.standalone {
                     attachments::reference_section(s, item, cx)
@@ -580,7 +660,6 @@ impl ReadDetail<'_> {
                 } else {
                     mono(text::DOTS, cx)
                         .debug_selector(move || format!("field-masked {ix}"))
-                        .text_color(theme.muted_foreground)
                         .into_any_element()
                 }
             }
@@ -619,38 +698,14 @@ impl ReadDetail<'_> {
             .into_any_element(),
         );
 
-        ui::h_flex()
-            .debug_selector(move || format!("field-row {ix}"))
-            .w_full()
-            .items_start()
-            .py(px(12.))
-            .gap(px(16.))
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .debug_selector(move || format!("field-label {ix}"))
-                    .w(relative(0.26))
-                    .min_w(px(80.))
-                    .max_w(px(140.))
-                    .flex_shrink_0()
-                    .pt(px(3.))
-                    .whitespace_normal()
-                    .text_color(theme.muted_foreground)
-                    .child(field.name.clone()),
-            )
-            .child(
-                ui::h_flex()
-                    .debug_selector(move || format!("field-content {ix}"))
-                    .flex_1()
-                    .min_w_0()
-                    .items_start()
-                    .gap(px(4.))
-                    .min_h(px(28.))
-                    .child(copy_on_click(ix, &field.name, shown, &self.actions, cx))
-                    .child(ui::h_flex().flex_none().gap(px(4.)).children(buttons)),
-            )
-            .into_any_element()
+        field_row(
+            ix,
+            field.name.clone().into(),
+            copy_on_click(ix, &field.name, shown, &self.actions, cx),
+            buttons,
+            cx,
+        )
+        .into_any_element()
     }
 
     fn render_totp(&self, ix: usize, field: &Field, now_ms: u64, cx: &App) -> AnyElement {

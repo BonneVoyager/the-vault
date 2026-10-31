@@ -50,28 +50,31 @@ impl Template {
         }
     }
 
-    /// Preset fields: (name, kind), all starting empty.
+    /// Preset fields: (name, kind), all starting empty. Names are natural English labels
+    /// (orchestrator decision 2026-10-31): "Website" for the URL field, "CVV", "First
+    /// name". Nothing looks a field up by these names case-sensitively, and the URL
+    /// field is found by its kind.
     pub fn fields(self) -> &'static [(&'static str, FieldKind)] {
         match self {
             Template::Login => &[
-                ("username", FieldKind::Text),
-                ("password", FieldKind::Password),
-                ("url", FieldKind::Url),
-                ("notes", FieldKind::Notes),
+                ("Username", FieldKind::Text),
+                ("Password", FieldKind::Password),
+                ("Website", FieldKind::Url),
+                ("Notes", FieldKind::Notes),
             ],
-            Template::Note => &[("notes", FieldKind::Notes)],
+            Template::Note => &[("Notes", FieldKind::Notes)],
             Template::Card => &[
-                ("number", FieldKind::Text),
-                ("expiry", FieldKind::MonthYear),
-                ("cvv", FieldKind::Password),
-                ("name", FieldKind::Text),
+                ("Number", FieldKind::Text),
+                ("Expiry", FieldKind::MonthYear),
+                ("CVV", FieldKind::Password),
+                ("Name", FieldKind::Text),
             ],
             Template::Identity => &[
-                ("first name", FieldKind::Text),
-                ("last name", FieldKind::Text),
-                ("email", FieldKind::Email),
-                ("phone", FieldKind::Text),
-                ("address", FieldKind::Notes),
+                ("First name", FieldKind::Text),
+                ("Last name", FieldKind::Text),
+                ("Email", FieldKind::Email),
+                ("Phone", FieldKind::Text),
+                ("Address", FieldKind::Notes),
             ],
         }
     }
@@ -171,10 +174,34 @@ mod tests {
         }
         let card = Template::Card.new_item("Visa", Uuid::new_v4(), 1);
         assert!(is_card(&card));
-        assert_eq!(card.fields[0].name, "number");
+        assert_eq!(card.fields[0].name, "Number");
+        // The label table: natural English labels, each starting with a capital.
+        let names = |t: Template| t.fields().iter().map(|(n, _)| *n).collect::<Vec<_>>();
+        assert_eq!(
+            names(Template::Login),
+            ["Username", "Password", "Website", "Notes"]
+        );
+        assert_eq!(names(Template::Note), ["Notes"]);
+        assert_eq!(names(Template::Card), ["Number", "Expiry", "CVV", "Name"]);
+        assert_eq!(
+            names(Template::Identity),
+            ["First name", "Last name", "Email", "Phone", "Address"]
+        );
+        for t in Template::ALL {
+            for (name, _) in t.fields() {
+                assert_eq!(*name, crate::text::capitalize_first(name), "{name}");
+            }
+        }
+        // The website is found by kind, whatever its label.
+        let mut login = Template::Login.new_item("x", Uuid::new_v4(), 1);
+        login.fields[2].value = SecretString::new("https://github.com".into());
+        assert!(matches!(
+            crate::icon::automatic(&login),
+            crate::icon::IconSpec::Logo { slug: "github", .. }
+        ));
         assert_eq!(card.fields[1].kind, FieldKind::MonthYear);
         let id = Template::Identity.new_item("Me", Uuid::new_v4(), 1);
-        assert_eq!(id.field("phone").map(|f| f.kind), Some(FieldKind::Text));
+        assert_eq!(id.field("Phone").map(|f| f.kind), Some(FieldKind::Text));
         assert!(
             Template::ALL
                 .iter()

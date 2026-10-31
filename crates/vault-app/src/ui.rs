@@ -28,6 +28,48 @@ use crate::persist::WindowState;
 /// Default and minimum main window size (specs/05-ui.md §1).
 const MAIN_DEFAULT: (f32, f32) = (1100., 720.);
 const MAIN_MIN: (f32, f32) = (820., 520.);
+/// How much narrower the main window may get while the sidebar is collapsed: the
+/// sidebar's default width (05 §1).
+const SIDEBAR_MIN_DROP: f32 = 220.;
+
+/// Main window minimum size for a sidebar state: 820 x 520 expanded, 600 x 520
+/// collapsed.
+pub fn main_min_size(sidebar_visible: bool) -> (f32, f32) {
+    if sidebar_visible {
+        MAIN_MIN
+    } else {
+        (MAIN_MIN.0 - SIDEBAR_MIN_DROP, MAIN_MIN.1)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The last size `apply_main_min_size` asked for, on this thread (tests only).
+    static LAST_MIN_SIZE: Cell<Option<(f32, f32)>> = const { Cell::new(None) };
+}
+
+/// The minimum size the last `apply_main_min_size` on this thread asked for.
+#[cfg(test)]
+pub fn last_main_min_size() -> Option<(f32, f32)> {
+    LAST_MIN_SIZE.get()
+}
+
+/// The single hook for the main window's minimum size: called on every sidebar toggle
+/// and once at launch when the persisted sidebar state is collapsed. gpui only sets a
+/// window's minimum at creation, so this goes through AppKit.
+///
+/// Uses vault-macos's key-window variant: the per-view variant is an `unsafe fn`, and
+/// vault-app has no `unsafe`. The toggle only runs while the main window is active
+/// (`actions::on_main`), so the key window is the main window. Off the main thread, with
+/// no key window, or in tests nothing is updated, which is harmless.
+pub fn apply_main_min_size(sidebar_visible: bool) {
+    let (width, height) = main_min_size(sidebar_visible);
+    #[cfg(test)]
+    LAST_MIN_SIZE.set(Some((width, height)));
+    if !vault_macos::set_key_window_min_content_size(f64::from(width), f64::from(height)) {
+        log::debug!("main window minimum size {width}x{height}: no key window updated");
+    }
+}
 /// Traffic-light inset from the window's top-left corner.
 const TRAFFIC_LIGHTS: (f32, f32) = (16., 16.);
 /// Height of one macOS traffic-light button.
@@ -49,6 +91,22 @@ pub const SEARCH_TOP: f32 = (TOP_BAND_HEIGHT - SEARCH_HEIGHT) / 2.;
 /// Left and right padding of the list's search row and the detail column, so the
 /// columns' content starts on the same inset.
 pub const COLUMN_PAD_X: f32 = 16.;
+/// Right edge of the traffic lights: three buttons on AppKit's 20 px pitch
+/// (14 px button, 6 px gap) from the inset.
+pub const TRAFFIC_LIGHTS_RIGHT: f32 = TRAFFIC_LIGHTS.0 + 2. * 20. + TRAFFIC_LIGHT_SIZE;
+/// Left padding of the list's search row while the sidebar is collapsed: past the
+/// traffic lights with the gap Finder leaves before its first toolbar button.
+pub const COLLAPSED_PAD_X: f32 = TRAFFIC_LIGHTS_RIGHT + 12.;
+
+/// Left padding of the list's search row with `sidebar_width` px of sidebar to its
+/// left: the column inset, or more while the traffic lights would overlap the row.
+pub fn list_header_pad_left(sidebar_width: f32) -> f32 {
+    (COLLAPSED_PAD_X - sidebar_width).max(COLUMN_PAD_X)
+}
+
+/// Sidebar slide on ⌃⌘S (05 §5: 120-180 ms ease-out panel motion).
+pub const SIDEBAR_MOTION: std::time::Duration = std::time::Duration::from_millis(180);
+
 /// Height of the sidebar and list footers, including their 1 px top divider. Scaled with
 /// the text size (`theme::scaled`) in both columns so they always match.
 pub const FOOTER_HEIGHT: f32 = 44.;
@@ -69,16 +127,21 @@ pub fn content_top(s: &crate::state::AppState) -> f32 {
 
 /// Window options for the main window: restored or centred, hidden title, transparent titlebar.
 pub fn main_window_options(restore: Option<WindowState>, cx: &App) -> WindowOptions {
+    window_options(restore, MAIN_MIN, cx)
+}
+
+/// [`main_window_options`] with minimum size `min`, which also clamps restored bounds.
+fn window_options(restore: Option<WindowState>, min: (f32, f32), cx: &App) -> WindowOptions {
     let bounds = match restore {
         Some(s) => Bounds::new(
             point(px(s.x), px(s.y)),
-            size(px(s.width.max(MAIN_MIN.0)), px(s.height.max(MAIN_MIN.1))),
+            size(px(s.width.max(min.0)), px(s.height.max(min.1))),
         ),
         None => Bounds::centered(None, size(px(MAIN_DEFAULT.0), px(MAIN_DEFAULT.1)), cx),
     };
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        window_min_size: Some(size(px(MAIN_MIN.0), px(MAIN_MIN.1))),
+        window_min_size: Some(size(px(min.0), px(min.1))),
         titlebar: Some(TitlebarOptions {
             title: None,
             appears_transparent: true,
@@ -159,12 +222,15 @@ pub fn window_moves() -> usize {
 /// Opens the main window with `build` as content, wrapped in gpui-component's `Root`.
 ///
 /// `Root` hosts dialogs, sheets and notifications, so every window needs it on top.
+/// The minimum size (and the clamp on restored bounds) follows the persisted sidebar
+/// state, so a narrow window saved while collapsed is not widened at launch.
 pub fn open_main_window<V: Render>(
     restore: Option<WindowState>,
+    sidebar_visible: bool,
     cx: &mut App,
     build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
 ) -> Result<WindowHandle<Root>> {
-    let options = main_window_options(restore, cx);
+    let options = window_options(restore, main_min_size(sidebar_visible), cx);
     cx.open_window(options, |window, cx| {
         let view = build(window, cx);
         cx.new(|cx| Root::new(view, window, cx))
@@ -661,6 +727,13 @@ pub fn popover<T: Selectable + IntoElement + 'static>(
         .content(move |_, window, cx| content(window, cx))
 }
 
+/// Like [`focus_ring`], but drawn when `on` (the caller decides when focus is visible).
+pub fn ring_when<E: gpui::Styled>(el: E, on: bool, cx: &App) -> E {
+    let ring = cx.theme().ring;
+    el.border_1()
+        .border_color(if on { ring } else { gpui::transparent_black() })
+}
+
 /// Keyboard focus ring (§6): a transparent 1 px border that takes the ring colour on
 /// `:focus-visible`, so layout does not shift. The element must be focusable.
 pub fn focus_ring<E: gpui::InteractiveElement + gpui::Styled>(el: E, cx: &App) -> E {
@@ -767,4 +840,121 @@ where
             move |el, t| el.opacity(t).left(px(-slide * (1. - t))),
         )
         .into_any_element()
+}
+
+/// A zero-sized [`probe::Probe`] in test builds; nothing otherwise.
+pub fn test_probe(name: &'static str) -> Option<AnyElement> {
+    #[cfg(test)]
+    {
+        Some(probe::Probe(name).into_any_element())
+    }
+    #[cfg(not(test))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+/// Test-only element that records, on every frame, its element-id path, whether its
+/// element state was fresh (a remount), and its x position. Placed in the list and
+/// detail columns to prove they keep their identity and do not jump across a sidebar
+/// slide. Zero-sized; not compiled outside tests.
+#[cfg(test)]
+pub mod probe {
+    use std::cell::RefCell;
+
+    use gpui::{
+        App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
+        LayoutId, Pixels, Style, Window,
+    };
+
+    /// One frame's record of one probe.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Seen {
+        pub name: &'static str,
+        pub path: String,
+        /// No element state from the previous frame: the element was (re)mounted.
+        pub fresh: bool,
+        pub x: Option<Pixels>,
+    }
+
+    thread_local! {
+        static LOG: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Takes everything recorded on this thread so far.
+    pub fn take() -> Vec<Seen> {
+        LOG.with_borrow_mut(std::mem::take)
+    }
+
+    pub struct Probe(pub &'static str);
+
+    impl IntoElement for Probe {
+        type Element = Self;
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl Element for Probe {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            Some(self.0.into())
+        }
+
+        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            id: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, ()) {
+            let id = id.expect("probe has an id");
+            let fresh = window.with_element_state(id, |state: Option<()>, _| (state.is_none(), ()));
+            LOG.with_borrow_mut(|log| {
+                log.push(Seen {
+                    name: self.0,
+                    path: id.to_string(),
+                    fresh,
+                    x: None,
+                })
+            });
+            (window.request_layout(Style::default(), [], cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            _: &mut (),
+            _: &mut Window,
+            _: &mut App,
+        ) {
+            let name = self.0;
+            LOG.with_borrow_mut(|log| {
+                if let Some(seen) = log.iter_mut().rev().find(|s| s.name == name) {
+                    seen.x = Some(bounds.origin.x);
+                }
+            });
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            _: &mut (),
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+    }
 }

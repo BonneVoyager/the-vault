@@ -203,3 +203,13 @@ fn custom_mapping_and_headerless() {
     assert_eq!(items[0].title, "x");
     assert_eq!(get(&items[0], "password"), "p");
 }
+
+#[test]
+fn export_matches_field_names_case_insensitively() {
+    let mut i = Item::new("T", Uuid::nil(), 1);
+    i.fields.push(field("Username", FieldKind::Text, "alice"));
+    i.fields.push(field("Password", FieldKind::Password, "pw1"));
+    let out = export_csv(&vault(vec![i]));
+    let text = String::from_utf8(out.0.clone()).unwrap();
+    assert!(text.contains("T,alice,pw1,,,"), "{text}");
+}

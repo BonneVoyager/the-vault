@@ -78,6 +78,25 @@ pub struct IconImages {
     pub(super) drops: Vec<(Uuid, Uuid)>,
     /// Blob decodes started (tests count them).
     pub(crate) decodes: usize,
+    /// The file panel ("Drop or choose image…"); tests swap in a fake.
+    pub(crate) chooser: FileChooser,
+    /// The panel is up: a second click must not open another.
+    pub(crate) choosing: bool,
+}
+
+/// Shows a file panel limited to `extensions` with confirm button `prompt`; `None` on
+/// cancel. Runs on the main thread (the macOS panel is modal).
+pub type FileChooser = std::rc::Rc<dyn Fn(&[&str], &str) -> Option<PathBuf>>;
+
+/// Extensions "Drop or choose image…" accepts in its panel (the magic-byte check in
+/// `icon_image` still decides).
+pub const IMAGE_EXTENSIONS: [&str; 3] = ["png", "jpg", "jpeg"];
+
+fn native_chooser() -> FileChooser {
+    // A no-op off macOS: vault_macos::choose_file returns None there.
+    std::rc::Rc::new(|extensions: &[&str], prompt: &str| {
+        vault_macos::choose_file(extensions, prompt)
+    })
 }
 
 impl Default for IconImages {
@@ -91,6 +110,8 @@ impl Default for IconImages {
             dirty: true,
             drops: Vec::new(),
             decodes: 0,
+            chooser: native_chooser(),
+            choosing: false,
         }
     }
 }
@@ -388,29 +409,31 @@ impl AppState {
         matches!(self.mode, Mode::Edit(_)) && self.can_attach() && self.busy.is_none()
     }
 
-    /// "Drop or choose image…": the open panel, then [`Self::set_icon_image_file`].
+    /// "Drop or choose image…": a native panel limited to PNG and JPEG
+    /// (`vault_macos::choose_file`), then [`Self::set_icon_image_file`], the path a
+    /// dropped file takes. One panel at a time: a click while it is up does nothing.
+    /// Cancel (or no panel, off macOS) changes nothing. The picker stays open.
+    ///
+    /// The panel is modal (`runModal` spins a nested run loop), so it is shown from a
+    /// foreground task between `update`s, never while gpui holds the app borrowed.
     pub fn pick_icon_image(&mut self, cx: &mut Context<Self>) {
-        if !self.can_choose_icon_image() {
+        if !self.can_choose_icon_image() || self.icon_images.choosing {
             return;
         }
+        self.icon_images.choosing = true;
         let (lock_gen, epoch, session) = (self.lock_gen, self.epoch, self.edit_session);
-        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Choose".into()),
-        });
+        let chooser = self.icon_images.chooser.clone();
         cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = rx.await else {
-                return;
-            };
+            let path = chooser(&IMAGE_EXTENSIONS, "Choose");
             this.update(cx, |this, cx| {
+                this.icon_images.choosing = false;
                 let same = this.lock_gen == lock_gen
                     && this.epoch == epoch
                     && this.edit_session == session;
-                if same && let Some(path) = paths.into_iter().next() {
+                if same && let Some(path) = path {
                     this.set_icon_image_file(path, cx);
                 }
+                cx.notify();
             })
             .ok();
         })
@@ -431,12 +454,11 @@ impl AppState {
         let Some(item) = self.edit_buffer().map(|b| b.item.id) else {
             return;
         };
-        match std::fs::metadata(&path) {
-            Ok(m) if m.is_file() && m.len() > icon_image::MAX_INPUT_BYTES => {
-                return self.show_toast(Refusal::TooLarge.message(), cx);
-            }
-            Ok(m) if m.is_file() => {}
-            _ => return self.show_toast(Refusal::Unreadable.message(), cx),
+        // The panel's PNG/JPEG filter is UI only (a folder named "x.png" is a package
+        // and selectable; Go To accepts any typed path), and drops can be anything: only
+        // a regular file is read. `symlink_metadata` so a symlink is refused, not followed.
+        if let Err(refusal) = check_regular_file(&path) {
+            return self.show_toast(refusal.message(), cx);
         }
         self.hold_selected();
         let Some(mut vault) = self.vault.take() else {
@@ -517,9 +539,25 @@ impl AppState {
 }
 
 /// Background: the chosen file, checked and turned into the stored PNG.
+/// `path` is a regular file (not a directory, package or symlink) of at most 512 KB.
+fn check_regular_file(path: &std::path::Path) -> Result<(), Refusal> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if !m.file_type().is_file() => Err(Refusal::Unreadable),
+        Ok(m) if m.len() > icon_image::MAX_INPUT_BYTES => Err(Refusal::TooLarge),
+        Ok(_) => Ok(()),
+        Err(_) => Err(Refusal::Unreadable),
+    }
+}
+
 fn read_and_prepare(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let refuse = |r: Refusal| r.message().to_owned();
+    // Checked again here: the path may have been swapped since the main-thread check.
+    check_regular_file(path).map_err(refuse)?;
     let file = std::fs::File::open(path).map_err(|_| refuse(Refusal::Unreadable))?;
+    // And the file actually opened is a regular file (fstat on the open descriptor).
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return Err(refuse(Refusal::Unreadable));
+    }
     let mut bytes = Vec::new();
     // One byte past the limit is enough to know it is too large.
     file.take(icon_image::MAX_INPUT_BYTES + 1)

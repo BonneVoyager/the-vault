@@ -51,7 +51,7 @@ actions!(
         DeleteItem,
         /// ⌘G: password generator popover.
         Generator,
-        /// ⌘⌥S.
+        /// ⌃⌘S, View ▸ Hide Sidebar / Show Sidebar.
         ToggleSidebar,
         /// ↓ in the list.
         NextItem,
@@ -82,6 +82,18 @@ actions!(
     ]
 );
 
+/// ⌃⌘S, as in Finder and Passwords.
+pub const TOGGLE_SIDEBAR_KEYS: &str = "ctrl-cmd-s";
+
+/// View menu title of [`ToggleSidebar`] for the current sidebar state.
+pub fn sidebar_menu_title(sidebar_visible: bool) -> &'static str {
+    if sidebar_visible {
+        "Hide Sidebar"
+    } else {
+        "Show Sidebar"
+    }
+}
+
 /// Key context of the focused item list (↑/↓/⏎/⌘C).
 pub const LIST_CONTEXT: &str = "ItemList";
 /// Key context of the focused detail column (Esc).
@@ -109,7 +121,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-d", ToggleFavorite, None),
         KeyBinding::new("cmd-backspace", DeleteItem, None),
         KeyBinding::new("cmd-g", Generator, None),
-        KeyBinding::new("cmd-alt-s", ToggleSidebar, None),
+        KeyBinding::new(TOGGLE_SIDEBAR_KEYS, ToggleSidebar, None),
         KeyBinding::new("down", NextItem, list),
         KeyBinding::new("up", PrevItem, list),
         KeyBinding::new("enter", FocusDetail, list),
@@ -119,8 +131,14 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-/// Installs the menu bar. Called again when the sort changes, to move the checkmark.
-pub fn set_menus(sort: Sort, cx: &mut App) {
+/// Installs the menu bar from the state's sort and sidebar visibility.
+pub fn refresh_menus(s: &AppState, cx: &mut App) {
+    set_menus(s.sort, s.sidebar_visible(), cx);
+}
+
+/// Installs the menu bar. Called again when the sort changes, to move the checkmark, and
+/// when the sidebar toggles, to flip "Hide Sidebar" / "Show Sidebar".
+pub fn set_menus(sort: Sort, sidebar_visible: bool, cx: &mut App) {
     cx.set_menus([
         Menu::new("Vault").items([
             MenuItem::action("About Vault", About),
@@ -180,7 +198,7 @@ pub fn set_menus(sort: Sort, cx: &mut App) {
                 ]),
             ),
             MenuItem::separator(),
-            MenuItem::action("Toggle Sidebar", ToggleSidebar),
+            MenuItem::action(sidebar_menu_title(sidebar_visible), ToggleSidebar),
             MenuItem::action("Item List", FocusList),
             MenuItem::action("Item Details", FocusDetail),
         ]),
@@ -233,7 +251,7 @@ fn on<A: Action>(
 fn sort_by(sort: Sort) -> impl Fn(&mut AppState, &mut Context<AppState>) {
     move |s, cx| {
         s.set_sort(sort, cx);
-        set_menus(sort, cx);
+        refresh_menus(s, cx);
     }
 }
 
@@ -260,7 +278,10 @@ pub fn register(state: &Entity<AppState>, cx: &mut App) {
     on_main::<FocusDetail>(state, cx, |s, cx| s.request_focus(FocusTarget::Detail, cx));
     on_main::<NextItem>(state, cx, |s, cx| s.select_offset(1, cx));
     on_main::<PrevItem>(state, cx, |s, cx| s.select_offset(-1, cx));
-    on_main::<ToggleSidebar>(state, cx, |s, cx| s.toggle_sidebar(cx));
+    on_main::<ToggleSidebar>(state, cx, |s, cx| {
+        s.toggle_sidebar(cx);
+        refresh_menus(s, cx);
+    });
     on_main::<SortAlphabetical>(state, cx, sort_by(Sort::Alphabetical));
     on_main::<SortRecentlyModified>(state, cx, sort_by(Sort::RecentlyModified));
 

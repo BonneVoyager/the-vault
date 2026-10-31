@@ -355,10 +355,18 @@ impl AppState {
         cx.notify();
     }
 
+    /// Whether the main window shows its sidebar (persisted in `settings.json`).
+    pub fn sidebar_visible(&self) -> bool {
+        !self.settings.sidebar_hidden
+    }
+
+    /// ⌃⌘S, View ▸ Hide/Show Sidebar and the list's sidebar button. Keeps the filter,
+    /// selection and focus; persists through `update_settings`; updates the window
+    /// minimum (narrower while collapsed).
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_visible = !self.sidebar_visible;
         self.sidebar_toggles = self.sidebar_toggles.wrapping_add(1);
-        cx.notify();
+        self.update_settings(cx, |s| s.sidebar_hidden = !s.sidebar_hidden);
+        crate::ui::apply_main_min_size(self.sidebar_visible());
     }
 
     pub fn request_focus(&mut self, target: FocusTarget, cx: &mut Context<Self>) {
@@ -613,6 +621,48 @@ mod tests {
             );
             assert!(!s.selected_item().unwrap().favorite);
         });
+    }
+
+    /// ⌘⇧U and the list subtitle find the username in any case: an imported or
+    /// CLI-created lowercase "username" and a template's "Username" behave the same.
+    #[gpui::test]
+    fn copy_username_ignores_the_name_case(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = state_with_items(dir.path(), cx);
+        let board = FakePasteboard::default();
+        let ids = state.update(cx, |s, cx| {
+            s.set_pasteboard(Box::new(board.clone()));
+            let device = s.device_id();
+            let ids = s
+                .vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| {
+                    let mut imported = Item::new("Imported", device, 40);
+                    imported.fields = vec![Field::new(
+                        "username",
+                        FieldKind::Text,
+                        SecretString::new("lower".into()),
+                        40,
+                    )];
+                    let mut templ = crate::templates::Template::Login.new_item("Templ", device, 40);
+                    templ.fields[0].value = SecretString::new("upper".into());
+                    [v.insert(imported, 40), v.insert(templ, 40)]
+                })
+                .unwrap();
+            s.vault_changed();
+            cx.notify();
+            ids
+        });
+        for (id, want) in ids.into_iter().zip(["lower", "upper"]) {
+            state.update(cx, |s, cx| {
+                s.select(id, cx);
+                let item = s.selected_item().unwrap();
+                assert_eq!(crate::listing::subtitle(item), want, "subtitle");
+                s.copy(CopyTarget::Username, cx);
+            });
+            assert_eq!(board.contents().as_deref(), Some(want), "⌘⇧U");
+        }
     }
 
     #[gpui::test]

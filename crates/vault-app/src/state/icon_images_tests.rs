@@ -178,6 +178,14 @@ fn automatic_symbol_or_colour_on_an_image_removes_its_reference(cx: &mut TestApp
         let a = with_saved_image(&state, id, dir.path(), cx);
         state.update(cx, |s, cx| {
             s.begin_edit(cx);
+            // A colour that is not the item's default (the default would mean no icon).
+            let cell = match cell {
+                PickerCell::Color(_) => {
+                    let default = icon::palette_color(&s.edit_buffer().unwrap().item);
+                    PickerCell::Color(icon::PALETTE.iter().position(|c| *c != default).unwrap())
+                }
+                other => other,
+            };
             s.choose_icon(cell, cx);
         });
         // Not removed before Save: Cancel would keep the image.
@@ -542,4 +550,148 @@ fn cache_is_capped_and_evicts_the_least_recently_drawn(cx: &mut TestAppContext) 
                 <= 2
         );
     });
+}
+
+/// Each panel call's extensions and prompt.
+type PanelCalls = std::rc::Rc<std::cell::RefCell<Vec<(Vec<String>, String)>>>;
+
+/// A fake panel returning `answer`, recording each call's extensions and prompt.
+fn fake_chooser(
+    state: &Entity<AppState>,
+    answer: Option<PathBuf>,
+    cx: &mut TestAppContext,
+) -> PanelCalls {
+    let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = calls.clone();
+    state.update(cx, |s, _| {
+        s.icon_images.chooser = std::rc::Rc::new(move |exts: &[&str], prompt: &str| {
+            seen.borrow_mut().push((
+                exts.iter().map(|e| (*e).to_owned()).collect(),
+                prompt.to_owned(),
+            ));
+            answer.clone()
+        });
+    });
+    calls
+}
+
+#[gpui::test]
+fn one_panel_at_a_time_and_cancel_changes_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, id, _) = setup(dir.path(), cx);
+    let calls = fake_chooser(&state, None, cx);
+    state.update(cx, |s, cx| {
+        s.begin_edit(cx);
+        s.set_icon_picker(true, cx);
+        // Two clicks before the panel returns: one panel.
+        s.choose_icon(PickerCell::Image, cx);
+        assert!(s.icon_images.choosing, "guard set while the panel is up");
+        s.choose_icon(PickerCell::Image, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        calls.borrow().len(),
+        1,
+        "a second click opened no second panel"
+    );
+    assert_eq!(
+        calls.borrow()[0],
+        (
+            vec!["png".into(), "jpg".into(), "jpeg".into()],
+            "Choose".into()
+        )
+    );
+    state.read_with(cx, |s, _| {
+        assert!(!s.icon_images.choosing, "guard cleared after the panel");
+        let b = s.edit_buffer().expect("still editing");
+        assert!(b.icon_picker.is_some(), "picker stays open");
+        assert!(
+            b.item.icon.is_none() && b.icon_added.is_empty(),
+            "cancel: nothing"
+        );
+        assert!(s.busy.is_none() && s.toast.is_none());
+    });
+    assert!(stored(&state, id, cx).attachments.is_empty());
+    // After it closed, a click opens the panel again.
+    state.update(cx, |s, cx| s.choose_icon(PickerCell::Image, cx));
+    cx.run_until_parked();
+    assert_eq!(calls.borrow().len(), 2);
+}
+
+#[gpui::test]
+fn chosen_file_takes_the_drop_path(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, id, _) = setup(dir.path(), cx);
+    let path = image_file(dir.path(), "logo.png", [9, 9, 9, 255]);
+    fake_chooser(&state, Some(path), cx);
+    state.update(cx, |s, cx| {
+        s.begin_edit(cx);
+        s.pick_icon_image(cx);
+    });
+    cx.run_until_parked();
+    let a = state.read_with(cx, |s, _| {
+        *s.edit_buffer().unwrap().icon_added.first().unwrap()
+    });
+    assert_eq!(ref_ids(&stored(&state, id, cx)), vec![a]);
+    // A non-image that gets through the panel is still refused by the magic bytes.
+    let fake_png = dir.path().join("fake.png");
+    std::fs::write(&fake_png, b"%PDF-1.7").unwrap();
+    fake_chooser(&state, Some(fake_png), cx);
+    state.update(cx, |s, cx| {
+        s.toast = None;
+        s.pick_icon_image(cx);
+    });
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| {
+        assert_eq!(
+            s.toast.as_ref().map(|t| t.message.to_string()).as_deref(),
+            Some(Refusal::Unreadable.message())
+        );
+        assert_eq!(s.edit_buffer().unwrap().icon_added.len(), 1);
+    });
+}
+
+#[gpui::test]
+fn only_regular_files_are_read(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, id, _) = setup(dir.path(), cx);
+    state.update(cx, |s, cx| s.begin_edit(cx));
+    // A folder named like an image (a package to the panel), a symlink to a real PNG,
+    // and an oversized file.
+    let folder = dir.path().join("photo.png");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("inner.png"), png(4, 4, [1, 1, 1, 255])).unwrap();
+    let real = image_file(dir.path(), "real.png", [2, 2, 2, 255]);
+    let link = dir.path().join("link.png");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let big = dir.path().join("big.jpg");
+    std::fs::write(&big, vec![0xFF; 600 * 1024]).unwrap();
+    for (path, refusal) in [
+        (folder, Refusal::Unreadable),
+        (link, Refusal::Unreadable),
+        (dir.path().join("missing.png"), Refusal::Unreadable),
+        (big, Refusal::TooLarge),
+    ] {
+        // Through the panel path (a fake panel answering this path).
+        fake_chooser(&state, Some(path.clone()), cx);
+        state.update(cx, |s, cx| {
+            s.toast = None;
+            s.pick_icon_image(cx);
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |s, _| {
+            assert_eq!(
+                s.toast.as_ref().map(|t| t.message.to_string()).as_deref(),
+                Some(refusal.message()),
+                "{path:?}"
+            );
+            assert!(s.busy.is_none(), "nothing read: {path:?}");
+            assert!(s.edit_buffer().unwrap().icon_added.is_empty());
+        });
+    }
+    assert!(stored(&state, id, cx).attachments.is_empty());
+    // The real file itself is fine.
+    state.update(cx, |s, cx| s.set_icon_image_file(real, cx));
+    cx.run_until_parked();
+    assert_eq!(stored(&state, id, cx).attachments.len(), 1);
 }

@@ -13,19 +13,24 @@ mod list;
 pub use icon_view::item_tile;
 #[cfg(test)]
 pub use {detail::detail_placeholder, list::list_placeholder};
+#[cfg(test)]
+#[path = "main/collapse_tests.rs"]
+mod collapse_tests;
 mod prompts;
 mod sidebar;
 mod sync_banners;
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, IntoElement, ListAlignment,
-    ListState, ParentElement as _, Render, Styled as _, Subscription, Task, Window, px,
+    App, AppContext as _, Axis, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle,
+    InteractiveElement as _, IntoElement, ListAlignment, ListState, ParentElement as _, Render,
+    Styled as _, Subscription, Task, Window, prelude::FluentBuilder as _, px,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::input::{InputEvent, InputState};
-use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use vault_core::Uuid;
 
 use self::editor::Editor;
@@ -36,9 +41,27 @@ use crate::{text, ui};
 /// Default widths and ranges for the sidebar and item list (§1).
 const SIDEBAR: (f32, f32, f32) = (220., 180., 320.);
 const LIST: (f32, f32, f32) = (300., 240., 420.);
+/// The detail column never gets narrower than this (dragging, or restored widths in a
+/// narrower window).
+const DETAIL_MIN: f32 = 320.;
+
+/// `[sidebar, list]` widths that leave the detail column at least `DETAIL_MIN` in a
+/// window `window` px wide: the list gives way first, then the sidebar, neither below
+/// its own minimum. `sidebar` says whether the sidebar takes room.
+fn fit_widths([side, list]: [f32; 2], window: f32, sidebar: bool) -> [f32; 2] {
+    let room = window - DETAIL_MIN;
+    let taken = if sidebar { side } else { 0. };
+    let list = list.min(room - taken).max(LIST.1);
+    let side = if sidebar {
+        side.min(room - list).max(SIDEBAR.1)
+    } else {
+        side
+    };
+    [side, list]
+}
 
 /// A column footer: fixed height, full-width 1 px top divider, contents centred
-/// vertically. The sidebar and the item list both use it, so their dividers line up.
+/// vertically. Only the item list has one (the sidebar has no bottom bar).
 fn column_footer(border: gpui::Hsla, cx: &App) -> gpui::Div {
     ui::h_flex()
         .flex_none()
@@ -52,24 +75,121 @@ fn column_footer(border: gpui::Hsla, cx: &App) -> gpui::Div {
 /// Emitted after the user drags a column divider: `[sidebar, list]` widths.
 pub struct ColumnsResized(pub [f32; 2]);
 
+/// The column divider being dragged; also the (empty) drag preview.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ColumnDrag {
+    /// Between the sidebar and the list.
+    Sidebar,
+    /// Between the list and the detail.
+    List,
+}
+
+impl Render for ColumnDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// The sidebar's width state (05 §5 panel motion). There is always one: at rest it is a
+/// finished slide, so the columns use the same layout, and keep the same element
+/// identity, before, during and after a toggle. The sidebar's width animates between 0
+/// and its column width while the list and detail reflow beside it.
+#[derive(Clone, Debug)]
+struct Slide {
+    /// Sliding in (expanding) rather than out; at rest, whether the sidebar shows.
+    showing: bool,
+    /// `AppState::sidebar_toggles` when it started; keys the animation.
+    key: usize,
+    /// Visible fraction it starts from: 0 or 1, or wherever a reversed slide was.
+    from: f32,
+    started: std::time::Instant,
+    /// The full motion scaled by the distance left to travel.
+    duration: Duration,
+    /// Set by the animation itself on its last frame (t = 1): the slide's end comes
+    /// from the animation, not from a timer that could run ahead of it.
+    done: Rc<Cell<bool>>,
+}
+
+impl Slide {
+    fn new(showing: bool, key: usize, from: f32) -> Self {
+        let to = if showing { 1. } else { 0. };
+        let distance = (to - from).abs().clamp(0.05, 1.);
+        Self {
+            showing,
+            key,
+            from,
+            started: std::time::Instant::now(),
+            duration: ui::SIDEBAR_MOTION.mul_f32(distance),
+            done: Rc::new(Cell::new(false)),
+        }
+    }
+
+    /// At rest (launch, Reduce Motion): already at its end.
+    fn settled(showing: bool, key: usize) -> Self {
+        let slide = Self::new(showing, key, if showing { 1. } else { 0. });
+        slide.done.set(true);
+        slide
+    }
+
+    fn is_done(&self) -> bool {
+        self.done.get()
+    }
+
+    /// Visible fraction of the sidebar at (eased) animation progress `t`.
+    fn visible(&self, t: f32) -> f32 {
+        let to = if self.showing { 1. } else { 0. };
+        self.from + (to - self.from) * t
+    }
+
+    /// Visible fraction at `now`, so a toggle mid-slide reverses from there.
+    fn current_at(&self, now: std::time::Instant) -> f32 {
+        if self.is_done() {
+            return self.visible(1.);
+        }
+        let elapsed = now.saturating_duration_since(self.started);
+        let p = elapsed.as_secs_f32() / self.duration.as_secs_f32();
+        self.visible(gpui::ease_out_quint()(p.min(1.)))
+    }
+
+    fn animation(&self) -> gpui::Animation {
+        gpui::Animation::new(self.duration).with_easing(gpui::ease_out_quint())
+    }
+}
+
 pub struct MainScreen {
     state: Entity<AppState>,
-    /// Three-column layout.
-    columns: Entity<ResizableState>,
-    /// Two-column layout while the sidebar is hidden (⌘⌥S).
-    compact_columns: Entity<ResizableState>,
+    /// Sidebar and list column widths as chosen (dragged or restored).
     widths: [f32; 2],
+    /// `widths` fitted to the current window by `fit_widths`, as laid out.
+    fitted: [f32; 2],
+    /// A divider drag is in progress; its end saves the widths.
+    column_drag: bool,
     search: Entity<InputState>,
     /// Master password for the "re-keyed on another device" prompt.
     key_input: Entity<InputState>,
     editor: Entity<Editor>,
     generator: Entity<GeneratorView>,
     list_focus: FocusHandle,
+    /// The list draws its focus ring: it gained focus from the keyboard (Tab, ⌘1, Enter
+    /// in search). Not gpui's `focus_visible`, which turns on with any key press while
+    /// focused, so a shortcut such as ⌃⌘S outlined a list focused by a click.
+    list_ring: bool,
+    /// The list had focus at the last render (focus arrival is detected there).
+    list_had_focus: bool,
+    /// Tracks focus inside the sidebar, so collapsing it can move that focus on.
+    sidebar_focus: FocusHandle,
     detail_focus: FocusHandle,
     list_state: ListState,
     seen_listing: u64,
     seen_selection: Option<Uuid>,
     seen_locked: bool,
+    /// Sidebar visibility the layout last applied.
+    seen_sidebar: bool,
+    /// The sidebar's slide; finished at rest.
+    slide: Slide,
+    /// Tests pin the slide clock here instead of reading real time.
+    #[cfg(test)]
+    slide_now: Option<std::time::Instant>,
     _ticker: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -92,6 +212,7 @@ impl MainScreen {
         let key_input = ui::password_input("Master password", window, cx);
         let generator = cx.new(|cx| GeneratorView::new(state.clone(), window, cx));
         let editor = cx.new(|cx| Editor::new(state.clone(), generator.clone(), window, cx));
+        let list_focus = cx.focus_handle();
         let subscriptions = vec![
             cx.observe_in(&state, window, |this, _, window, cx| this.sync(window, cx)),
             cx.subscribe_in(
@@ -118,15 +239,25 @@ impl MainScreen {
         ];
         Self {
             seen_locked: state.read(cx).locked,
+            seen_sidebar: state.read(cx).sidebar_visible(),
+            slide: Slide::settled(
+                state.read(cx).sidebar_visible(),
+                state.read(cx).sidebar_toggles,
+            ),
+            #[cfg(test)]
+            slide_now: None,
             state,
-            columns: cx.new(|_| ResizableState::default()),
-            compact_columns: cx.new(|_| ResizableState::default()),
             widths,
+            fitted: widths,
+            column_drag: false,
             search,
             key_input,
             editor,
             generator,
-            list_focus: cx.focus_handle(),
+            list_focus,
+            list_ring: false,
+            list_had_focus: false,
+            sidebar_focus: cx.focus_handle(),
             detail_focus: cx.focus_handle(),
             list_state: ListState::new(0, ListAlignment::Top, px(200.)),
             seen_listing: u64::MAX,
@@ -193,6 +324,7 @@ impl MainScreen {
                 s.clear_search,
             )
         };
+        self.sync_sidebar(window, cx);
         if clear_search {
             self.state.update(cx, |s, _| s.clear_search = false);
             ui::clear_input(&self.search, window, cx);
@@ -226,14 +358,99 @@ impl MainScreen {
         cx.notify();
     }
 
-    fn on_resized(&mut self, sizes: &[gpui::Pixels], sidebar: bool, cx: &mut Context<Self>) {
-        match (sidebar, sizes) {
-            (true, [s, l, ..]) => self.widths = [s.as_f32(), l.as_f32()],
-            (false, [l, ..]) => self.widths[1] = l.as_f32(),
-            _ => return,
+    /// Starts the slide when the sidebar was toggled. Focus is left alone: the focused
+    /// search field, list or editor input stays rendered in both layouts.
+    fn sync_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (visible, key, reduce_motion) = {
+            let s = self.state.read(cx);
+            (s.sidebar_visible(), s.sidebar_toggles, s.reduce_motion)
+        };
+        if visible == self.seen_sidebar {
+            return;
         }
-        cx.emit(ColumnsResized(self.widths));
+        self.seen_sidebar = visible;
+        // Focus inside a sidebar that is going away moves to the search field (as in
+        // Finder); focus anywhere else stays exactly where it is.
+        if !visible && self.sidebar_focus.contains_focused(window, cx) {
+            ui::focus_input(&self.search, window, cx);
+        }
+        if reduce_motion {
+            self.slide = Slide::settled(visible, key);
+            return;
+        }
+        // Toggled again mid-slide: reverse from the current width, not the far end.
+        let from = self.slide.current_at(self.slide_clock());
+        self.slide = Slide::new(visible, key, from);
     }
+
+    /// The time a reversed slide is measured at: real time, or the test's pinned time.
+    fn slide_clock(&self) -> std::time::Instant {
+        #[cfg(test)]
+        if let Some(now) = self.slide_now {
+            return now;
+        }
+        std::time::Instant::now()
+    }
+
+    /// Whether the sidebar is out of the layout (collapsed, or sliding out).
+    pub(super) fn sidebar_collapsed(&self) -> bool {
+        !self.seen_sidebar
+    }
+
+    /// Follows a divider drag: the dragged column's width from the pointer's x,
+    /// clamped to its range and to what leaves the detail `DETAIL_MIN`.
+    fn on_column_drag(
+        &mut self,
+        event: &DragMoveEvent<ColumnDrag>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let x = (event.event.position.x - event.bounds.left()).as_f32();
+        let room = window.viewport_size().width.as_f32() - DETAIL_MIN;
+        let [side, list] = self.fitted;
+        self.widths = match *event.drag(cx) {
+            ColumnDrag::Sidebar => [
+                x.clamp(SIDEBAR.1, SIDEBAR.2)
+                    .min(room - list)
+                    .max(SIDEBAR.1),
+                list,
+            ],
+            ColumnDrag::List => {
+                let taken = if self.seen_sidebar { side } else { 0. };
+                [
+                    side,
+                    (x - taken)
+                        .clamp(LIST.1, LIST.2)
+                        .min(room - taken)
+                        .max(LIST.1),
+                ]
+            }
+        };
+        self.column_drag = true;
+        cx.notify();
+    }
+
+    /// Any mouse-up that ends a divider drag, wherever it happens (over a handle, a
+    /// column or outside the window), saves the widths.
+    fn end_column_drag(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.column_drag) {
+            cx.emit(ColumnsResized(self.widths));
+        }
+    }
+}
+
+/// A column divider: gpui-component's resize handle on the leading edge of the column
+/// to its right (which must be `relative`).
+fn column_handle(drag: ColumnDrag) -> impl IntoElement {
+    gpui_component::resizable::resize_handle::<ColumnDrag, ColumnDrag>(
+        ("resizable-handle", drag as usize),
+        Axis::Horizontal,
+    )
+    .debug_selector(move || format!("column-handle {drag:?}"))
+    .on_drag(drag, |drag, _, _, cx| {
+        cx.stop_propagation();
+        cx.new(|_| *drag)
+    })
 }
 
 impl Render for MainScreen {
@@ -243,43 +460,109 @@ impl Render for MainScreen {
         if window.rem_size() != rem {
             window.set_rem_size(rem);
         }
-        let (sidebar_visible, sidebar_toggles, reduce_motion) = {
-            let s = self.state.read(cx);
-            (s.sidebar_visible, s.sidebar_toggles, s.reduce_motion)
-        };
+        // The list just gained focus: ring if the keyboard moved it there. Lost: no ring.
+        let list_focused = self.list_focus.is_focused(window);
+        if list_focused != self.list_had_focus {
+            self.list_had_focus = list_focused;
+            self.list_ring = list_focused && window.last_input_was_keyboard();
+        }
+        let slide = self.slide.clone();
+        // Fit before rendering the list: its header follows the fitted sidebar width.
+        // The sidebar takes room while it shows or slides.
+        self.fitted = fit_widths(
+            self.widths,
+            window.viewport_size().width.as_f32(),
+            self.seen_sidebar || !slide.is_done(),
+        );
         let list = self.render_list(window, cx);
         let detail = self.render_detail(window, cx);
-        let this = cx.entity().downgrade();
+        // `done` is set while laying out the slide's last frame, after this render. In
+        // the app a next-frame callback re-renders then; otherwise the next render does.
+        let settled = slide.is_done();
+        if !settled {
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                this.update(cx, |_, cx| cx.notify()).ok();
+            });
+        }
 
-        let list_panel = resizable_panel()
-            .size(px(self.widths[1]))
-            .size_range(px(LIST.1)..px(LIST.2))
-            .fixed()
-            .child(list);
-        let detail_panel = resizable_panel().child(detail);
-
-        // One handler for both layouts; `sidebar_visible` says which widths it reports.
-        let on_resize = move |columns: &Entity<ResizableState>, _: &mut Window, cx: &mut App| {
-            let sizes = columns.read(cx).sizes().clone();
-            this.update(cx, |this, cx| this.on_resized(&sizes, sidebar_visible, cx))
-                .ok();
-        };
-        let group = if sidebar_visible {
-            h_resizable("main-columns").with_state(&self.columns).child(
-                resizable_panel()
-                    .size(px(self.widths[0]))
-                    .size_range(px(SIDEBAR.1)..px(SIDEBAR.2))
-                    .fixed()
-                    .child(ui::panel_in(
-                        gpui::div().size_full().child(self.render_sidebar(cx)),
-                        ("sidebar-in", sidebar_toggles),
-                        12.,
-                        reduce_motion || sidebar_toggles == 0,
-                    )),
+        // One layout for every state, so the list and detail columns keep their element
+        // identity (and the detail's fade-in state) across a toggle. Collapsed and at
+        // rest, the sidebar is not in the tree at all; the list keeps its width.
+        let sidebar = (self.seen_sidebar || !settled).then(|| {
+            use gpui::AnimationExt as _;
+            let width = self.fitted[0];
+            let done = slide.done.clone();
+            let at = slide.clone();
+            let at_rest = settled;
+            gpui::div()
+                .id("sidebar-slot")
+                .flex_none()
+                .h_full()
+                .relative()
+                .overflow_hidden()
+                .when(!settled, |el| el.debug_selector(|| "sidebar-slide".into()))
+                .child(
+                    gpui::div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .w(px(width))
+                        .child(self.render_sidebar(cx)),
+                )
+                // Anchored right, so the sidebar slides rather than squeezes.
+                .with_animation(
+                    ("sidebar-slide", slide.key),
+                    slide.animation(),
+                    move |el, t| {
+                        // A finished slide stays at its end: a remount (after unlock,
+                        // the root's crossfade) restarts animation state at t = 0.
+                        let t = if at_rest { 1. } else { t };
+                        if t >= 1. {
+                            done.set(true);
+                        }
+                        el.w(px(width * at.visible(t)))
+                    },
+                )
+        });
+        // While a divider drag runs, any mouse-up (even outside the window, which keeps
+        // receiving the mouse during a drag) ends it and saves the widths.
+        let drag_end = self.column_drag.then(|| {
+            let this = cx.entity().downgrade();
+            gpui::canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    window.on_mouse_event(move |_: &gpui::MouseUpEvent, phase, _, cx| {
+                        if phase.bubble() {
+                            this.update(cx, |this, cx| this.end_column_drag(cx)).ok();
+                        }
+                    });
+                },
             )
-        } else {
-            h_resizable("main-columns-compact").with_state(&self.compact_columns)
-        };
+        });
+        let list_column = gpui::div()
+            .id("list-slot")
+            .flex_none()
+            .h_full()
+            .w(px(self.fitted[1]))
+            .relative()
+            .child(list)
+            .children(ui::test_probe("list-probe"))
+            // No divider to drag while the sidebar moves.
+            .when(self.seen_sidebar && settled, |el| {
+                el.child(column_handle(ColumnDrag::Sidebar))
+            });
+        let detail_column = gpui::div()
+            .id("detail-slot")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .relative()
+            .child(detail)
+            .children(ui::test_probe("detail-probe"))
+            .child(column_handle(ColumnDrag::List));
+
         // The window claims its titlebar, so it moves only by this band; it paints first
         // (underneath), and the controls in it opt out with `ui::no_window_drag`.
         gpui::div()
@@ -287,12 +570,37 @@ impl Render for MainScreen {
             .text_size(cx.theme().font_size)
             .relative()
             .child(ui::window_drag_band())
+            .children(drag_end)
             .child(
-                group
-                    .on_resize(on_resize)
-                    .child(list_panel)
-                    .child(detail_panel),
+                ui::h_flex()
+                    .id("main-columns")
+                    .size_full()
+                    .on_drag_move(cx.listener(Self::on_column_drag))
+                    .children(sidebar)
+                    .child(list_column)
+                    .child(detail_column),
             )
+    }
+}
+
+impl MainScreen {
+    /// Wraps the list's search row so its left inset follows the sidebar slide.
+    pub(super) fn slide_header(&self, header: gpui::Div) -> gpui::AnyElement {
+        use gpui::AnimationExt as _;
+        let slide = self.slide.clone();
+        let width = self.fitted[0];
+        // Finished: the end inset from the first frame, also after a remount.
+        let at_rest = slide.is_done();
+        header
+            .with_animation(
+                ("list-header-slide", slide.key),
+                slide.animation(),
+                move |el, t| {
+                    let t = if at_rest { 1. } else { t };
+                    el.pl(px(ui::list_header_pad_left(width * slide.visible(t))))
+                },
+            )
+            .into_any_element()
     }
 }
 
@@ -312,7 +620,7 @@ mod tests {
     use crate::actions;
     use crate::state::{Filter, GeneratorTarget};
 
-    const PW: &str = "pw";
+    pub(super) const PW: &str = "pw";
 
     fn field(name: &str, kind: FieldKind, value: &str) -> Field {
         Field::new(name, kind, SecretString::new(value.into()), 1)
@@ -362,7 +670,7 @@ mod tests {
         v
     }
 
-    fn open(
+    pub(super) fn open(
         populated: bool,
         dir: &std::path::Path,
         cx: &mut TestAppContext,
@@ -439,7 +747,11 @@ mod tests {
             .expect("second window");
         let mut detail = VisualTestContext::from_window(detail_window, &vcx.cx);
         detail.run_until_parked();
-        assert_eq!(detail.window_title().as_deref(), Some("Item details"));
+        assert_eq!(
+            detail.window_title().as_deref(),
+            Some("GitHub"),
+            "the item's name"
+        );
         assert!(detail.debug_bounds("detail-title GitHub").is_some());
         for selector in [
             "detail-header",
@@ -464,7 +776,11 @@ mod tests {
         });
         state.update(&mut vcx, |s, cx| s.select(visa, cx));
         detail.run_until_parked();
-        assert_eq!(detail.window_title().as_deref(), Some("Item details"));
+        assert_eq!(
+            detail.window_title().as_deref(),
+            Some("GitHub"),
+            "pinned: the main window's selection does not retitle it"
+        );
         assert!(detail.debug_bounds("detail-title GitHub").is_some());
 
         // Value clicks copy from the pinned item, even with Visa selected in the main window.
@@ -551,10 +867,10 @@ mod tests {
         state.read_with(&vcx, |s, _| assert!(s.listing.items.is_empty()));
 
         // Sidebar toggle, filters, resizing to the minimum.
-        vcx.simulate_keystrokes("cmd-alt-s");
-        assert!(!state.read_with(&vcx, |s, _| s.sidebar_visible));
+        vcx.simulate_keystrokes("ctrl-cmd-s");
+        assert!(!state.read_with(&vcx, |s, _| s.sidebar_visible()));
         vcx.simulate_resize(size(px(820.), px(520.)));
-        vcx.simulate_keystrokes("cmd-alt-s");
+        vcx.simulate_keystrokes("ctrl-cmd-s");
         state.update(&mut vcx, |s, cx| {
             s.set_query(String::new(), cx);
             s.set_filter(Filter::Tag("INFRA".into()), cx);
@@ -633,6 +949,7 @@ mod tests {
         };
         let band = bounds("window-drag-band", &mut vcx);
         let search = bounds("list-search", &mut vcx);
+        let toggle = bounds("sidebar-toggle Hide Sidebar", &mut vcx);
         let header = bounds("detail-header", &mut vcx);
         let buttons = bounds("detail-header-buttons", &mut vcx);
         // The controls really sit in the band; otherwise this test proves nothing.
@@ -653,7 +970,7 @@ mod tests {
             1,
             "sidebar band"
         );
-        let pad = point(search.left() - px(ui::COLUMN_PAD_X / 2.), search.center().y);
+        let pad = point(toggle.left() - px(ui::COLUMN_PAD_X / 2.), search.center().y);
         assert_eq!(drags_from(pad, &mut vcx), 1, "list padding");
         let avatar = point(header.left() + px(20.), header.top() + px(20.));
         assert!(band.contains(&avatar));
@@ -663,6 +980,10 @@ mod tests {
         let before = ui::window_moves();
         vcx.simulate_click(pad, gpui::Modifiers::default());
         assert_eq!(ui::window_moves(), before);
+
+        // The sidebar toggle is a control too (pressing it toggles, never drags).
+        assert!(band.contains(&toggle.center()));
+        assert_eq!(drags_from(toggle.center(), &mut vcx), 0, "sidebar toggle");
     }
 
     #[gpui::test]
@@ -685,27 +1006,31 @@ mod tests {
         assert!(near(search.center().y, px(ui::TOP_BAND_HEIGHT / 2.)));
         assert_eq!(header.top(), search.top());
 
-        // Same left inset in the list and the detail column.
+        // Same left inset in the list (its first control, the sidebar toggle) and the
+        // detail column.
         let list_x = bounds("list-footer", &mut vcx).left();
-        assert_eq!(search.left() - list_x, px(ui::COLUMN_PAD_X));
+        let toggle = bounds("sidebar-toggle Hide Sidebar", &mut vcx);
+        assert_eq!(toggle.left() - list_x, px(ui::COLUMN_PAD_X));
+        assert!(near(toggle.center().y, search.center().y));
         let detail_x = bounds("detail-column", &mut vcx).left();
         assert_eq!(header.left() - detail_x, px(ui::COLUMN_PAD_X));
 
-        // Footers: same height, divider at the same y, contents centred alike.
-        let side = bounds("sidebar-footer", &mut vcx);
+        // The list footer (the only bottom bar): fixed height, a top divider, and
+        // "+ New" and the count centred alike; no Lock button. The sidebar runs to the
+        // bottom.
         let list = bounds("list-footer", &mut vcx);
-        assert_eq!(side.size.height, px(ui::FOOTER_HEIGHT));
-        assert_eq!(side.size.height, list.size.height);
-        assert_eq!(side.top(), list.top());
-        let side_divider = top_divider_y(side, &mut vcx).expect("sidebar footer divider");
-        let list_divider = top_divider_y(list, &mut vcx).expect("list footer divider");
-        assert_eq!(side_divider, list_divider);
-        let side_content = bounds("sidebar-footer-content", &mut vcx);
-        let list_content = bounds("list-footer-count", &mut vcx);
+        assert_eq!(list.size.height, px(ui::FOOTER_HEIGHT));
+        let divider = top_divider_y(list, &mut vcx).expect("list footer divider");
+        assert_eq!(divider, list.top());
+        assert!(vcx.debug_bounds("sidebar-footer").is_none());
+        let sidebar = bounds("sidebar-column", &mut vcx);
+        assert!(sidebar.bottom() > list.bottom() - px(1.));
         // Content centres sit half a divider below the box centre (1 px top border).
-        let centre = side.top() + px(0.5) + side.size.height / 2.;
-        assert!(near(side_content.center().y, centre));
-        assert!(near(list_content.center().y, centre));
+        let centre = list.top() + px(0.5) + list.size.height / 2.;
+        assert!(vcx.debug_bounds("list-lock").is_none());
+        for key in ["new-item", "list-footer-count"] {
+            assert!(near(bounds(key, &mut vcx).center().y, centre), "{key}");
+        }
     }
 
     #[gpui::test]

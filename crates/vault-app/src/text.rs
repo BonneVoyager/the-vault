@@ -88,6 +88,17 @@ pub fn mask_card(number: &str) -> String {
 /// Fixed-length mask so the dots do not leak a password's length.
 pub const DOTS: &str = "••••••••••";
 
+/// `s` with its first character upper-cased ("username" → "Username"); the rest is
+/// untouched ("first name" → "First name", "iCloud" → "ICloud"). For field-name display
+/// and template names; stored names are never rewritten with it.
+pub fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// At most `max` characters, with an ellipsis when cut.
 pub fn truncate(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {

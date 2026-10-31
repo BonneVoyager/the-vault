@@ -34,6 +34,9 @@ enum ValueInput {
     Area(Entity<TextareaState>),
 }
 
+// `capitalize_first`: shared with the read-only field labels.
+use crate::text::capitalize_first;
+
 struct Row {
     key: u64,
     name: Entity<InputState>,
@@ -191,7 +194,10 @@ impl Editor {
             self.session = u64::MAX;
             return;
         };
-        if session != self.session {
+        // Rows built when a session starts hold the item's own (or template) fields;
+        // rows built later are fields added in this edit.
+        let starting = session != self.session;
+        if starting {
             self.session = session;
             self.rows.clear();
             ui::set_input(&self.title, &buffer.item.title, window, cx);
@@ -205,7 +211,7 @@ impl Editor {
             self.tags_scroll.scroll_to_item(tag_count - 1);
         }
         self.tag_count = tag_count;
-        self.reconcile(&buffer, window, cx);
+        self.reconcile(&buffer, !starting, window, cx);
         if !buffer.pushed.is_empty() {
             for key in &buffer.pushed {
                 if let (Some(row), Some(field)) =
@@ -228,36 +234,60 @@ impl Editor {
     }
 
     /// Creates rows for new keys, drops rows for removed keys, and orders rows like the buffer.
-    fn reconcile(&mut self, buffer: &EditBuffer, window: &mut Window, cx: &mut Context<Self>) {
+    /// `added`: rows created now are fields the user just added.
+    fn reconcile(
+        &mut self,
+        buffer: &EditBuffer,
+        added: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut old = std::mem::take(&mut self.rows);
         for (key, field) in buffer.keys.iter().zip(&buffer.item.fields) {
             let row = match old.iter().position(|r| r.key == *key) {
                 Some(i) => old.swap_remove(i),
-                None => self.new_row(*key, field, window, cx),
+                None => self.new_row(*key, field, added, window, cx),
             };
             self.rows.push(row);
         }
     }
 
+    /// `added`: a field added in this edit, whose name gets [`capitalize_first`].
     fn new_row(
         &self,
         key: u64,
         field: &vault_core::Field,
+        added: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Row {
         let name = ui::text_input("Field name", window, cx);
         ui::set_input(&name, &field.name, window, cx);
-        let mut subs =
-            vec![
-                cx.subscribe_in(&name, window, move |this, input, ev: &InputEvent, _, cx| {
-                    if let InputEvent::Change = ev {
-                        let text = ui::input_text(input, cx);
-                        this.state
-                            .update(cx, |s, cx| s.set_edit_name(key, text, cx));
+        // New fields only: the first time the name's first character is typed, it is
+        // capitalised; after that the user's edits stand (they can lowercase it again).
+        let mut auto_cap = added;
+        let mut previous = field.name.clone();
+        let mut subs = vec![cx.subscribe_in(
+            &name,
+            window,
+            move |this, input, ev: &InputEvent, window, cx| {
+                if let InputEvent::Change = ev {
+                    let mut text = ui::input_text(input, cx);
+                    if auto_cap && text.chars().next() != previous.chars().next() {
+                        auto_cap = false;
+                        let capitalized = capitalize_first(&text);
+                        if capitalized != text {
+                            // `set_input` emits no Change, so the buffer takes it below.
+                            ui::set_input(input, &capitalized, window, cx);
+                            text = capitalized;
+                        }
                     }
-                }),
-            ];
+                    previous.clone_from(&text);
+                    this.state
+                        .update(cx, |s, cx| s.set_edit_name(key, text, cx));
+                }
+            },
+        )];
         let current = field.value.expose_secret();
         let value = match field.kind {
             FieldKind::Notes => {

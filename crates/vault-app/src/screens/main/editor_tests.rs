@@ -511,14 +511,20 @@ fn icon_picker_opens_from_the_tile_and_works_by_keyboard(cx: &mut TestAppContext
     let icon = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().item.icon.clone());
     assert_eq!(icon.as_ref().map(|i| i.value.as_str()), Some(SYMBOLS[1].0));
 
-    // A swatch click recolours it; the header tile follows.
-    let swatch = vcx.debug_bounds("icon-color 1").unwrap();
+    // A swatch click recolours it (one that is not the item's default); the header
+    // tile follows.
+    let default = state.read_with(&vcx, |s, _| {
+        crate::icon::palette_color(&s.edit_buffer().unwrap().item)
+    });
+    let ix = PALETTE.iter().position(|c| *c != default).unwrap();
+    let swatch_sel: &'static str = Box::leak(format!("icon-color {ix}").into_boxed_str());
+    let swatch = vcx.debug_bounds(swatch_sel).unwrap();
     vcx.simulate_click(swatch.center(), gpui::Modifiers::none());
     vcx.run_until_parked();
     let want: &'static str = Box::leak(
         format!(
             "icon-tile symbol {:?} #{:06X} fill white",
-            SYMBOLS[1].1, PALETTE[1]
+            SYMBOLS[1].1, PALETTE[ix]
         )
         .into_boxed_str(),
     );
@@ -538,7 +544,10 @@ fn icon_picker_opens_from_the_tile_and_works_by_keyboard(cx: &mut TestAppContext
     let saved = state.read_with(&vcx, |s, _| {
         s.unlocked_vault().unwrap().get(id).unwrap().icon.clone()
     });
-    assert_eq!(saved.unwrap().color.as_deref(), Some("#30A46C"));
+    assert_eq!(
+        saved.unwrap().color,
+        Some(crate::icon::format_color(PALETTE[ix]))
+    );
     assert!(
         vcx.debug_bounds(want).is_some(),
         "read-mode header shows the symbol"
@@ -863,4 +872,278 @@ fn choose_image_row_takes_a_drop_and_the_picker_stays_open(cx: &mut TestAppConte
     );
     assert_eq!(item.attachments[0].id, a);
     assert_eq!(item.attachments[0].name, crate::icon_image::ATTACHMENT_NAME);
+}
+
+/// The name input of row `key`.
+fn name_input(
+    main: &Entity<MainScreen>,
+    key: u64,
+    vcx: &mut VisualTestContext,
+) -> Entity<InputState> {
+    main.read_with(vcx, |m, cx| {
+        m.editor
+            .read(cx)
+            .rows
+            .iter()
+            .find(|r| r.key == key)
+            .expect("row")
+            .name
+            .clone()
+    })
+}
+
+/// Selects all of `input` and types `text` one character at a time.
+fn retype(input: &Entity<InputState>, text: &str, vcx: &mut VisualTestContext) {
+    vcx.update(|window, cx| ui::focus_input(input, window, cx));
+    vcx.simulate_keystrokes("cmd-a");
+    for c in text.chars() {
+        vcx.simulate_input(&c.to_string());
+    }
+    vcx.run_until_parked();
+}
+
+/// A field added in edit mode gets its name's first character capitalised as it is
+/// typed; the rest stays as typed, the user can lowercase it again, and existing field
+/// names and values are left alone.
+#[gpui::test]
+fn new_field_names_start_with_a_capital(cx: &mut TestAppContext) {
+    assert_eq!(super::capitalize_first("gpg passphrase"), "Gpg passphrase");
+    assert_eq!(super::capitalize_first("ärger"), "Ärger");
+    assert_eq!(super::capitalize_first(""), "");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    state.update(&mut vcx, |s, cx| {
+        s.begin_new(crate::templates::Template::Login, "Box".into(), cx)
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("cmd-s");
+    vcx.simulate_keystrokes("cmd-e");
+    vcx.run_until_parked();
+    let existing = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().keys[0]);
+    let key = state.update(&mut vcx, |s, cx| {
+        let mut key = 0;
+        s.edit(cx, |b| key = b.add_field(FieldKind::Text));
+        key
+    });
+    vcx.run_until_parked();
+
+    // Capitalised from the moment it appears: the pre-filled name, in the buffer and
+    // the input. The template's own names keep their spelling.
+    let name = name_input(&main, key, &mut vcx);
+    assert_eq!(vcx.update(|_, cx| ui::input_text(&name, cx)), "Text");
+    state.read_with(&vcx, |s, _| {
+        let b = s.edit_buffer().unwrap();
+        assert_eq!(b.field(key).unwrap().name, "Text");
+        assert_eq!(b.field(existing).unwrap().name, "Username");
+    });
+    retype(&name, "gpg passphrase", &mut vcx);
+    assert_eq!(
+        vcx.update(|_, cx| ui::input_text(&name, cx)),
+        "Gpg passphrase"
+    );
+    let buffer_name = |vcx: &mut VisualTestContext| {
+        state.read_with(vcx, |s, _| {
+            s.edit_buffer().unwrap().field(key).unwrap().name.clone()
+        })
+    };
+    assert_eq!(buffer_name(&mut vcx), "Gpg passphrase");
+
+    // The user can lowercase it again: no second capitalisation.
+    retype(&name, "pin", &mut vcx);
+    assert_eq!(buffer_name(&mut vcx), "pin");
+
+    // The new field's value and an existing field's name are left as typed.
+    let value = value_input(&main, key, &mut vcx);
+    type_into(&value, "lower", &mut vcx);
+    assert_eq!(vcx.update(|_, cx| ui::input_text(&value, cx)), "lower");
+    let old = name_input(&main, existing, &mut vcx);
+    retype(&old, "login", &mut vcx);
+    assert_eq!(vcx.update(|_, cx| ui::input_text(&old, cx)), "login");
+
+    vcx.simulate_keystrokes("cmd-s");
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| {
+        let names: Vec<_> = s
+            .selected_item()
+            .unwrap()
+            .fields
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert!(names.contains(&"pin".to_owned()), "{names:?}");
+        assert!(names.contains(&"login".to_owned()), "{names:?}");
+    });
+}
+
+/// Opens the icon picker on a new item titled `title` with optional website `url`.
+fn picker_on(
+    title: &str,
+    url: Option<&str>,
+    cx: &mut TestAppContext,
+) -> (tempfile::TempDir, Entity<AppState>, VisualTestContext, u32) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    let mut item = vault_core::Item::new(title, device, 10);
+    if let Some(url) = url {
+        item.fields = vec![vault_core::Field::new(
+            "url",
+            FieldKind::Url,
+            SecretString::new(url.into()),
+            10,
+        )];
+    }
+    insert_and_select(&state, item, &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let tile = vcx.debug_bounds("edit-icon").unwrap();
+    vcx.simulate_click(tile.center(), gpui::Modifiers::none());
+    vcx.run_until_parked();
+    let default = state.read_with(&vcx, |s, _| {
+        crate::icon::palette_color(&s.edit_buffer().unwrap().item)
+    });
+    (dir, state, vcx, default)
+}
+
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+fn click(vcx: &mut VisualTestContext, selector: String) {
+    let b = vcx.debug_bounds(leak(selector)).expect("on screen");
+    vcx.simulate_click(b.center(), gpui::Modifiers::none());
+    vcx.run_until_parked();
+}
+
+#[gpui::test]
+fn picker_shape_and_colour_are_independent(cx: &mut TestAppContext) {
+    use crate::icon::PALETTE;
+    let (_dir, state, mut vcx, default) = picker_on("Wallet", None, cx);
+    let def_ix = PALETTE.iter().position(|c| *c == default).unwrap();
+    let x_ix = (def_ix + 1) % PALETTE.len();
+    // Opening: Automatic selected, the default colour selected, no default marker; the
+    // Automatic row previews the letter in the default colour.
+    let preview = |c: u32| leak(format!("icon-auto-preview letter W #{c:06X}"));
+    assert!(vcx.debug_bounds(preview(default)).is_some());
+    assert!(vcx.debug_bounds("icon-auto-selected").is_some());
+    assert!(
+        vcx.debug_bounds(leak(format!("icon-color-chosen {def_ix}")))
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds(leak(format!("icon-color-default {def_ix}")))
+            .is_none()
+    );
+    assert!(vcx.debug_bounds("icon-color-disabled").is_none());
+
+    // A colour pick keeps Automatic selected; the header tile follows live.
+    click(&mut vcx, format!("icon-color {x_ix}"));
+    assert!(
+        vcx.debug_bounds("icon-auto-selected").is_some(),
+        "Automatic stays"
+    );
+    assert!(
+        vcx.debug_bounds(preview(PALETTE[x_ix])).is_some(),
+        "row preview follows"
+    );
+    assert!(
+        vcx.debug_bounds(leak(format!("icon-color-chosen {x_ix}")))
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds(leak(format!(
+            "icon-tile letter W #{:06X} fill white",
+            PALETTE[x_ix]
+        )))
+        .is_some(),
+        "header tile preview"
+    );
+    // Back to the default colour clears the override entirely.
+    click(&mut vcx, format!("icon-color {def_ix}"));
+    state.read_with(&vcx, |s, _| {
+        assert_eq!(s.edit_buffer().unwrap().item.icon, None)
+    });
+
+    // A colour on a symbol is previewed by the Automatic row too (what picking it gives).
+    click(&mut vcx, "icon-symbol 2".into());
+    click(&mut vcx, format!("icon-color {x_ix}"));
+    assert!(vcx.debug_bounds(preview(PALETTE[x_ix])).is_some());
+    click(&mut vcx, format!("icon-color {def_ix}"));
+    assert!(vcx.debug_bounds(preview(default)).is_some());
+
+    // A symbol: Automatic deselects, the default colour shows selected.
+    click(&mut vcx, "icon-symbol 4".into());
+    assert!(vcx.debug_bounds("icon-auto-selected").is_none());
+    assert!(vcx.debug_bounds("icon-symbol-chosen 4").is_some());
+    assert!(
+        vcx.debug_bounds(leak(format!("icon-color-chosen {def_ix}")))
+            .is_some()
+    );
+    state.read_with(&vcx, |s, _| {
+        let i = s.edit_buffer().unwrap().item.icon.clone().unwrap();
+        assert_eq!((i.kind.as_str(), i.color), ("symbol", None));
+    });
+}
+
+#[gpui::test]
+fn logo_disables_the_colour_row(cx: &mut TestAppContext) {
+    use crate::icon::PALETTE;
+    let (_dir, state, mut vcx, default) = picker_on("Code", Some("https://github.com"), cx);
+    assert!(
+        vcx.debug_bounds("icon-color-disabled").is_some(),
+        "hint shown"
+    );
+    assert!(
+        vcx.debug_bounds("icon-auto-preview logo github").is_some(),
+        "Automatic previews the logo"
+    );
+    assert!(vcx.debug_bounds("icon-auto-selected").is_some());
+    let x_ix = PALETTE.iter().position(|c| *c != default).unwrap();
+    click(&mut vcx, format!("icon-color {x_ix}"));
+    state.read_with(&vcx, |s, _| {
+        assert_eq!(s.edit_buffer().unwrap().item.icon, None, "click ignored");
+    });
+    // With a symbol the colour row works again.
+    click(&mut vcx, "icon-symbol 0".into());
+    assert!(vcx.debug_bounds("icon-color-disabled").is_none());
+    click(&mut vcx, format!("icon-color {x_ix}"));
+    state.read_with(&vcx, |s, _| {
+        let i = s.edit_buffer().unwrap().item.icon.clone().unwrap();
+        assert_eq!(i.color, Some(crate::icon::format_color(PALETTE[x_ix])));
+    });
+}
+
+#[gpui::test]
+fn non_image_files_are_refused_on_drop(cx: &mut TestAppContext) {
+    // gpui 0.3.10's open panel has no file-type filter, so a PDF can be chosen or
+    // dropped; the magic-byte check refuses it with the same toast either way.
+    let (_dir, state, mut vcx, _) = picker_on("Scan", None, cx);
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = dir.path().join("scan.pdf");
+    std::fs::write(&pdf, b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n").unwrap();
+    let row = vcx.debug_bounds("icon-picker-image").unwrap().center();
+    vcx.simulate_event(gpui::FileDropEvent::Entered {
+        position: row,
+        paths: gpui::ExternalPaths(vec![pdf].into()),
+    });
+    vcx.simulate_event(gpui::FileDropEvent::Submit { position: row });
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| {
+        assert_eq!(
+            s.toast.as_ref().map(|t| t.message.to_string()).as_deref(),
+            Some(crate::icon_image::Refusal::Unreadable.message())
+        );
+        let b = s.edit_buffer().unwrap();
+        assert!(b.icon_added.is_empty() && b.item.icon.is_none());
+        let id = b.item.id;
+        assert!(
+            s.unlocked_vault()
+                .unwrap()
+                .get(id)
+                .unwrap()
+                .attachments
+                .is_empty()
+        );
+    });
 }

@@ -142,8 +142,7 @@ const MAIN: &[&str] = &[
     "nav-favorites",
     "nav-tags",
     "nav-tag",
-    "nav-settings",
-    "sidebar-lock",
+    "sidebar-toggle",
     "sort",
     "generator",
     "item-row",
@@ -236,6 +235,36 @@ fn main_read(cx: &mut TestAppContext) {
         Case {
             label: "main",
             targets: &targets,
+            disabled: &[],
+        },
+        &mut vcx,
+    );
+}
+
+/// Sidebar collapsed (⌃⌘S): the toggle and the list footer's Lock keep the pointer.
+#[gpui::test]
+fn main_sidebar_collapsed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mut vcx) = main_window(dir.path(), TALL, cx);
+    state.update(&mut vcx, |s, cx| s.toggle_sidebar(cx));
+    // The slide runs on real time and ends on its own last frame.
+    std::thread::sleep(crate::ui::SIDEBAR_MOTION * 2);
+    for _ in 0..2 {
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+    }
+    audit(
+        Case {
+            label: "main, sidebar collapsed",
+            targets: &[
+                "sidebar-toggle",
+                "sort",
+                "generator",
+                "item-row",
+                "new-item",
+                "favorite",
+                "edit",
+            ],
             disabled: &[],
         },
         &mut vcx,
@@ -442,9 +471,11 @@ fn edit_field_generator(cx: &mut TestAppContext) {
 fn edit_icon_picker(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (state, mut vcx) = main_window(dir.path(), SHORT, cx);
+    // A symbol first: the colour row is enabled (on the automatic logo it is not).
     state.update(&mut vcx, |s, cx| {
         s.begin_edit(cx);
         s.set_icon_picker(true, cx);
+        s.choose_icon(crate::icon::PickerCell::Symbol(0), cx);
     });
     let last_down = last_move_down(&state, &vcx);
     audit(
@@ -458,6 +489,30 @@ fn edit_icon_picker(cx: &mut TestAppContext) {
                 "icon-image",
             ],
             disabled: &["move-up-0", &last_down],
+        },
+        &mut vcx,
+    );
+    // Back to Automatic on the GitHub logo: the colour swatches are disabled.
+    state.update(&mut vcx, |s, cx| {
+        s.choose_icon(crate::icon::PickerCell::Automatic, cx);
+        assert!(crate::icon::color_disabled_reason(&s.edit_buffer().unwrap().item).is_some());
+    });
+    audit(
+        Case {
+            label: "icon picker, logo",
+            targets: &["edit-icon", "icon-auto", "icon-symbol", "icon-image"],
+            disabled: &[
+                "move-up-0",
+                &last_down,
+                "icon-color-0",
+                "icon-color-1",
+                "icon-color-2",
+                "icon-color-3",
+                "icon-color-4",
+                "icon-color-5",
+                "icon-color-6",
+                "icon-color-7",
+            ],
         },
         &mut vcx,
     );

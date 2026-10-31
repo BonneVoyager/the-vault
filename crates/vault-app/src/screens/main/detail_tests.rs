@@ -337,3 +337,163 @@ fn one_rule_between_last_field_and_footer(cx: &mut TestAppContext) {
     // exactly one column gap, with no extra divider (1 px + another gap) between.
     assert_eq!(footer.top() - last.bottom(), px(12.));
 }
+
+#[gpui::test]
+fn field_rows_use_7px_padding_and_label_foreground_value_muted(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open(dir.path(), &[("Alpha", STRONG)], cx);
+    select(&state, ids[0], &mut vcx);
+    for ix in 0..2 {
+        let row = vcx
+            .debug_bounds(Box::leak(format!("field-row {ix}").into_boxed_str()))
+            .unwrap();
+        let content = vcx
+            .debug_bounds(Box::leak(format!("field-content {ix}").into_boxed_str()))
+            .unwrap();
+        assert_eq!(
+            content.top() - row.top(),
+            px(FIELD_ROW_PAD_Y),
+            "top padding"
+        );
+        // Bottom: padding plus the 1 px rule.
+        assert_eq!(
+            row.bottom() - content.bottom(),
+            px(FIELD_ROW_PAD_Y + 1.),
+            "bottom padding"
+        );
+    }
+    assert_eq!(FIELD_ROW_PAD_Y, 7., "12 px before, about 5 px less");
+    // Label in the foreground colour, value in the muted foreground, both appearances.
+    for mode in [
+        gpui_component::ThemeMode::Light,
+        gpui_component::ThemeMode::Dark,
+    ] {
+        vcx.update(|window, cx| {
+            gpui_component::Theme::change(mode, Some(window), cx);
+            let theme = cx.theme();
+            assert_eq!(
+                field_row_colors(cx),
+                (theme.foreground, theme.muted_foreground)
+            );
+            assert_ne!(theme.foreground, theme.muted_foreground);
+        });
+    }
+}
+
+/// Draws a frame and returns the detail content probe's records from it.
+fn content_probe(vcx: &mut VisualTestContext) -> crate::ui::probe::Seen {
+    crate::ui::probe::take();
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    crate::ui::probe::take()
+        .into_iter()
+        .rev()
+        .find(|s| s.name == "detail-content-probe")
+        .expect("detail content rendered")
+}
+
+/// Edit and Cancel keep the detail content (inside the fade-in) at the same element
+/// path with its state, so the fade does not replay (the edit blink). Selecting
+/// another item still restarts it.
+#[gpui::test]
+fn edit_and_cancel_do_not_replay_the_detail_fade(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open(dir.path(), &[("GitHub", "a"), ("Mail", "b")], cx);
+    select(&state, ids[0], &mut vcx);
+    let read = content_probe(&mut vcx);
+    assert!(read.path.contains("detail-in"), "{}", read.path);
+
+    vcx.update(|_, cx| state.update(cx, |s, cx| s.begin_edit(cx)));
+    vcx.run_until_parked();
+    assert!(state.read_with(&vcx, |s, _| s.is_editing()));
+    let editing = content_probe(&mut vcx);
+    assert_eq!(editing.path, read.path, "Edit changed the faded container");
+    assert!(!editing.fresh, "Edit restarted the fade");
+
+    vcx.update(|_, cx| state.update(cx, |s, cx| s.cancel_edit(cx)));
+    vcx.run_until_parked();
+    assert!(!state.read_with(&vcx, |s, _| s.is_editing()));
+    let cancelled = content_probe(&mut vcx);
+    assert_eq!(
+        cancelled.path, read.path,
+        "Cancel changed the faded container"
+    );
+    assert!(!cancelled.fresh, "Cancel restarted the fade");
+
+    // A different item does fade in: its first frame has a fresh fade state.
+    crate::ui::probe::take();
+    select(&state, ids[1], &mut vcx);
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let other = crate::ui::probe::take()
+        .into_iter()
+        .find(|s| s.name == "detail-content-probe")
+        .expect("detail content rendered");
+    assert_ne!(other.path, read.path);
+    assert!(other.fresh, "a new selection restarts the fade");
+}
+
+/// The rule under the tags sits as far above the first row's content as each row's
+/// bottom border sits above the next row's content: the row's own top padding only.
+/// Same in the item window, which uses the same renderer.
+#[gpui::test]
+fn first_field_row_sits_under_the_rule_like_the_others(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open(dir.path(), &[("GitHub", "a")], cx);
+    select(&state, ids[0], &mut vcx);
+    let spacing = |vcx: &mut VisualTestContext| {
+        let b = |key: &'static str, vcx: &mut VisualTestContext| {
+            vcx.debug_bounds(key)
+                .unwrap_or_else(|| panic!("{key} not rendered"))
+        };
+        let rule = b("detail-fields-rule", vcx);
+        let row0 = b("field-row 0", vcx);
+        let first = b("field-content 0", vcx).top() - rule.bottom();
+        let between = b("field-content 1", vcx).top() - row0.bottom();
+        (first, between)
+    };
+    let (first, between) = spacing(&mut vcx);
+    assert_eq!(first, between, "main window");
+    assert_eq!(first, gpui::px(FIELD_ROW_PAD_Y));
+
+    let main_window = vcx.cx.update(|cx| cx.windows()[0]);
+    vcx.update(|_, cx| {
+        crate::screens::open_item_window(state.clone(), ids[0], cx).unwrap();
+    });
+    vcx.run_until_parked();
+    let item_window = vcx
+        .cx
+        .update(|cx| cx.windows())
+        .into_iter()
+        .find(|w| w.window_id() != main_window.window_id())
+        .expect("item window");
+    let mut item = VisualTestContext::from_window(item_window, &vcx.cx);
+    item.run_until_parked();
+    let (first, between) = spacing(&mut item);
+    assert_eq!(first, between, "item window");
+    assert_eq!(first, gpui::px(FIELD_ROW_PAD_Y));
+}
+
+#[gpui::test]
+fn labels_show_a_capital_but_stored_names_stay(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open(dir.path(), &[("Alpha", STRONG)], cx);
+    select(&state, ids[0], &mut vcx);
+    let names: Vec<String> = state.read_with(&vcx, |s, _| {
+        s.selected_item()
+            .unwrap()
+            .fields
+            .iter()
+            .map(|f| f.name.clone())
+            .collect()
+    });
+    assert_eq!(names[0], "username", "the fixture stores lowercase names");
+    assert!(vcx.debug_bounds("field-label-text 0 Username").is_some());
+    assert!(vcx.debug_bounds("field-label-text 0 username").is_none());
+    // Display only: the item and the editor keep the stored spelling.
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| {
+        assert_eq!(s.edit_buffer().unwrap().item.fields[0].name, "username");
+    });
+}

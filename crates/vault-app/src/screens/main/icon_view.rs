@@ -249,14 +249,21 @@ fn picker(
     };
     let theme = cx.theme();
     let cursor = buffer.icon_picker.map(|c| c.cell());
-    let current = buffer.item.icon.as_ref();
-    let chosen_symbol = current
-        .filter(|i| i.kind == icon::KIND_SYMBOL)
-        .and_then(|i| icon::symbol(&i.value));
-    let chosen_color = current
-        .and_then(|i| i.color.as_deref())
-        .and_then(icon::parse_color);
-    let auto = icon::automatic(&buffer.item);
+    // Shape and colour are independent (see `icon::Shape`): the Automatic row is
+    // selected whenever no symbol (or image) is, and the colour row always shows the
+    // effective colour, the item's own palette colour being marked as the default.
+    let shape = icon::shape(buffer.item.icon.as_ref());
+    let auto_selected = shape == icon::Shape::Automatic;
+    let chosen_symbol = match shape {
+        icon::Shape::Symbol(name) => Some(name),
+        _ => None,
+    };
+    let color_disabled = icon::color_disabled_reason(&buffer.item);
+    let chosen_color = color_disabled
+        .is_none()
+        .then(|| icon::effective_color(&buffer.item));
+    let default_color = icon::palette_color(&buffer.item);
+    let auto = icon::automatic_preview(&buffer.item);
     let ring = theme.ring;
 
     let choose = |cell: PickerCell| {
@@ -284,10 +291,16 @@ fn picker(
         .rounded(theme.radius)
         .clickable()
         .hover(|d| d.bg(theme.accent))
-        .when(current.is_none(), |d| d.bg(theme.primary.opacity(0.12)))
+        .when(auto_selected, |d| d.bg(theme.primary.opacity(0.12)))
         .map(|d| cursor_ring(d, PickerCell::Automatic))
         .on_click(choose(PickerCell::Automatic))
-        .child(icon_tile(&auto, 24., cx))
+        // What Automatic means right now, in the effective colour (updates live).
+        .child({
+            let preview = format!("icon-auto-preview {}", auto.describe());
+            div()
+                .debug_selector(move || preview.clone())
+                .child(icon_tile(&auto, 24., cx))
+        })
         .child(
             ui::v_flex()
                 .flex_1()
@@ -295,11 +308,13 @@ fn picker(
                 .child(div().text_sm().child("Automatic"))
                 .child(ui::muted(auto.label(), cx).text_xs().truncate()),
         )
-        .when(current.is_none(), |d| {
+        .when(auto_selected, |d| {
             d.child(
-                Icon::new(IconName::Check)
-                    .size_4()
-                    .text_color(theme.primary),
+                div().debug_selector(|| "icon-auto-selected".into()).child(
+                    Icon::new(IconName::Check)
+                        .size_4()
+                        .text_color(theme.primary),
+                ),
             )
         });
 
@@ -324,7 +339,10 @@ fn picker(
                     .rounded(theme.radius)
                     .clickable()
                     .hover(|d| d.bg(theme.accent))
-                    .when(chosen, |d| d.bg(theme.primary.opacity(0.18)))
+                    .when(chosen, |d| {
+                        d.bg(theme.primary.opacity(0.18))
+                            .debug_selector(move || format!("icon-symbol-chosen {ix}"))
+                    })
                     .map(|d| cursor_ring(d, cell))
                     .on_click(choose(cell))
                     .child(Icon::new(*name).size_4().text_color(if chosen {
@@ -335,33 +353,50 @@ fn picker(
             }))
     });
 
+    let enabled = color_disabled.is_none();
     let swatches = ui::h_flex()
         .gap(px(CELL_GAP + (CELL - SWATCH)))
         .px(px((CELL - SWATCH) / 2.))
+        .when(!enabled, |d| d.opacity(0.4))
         .children(PALETTE.iter().enumerate().map(|(ix, c)| {
             let cell = PickerCell::Color(ix);
             let chosen = chosen_color == Some(*c);
+            let default = *c == default_color;
+            let label = if default {
+                format!("{} (default)", PALETTE_NAMES[ix])
+            } else {
+                PALETTE_NAMES[ix].to_owned()
+            };
             div()
                 .id(("icon-color", ix))
                 .debug_selector(move || format!("icon-color {ix}"))
-                .aria_label(SharedString::from(PALETTE_NAMES[ix]))
+                .aria_label(SharedString::from(label))
                 .size(px(SWATCH))
                 .rounded_full()
                 .bg(rgb(*c))
-                .clickable()
+                .clickable_when(enabled)
                 .flex()
                 .items_center()
                 .justify_center()
                 .map(|d| cursor_ring(d, cell))
                 .when(chosen, |d| {
                     d.child(
-                        Icon::new(IconName::Check)
-                            .size_3()
-                            .text_color(gpui::white()),
+                        div()
+                            .debug_selector(move || format!("icon-color-chosen {ix}"))
+                            .child(
+                                Icon::new(IconName::Check)
+                                    .size_3()
+                                    .text_color(gpui::white()),
+                            ),
                     )
                 })
-                .on_click(choose(cell))
+                .when(enabled, |d| d.on_click(choose(cell)))
         }));
+    let color_hint = color_disabled.map(|why| {
+        ui::muted(why, cx)
+            .debug_selector(|| "icon-color-disabled".into())
+            .text_xs()
+    });
 
     let image_row = image_row(s, state, cursor == Some(PickerCell::Image), &choose, cx);
 
@@ -391,6 +426,7 @@ fn picker(
         .child(ui::v_flex().gap(px(CELL_GAP)).children(symbols))
         .child(ui::muted("Colour", cx).text_xs())
         .child(swatches)
+        .children(color_hint)
         .child(image_row)
         .into_any_element()
 }

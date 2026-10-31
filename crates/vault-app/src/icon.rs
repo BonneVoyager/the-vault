@@ -322,7 +322,13 @@ pub fn resolve(item: &Item) -> IconSpec {
         KIND_LOGO => BrandPack::get()
             .brand(&icon.value)
             .map_or_else(as_letter, |(slug, b)| IconSpec::Logo { slug, hex: b.hex }),
-        KIND_LETTER => as_letter(),
+        // "Automatic shape with a colour override" (orchestrator decision 2026-10-31):
+        // the brand logo when one matches (logos keep the brand colour), else the letter
+        // in the chosen colour.
+        KIND_LETTER => match automatic(item) {
+            logo @ IconSpec::Logo { .. } => logo,
+            _ => as_letter(),
+        },
         KIND_IMAGE => match image_attachment(icon) {
             Some(attachment) => IconSpec::Image { attachment },
             None => automatic(item),
@@ -387,30 +393,101 @@ fn website(item: &Item) -> Option<String> {
 }
 
 // --- Picker choices (edit mode). Each returns the new `Item.icon`. ---
+//
+// Shape and colour are independent (orchestrator decision 2026-10-31). Shape is
+// Automatic or one symbol (or a custom image, chosen elsewhere); colour is an override
+// of the item's palette colour, or none. Storage:
+//   Automatic + default colour → no icon
+//   Automatic + colour X       → kind `letter`, colour X
+//   symbol S  + default colour → kind `symbol` S, no colour
+//   symbol S  + colour X       → kind `symbol` S, colour X
 
-/// "Automatic": no icon.
-pub fn choose_automatic() -> Option<ItemIcon> {
-    None
+/// The shape part of the picker: what the Automatic row and the symbol grid show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Automatic,
+    Symbol(IconName),
+    /// A custom image (`kind: image`).
+    Image,
 }
 
-/// A symbol: kind `symbol`, keeping a colour chosen before.
+/// The shape `icon` stands for. Anything that is not a known symbol or an image (no
+/// icon, `letter`, `logo`, an unknown kind) counts as Automatic.
+pub fn shape(icon: Option<&ItemIcon>) -> Shape {
+    match icon {
+        Some(i) if i.kind == KIND_SYMBOL => {
+            symbol(&i.value).map_or(Shape::Automatic, Shape::Symbol)
+        }
+        Some(i) if image_attachment(i).is_some() => Shape::Image,
+        _ => Shape::Automatic,
+    }
+}
+
+/// The colour override stored in `icon`, if any (a valid `#RRGGBB`).
+pub fn color_override(icon: Option<&ItemIcon>) -> Option<u32> {
+    icon.and_then(|i| i.color.as_deref()).and_then(parse_color)
+}
+
+/// The colour the picker shows as selected: the override, else the item's palette colour.
+pub fn effective_color(item: &Item) -> u32 {
+    color_override(item.icon.as_ref()).unwrap_or_else(|| palette_color(item))
+}
+
+/// The icon for `shape` with colour override `color` (see the storage table above).
+fn compose(shape: Shape, color: Option<u32>, current: Option<&ItemIcon>) -> Option<ItemIcon> {
+    let with_color = |mut i: ItemIcon| {
+        i.color = color.map(format_color);
+        i
+    };
+    match shape {
+        Shape::Automatic => color.map(|_| with_color(ItemIcon::new(KIND_LETTER, ""))),
+        Shape::Symbol(icon) => symbol_name(icon).map(|n| with_color(ItemIcon::new(KIND_SYMBOL, n))),
+        // An image carries no colour; it stays as it is.
+        Shape::Image => current.cloned(),
+    }
+}
+
+/// "Automatic": the automatic shape, keeping a colour override.
+pub fn choose_automatic(current: Option<&ItemIcon>) -> Option<ItemIcon> {
+    compose(Shape::Automatic, color_override(current), current)
+}
+
+/// A symbol, keeping a colour override. A symbol outside the curated set changes nothing.
 pub fn choose_symbol(current: Option<&ItemIcon>, icon: IconName) -> Option<ItemIcon> {
-    let Some(name) = symbol_name(icon) else {
+    if symbol_name(icon).is_none() {
         return current.cloned();
-    };
-    let mut next = ItemIcon::new(KIND_SYMBOL, name);
-    next.color = current.and_then(|c| c.color.clone());
-    Some(next)
+    }
+    compose(Shape::Symbol(icon), color_override(current), current)
 }
 
-/// A colour: recolours a symbol; anything else becomes a tinted letter (kind `letter`).
-pub fn choose_color(current: Option<&ItemIcon>, color: u32) -> Option<ItemIcon> {
-    let mut next = match current {
-        Some(c) if c.kind == KIND_SYMBOL => c.clone(),
-        _ => ItemIcon::new(KIND_LETTER, ""),
+/// A colour for the current shape. Picking `default` (the item's palette colour) clears
+/// the override. On a custom image a colour means the automatic shape in that colour
+/// (the image is given up, as the IC-3 brief has it).
+pub fn choose_color(current: Option<&ItemIcon>, color: u32, default: u32) -> Option<ItemIcon> {
+    let shape = match shape(current) {
+        Shape::Image => Shape::Automatic,
+        other => other,
     };
-    next.color = Some(format_color(color));
-    Some(next)
+    let color = (color != default).then_some(color);
+    compose(shape, color, current)
+}
+
+/// What "Automatic" means for `item` right now, for the picker's Automatic row: the
+/// automatic shape in the effective colour (the brand logo when one matches, else the
+/// letter tinted with the colour override, or the palette colour without one). Updates
+/// with every colour pick, like the header tile.
+pub fn automatic_preview(item: &Item) -> IconSpec {
+    match (automatic(item), color_override(item.icon.as_ref())) {
+        (IconSpec::Letter { letter, .. }, Some(color)) => IconSpec::Letter { letter, color },
+        (spec, _) => spec,
+    }
+}
+
+/// Why the colour row is disabled for `item`: the Automatic shape resolves to a brand
+/// logo, which keeps the brand colour. `None` when it is enabled.
+pub fn color_disabled_reason(item: &Item) -> Option<&'static str> {
+    let logo = matches!(automatic(item), IconSpec::Logo { .. });
+    (shape(item.icon.as_ref()) == Shape::Automatic && logo).then_some("Logos use the brand colour")
 }
 
 // --- Tile colours. ---
@@ -562,22 +639,18 @@ impl PickerCursor {
         }
     }
 
-    /// Where the cursor starts when the picker opens: on the current choice.
+    /// Where the cursor starts when the picker opens: on the current shape (the colour
+    /// row always shows its selection, so the cursor starts on the shape).
     pub fn for_icon(icon: Option<&ItemIcon>) -> Self {
-        if icon.and_then(image_attachment).is_some() {
-            return Self::at(PickerCell::Image);
-        }
-        let symbol_ix = icon
-            .filter(|i| i.kind == KIND_SYMBOL)
-            .and_then(|i| SYMBOLS.iter().position(|(n, ..)| *n == i.value));
-        let color_ix = icon
-            .and_then(|i| i.color.as_deref())
-            .and_then(parse_color)
-            .and_then(|c| PALETTE.iter().position(|p| *p == c));
-        match (icon, symbol_ix, color_ix) {
-            (_, Some(i), _) => Self::at(PickerCell::Symbol(i)),
-            (Some(_), None, Some(i)) => Self::at(PickerCell::Color(i)),
-            _ => Self::at(PickerCell::Automatic),
+        match shape(icon) {
+            Shape::Image => Self::at(PickerCell::Image),
+            Shape::Symbol(icon) => SYMBOLS
+                .iter()
+                .position(|(_, i, _)| *i == icon)
+                .map_or(Self::at(PickerCell::Automatic), |i| {
+                    Self::at(PickerCell::Symbol(i))
+                }),
+            Shape::Automatic => Self::at(PickerCell::Automatic),
         }
     }
 }

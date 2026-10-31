@@ -232,7 +232,7 @@ fn new_item_inserts_template_and_selects_it(cx: &mut TestAppContext) {
         s.begin_new(crate::templates::Template::Card, "Visa".into(), cx);
         let b = s.edit_buffer().unwrap();
         let names: Vec<_> = b.item.fields.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, ["number", "expiry", "cvv", "name"]);
+        assert_eq!(names, ["Number", "Expiry", "CVV", "Name"]);
         assert_eq!(b.item.fields[1].kind, FieldKind::MonthYear);
         s.save_edit(cx);
         assert!(!s.is_editing());
@@ -569,9 +569,17 @@ fn kind_labels_are_capitalised_and_number_is_not_offered() {
     let k1 = b.add_field(FieldKind::Totp);
     let k2 = b.add_field(FieldKind::Totp);
     let k3 = b.add_field(FieldKind::Url);
-    assert_eq!(b.field(k1).unwrap().name, "one-time code");
-    assert_eq!(b.field(k2).unwrap().name, "one-time code 2");
-    assert_eq!(b.field(k3).unwrap().name, "url");
+    assert_eq!(b.field(k1).unwrap().name, "One-time code");
+    assert_eq!(b.field(k2).unwrap().name, "One-time code 2");
+    assert_eq!(b.field(k3).unwrap().name, "URL");
+    // A lower-case name already in the item (template spelling) counts as taken, and
+    // keeps its own spelling.
+    let mut item = Item::new("x", Uuid::new_v4(), 1);
+    item.fields = vec![Field::new("text", FieldKind::Text, secret(""), 1)];
+    let mut b = EditBuffer::new(item);
+    let k = b.add_field(FieldKind::Text);
+    assert_eq!(b.item.fields[0].name, "text");
+    assert_eq!(b.field(k).unwrap().name, "Text 2");
 }
 
 /// Gives GitHub's password two history entries ("old" at 20, "mid" at 30).
@@ -711,22 +719,25 @@ fn icon_picker_choices_are_part_of_the_edit(cx: &mut TestAppContext) {
         );
         assert!(b.has_changes());
 
-        // A colour recolours the symbol.
-        s.choose_icon(PickerCell::Color(1), cx);
+        // A colour recolours the symbol (one that is not the item's own default).
+        let default = crate::icon::palette_color(&s.edit_buffer().unwrap().item);
+        let ix = PALETTE.iter().position(|c| *c != default).unwrap();
+        s.choose_icon(PickerCell::Color(ix), cx);
         let item = s.edit_buffer().unwrap().item.clone();
         assert_eq!(
             resolve(&item),
             IconSpec::Symbol {
                 name: SYMBOLS[1].1,
-                color: PALETTE[1]
+                color: PALETTE[ix]
             }
         );
         s.save_edit(cx);
         let saved = stored(s, gh).icon.unwrap();
         assert_eq!(saved.kind, "symbol");
-        assert_eq!(saved.color.as_deref(), Some("#30A46C"));
+        assert_eq!(saved.color, Some(crate::icon::format_color(PALETTE[ix])));
 
-        // Back to automatic clears the icon; saved too.
+        // Back to automatic keeps the colour (shape and colour are independent); the
+        // default colour then clears the icon. Saved too.
         s.begin_edit(cx);
         assert_eq!(
             s.edit_buffer().unwrap().icon_picker,
@@ -734,19 +745,29 @@ fn icon_picker_choices_are_part_of_the_edit(cx: &mut TestAppContext) {
             "a new edit starts closed"
         );
         s.choose_icon(PickerCell::Automatic, cx);
+        let kept = s.edit_buffer().unwrap().item.icon.clone().unwrap();
+        assert_eq!(kept.kind, "letter");
+        assert_eq!(kept.color, Some(crate::icon::format_color(PALETTE[ix])));
+        // Automatic + the default colour: no icon at all. Saved too.
+        assert!(crate::icon::color_disabled_reason(&s.edit_buffer().unwrap().item).is_none());
+        let def_ix = PALETTE.iter().position(|c| *c == default).unwrap();
+        s.choose_icon(PickerCell::Color(def_ix), cx);
+        assert_eq!(s.edit_buffer().unwrap().item.icon, None);
+        s.choose_icon(PickerCell::Color(ix), cx);
+        let tinted = s.edit_buffer().unwrap().item.icon.clone().unwrap();
+        assert_eq!(tinted.kind, "letter");
         s.save_edit(cx);
-        assert_eq!(stored(s, gh).icon, None);
+        assert_eq!(stored(s, gh).icon, Some(tinted));
 
-        // Colour only on an automatic icon: a tinted letter. Cancel discards it.
+        // A symbol with the default colour stores no colour; Automatic + default clears.
         s.begin_edit(cx);
-        s.choose_icon(PickerCell::Color(2), cx);
-        let icon = s.edit_buffer().unwrap().item.icon.clone().unwrap();
-        assert_eq!(
-            (icon.kind.as_str(), icon.color.as_deref()),
-            ("letter", Some("#E5484D"))
-        );
+        s.choose_icon(PickerCell::Symbol(0), cx);
+        s.choose_icon(PickerCell::Color(def_ix), cx);
+        let i = s.edit_buffer().unwrap().item.icon.clone().unwrap();
+        assert_eq!((i.kind.as_str(), i.color), ("symbol", None));
+        s.choose_icon(PickerCell::Automatic, cx);
+        assert_eq!(s.edit_buffer().unwrap().item.icon, None);
         s.cancel_edit(cx);
-        assert_eq!(stored(s, gh).icon, None);
     });
 }
 
@@ -782,5 +803,66 @@ fn icon_change_keeps_fields_and_unknown_icons_survive_other_edits(cx: &mut TestA
         for (a, b) in after.fields.iter().zip(&before.fields) {
             assert_eq!(a.modified_at, b.modified_at);
         }
+    });
+}
+
+#[gpui::test]
+fn duplicate_field_names_ignore_case(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, gh, _) = setup(dir.path(), cx);
+    state.update(cx, |s, cx| {
+        s.select(gh, cx);
+        s.begin_edit(cx);
+        // The fixture has "username"; a second "Username" is the same name to ⌘⇧U.
+        let key = {
+            let mut key = 0;
+            s.edit(cx, |b| key = b.add_field(FieldKind::Text));
+            key
+        };
+        s.set_edit_name(key, "Username".into(), cx);
+        s.save_edit(cx);
+        let err = s.edit_buffer().unwrap().error.clone().unwrap();
+        assert!(err.contains("Two fields are named"), "{err}");
+        assert!(s.is_editing());
+    });
+}
+
+#[gpui::test]
+fn pre_existing_case_only_duplicates_still_save(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, gh, _) = setup(dir.path(), cx);
+    state.update(cx, |s, cx| {
+        // An older item (import, CLI) already holding "username" and "Username".
+        s.vault
+            .as_mut()
+            .unwrap()
+            .edit(|v| {
+                v.update(gh, 20, |it| {
+                    it.fields
+                        .push(Field::new("Username", FieldKind::Text, secret("dup"), 20))
+                })
+            })
+            .unwrap()
+            .unwrap();
+        s.vault_changed();
+        s.select(gh, cx);
+        // Editing something else saves: the collision was not made in this edit.
+        s.begin_edit(cx);
+        s.set_edit_title("GitHub 2".into(), cx);
+        s.save_edit(cx);
+        assert!(
+            !s.is_editing(),
+            "{:?}",
+            s.edit_buffer().and_then(|b| b.error.clone())
+        );
+        assert_eq!(stored(s, gh).title, "GitHub 2");
+
+        // Renaming one of them to another case-only twin is still refused.
+        s.begin_edit(cx);
+        let key = s.edit_buffer().unwrap().keys[1]; // "password"
+        s.set_edit_name(key, "USERNAME".into(), cx);
+        s.save_edit(cx);
+        let err = s.edit_buffer().unwrap().error.clone().unwrap();
+        assert!(err.contains("Two fields are named"), "{err}");
     });
 }

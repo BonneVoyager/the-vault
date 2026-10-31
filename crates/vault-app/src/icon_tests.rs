@@ -206,14 +206,11 @@ fn resolve_explicit_kinds() {
             ..
         }
     ));
-    // Letter tinted by a colour-only choice.
-    assert_eq!(
+    // A colour-only choice no longer turns a logo into a letter (2026-10-31).
+    assert!(matches!(
         resolve(&with_icon(base(), "letter", "", Some("#E5484D"))),
-        IconSpec::Letter {
-            letter: "G".into(),
-            color: 0xE5484D
-        }
-    );
+        IconSpec::Logo { slug: "github", .. }
+    ));
 }
 
 #[test]
@@ -324,29 +321,86 @@ fn contrast_rule_in_both_appearances() {
 
 #[test]
 fn picker_choices() {
-    // Symbol from automatic, then a colour keeps the symbol.
-    let s = choose_symbol(None, IconName::Bug).unwrap();
+    // The four storage mappings (default = the item's palette colour).
+    let (default, x) = (PALETTE[0], PALETTE[4]);
+    let triple = |i: &Option<ItemIcon>| {
+        i.as_ref()
+            .map(|i| (i.kind.clone(), i.value.clone(), i.color.clone()))
+    };
+    // Automatic + default → none; Automatic + X → letter X.
+    assert_eq!(choose_color(None, default, default), None);
+    let l = choose_color(None, x, default);
     assert_eq!(
-        (s.kind.as_str(), s.value.as_str(), s.color.as_deref()),
-        ("symbol", "Bug", None)
+        triple(&l),
+        Some(("letter".into(), "".into(), Some(format_color(x))))
     );
-    let c = choose_color(Some(&s), 0x30A46C).unwrap();
+    // Symbol + default → symbol, no colour; symbol + X → symbol, colour X.
+    let s = choose_symbol(None, IconName::Bug);
+    assert_eq!(triple(&s), Some(("symbol".into(), "Bug".into(), None)));
+    let sx = choose_color(s.as_ref(), x, default);
     assert_eq!(
-        (c.kind.as_str(), c.value.as_str(), c.color.as_deref()),
-        ("symbol", "Bug", Some("#30A46C"))
+        triple(&sx),
+        Some(("symbol".into(), "Bug".into(), Some(format_color(x))))
     );
-    // A new symbol keeps the colour.
-    let s2 = choose_symbol(Some(&c), IconName::Mail).unwrap();
-    assert_eq!(s2.color.as_deref(), Some("#30A46C"));
-    // Colour only: a tinted letter.
-    let l = choose_color(None, 0xE5484D).unwrap();
+    // Picking the default again clears the override, keeping the shape.
     assert_eq!(
-        (l.kind.as_str(), l.color.as_deref()),
-        ("letter", Some("#E5484D"))
+        triple(&choose_color(sx.as_ref(), default, default)),
+        triple(&s)
     );
+    assert_eq!(choose_color(l.as_ref(), default, default), None);
+    // Shape changes keep the colour: symbol keeps X, Automatic keeps X as a letter.
+    assert_eq!(
+        choose_symbol(l.as_ref(), IconName::Mail).unwrap().color,
+        Some(format_color(x))
+    );
+    assert_eq!(triple(&choose_automatic(sx.as_ref())), triple(&l));
+    assert_eq!(choose_automatic(s.as_ref()), None);
+    assert_eq!(choose_automatic(None), None);
     // A symbol outside the set changes nothing.
-    assert_eq!(choose_symbol(Some(&c), IconName::Zap), Some(c));
-    assert_eq!(choose_automatic(), None);
+    assert_eq!(choose_symbol(sx.as_ref(), IconName::Zap), sx);
+    // Shapes.
+    assert_eq!(shape(None), Shape::Automatic);
+    assert_eq!(shape(l.as_ref()), Shape::Automatic);
+    assert_eq!(shape(s.as_ref()), Shape::Symbol(IconName::Bug));
+    let img = image_icon(vault_core::Uuid::new_v4());
+    assert_eq!(shape(Some(&img)), Shape::Image);
+    // A colour on an image: the automatic shape in that colour (the image is given up).
+    assert_eq!(triple(&choose_color(Some(&img), x, default)), triple(&l));
+    assert_eq!(choose_color(Some(&img), default, default), None);
+}
+
+#[test]
+fn letter_kind_is_automatic_with_a_colour_override() {
+    let logo_item = || item("github", &[("url", FieldKind::Url, "github.com")]);
+    // A colour override on a logo-matching item still shows the logo.
+    let it = with_icon(logo_item(), "letter", "", Some("#E5484D"));
+    assert!(matches!(
+        resolve(&it),
+        IconSpec::Logo { slug: "github", .. }
+    ));
+    assert_eq!(
+        color_disabled_reason(&it),
+        Some("Logos use the brand colour")
+    );
+    assert_eq!(
+        color_disabled_reason(&logo_item()),
+        Some("Logos use the brand colour")
+    );
+    // Without a logo it is the tinted letter, and the colour row is enabled.
+    let plain = with_icon(item("Bank", &[]), "letter", "", Some("#E5484D"));
+    assert_eq!(
+        resolve(&plain),
+        IconSpec::Letter {
+            letter: "B".into(),
+            color: 0xE5484D
+        }
+    );
+    assert_eq!(color_disabled_reason(&plain), None);
+    assert_eq!(effective_color(&plain), 0xE5484D);
+    // A symbol on a logo item can be coloured; no override means the palette colour.
+    let sym = with_icon(logo_item(), "symbol", "Bug", None);
+    assert_eq!(color_disabled_reason(&sym), None);
+    assert_eq!(effective_color(&sym), palette_color(&sym));
 }
 
 #[test]
@@ -408,10 +462,11 @@ fn picker_cursor_starts_on_the_current_choice() {
         PickerCursor::for_icon(Some(&s)).cell(),
         PickerCell::Symbol(mail)
     );
-    let l = choose_color(None, PALETTE[3]).unwrap();
+    // A colour-only choice is the Automatic shape: the cursor starts there.
+    let l = choose_color(None, PALETTE[3], PALETTE[0]).unwrap();
     assert_eq!(
         PickerCursor::for_icon(Some(&l)).cell(),
-        PickerCell::Color(3)
+        PickerCell::Automatic
     );
 }
 
@@ -461,4 +516,29 @@ fn only_the_icon_attachment_is_hidden() {
     assert!(!is_icon_attachment(&it, &icon_ref));
     it.icon = Some(vault_core::ItemIcon::new("image", "nope"));
     assert!(!is_icon_attachment(&it, &icon_ref));
+}
+
+#[test]
+fn automatic_preview_uses_the_effective_colour() {
+    let plain = item("Bank", &[]);
+    assert_eq!(automatic_preview(&plain), automatic(&plain));
+    let x = PALETTE[2];
+    let tinted = with_icon(item("Bank", &[]), "symbol", "Bug", Some(&format_color(x)));
+    assert_eq!(
+        automatic_preview(&tinted),
+        IconSpec::Letter {
+            letter: "B".into(),
+            color: x
+        }
+    );
+    let logo = with_icon(
+        item("gh", &[("url", FieldKind::Url, "github.com")]),
+        "letter",
+        "",
+        Some(&format_color(x)),
+    );
+    assert!(matches!(
+        automatic_preview(&logo),
+        IconSpec::Logo { slug: "github", .. }
+    ));
 }

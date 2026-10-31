@@ -51,7 +51,7 @@ fn rank(item: &Item, q: &str) -> Option<u8> {
         return Some(2);
     }
     if item.fields.iter().any(|f| {
-        (f.name == "username" || f.kind == FieldKind::Email)
+        (f.name.eq_ignore_ascii_case("username") || f.kind == FieldKind::Email)
             && fold(f.value.expose_secret()).contains(q)
     }) {
         return Some(3);
@@ -84,4 +84,40 @@ pub fn search<'a>(vault: &'a UnlockedVault, q: &Query) -> Vec<&'a Item> {
         .collect();
     hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.as_str().cmp(b.1.as_str())));
     hits.into_iter().map(|(_, _, i)| i).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::item::Field;
+    use secrecy::SecretString;
+    use uuid::Uuid;
+
+    fn with(name: &str, kind: FieldKind, v: &str) -> Item {
+        let mut i = Item::new("T", Uuid::nil(), 1);
+        i.fields
+            .push(Field::new(name, kind, SecretString::new(v.to_owned()), 1));
+        i
+    }
+
+    #[test]
+    fn username_field_name_is_case_insensitive() {
+        for name in ["username", "Username", "USERNAME"] {
+            assert_eq!(
+                rank(&with(name, FieldKind::Text, "zed@x.org"), "zed"),
+                Some(3)
+            );
+        }
+        // Other ranks are unchanged.
+        assert_eq!(rank(&with("other", FieldKind::Text, "zed"), "zed"), None);
+        assert_eq!(
+            rank(&with("e", FieldKind::Email, "zed@x.org"), "zed"),
+            Some(3)
+        );
+        assert_eq!(rank(&with("n", FieldKind::Notes, "zed"), "zed"), Some(5));
+        assert_eq!(
+            rank(&with("url", FieldKind::Url, "https://zed.dev"), "zed"),
+            Some(2)
+        );
+    }
 }

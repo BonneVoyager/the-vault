@@ -51,9 +51,8 @@ fn main() {
         .run(|cx: &mut App| {
             gpui_component::init(cx);
             actions::bind_keys(cx);
-            actions::set_menus(Sort::default(), cx);
-
             let settings = persist::load_settings();
+            actions::set_menus(Sort::default(), !settings.sidebar_hidden, cx);
             theme::set_prefs(&settings, cx);
             let state = cx.new(|_| {
                 AppState::new(vault_macos::device_id(), persist::load_recent(), true)
@@ -62,7 +61,8 @@ fn main() {
             register_actions(&state, cx);
 
             let restore = persist::load_window_state();
-            let opened = ui::open_main_window(restore, cx, |window, cx| {
+            let sidebar_visible = state.read(cx).sidebar_visible();
+            let opened = ui::open_main_window(restore, sidebar_visible, cx, |window, cx| {
                 theme::apply(window, cx);
                 cx.new(|cx| VaultRoot::new(state.clone(), restore, window, cx))
             });
@@ -79,5 +79,10 @@ fn main() {
                 }
             });
             cx.activate(true);
+            // The window opened with this minimum already; re-applied through the one
+            // hook (best effort: the window may not be key yet).
+            if !sidebar_visible {
+                ui::apply_main_min_size(false);
+            }
         });
 }

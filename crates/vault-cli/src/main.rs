@@ -232,13 +232,25 @@ fn sanitize_for_terminal(s: &str) -> String {
     out
 }
 
+/// The username shown in the `list` column: a non-sensitive field named "username" in any ASCII case.
+fn list_username(item: &Item) -> Option<String> {
+    item.fields
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case("username"))
+        .filter(|f| !f.kind.is_sensitive())
+        .map(|f| sanitize_for_terminal(f.value.expose_secret()))
+        .filter(|u| !u.is_empty())
+}
+
 /// What `get` prints for a field: secrets are masked unless `reveal` is set.
 fn display_value(item: &Item, f: &Field, reveal: bool) -> String {
     let raw = f.value.expose_secret();
     if reveal {
         return sanitize_for_terminal(raw);
     }
-    if f.name == "number" && item.tags.iter().any(|t| t == "card") {
+    if f.name.eq_ignore_ascii_case("number")
+        && item.tags.iter().any(|t| t.eq_ignore_ascii_case("card"))
+    {
         let digits: Vec<char> = raw.chars().filter(|c| !c.is_whitespace()).collect();
         if digits.len() >= 4 {
             let last4: String = digits[digits.len() - 4..].iter().collect();
@@ -581,7 +593,11 @@ fn run(cli: Cli) -> Result<()> {
             let now = now_millis();
             let mut item = Item::new(a.title.clone(), sv.device_id(), now);
             item.tags = a.tags.clone();
-            if !item.tags.contains(&a.template) {
+            if !item
+                .tags
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(&a.template))
+            {
                 item.tags.push(a.template.clone());
             }
             match a.template.as_str() {
@@ -670,11 +686,7 @@ fn run(cli: Cli) -> Result<()> {
             };
             for item in search(vault, &q) {
                 let short = &item.id.simple().to_string()[..8];
-                let user = item
-                    .field("username")
-                    .filter(|f| !f.kind.is_sensitive())
-                    .map(|f| sanitize_for_terminal(f.value.expose_secret()))
-                    .filter(|u| !u.is_empty());
+                let user = list_username(item);
                 let tags = sanitize_for_terminal(&item.tags.join(","));
                 let title = sanitize_for_terminal(&item.title);
                 match user {
@@ -701,7 +713,7 @@ fn run(cli: Cli) -> Result<()> {
             let field = item
                 .fields
                 .iter()
-                .find(|f| f.name == "totp")
+                .find(|f| f.name.eq_ignore_ascii_case("totp"))
                 .or_else(|| item.fields.iter().find(|f| f.kind == FieldKind::Totp))
                 .context("item has no totp field")?;
             let raw = field.value.expose_secret();
@@ -956,5 +968,21 @@ mod tests {
         assert!(remove_attachment_and_icon(&mut v, item, icon_blob, 30).unwrap());
         let it = v.get(item).unwrap();
         assert!(it.icon.is_none() && it.attachments.is_empty());
+    }
+
+    #[test]
+    fn capitalised_names_mask_and_match() {
+        let i = item(true, "Number", FieldKind::Text, "4111 1111 1111 1234");
+        let masked = display_value(&i, &i.fields[0], false);
+        assert!(
+            masked.ends_with(" 1234") && !masked.contains("4111"),
+            "{masked}"
+        );
+        assert_eq!(display_value(&i, &i.fields[0], true), "4111 1111 1111 1234");
+        let mut t = item(false, "Number", FieldKind::Text, "4111111111111234");
+        t.tags.push("Card".to_owned());
+        assert!(!display_value(&t, &t.fields[0], false).contains("4111"));
+        let u = item(false, "Username", FieldKind::Text, "octo");
+        assert_eq!(list_username(&u).as_deref(), Some("octo"));
     }
 }

@@ -164,11 +164,19 @@ impl EditBuffer {
 
     /// Appends a field of `kind` with a unique default name; returns its key.
     pub fn add_field(&mut self, kind: FieldKind) -> u64 {
-        // Field names stay lower case, like the template names ("password", "url").
-        let base = kind_name(kind).to_lowercase();
+        // A field added here starts with a capital, as its name will be typed (owner
+        // 2026-10-31): the kind's label ("Text", "URL", "One-time code"). Template and
+        // existing names keep their own spelling. "Text" next to an existing "text"
+        // counts as taken, so the new one is numbered.
+        let base = kind_name(kind).to_owned();
         let mut name = base.clone();
         let mut n = 2;
-        while self.item.fields.iter().any(|f| f.name == name) {
+        while self
+            .item
+            .fields
+            .iter()
+            .any(|f| f.name.to_lowercase() == name.to_lowercase())
+        {
             name = format!("{base} {n}");
             n += 1;
         }
@@ -278,12 +286,33 @@ impl EditBuffer {
             }
             f.value = normalize_totp(&f.value, &item.title);
         }
+        // Whether row `i`'s name was added or changed in this edit.
+        let name_touched: Vec<bool> = self
+            .keys
+            .iter()
+            .zip(&item.fields)
+            .map(|(key, f)| {
+                usize::try_from(*key)
+                    .ok()
+                    .and_then(|k| self.original.fields.get(k))
+                    .is_none_or(|of| of.name.trim() != f.name.trim())
+            })
+            .collect();
         for i in 0..item.fields.len() {
             let name = item.fields[i].name.trim().to_owned();
             if name.is_empty() {
                 return Err("Every field needs a name".into());
             }
-            if item.fields[..i].iter().any(|f| f.name == name) {
+            // Exact duplicates are always refused. Names equal but for case are refused
+            // too, like every app-side name lookup ("Username" and "username" are the
+            // same field to ⌘⇧U and the subtitle), but only when this edit added or
+            // renamed one of them: an older item already holding both still saves.
+            let clash = item.fields[..i].iter().enumerate().any(|(j, f)| {
+                f.name == name
+                    || (f.name.to_lowercase() == name.to_lowercase()
+                        && (name_touched[i] || name_touched[j]))
+            });
+            if clash {
                 return Err(format!("Two fields are named \u{201c}{name}\u{201d}").into());
             }
             item.fields[i].name = name;
@@ -662,13 +691,15 @@ impl AppState {
         self.edit(cx, |b| {
             let current = b.item.icon.as_ref();
             b.item.icon = match cell {
-                PickerCell::Automatic => icon::choose_automatic(),
+                PickerCell::Automatic => icon::choose_automatic(current),
                 PickerCell::Symbol(i) => match icon::SYMBOLS.get(i) {
                     Some((_, name, _)) => icon::choose_symbol(current, *name),
                     None => current.cloned(),
                 },
                 PickerCell::Color(i) => match icon::PALETTE.get(i) {
-                    Some(c) => icon::choose_color(current, *c),
+                    // Disabled while Automatic shows a brand logo.
+                    Some(_) if icon::color_disabled_reason(&b.item).is_some() => current.cloned(),
+                    Some(c) => icon::choose_color(current, *c, icon::palette_color(&b.item)),
                     None => current.cloned(),
                 },
                 PickerCell::Image => current.cloned(),

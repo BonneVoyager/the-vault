@@ -23,9 +23,12 @@ pub use idle::{
     on_will_sleep, reduce_motion_enabled, seconds_since_user_input,
 };
 pub use pasteboard::{CONCEALED_TYPE, ChangeCount, Clipboard, PLAIN_TEXT_TYPE};
-pub use window::exclude_app_windows_from_capture;
 #[cfg(target_os = "macos")]
 pub use window::exclude_window_from_capture;
+pub use window::{
+    exclude_app_windows_from_capture, set_key_window_min_content_size,
+    set_min_content_size_for_view,
+};
 
 mod biometric;
 pub use biometric::Biometric;
@@ -44,3 +47,6 @@ pub use qr::{
 
 mod appearance;
 pub use appearance::{Rgba, on_system_colors_changed, system_accent_color};
+
+mod panel;
+pub use panel::{choose_file, normalize_extensions};

@@ -168,7 +168,7 @@ pub struct Query<'a> { pub text: &'a str, pub tag: Option<&'a str>, pub favorite
 pub fn search<'a>(vault: &'a UnlockedVault, q: &Query) -> Vec<&'a Item>;   // ranked
 ```
 
-Ranking: title prefix match > title substring > url host match > username match > tag match > notes substring. Case-insensitive, Unicode-folded. Stable sort by `title` within rank. Simple, no fuzzy library in v1.
+Ranking: title prefix match > title substring > url host match > username match > tag match > notes substring. Case-insensitive, Unicode-folded. Field-name comparisons in search and export (e.g. the `username` field) are ASCII case-insensitive (2026-10-31), because the app's templates store natural labels such as "Username" while importers and the CLI write lowercase names. Stable sort by `title` within rank. Simple, no fuzzy library in v1.
 
 ## `import` / `export`
 

@@ -85,6 +85,10 @@ impl Clipboard {
 
 `window::exclude_app_windows_from_capture() -> usize` sets `NSWindow.sharingType = .none` on every app window; `vault-app` calls it on the main thread whenever a window is created. Apple documents this constant as legacy and says it must not be relied on to hide content, so it is set as best effort only and never described to the user as protection.
 
+`window::set_min_content_size_for_view(ns_view: NonNull<c_void>, width: f64, height: f64) -> bool` (unsafe; the view pointer comes from gpui's raw window handle) and `window::set_key_window_min_content_size(width: f64, height: f64) -> bool` (2026-10-31) set `contentMinSize` on that one window when it is titled, not an `NSPanel` and not a sheet; false off the main thread, off macOS, or when the filter fails. Never applied to every window, so item-detail windows keep their own minimum.
+
+`panel::choose_file(extensions: &[&str], prompt: &str) -> Option<PathBuf>` (2026-10-31) runs a modal `NSOpenPanel` for one file (no directories, aliases resolved, `prompt` as the button title) limited to the lowercased, deduplicated `extensions` via the deprecated but still honoured `allowedFileTypes`, because gpui's path prompt has no type filter; it returns None on cancel, off the main thread, off macOS, or for an empty extension list. The app uses it for the icon picker (png, jpg, jpeg) and still verifies the file by magic bytes. AppKit grows a window that is smaller than the new minimum. `vault-app` calls it on every sidebar toggle (820 expanded, 600 collapsed) because gpui sets a window minimum only at creation.
+
 ## 4. iCloud eviction (`CloudHooks` impl for `vault-sync`)
 
 ```rust

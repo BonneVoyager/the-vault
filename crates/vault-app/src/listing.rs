@@ -172,17 +172,21 @@ pub fn subtitle(item: &Item) -> String {
         .unwrap_or_default()
 }
 
-/// A card's number field: the `number` field of a `card`-tagged item, masked as
-/// `•••• 4242` until revealed (main detail and the backup viewer share this rule).
+/// A card's number field: the field named `number` (any case) of a `card`-tagged item,
+/// masked as `•••• 4242` until revealed (main detail and the backup viewer share this
+/// rule).
 pub fn is_card_number(item: &Item, field: &Field) -> bool {
-    field.name == "number" && crate::templates::is_card(item)
+    field.name.eq_ignore_ascii_case("number") && crate::templates::is_card(item)
 }
 
-/// The field ⌘⇧U copies and the list subtitle shows: `username`, else the first email.
-/// A sensitive field (password, TOTP, unknown kind) named "username" is never used, so
-/// its value cannot leak into the always-visible subtitle.
+/// The field ⌘⇧U copies and the list subtitle shows: the first field named `username`
+/// in any case (templates write "Username", imports and the CLI often "username"), else
+/// the first email. A sensitive field (password, TOTP, unknown kind) named "username" is
+/// never used, so its value cannot leak into the always-visible subtitle.
 pub fn username_field(item: &Item) -> Option<&Field> {
-    item.field("username")
+    item.fields
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case("username"))
         .filter(|f| !f.kind.is_sensitive())
         .or_else(|| item.fields.iter().find(|f| f.kind == FieldKind::Email))
 }
@@ -216,6 +220,46 @@ mod tests {
     fn add(v: &mut UnlockedVault, title: &str, now: u64) -> Uuid {
         let item = Item::new(title, v.device_id(), now);
         v.insert(item, now)
+    }
+
+    #[test]
+    fn name_lookups_ignore_case() {
+        let d = Uuid::new_v4();
+        let field = |name: &str, kind, value: &str| {
+            Field::new(name, kind, vault_core::SecretString::new(value.into()), 1)
+        };
+        // Imported / CLI lowercase, template capitalised, shouting: all the username.
+        for name in ["username", "Username", "USERNAME"] {
+            let mut item = Item::new("x", d, 1);
+            item.fields = vec![
+                field("Email", FieldKind::Email, "a@b.c"),
+                field(name, FieldKind::Text, "chris"),
+            ];
+            assert_eq!(subtitle(&item), "chris", "{name}");
+            assert_eq!(
+                username_field(&item).map(|f| f.name.as_str()),
+                Some(name),
+                "{name}"
+            );
+        }
+        // A sensitive "Username" still never leaks; the email is used instead.
+        let mut item = Item::new("x", d, 1);
+        item.fields = vec![
+            field("Username", FieldKind::Password, "secret"),
+            field("mail", FieldKind::Email, "a@b.c"),
+        ];
+        assert_eq!(subtitle(&item), "a@b.c");
+        // The card number, whatever its case.
+        for name in ["number", "Number"] {
+            let mut card = crate::templates::tagged(crate::templates::Template::Card, "V", d, 1);
+            card.fields = vec![field(name, FieldKind::Text, "4242424242424242")];
+            assert!(is_card_number(&card, &card.fields[0]), "{name}");
+            assert_eq!(
+                subtitle(&card),
+                "\u{2022}\u{2022}\u{2022}\u{2022} 4242",
+                "{name}"
+            );
+        }
     }
 
     #[test]

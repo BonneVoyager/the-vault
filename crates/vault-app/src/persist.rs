@@ -181,12 +181,14 @@ mod tests {
             appearance: crate::state::Appearance::Dark,
             text_size: crate::state::TextSize::Larger,
             onboarding_dismissed: true,
+            sidebar_hidden: true,
         };
         save_settings_to(dir.path(), &settings);
         assert_eq!(load_settings_from(dir.path()), settings);
         let json = fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
         assert!(json.contains("\"backup_enabled\": false"), "{json}");
         assert!(json.contains("\"retention_multiplier\": 4.0"), "{json}");
+        assert!(json.contains("\"sidebar_hidden\": true"), "{json}");
 
         // Older or hand-edited files: missing keys take defaults, garbage is ignored.
         fs::write(
@@ -210,6 +212,7 @@ mod tests {
         assert_eq!(lenient.text_size, crate::state::TextSize::Default);
         assert_eq!(partial.clipboard_clear_secs, 30);
         assert!(partial.backup_enabled);
+        assert!(!partial.sidebar_hidden, "the sidebar defaults to expanded");
         assert_eq!(partial.retention_multiplier, 1.0);
         // A multiplier outside the offered segments snaps back to 1x.
         for m in ["3.0", "0.0", "-1", "100"] {
@@ -231,6 +234,16 @@ mod tests {
                 "{minutes}/{secs}"
             );
         }
+        // A malformed sidebar flag falls back alone; the other settings survive.
+        fs::write(
+            dir.path().join(SETTINGS_FILE),
+            r#"{"lock_on_sleep": false, "sidebar_hidden": "yes", "onboarding_dismissed": true}"#,
+        )
+        .unwrap();
+        let sidebar = load_settings_from(dir.path());
+        assert!(!sidebar.sidebar_hidden);
+        assert!(!sidebar.lock_on_sleep);
+        assert!(sidebar.onboarding_dismissed);
         fs::write(dir.path().join(SETTINGS_FILE), "not json").unwrap();
         assert_eq!(load_settings_from(dir.path()), Settings::default());
     }

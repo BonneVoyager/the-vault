@@ -21,7 +21,7 @@ impl Drop for PlaintextExport {
 fn value<'a>(item: &'a Item, name: &str, kind: FieldKind) -> &'a str {
     item.fields
         .iter()
-        .find(|f| f.name == name)
+        .find(|f| f.name.eq_ignore_ascii_case(name))
         .or_else(|| item.fields.iter().find(|f| f.kind == kind))
         .map_or("", |f| f.value.expose_secret().as_str())
 }

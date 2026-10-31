@@ -15,10 +15,12 @@ use gpui_kit_assets::IconName;
 use super::MainScreen;
 use super::icon_view::item_tile;
 
-use crate::actions::{LIST_CONTEXT, SortAlphabetical, SortRecentlyModified};
+use crate::actions::{
+    LIST_CONTEXT, SortAlphabetical, SortRecentlyModified, ToggleSidebar, sidebar_menu_title,
+};
 use crate::audit::Issue;
 use crate::listing::{self, Row};
-use crate::state::{AppState, GeneratorTarget, Sort};
+use crate::state::{AppState, Filter, GeneratorTarget, Sort};
 use crate::templates::Template;
 use crate::ui::{self, Clickable as _};
 
@@ -227,6 +229,31 @@ fn template_picker(state: &Entity<AppState>, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// The list heading while the sidebar is collapsed: the active filter as the sidebar
+/// names it, and the count the sidebar shows next to it.
+pub fn filter_heading(s: &AppState) -> (String, usize) {
+    match &s.filter {
+        Filter::All => ("All Items".into(), s.counts.all),
+        Filter::Favorites => ("Favorites".into(), s.counts.favorites),
+        Filter::Tag(tag) => s
+            .counts
+            .tags
+            .iter()
+            .find(|(t, _)| crate::templates::tag_matches(t, tag))
+            .map(|(t, n)| (format!("#{t}"), *n))
+            .unwrap_or_else(|| (format!("#{tag}"), 0)),
+    }
+}
+
+/// The sidebar button at the left of the search row, in both sidebar states.
+fn sidebar_toggle(sidebar_visible: bool) -> Button {
+    let title = sidebar_menu_title(sidebar_visible);
+    ui::icon_button("sidebar-toggle", IconName::PanelLeft, title)
+        .tooltip(format!("{title}  \u{2303}\u{2318}S"))
+        .debug_selector(move || format!("sidebar-toggle {title}"))
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx))
+}
+
 pub const EMPTY_VAULT: &str = "This vault is empty";
 pub const NO_RESULTS: &str = "No results";
 pub const NO_ITEMS_HERE: &str = "No items here";
@@ -295,6 +322,8 @@ impl MainScreen {
         let item_count = s.listing.items.len();
         let picker_open = s.template_picker.is_some();
         let generator_open = s.generator_target == Some(GeneratorTarget::Global);
+        let collapsed = self.sidebar_collapsed();
+        let heading = collapsed.then(|| filter_heading(s));
 
         let sort_button = ui::icon_button("sort", IconName::SortAscending, "Sort items")
             .dropdown_menu(move |menu, _, _| {
@@ -312,12 +341,19 @@ impl MainScreen {
             });
 
         // The search row sits in the title-bar band, centred on the traffic lights.
+        // Left padding comes from `slide_header`: wider while the sidebar is collapsed,
+        // so the toggle sits right of the traffic lights.
         let header = ui::h_flex()
             .flex_none()
             // Symmetric padding: at the default text size the row is exactly the band.
             .py(px(ui::SEARCH_TOP))
             .px(px(ui::COLUMN_PAD_X))
             .gap(px(4.))
+            .child(
+                ui::no_window_drag(div())
+                    .flex_none()
+                    .child(sidebar_toggle(!collapsed)),
+            )
             .child(
                 ui::no_window_drag(div())
                     .flex_1()
@@ -418,6 +454,7 @@ impl MainScreen {
                 ui::popover(
                     "kind-picker",
                     Button::new("new-item")
+                        .debug_selector(|| "new-item".into())
                         .ghost()
                         .small()
                         .icon(Icon::new(IconName::Plus))
@@ -438,6 +475,7 @@ impl MainScreen {
                     move |_, cx| template_picker(&picker_state, cx),
                 )
             })
+            // No Lock button (owner, 2026-10-31): ⌘L and File ▸ Lock only.
             .child(
                 div()
                     .debug_selector(|| "list-footer-count".into())
@@ -449,11 +487,41 @@ impl MainScreen {
                     }),
             );
 
+        // Collapsed only: the active filter the sidebar would show selected.
+        let heading = heading.map(|(title, count)| {
+            ui::h_flex()
+                .flex_none()
+                .px(px(ui::COLUMN_PAD_X))
+                .pb(px(6.))
+                .gap(px(8.))
+                .debug_selector(|| "list-filter-heading".into())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .debug_selector({
+                            let title = title.clone();
+                            move || format!("list-filter-title {title}")
+                        })
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .debug_selector(move || format!("list-filter-count {count}"))
+                        .child(count.to_string()),
+                )
+        });
+
         ui::v_flex()
             .size_full()
             .border_r_1()
             .border_color(theme.border)
-            .child(header)
+            .child(self.slide_header(header))
+            .children(heading)
             .child(
                 ui::v_flex()
                     .id("item-list")
@@ -464,7 +532,18 @@ impl MainScreen {
                     .min_h_0()
                     .mx(px(2.))
                     .rounded(theme.radius)
-                    .map(|el| ui::focus_ring(el, cx))
+                    // Ring only when focus came from the keyboard (see `list_ring`); a
+                    // click in the list turns it off again.
+                    .map(|el| ui::ring_when(el, list_focused && self.list_ring, cx))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                            if this.list_ring {
+                                this.list_ring = false;
+                                cx.notify();
+                            }
+                        }),
+                    )
                     .child(body),
             )
             .child(footer)
