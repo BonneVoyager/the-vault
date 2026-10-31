@@ -267,3 +267,103 @@ fn close_during_unlock_discards_result(cx: &mut TestAppContext) {
         assert_eq!(s.choose_request, Some(ChooseIntent::Home));
     });
 }
+
+/// Opens a vault, adds an unsaved item and makes the package folder read-only, so the
+/// save right before a lock fails. With `backups_too`, the Unsaved backup fails as well.
+fn lock_with_failing_disk(backups_too: bool, cx: &mut TestAppContext) -> Option<Toast> {
+    locked_with_failing_disk(backups_too, cx)
+        .0
+        .read_with(cx, |s, _| s.toast.clone())
+}
+
+/// [`lock_with_failing_disk`], returning the locked state (and its temp dir).
+fn locked_with_failing_disk(
+    backups_too: bool,
+    cx: &mut TestAppContext,
+) -> (gpui::Entity<AppState>, tempfile::TempDir) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = create(dir.path()).path().to_owned();
+    let backups = path.join("backups");
+    std::fs::create_dir_all(&backups).unwrap();
+    let state = new_state(cx);
+    open_and_unlock(&state, &path, cx);
+    let read_only = |p: &Path, mode| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    state.update(cx, |s, cx| {
+        let vault = s.vault.as_mut().unwrap();
+        let device = vault.device_id();
+        vault
+            .edit(|v| v.insert(Item::new("GitHub", device, 1), 1))
+            .unwrap();
+        read_only(&path, 0o500);
+        if backups_too {
+            read_only(&backups, 0o500);
+        }
+        s.lock(cx);
+        // vault-sync's SyncEvent::Error fallback must not replace the lock toast.
+        s.poll_sync(cx);
+    });
+    read_only(&backups, 0o700);
+    read_only(&path, 0o700);
+    state.read_with(cx, |s, _| assert!(s.locked));
+    (state, dir)
+}
+
+#[gpui::test]
+fn danger_toast_outlives_later_toasts_until_its_ttl(cx: &mut TestAppContext) {
+    let (state, _dir) = locked_with_failing_disk(true, cx);
+    state.update(cx, |s, cx| {
+        s.show_toast("Copied", cx);
+        s.handle_sync_event(SyncEvent::ForeignVault, cx);
+        s.handle_sync_event(SyncEvent::Error("boom".into()), cx);
+        // A second lock (auto-lock while locked) keeps it too.
+        s.lock(cx);
+        let toast = s.toast.as_ref().expect("still up");
+        assert!(toast.danger);
+        assert!(toast.message.starts_with(LOCK_LOST), "{}", toast.message);
+        assert!(toast.message.contains("Copied"), "later text is appended");
+        assert_eq!(toast.ttl, Duration::from_secs(10));
+
+        // Its 10 s run out: the tick removes it and ordinary toasts show again.
+        s.toast.as_mut().unwrap().shown_at -= Duration::from_secs(11);
+        s.tick(0.0, cx);
+        assert!(s.toast.is_none());
+        s.show_toast("Copied", cx);
+        assert_eq!(s.toast.as_ref().unwrap().message.as_ref(), "Copied");
+    });
+}
+
+#[gpui::test]
+fn lock_toast_reports_a_kept_snapshot(cx: &mut TestAppContext) {
+    let toast = lock_with_failing_disk(false, cx).expect("a toast");
+    assert!(!toast.danger);
+    assert!(
+        toast.message.starts_with("Could not save before locking"),
+        "{}",
+        toast.message
+    );
+    assert!(toast.message.ends_with(LOCK_KEPT), "{}", toast.message);
+}
+
+#[gpui::test]
+fn lock_toast_never_claims_unpreserved_edits_were_kept(cx: &mut TestAppContext) {
+    let toast = lock_with_failing_disk(true, cx).expect("a toast");
+    assert!(toast.danger);
+    assert_eq!(toast.message.as_ref(), LOCK_LOST);
+    assert!(!toast.message.contains("kept"));
+}
+
+#[test]
+fn lock_toast_texts() {
+    let path = PathBuf::from("b.vault");
+    assert!(lock_toast(None, &LockOutcome::Clean).is_none());
+    let kept = lock_toast(None, &LockOutcome::Snapshotted(path)).unwrap();
+    assert_eq!((kept.message.as_ref(), kept.danger), (LOCK_KEPT, false));
+    let failed = lock_toast(Some("disk full"), &LockOutcome::Clean).unwrap();
+    assert_eq!(
+        failed.message.as_ref(),
+        "Could not save before locking (disk full)."
+    );
+}

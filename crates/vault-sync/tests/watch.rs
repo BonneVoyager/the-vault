@@ -406,7 +406,7 @@ fn corrupt_primary_is_reported_and_rewritten_on_save() {
 fn change_while_locked_is_seen_at_unlock() {
     let (_dir, _path, mut a, mut b, _id) = two_devices();
     a.start_watching().unwrap();
-    a.lock();
+    let _ = a.lock();
     let mut ea = Events::new(&a);
     b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
         .unwrap();
@@ -464,7 +464,7 @@ fn key_rotation_elsewhere_reports_rotation_and_reverify_merges() {
 #[test]
 fn conflict_seen_while_locked_is_absorbed_on_unlock() {
     let (dir, _path, mut a, mut b, _id) = two_devices();
-    a.lock();
+    let _ = a.lock();
     b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
         .unwrap();
     let copy = dir.path().join("test 2.vault");
@@ -560,7 +560,7 @@ fn key_mismatch_then_lock_preserves_a_clean_vault() {
     }));
     assert!(!a.is_dirty());
 
-    a.lock();
+    let _ = a.lock();
     ea.pump();
     let unsaved = a
         .backups()
@@ -628,7 +628,7 @@ fn foreign_primary_then_clean_lock_preserves_our_state() {
     assert!(!a.is_dirty());
 
     // Clean, but our last saved state is no longer on disk: lock still preserves it.
-    a.lock();
+    let _ = a.lock();
     ea.pump();
     let unsaved = a
         .backups()
@@ -663,12 +663,12 @@ fn tampered_primary_then_lock_without_save_is_rewritten_after_unlock() {
         ea.any(|e| *e == SyncEvent::CorruptOnDisk)
     }));
 
-    a.lock();
+    let _ = a.lock();
     a.unlock(&pw()).unwrap();
     assert!(a.is_dirty(), "rewrite was forgotten across lock");
     assert_eq!(titles(&a), ["mail", "second"]);
     // And once more across another lock without saving.
-    a.lock();
+    let _ = a.lock();
     a.unlock(&pw()).unwrap();
     assert!(a.is_dirty());
     a.save().unwrap();
@@ -680,7 +680,7 @@ fn tampered_primary_then_lock_without_save_is_rewritten_after_unlock() {
 fn restore_while_locked_absorbs_queued_conflicts() {
     let (dir, _path, mut a, mut b, _id) = two_devices();
     let snap = a.backups().unwrap()[0].path.clone();
-    a.lock();
+    let _ = a.lock();
     b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
         .unwrap();
     let copy = dir.path().join("test 2.vault");
@@ -841,7 +841,7 @@ fn numbered_per_file_copy_is_absorbed() {
 #[test]
 fn per_file_copy_seen_while_locked_is_absorbed_on_unlock() {
     let (_dir, path, mut a, mut b, _id) = two_devices();
-    a.lock();
+    let _ = a.lock();
     b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
         .unwrap();
     let copy = path.parent().unwrap().join("vault 2.bin");
@@ -973,7 +973,7 @@ fn flipped_slot_nonce_is_detected_as_tamper() {
         .unlock(&pw())
         .unwrap();
     assert_eq!(disk.items().count(), 2);
-    a.lock();
+    let _ = a.lock();
     a.unlock(&pw()).unwrap();
     assert_eq!(titles(&a), ["from a", "mail"]);
 }

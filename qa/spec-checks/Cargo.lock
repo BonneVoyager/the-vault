@@ -1613,6 +1613,7 @@ dependencies = [
  "notify",
  "notify-debouncer-full",
  "rand",
+ "rustix",
  "thiserror",
  "tracing",
  "vault-core",

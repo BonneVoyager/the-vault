@@ -47,4 +47,10 @@ pub enum SyncEvent {
     /// references any more and that were older than the 24 h grace period. Stale tmp files
     /// are not counted.
     AttachmentsPruned(usize),
+    /// `vault.bin` disappeared while the vault was unlocked (deleted, or not yet re-created
+    /// by a provider). The in-memory vault is kept and marked dirty: the next `save`
+    /// recreates the file (without replacing one that reappeared meanwhile), and `lock`
+    /// writes an Unsaved backup if that has not happened. Emitted once until the primary is
+    /// seen or written again.
+    PrimaryMissing,
 }

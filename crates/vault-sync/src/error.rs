@@ -75,6 +75,16 @@ pub enum SyncError {
     /// exists but its blob does not.
     #[error("attachment {id} not found on this item")]
     AttachmentNotFound { item: Uuid, id: Uuid },
+    /// A package subdirectory (`attachments/` or `backups/`) is a symlink or not a directory.
+    /// Refused rather than followed: it could redirect blob and backup writes, listing and
+    /// retention deletes outside the package. Move the entry away to recover.
+    #[error("{} is a symlink or not a directory; refusing to use it", .0.display())]
+    UnsafePackageDir(PathBuf),
+    /// A vault file (`vault.bin`, a backup or a conflicted copy) is larger than
+    /// [`crate::MAX_VAULT_FILE_SIZE`]; refused before parsing. No vault this app writes gets
+    /// near that size.
+    #[error("{} is too large to be a vault file", .0.display())]
+    PrimaryTooLarge(PathBuf),
     /// The attachment blob is evicted to the cloud and did not download within
     /// `DOWNLOAD_TIMEOUT` (03 §1.1 `NotDownloaded`). Retry later.
     #[error("attachment {0} is not downloaded yet")]

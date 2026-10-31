@@ -303,29 +303,28 @@ impl AppState {
                 (vault, result)
             },
             move |this, (mut vault, result), outcome| match (outcome, result) {
-                (Outcome::Closed, _) => vault.lock(),
+                (Outcome::Closed, _) => this.report_lock(None, &vault.lock()),
                 (Outcome::Locked, result) => {
-                    vault.lock();
+                    let lock = vault.lock();
                     this.vault = Some(vault);
-                    match result {
+                    let save_error = match result {
                         Ok(()) => {
                             let message = done(this);
-                            this.toast = Some(Toast::window(message));
+                            this.set_toast(Toast::window(message));
+                            None
                         }
-                        Err(Failure::Save(e)) => {
-                            this.toast = Some(Toast::window(format!(
-                                "The change could not be saved before locking: {e}"
-                            )));
-                        }
-                        Err(Failure::Refused(_)) => {}
-                    }
+                        Err(Failure::Save(e)) => Some(super::error_message(&e)),
+                        Err(Failure::Refused(_)) => None,
+                    };
+                    // Last, so what happened to the unsaved change is what the user sees.
+                    this.report_lock(save_error.as_deref(), &lock);
                 }
                 (Outcome::Fresh, Ok(())) => {
                     this.vault = Some(vault);
                     this.record_save(Ok(()));
                     this.security.form = None;
                     let message = done(this);
-                    this.toast = Some(Toast::window(message));
+                    this.set_toast(Toast::window(message));
                 }
                 (Outcome::Fresh, Err(Failure::Refused(message))) => {
                     this.vault = Some(vault);
@@ -582,5 +581,45 @@ mod tests {
             assert_eq!(s.screen, Screen::Main);
         });
         assert!(unlocks(&path, PW, cx));
+    }
+
+    #[gpui::test]
+    fn lock_during_a_failed_save_shows_the_danger_toast(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, path) = setup(dir.path(), cx);
+        let backups = path.join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let mode = |p: &Path, m| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        // Neither the save nor the Unsaved backup can be written.
+        mode(&path, 0o500);
+        mode(&backups, 0o500);
+        state.update(cx, |s, cx| {
+            s.security_task(
+                Busy::ChangingPassword,
+                cx,
+                |vault| {
+                    let device = vault.device_id();
+                    vault
+                        .edit(|v| v.insert(vault_core::Item::new("New", device, 5), 5))
+                        .map_err(Failure::Save)?;
+                    vault.save().map_err(Failure::Save)
+                },
+                |_| "done".into(),
+            );
+            // Locked while the task holds the vault: the Locked branch handles it.
+            s.lock(cx);
+        });
+        cx.run_until_parked();
+        mode(&backups, 0o700);
+        mode(&path, 0o700);
+        state.read_with(cx, |s, _| {
+            assert!(s.locked);
+            let toast = s.toast.as_ref().expect("a toast");
+            assert!(toast.danger, "{}", toast.message);
+            assert!(toast.message.starts_with(super::super::LOCK_LOST));
+        });
     }
 }

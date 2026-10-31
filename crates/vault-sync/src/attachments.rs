@@ -145,13 +145,17 @@ pub(crate) fn prune_stale_vault_tmp(package: &Path, now: SystemTime) -> Result<u
 /// Delete orphaned blobs and stale tmp files in `dir` (03 §1.1). A `*.bin` whose id is not in
 /// `referenced` goes once its age (from `max(mtime, ctime)`, see the module docs) exceeds
 /// [`ORPHAN_GRACE`]; a blob tmp once it exceeds [`STALE_TMP_GRACE`]. Anything else (other
-/// names, directories, symlinks, files stamped in the future or unreadable) is left alone. A missing directory is not an error. Returns the number
+/// names, directories, symlinks, files stamped in the future or unreadable) is left alone. A missing directory is not an error; a symlinked one is [`SyncError::UnsafePackageDir`]. Returns the number
 /// of blobs deleted; individual delete failures are logged and skipped.
 pub(crate) fn prune(
     dir: &Path,
     referenced: &HashSet<Uuid>,
     now: SystemTime,
 ) -> Result<usize, SyncError> {
+    // A symlinked `attachments/` is refused, never followed (deletes would land outside).
+    if !crate::package::check_dir(dir)? {
+        return Ok(0);
+    }
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),

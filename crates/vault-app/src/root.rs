@@ -291,7 +291,7 @@ impl Render for VaultRoot {
             .toast
             .as_ref()
             .filter(|t| self.screen != Screen::Main || t.place == ToastPlace::Window)
-            .map(|t| t.message.clone());
+            .map(|t| (t.message.clone(), t.danger));
         let unlock_count = state.unlock_count;
         let reduce_motion = state.reduce_motion;
         let theme = cx.theme();
@@ -326,7 +326,7 @@ impl Render for VaultRoot {
                 root.child(ui::window_drag_band())
             })
             .child(content)
-            .when_some(toast, |root, message| {
+            .when_some(toast, |root, (message, danger)| {
                 root.child(
                     ui::h_flex()
                         .absolute()
@@ -334,7 +334,11 @@ impl Render for VaultRoot {
                         .left_0()
                         .right_0()
                         .justify_center()
-                        .child(ui::pill(message, cx)),
+                        .child(if danger {
+                            ui::danger_pill(message, cx)
+                        } else {
+                            ui::pill(message, cx)
+                        }),
                 )
             })
     }

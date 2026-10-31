@@ -249,12 +249,12 @@ impl AppState {
                     self.save_policy();
                 }
                 self.touch.enrolled = false;
-                self.toast = Some(Toast::window(
+                self.set_toast(Toast::window(
                     "Touch ID was turned off for this vault. Turn it on again in Settings \u{25b8} Security.",
                 ));
             }
             Some(Err(e)) => {
-                self.toast = Some(Toast::window(format!(
+                self.set_toast(Toast::window(format!(
                     "Could not remove the old Touch ID setup: {e}"
                 )));
             }
@@ -336,7 +336,7 @@ impl AppState {
             },
             move |this, (mut vault, result), outcome| {
                 if outcome == Outcome::Closed {
-                    vault.lock();
+                    this.report_lock(None, &vault.lock());
                     return;
                 }
                 let unlocked = matches!(result, Ok(Ok(())));
@@ -357,13 +357,13 @@ impl AppState {
                     Err(MacError::UserCancelled) => {}
                     Err(MacError::BiometryChanged) => {
                         this.mark_stale();
-                        this.toast = Some(Toast::window(
+                        this.set_toast(Toast::window(
                             "Touch ID enrollment is no longer valid; enter your master password",
                         ));
                     }
                     Err(e) => {
                         this.count_touch_failure();
-                        this.toast = Some(Toast::window(format!("Touch ID failed: {e}")));
+                        this.set_toast(Toast::window(format!("Touch ID failed: {e}")));
                     }
                 }
                 match (outcome, unlocked) {
@@ -372,7 +372,7 @@ impl AppState {
                         this.unlocked();
                     }
                     (_, true) => {
-                        vault.lock();
+                        this.report_lock(None, &vault.lock());
                         this.vault = Some(vault);
                     }
                     (_, false) => this.vault = Some(vault),
@@ -429,25 +429,25 @@ impl AppState {
                     this.save_policy();
                 }
                 if outcome == Outcome::Closed {
-                    vault.lock();
+                    this.report_lock(None, &vault.lock());
                     return;
                 }
                 match result {
                     Ok(_) => {
                         this.touch.enrolled = true;
                         this.record_save(Ok(()));
-                        this.toast = Some(Toast::window("Touch ID turned on"));
+                        this.set_toast(Toast::window("Touch ID turned on"));
                     }
                     Err(EnrollError { message, unsaved }) => {
                         if let Some(e) = unsaved {
                             // The slot removal is only in memory; autosave retries it.
                             this.record_save(Err(e));
                         }
-                        this.toast = Some(Toast::window(message));
+                        this.set_toast(Toast::window(message));
                     }
                 }
                 if outcome == Outcome::Locked {
-                    vault.lock();
+                    this.report_lock(None, &vault.lock());
                 }
                 this.vault = Some(vault);
             },

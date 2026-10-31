@@ -452,7 +452,7 @@ impl AppState {
                         .count();
                     this.return_vault(vault, outcome, cx);
                     if stuck > 0 && outcome == Outcome::Locked {
-                        this.toast = Some(Toast::window(
+                        this.set_toast(Toast::window(
                             "A file added just before locking could not be taken out again. \
                              Check the item's attachments after unlocking.",
                         ));
@@ -473,7 +473,7 @@ impl AppState {
                     (many, _) => Some(format!("{} files could not be added", many.len())),
                 };
                 if let Some(message) = message {
-                    this.toast = Some(Toast::window(message));
+                    this.set_toast(Toast::window(message));
                 }
             },
         );
@@ -501,13 +501,15 @@ impl AppState {
             return;
         }
         let saved = vault.is_dirty().then(|| vault.save());
+        let save_error = match outcome {
+            Outcome::Locked => saved.and_then(|r| self.record_save(r)),
+            _ => saved.and_then(Result::err).map(|e| e.to_string()),
+        };
         // Dropping after a vault switch zeroizes the keys.
-        vault.lock();
+        let lock = vault.lock();
+        self.report_lock(save_error.as_deref(), &lock);
         if outcome == Outcome::Locked {
             self.vault = Some(vault);
-            if let Some(e) = saved.and_then(|r| self.record_save(r)) {
-                self.toast = Some(Toast::window(super::lock_save_failed(&e)));
-            }
         }
     }
 
@@ -798,14 +800,14 @@ impl AppState {
             ReadResult::Text(text) => PreviewContent::Text(Rc::new(text)),
             ReadResult::Unavailable(why) => PreviewContent::Unavailable(why.into()),
             ReadResult::Saved(path) => {
-                self.toast = Some(Toast::window(format!(
+                self.set_toast(Toast::window(format!(
                     "Saved a decrypted copy to {}",
                     text::file_name(&path)
                 )));
                 return;
             }
             ReadResult::Failed(message) => {
-                self.toast = Some(Toast::window(message));
+                self.set_toast(Toast::window(message));
                 return;
             }
             ReadResult::Cancelled => return,
@@ -1137,7 +1139,9 @@ fn write_plain(reader: &mut dyn Read, path: &Path, cancel: &AtomicBool) -> io::R
             file.write_all(&buf[..n])?;
         }
         file.sync_all()?;
-        Ok(true)
+        // A lock may land after the last read but before the rename that publishes the
+        // plaintext: check again so a locked vault never leaves a decrypted file behind.
+        Ok(!cancel.load(Ordering::SeqCst))
     })();
     drop(file);
     match result {

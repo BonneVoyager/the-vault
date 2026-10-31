@@ -128,7 +128,7 @@ fn first_save_after_unlock_snapshots() {
     insert_item(&mut v, "a");
     v.save().unwrap();
     assert_eq!(v.backups().unwrap().len(), 1);
-    v.lock();
+    let _ = v.lock();
     v.unlock(&pw()).unwrap();
     insert_item(&mut v, "b");
     v.save().unwrap();
@@ -140,7 +140,7 @@ fn backup_now_copies_primary_even_while_locked() {
     let (_dir, path, mut v) = setup();
     insert_item(&mut v, "a");
     v.save().unwrap();
-    v.lock();
+    let _ = v.lock();
     let rx = v.subscribe();
     let snap = v.backup_now().unwrap();
     assert_eq!(fs::read(&snap).unwrap(), fs::read(bin(&path)).unwrap());
@@ -203,7 +203,7 @@ fn restore_replaces_primary_and_snapshots_old_state() {
         v.last_written().unwrap().hash,
         reopened.last_written().unwrap().hash
     );
-    v.lock();
+    let _ = v.lock();
     v.unlock(&pw()).unwrap();
     assert_eq!(titles(&v), ["a"]);
 }
@@ -248,7 +248,7 @@ fn restore_works_from_locked_and_over_a_corrupt_primary() {
     insert_item(&mut v, "a");
     v.save().unwrap();
     let snap = v.backups().unwrap()[0].path.clone();
-    v.lock();
+    let _ = v.lock();
     fs::write(bin(&path), b"garbage").unwrap();
 
     v.restore_from(&snap, &pw()).unwrap();
@@ -399,7 +399,7 @@ fn failed_first_snapshot_is_retried_on_next_save() {
     insert_item(&mut v, "a");
     v.save().unwrap();
     // A fresh snapshot exists, so only the first-save-after-unlock flag can trigger the next.
-    v.lock();
+    let _ = v.lock();
     v.unlock(&pw()).unwrap();
     let b = backups_dir(dir.path());
     let set_mode = |m| fs::set_permissions(&b, fs::Permissions::from_mode(m)).unwrap();
@@ -494,7 +494,7 @@ fn delete_backup_removes_unsaved_and_conflict_packages_while_locked() {
     fs::write(&outside, b"keep").unwrap();
     std::os::unix::fs::symlink(&outside, conflict.join("link")).unwrap();
     insert_item(&mut v, "unsaved");
-    v.lock();
+    let _ = v.lock();
     let unsaved = v
         .backups()
         .unwrap()
@@ -562,7 +562,7 @@ fn delete_backup_refuses_anything_that_is_not_a_backup() {
     assert!(outside.exists() && stray.exists() && bin(&conflict).exists());
     assert!(bin(&path).exists() && snap.exists());
     assert!(deleted(&rx).is_empty());
-    v.lock();
+    let _ = v.lock();
     v.unlock(&pw()).unwrap();
     assert_eq!(titles(&v), ["a"]);
 }

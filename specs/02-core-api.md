@@ -153,7 +153,7 @@ pub struct PasswordSpec { pub length: usize, pub lower: bool, pub upper: bool, p
 pub struct PassphraseSpec { pub words: usize, pub separator: char, pub capitalize: bool, pub number: bool }
 pub fn password(spec: &PasswordSpec) -> SecretString;    // guarantees ≥1 char from each enabled class
 pub fn passphrase(spec: &PassphraseSpec) -> SecretString; // EFF large wordlist, bundled via include_str!
-pub fn strength_bits(pw: &str) -> f64;                    // naive entropy estimate for the UI meter
+pub fn strength_bits(pw: &str) -> f64;                    // naive entropy estimate for the UI meter, with a repetition penalty: runs of three or more of one character, and whole-string repeats of a shorter unit, score as the unit plus log2(repeat count), so "aaaaaaaaaaa" or "abcabcabcabc" cannot pass the 50-bit gate
 ```
 
 Defaults: password 20 chars, all classes, exclude ambiguous. Passphrase 4 words, `-`, capitalize, number.

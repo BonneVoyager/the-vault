@@ -164,9 +164,21 @@ pub fn passphrase(spec: &PassphraseSpec) -> SecretString {
     SecretString::new(std::mem::take(&mut *out))
 }
 
-/// Naive entropy estimate: `length * log2(pool)`, with the pool inferred from the character
-/// classes present (26 lower, 26 upper, 10 digits, 32 for anything else).
+/// Naive entropy estimate with a repetition penalty. The pool is inferred from the character
+/// classes present (26 lower, 26 upper, 10 digits, 32 for anything else). Then:
+/// (a) a run of `r >= 3` equal characters counts as one character plus `log2(r)` bits;
+/// (b) a string that is `k >= 2` exact repeats of a unit `u` scores `strength_bits(u) + log2(k)`.
+/// Rule (b) is applied after rule (a).
 pub fn strength_bits(pw: &str) -> f64 {
+    let chars: Vec<char> = pw.chars().collect();
+    let n = chars.len();
+    // (b) shortest unit that tiles the whole string at least twice.
+    for len in 1..=n / 2 {
+        if n.is_multiple_of(len) && chars.chunks(len).all(|c| c == &chars[..len]) {
+            let unit: String = chars[..len].iter().collect();
+            return strength_bits(&unit) + ((n / len) as f64).log2();
+        }
+    }
     let mut pool = 0u32;
     if pw.chars().any(|c| c.is_ascii_lowercase()) {
         pool += 26;
@@ -183,5 +195,19 @@ pub fn strength_bits(pw: &str) -> f64 {
     if pool == 0 {
         return 0.0;
     }
-    pw.chars().count() as f64 * f64::from(pool).log2()
+    // (a) collapse runs of one character.
+    let mut bits = 0.0;
+    let per_char = f64::from(pool).log2();
+    let mut i = 0;
+    while i < n {
+        let run = chars[i..].iter().take_while(|&&c| c == chars[i]).count();
+        // Doubles ("ss", "ee") are ordinary in real passwords; only runs of 3+ are penalised.
+        bits += if run >= 3 {
+            per_char + (run as f64).log2()
+        } else {
+            per_char * run as f64
+        };
+        i += run;
+    }
+    bits
 }

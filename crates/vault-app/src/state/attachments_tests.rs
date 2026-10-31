@@ -519,3 +519,41 @@ fn attachment_not_found_has_its_own_toast() {
     assert_eq!(read_error(&e), NOT_FOUND);
     assert_eq!(NOT_FOUND, "Attachment not found on this item.");
 }
+
+/// A reader that "locks" (sets the cancel flag) as it reports end of file: the lock
+/// lands after the last cancel check in the copy loop, before fsync and rename.
+struct LockAtEof<'a> {
+    data: &'a [u8],
+    cancel: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Read for LockAtEof<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.data.len().min(buf.len());
+        if n == 0 {
+            self.cancel.store(true, Ordering::SeqCst);
+            return Ok(0);
+        }
+        buf[..n].copy_from_slice(&self.data[..n]);
+        self.data = &self.data[n..];
+        Ok(n)
+    }
+}
+
+#[test]
+fn lock_between_sync_and_rename_publishes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.txt");
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut reader = LockAtEof {
+        data: b"plaintext",
+        cancel: &cancel,
+    };
+    assert!(!write_plain(&mut reader, &path, &cancel).unwrap());
+    assert!(!path.exists());
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "temp removed"
+    );
+}

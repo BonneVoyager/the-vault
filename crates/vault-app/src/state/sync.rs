@@ -238,6 +238,14 @@ impl AppState {
             SyncEvent::ForeignVault => {
                 self.show_toast("Ignored a different vault in this folder", cx);
             }
+            // vault.bin vanished while unlocked: vault-sync keeps the vault and marks it
+            // dirty, so an autosave writes the file again (03 §8).
+            SyncEvent::PrimaryMissing => {
+                if !self.locked {
+                    self.schedule_autosave(cx);
+                }
+                self.show_toast("The vault file went missing. It will be written again.", cx);
+            }
             SyncEvent::CloudUnavailable => self.sync.waiting_for_cloud = true,
             // Orphan blobs deleted after a save: nothing the user needs to see.
             SyncEvent::AttachmentsPruned(_) => {}
@@ -273,7 +281,10 @@ impl AppState {
             // Fallback for errors without a typed event (watcher failures, a failed backup).
             SyncEvent::Error(message) => {
                 self.sync_status = SyncStatus::Error(message.clone().into());
-                self.show_toast(message, cx);
+                // A lock that lost unsaved edits already shows a danger toast; keep it.
+                if !self.toast.as_ref().is_some_and(|t| t.danger) {
+                    self.show_toast(message, cx);
+                }
             }
         }
         cx.notify();
@@ -323,23 +334,24 @@ impl AppState {
             },
             |this, (mut vault, result, saved), outcome| match (outcome, result) {
                 (Outcome::Closed, _) => {
-                    if let Some(Err(e)) = saved {
+                    let save_error = saved.and_then(Result::err).map(|e| e.to_string());
+                    if let Some(e) = &save_error {
                         eprintln!("vault: could not save after re-entering the password: {e}");
                     }
-                    vault.lock();
+                    let lock = vault.lock();
+                    this.report_lock(save_error.as_deref(), &lock);
                 }
                 (Outcome::Locked, _) => {
-                    vault.lock();
+                    let save_error = saved.and_then(|r| this.record_save(r));
+                    let lock = vault.lock();
                     this.vault = Some(vault);
-                    if let Some(e) = saved.and_then(|r| this.record_save(r)) {
-                        this.toast = Some(Toast::window(format!("Could not save: {e}")));
-                    }
+                    this.report_lock(save_error.as_deref(), &lock);
                 }
                 (Outcome::Fresh, Ok(())) => {
                     this.vault = Some(vault);
                     this.sync.key_mismatch = false;
                     if let Some(e) = saved.and_then(|r| this.record_save(r)) {
-                        this.toast = Some(Toast::window(format!("Could not save: {e}")));
+                        this.set_toast(Toast::window(format!("Could not save: {e}")));
                     }
                     this.vault_changed();
                 }
@@ -450,14 +462,15 @@ impl AppState {
                 (vault, result)
             },
             move |this, (mut vault, result), outcome| match (outcome, result) {
-                (Outcome::Closed, _) => vault.lock(),
+                (Outcome::Closed, _) => this.report_lock(None, &vault.lock()),
                 (Outcome::Locked, result) => {
-                    vault.lock();
+                    let lock = vault.lock();
                     this.vault = Some(vault);
                     this.sync.restore = None;
                     if let Err(e) = result {
-                        this.toast = Some(Toast::window(format!("Restore failed: {e}")));
+                        this.set_toast(Toast::window(format!("Restore failed: {e}")));
                     }
+                    this.report_lock(None, &lock);
                 }
                 (Outcome::Fresh, Ok(())) => {
                     this.vault = Some(vault);
@@ -512,9 +525,9 @@ impl AppState {
                 (vault, backup, result)
             },
             |this, (mut vault, backup, result), outcome, cx| match outcome {
-                Outcome::Closed => vault.lock(),
+                Outcome::Closed => this.report_lock(None, &vault.lock()),
                 Outcome::Locked => {
-                    vault.lock();
+                    this.report_lock(None, &vault.lock());
                     this.vault = Some(vault);
                     this.refresh_backups();
                 }
@@ -545,7 +558,7 @@ impl AppState {
         self.sync_status = SyncStatus::Idle;
         self.vault_changed();
         self.refresh_backups();
-        self.toast = Some(Toast::window(format!("Restored from {name}")));
+        self.set_toast(Toast::window(format!("Restored from {name}")));
     }
 }
 
@@ -587,9 +600,22 @@ impl Toast {
             shown_at: std::time::Instant::now(),
             place: ToastPlace::Window,
             ttl: TOAST_TTL,
+            danger: false,
+        }
+    }
+
+    /// A window toast in the danger colour that stays up longer: unsaved edits were lost.
+    pub(super) fn danger(message: impl Into<SharedString>) -> Self {
+        Self {
+            danger: true,
+            ttl: DANGER_TOAST_TTL,
+            ..Self::window(message)
         }
     }
 }
+
+/// Long enough to read a data-loss warning twice.
+const DANGER_TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[cfg(test)]
 mod tests {
@@ -763,6 +789,23 @@ mod tests {
             s.handle_sync_event(SyncEvent::Merged(changed), cx);
             assert!(s.edit_buffer().unwrap().remote_fields.is_empty());
         });
+    }
+
+    #[gpui::test]
+    fn missing_primary_is_written_again_by_autosave(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        let path = dir.path().join("t.vault").join("vault.bin");
+        fs::remove_file(&path).unwrap();
+        assert!(wait_for(&state, cx, |s| s
+            .toast
+            .as_ref()
+            .is_some_and(|t| t.message.contains("went missing"))));
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE);
+        cx.run_until_parked();
+        let bytes = fs::read(&path).expect("vault.bin recreated");
+        assert!(vault_core::LockedVault::parse(&bytes).is_ok());
+        state.read_with(cx, |s, _| assert!(!s.vault.as_ref().unwrap().is_dirty()));
     }
 
     #[gpui::test]
@@ -1041,6 +1084,7 @@ mod tests {
                 SyncEvent::SaveBlocked(SaveBlocked::ForeignVault),
                 SyncEvent::BackupDeleted(p.join("b.vault")),
                 SyncEvent::AttachmentsPruned(1),
+                SyncEvent::PrimaryMissing,
             ]
         };
         // Choose screen: no vault at all.

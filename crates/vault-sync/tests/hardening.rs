@@ -181,7 +181,7 @@ fn foreign_vault_on_disk_blocks_save_and_lock_preserves_edits() {
     assert_eq!(events(&rx), [blocked]);
 
     // Locking cannot save, so the dirty vault is preserved in the backups directory.
-    a.lock();
+    let _ = a.lock();
     let unsaved = a
         .backups()
         .unwrap()
@@ -205,7 +205,7 @@ fn foreign_vault_on_disk_blocks_save_and_lock_preserves_edits() {
 #[test]
 fn newer_format_seen_while_locked_still_blocks_after_unlock() {
     let (_dir, path, mut a, _b) = two_devices();
-    a.lock();
+    let _ = a.lock();
     let newer = newer_version(&fs::read(&path).unwrap());
     plant(&path, &newer);
 
@@ -272,7 +272,7 @@ fn key_mismatch_refuses_clean_save_kek_unlock_and_preserves_on_lock() {
 
     // A locks while the mismatch stands: its unsaved item is preserved, encrypted.
     let rx_a = a.subscribe();
-    a.lock();
+    let _ = a.lock();
     let unsaved = a
         .backups()
         .unwrap()
@@ -308,7 +308,7 @@ fn tampered_first_record_is_not_adopted_as_a_key_change() {
     a.save().unwrap();
     assert_eq!(disk_titles(&path), ["from a", "mail"]);
     // And a later lock/unlock opens the rewritten file.
-    a.lock();
+    let _ = a.lock();
     a.unlock(&pw()).unwrap();
     assert_eq!(titles(&a), ["from a", "mail"]);
 }
@@ -316,7 +316,7 @@ fn tampered_first_record_is_not_adopted_as_a_key_change() {
 #[test]
 fn tampered_change_while_locked_falls_back_to_last_verified() {
     let (_dir, path, mut a, mut b) = two_devices();
-    a.lock();
+    let _ = a.lock();
     insert(&mut b, "from b");
     b.save().unwrap();
     plant(&path, &tamper_first_item(&fs::read(&path).unwrap()));
@@ -350,7 +350,7 @@ fn save_without_watcher_merges_a_peer_write_first() {
 #[test]
 fn unlock_without_watcher_rereads_disk() {
     let (_dir, _path, mut a, mut b) = two_devices();
-    a.lock();
+    let _ = a.lock();
     insert(&mut b, "from b");
     b.save().unwrap();
     a.unlock(&pw()).unwrap();
@@ -457,15 +457,15 @@ fn repeated_locks_while_blocked_keep_one_unsaved_file_per_change() {
     plant(&path, &foreign_vault_bytes());
     insert(&mut a, "from a");
     assert!(matches!(a.save(), Err(SyncError::SaveBlocked(_))));
-    a.lock();
+    let _ = a.lock();
     assert_eq!(unsaved_files(&a).len(), 1);
     a.unlock(&pw()).unwrap();
-    a.lock();
+    let _ = a.lock();
     assert_eq!(unsaved_files(&a).len(), 1, "unchanged state written again");
     // A real change is preserved in a new file.
     a.unlock(&pw()).unwrap();
     insert(&mut a, "later");
-    a.lock();
+    let _ = a.lock();
     assert_eq!(unsaved_files(&a).len(), 2);
 }
 
@@ -533,9 +533,9 @@ fn lock_does_not_download_an_evicted_unsaved_copy() {
     plant(&path, &foreign_vault_bytes());
     insert(&mut c, "from c");
     assert!(matches!(c.save(), Err(SyncError::SaveBlocked(_))));
-    c.lock();
+    let _ = c.lock();
     c.unlock(&pw()).unwrap();
-    c.lock();
+    let _ = c.lock();
     // The evicted copy was not checked, so a fresh one was written instead of waiting.
     assert_eq!(unsaved_files(&c).len(), 2);
     assert_eq!(hooks.0.load(Ordering::SeqCst), 0);

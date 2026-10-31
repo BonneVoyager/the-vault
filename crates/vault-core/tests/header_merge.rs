@@ -649,3 +649,41 @@ fn fresh_vault_slot_tamper_is_caught_at_open() {
         manifest
     );
 }
+
+/// Splicing the OLD unstamped header bytes verbatim over a stamped file (keeping the new
+/// body) must fail the manifest check on both the password and the key-holding paths.
+#[test]
+fn old_unstamped_header_spliced_over_stamped_file_is_tampered() {
+    let manifest = VaultError::Tampered(TamperKind::Manifest);
+    let mut v = unstamped_vault();
+    populate(&mut v, 2);
+    let old = v.serialize();
+    v.change_password(&pw(), &new_pw(), KdfParams::for_tests(), T1)
+        .unwrap();
+    #[cfg(feature = "sync")]
+    let handle = v.export_vault_key();
+    let cur = v.serialize();
+
+    let old_file = VaultFile::parse(&old).unwrap();
+    let old_header = old_file.header.clone();
+    let old_bytes = old_header.to_bytes();
+    let spliced = rewrite(&cur, |f| f.header = old_header);
+    let contains = |hay: &[u8]| hay.windows(old_bytes.len()).any(|w| w == old_bytes);
+    assert!(
+        contains(&old) && contains(&spliced),
+        "old header kept verbatim"
+    );
+    assert!(
+        !contains(&cur),
+        "the stamped header differs from the old one"
+    );
+    assert_eq!(opens_with(&spliced, &pw()).unwrap_err(), manifest);
+    #[cfg(feature = "sync")]
+    assert_eq!(
+        LockedVault::parse(&spliced)
+            .unwrap()
+            .unlock_with_key(&handle, device())
+            .unwrap_err(),
+        manifest
+    );
+}

@@ -207,7 +207,7 @@ fn edit_save_reopen_round_trip() {
 #[test]
 fn locked_operations_fail() {
     let (_dir, path, mut v) = setup();
-    v.lock();
+    let _ = v.lock();
     assert!(matches!(v.save(), Err(SyncError::Locked)));
     assert!(matches!(v.edit(|_| ()), Err(SyncError::Locked)));
 
@@ -269,7 +269,7 @@ fn lock_then_unlock_again() {
     v.save().unwrap();
     insert_item(&mut v, "Unsaved");
 
-    v.lock();
+    let _ = v.lock();
     assert!(v.vault().is_none());
     assert!(!v.is_dirty());
 

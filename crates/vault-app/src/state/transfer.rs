@@ -1,7 +1,7 @@
 //! Settings ▸ Import / Export and File ▸ Import…/Export… (specs/05-ui.md §2.5).
 //!
-//! CSV export writes `vault_core::export_csv` bytes to a file created with mode 0600,
-//! behind a red confirm. CSV import maps columns with `CsvMapping::default()` and inserts
+//! CSV export writes `vault_core::export_csv` bytes to a fresh 0600 temp file next to the
+//! target and renames it over the target, behind a red confirm. CSV import maps columns with `CsvMapping::default()` and inserts
 //! every row as a new login. 1PUX import inserts every item of a 1Password export. The
 //! plaintext bytes stay in zeroizing wrappers.
 
@@ -19,20 +19,49 @@ use super::edit::edit_result;
 use super::sync::TRANSFER_TAB;
 use crate::{text, ui};
 
-/// Creates (or truncates) `path` owner-read/write only, then writes `bytes`.
+/// Publishes `bytes` at `path` owner-read/write only, atomically.
 ///
-/// An existing file keeps its inode, so its permissions are tightened before any
-/// plaintext lands in it.
+/// The bytes go to a fresh 0600 sibling (`create_new`, so never through a planted link),
+/// which is fsynced and renamed over `path`. An existing file is replaced, not rewritten:
+/// descriptors already open on it keep seeing the old bytes. A symlink at `path` is
+/// refused rather than followed; one planted after the check is replaced by `rename`
+/// itself, never written through.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use rand::RngCore as _;
+
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(io::Error::other("refusing to overwrite a symlink"));
+    }
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let tmp = dir.join(format!(
+        ".vault-export-{:08x}.tmp",
+        rand::rngs::OsRng.next_u32()
+    ));
     let mut file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
-        .open(path)?;
-    file.set_permissions(Permissions::from_mode(0o600))?;
-    file.write_all(bytes)?;
-    file.sync_all()
+        .open(&tmp)?;
+    let written = (|| {
+        // The umask can only narrow the mode; set it anyway in case of odd ACL defaults.
+        file.set_permissions(Permissions::from_mode(0o600))?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    drop(file);
+    let published = written.and_then(|()| std::fs::rename(&tmp, path));
+    if published.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return published;
+    }
+    // Best effort: make the rename itself durable.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 impl AppState {
@@ -63,13 +92,26 @@ impl AppState {
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
         let name = format!("{}.csv", self.vault_name());
+        let session = self.panel_session();
         let task = ui::pick_new_path(&dir, &name, cx);
         cx.spawn(async move |this, cx| {
             if let Some(path) = task.await {
-                this.update(cx, |s, cx| s.export_csv_to(&path, cx)).ok();
+                this.update(cx, |s, cx| {
+                    if s.panel_session() == session {
+                        s.export_csv_to(&path, cx);
+                    }
+                })
+                .ok();
             }
         })
         .detach();
+    }
+
+    /// `(epoch, lock_gen)` when an import/export panel opens. The panels are modeless: a
+    /// lock or vault switch meanwhile changes it, and the pick is then discarded so it
+    /// never acts on a session other than the one it was opened for.
+    fn panel_session(&self) -> (u64, u64) {
+        (self.epoch, self.lock_gen)
     }
 
     /// Writes every live item as CSV to `path` (mode 0600). Returns whether it worked.
@@ -100,10 +142,16 @@ impl AppState {
         if !self.main_active() {
             return self.show_toast("Unlock the vault to import into it", cx);
         }
+        let session = self.panel_session();
         let task = ui::pick_path(false, "Import", cx);
         cx.spawn(async move |this, cx| {
             if let Some(path) = task.await {
-                this.update(cx, |s, cx| s.import_csv_from(&path, cx)).ok();
+                this.update(cx, |s, cx| {
+                    if s.panel_session() == session {
+                        s.import_csv_from(&path, cx);
+                    }
+                })
+                .ok();
             }
         })
         .detach();
@@ -144,10 +192,14 @@ impl AppState {
         if !self.main_active() {
             return self.show_toast("Unlock the vault to import into it", cx);
         }
+        let session = self.panel_session();
         let task = ui::pick_path(false, "Import", cx);
         cx.spawn(async move |this, cx| {
             if let Some(path) = task.await {
                 this.update(cx, |s, cx| {
+                    if s.panel_session() != session {
+                        return;
+                    }
                     match std::fs::read(&path) {
                         Ok(bytes) => {
                             s.import_1pux_bytes(&SecretVec::new(bytes), cx);
@@ -262,7 +314,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = unlocked_state(&dir.path().join("a.vault"), &["Known Title", "Other"], cx);
         let csv = dir.path().join("out.csv");
-        // A pre-existing world-readable file is tightened before plaintext lands in it.
+        // A pre-existing world-readable file is replaced by a fresh 0600 one.
         std::fs::write(&csv, "old").unwrap();
         std::fs::set_permissions(&csv, Permissions::from_mode(0o644)).unwrap();
         assert!(source.update(cx, |s, cx| s.export_csv_to(&csv, cx)));
@@ -346,5 +398,163 @@ mod tests {
             assert!(message.contains("not a valid zip archive"), "{message}");
             assert_eq!(s.item_count(), 3);
         });
+    }
+
+    #[gpui::test]
+    fn export_refuses_a_symlink(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = unlocked_state(&dir.path().join("a.vault"), &["Known Title"], cx);
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, "keep").unwrap();
+        let link = dir.path().join("out.csv");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        state.update(cx, |s, cx| {
+            assert!(!s.export_csv_to(&link, cx));
+            let message = s.toast.as_ref().unwrap().message.to_string();
+            assert!(
+                message.contains("refusing to overwrite a symlink"),
+                "{message}"
+            );
+        });
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "keep");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        // No temp file left behind either.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
+    }
+
+    #[gpui::test]
+    fn export_replaces_the_target_atomically(cx: &mut TestAppContext) {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().unwrap();
+        let state = unlocked_state(&dir.path().join("a.vault"), &["Known Title"], cx);
+        let csv = dir.path().join("out.csv");
+        std::fs::write(&csv, "old bytes").unwrap();
+        let mut old = std::fs::File::open(&csv).unwrap();
+        assert!(state.update(cx, |s, cx| s.export_csv_to(&csv, cx)));
+        let mut seen = String::new();
+        old.read_to_string(&mut seen).unwrap();
+        assert_eq!(seen, "old bytes", "an open handle never sees the export");
+        assert!(
+            std::fs::read_to_string(&csv)
+                .unwrap()
+                .contains("Known Title-pw")
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.to_string_lossy().ends_with(".tmp")),
+            "{names:?}"
+        );
+    }
+
+    /// Locks and unlocks again: same vault, new session.
+    fn relock(state: &Entity<AppState>, cx: &mut TestAppContext) {
+        state.update(cx, |s, cx| {
+            s.lock(cx);
+            s.unlock(SecretString::new("pw".into()), cx);
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |s, _| assert!(s.main_active()));
+    }
+
+    /// Closes the vault and opens another one at `path`.
+    fn switch_vault(state: &Entity<AppState>, path: &Path, cx: &mut TestAppContext) {
+        let other = SyncedVault::create(
+            path,
+            &SecretString::new("pw".into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        state.update(cx, |s, cx| {
+            s.close_vault(cx);
+            s.install(other, false);
+            s.unlocked();
+            assert!(s.main_active());
+        });
+    }
+
+    #[gpui::test]
+    fn export_panel_answered_after_lock_or_switch_writes_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = unlocked_state(&dir.path().join("a.vault"), &["Known Title"], cx);
+        let csv = dir.path().join("out.csv");
+
+        state.update(cx, |s, cx| s.choose_export_path(cx));
+        relock(&state, cx);
+        cx.simulate_new_path_selection(|_| Some(csv.clone()));
+        cx.run_until_parked();
+        assert!(
+            !csv.exists(),
+            "lock while the panel was open voids the export"
+        );
+
+        state.update(cx, |s, cx| s.choose_export_path(cx));
+        switch_vault(&state, &dir.path().join("b.vault"), cx);
+        cx.simulate_new_path_selection(|_| Some(csv.clone()));
+        cx.run_until_parked();
+        assert!(!csv.exists(), "a vault switch voids the export");
+
+        // Control: an undisturbed panel exports.
+        state.update(cx, |s, cx| s.choose_export_path(cx));
+        cx.simulate_new_path_selection(|_| Some(csv.clone()));
+        cx.run_until_parked();
+        assert!(csv.exists());
+    }
+
+    #[gpui::test]
+    fn import_panels_answered_after_lock_or_switch_import_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = unlocked_state(&dir.path().join("src.vault"), &["One", "Two"], cx);
+        let csv = dir.path().join("in.csv");
+        assert!(source.update(cx, |s, cx| s.export_csv_to(&csv, cx)));
+        let pux = dir.path().join("in.1pux");
+        std::fs::write(
+            &pux,
+            onepux(serde_json::json!([
+                {"uuid": "a", "state": "active", "categoryUuid": "003",
+                 "details": {"notesPlain": "n"}, "overview": {"title": "Note"}}
+            ])),
+        )
+        .unwrap();
+
+        let state = unlocked_state(&dir.path().join("a.vault"), &["Existing"], cx);
+        let pick = |path: &Path, cx: &mut TestAppContext| {
+            let path = path.to_path_buf();
+            cx.simulate_path_prompt_response(move |_| Some(vec![path]));
+            cx.run_until_parked();
+        };
+        type Choose = fn(&mut AppState, &mut Context<AppState>);
+        let panels: [(Choose, &Path); 2] = [
+            (AppState::choose_import_path, &csv),
+            (AppState::choose_import_1pux, &pux),
+        ];
+        for (choose, file) in panels {
+            state.update(cx, choose);
+            relock(&state, cx);
+            pick(file, cx);
+            state.read_with(cx, |s, _| assert_eq!(s.item_count(), 1, "after lock"));
+        }
+
+        switch_vault(&state, &dir.path().join("b.vault"), cx);
+        for (i, (choose, file)) in panels.into_iter().enumerate() {
+            state.update(cx, choose);
+            switch_vault(&state, &dir.path().join(format!("c{i}.vault")), cx);
+            pick(file, cx);
+            state.read_with(cx, |s, _| assert_eq!(s.item_count(), 0, "after switch"));
+        }
+
+        // Control: an undisturbed panel imports.
+        state.update(cx, |s, cx| s.choose_import_path(cx));
+        pick(&csv, cx);
+        state.read_with(cx, |s, _| assert_eq!(s.item_count(), 2));
     }
 }

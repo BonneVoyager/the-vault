@@ -85,11 +85,35 @@ pub(crate) fn create_new_dir(dir: &Path) -> Result<(), SyncError> {
     }
 }
 
-/// Create `dir` (0700) if needed.
+/// Whether `dir` (a package subdirectory: `attachments/`, `backups/`) exists as a real
+/// directory. `Ok(false)` if nothing is there; [`SyncError::UnsafePackageDir`] if a symlink
+/// (never followed: it could redirect writes, listing and deletion outside the package) or
+/// anything other than a directory is there.
+pub(crate) fn check_dir(dir: &Path) -> Result<bool, SyncError> {
+    match fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(SyncError::UnsafePackageDir(dir.to_owned())),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(SyncError::io(dir, e)),
+    }
+}
+
+/// Create `dir` (0700) if needed; refuses a symlink or non-directory there (see
+/// [`check_dir`]).
 pub(crate) fn ensure_dir(dir: &Path) -> Result<(), SyncError> {
+    if check_dir(dir)? {
+        return Ok(());
+    }
     match dir_builder().create(dir) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
+        // Raced with another creator: accept only a real directory.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => check_dir(dir).and_then(|real| {
+            if real {
+                Ok(())
+            } else {
+                Err(SyncError::io(dir, e))
+            }
+        }),
         Err(e) => Err(SyncError::io(dir, e)),
     }
 }
@@ -107,5 +131,34 @@ mod tests {
         assert_eq!(vault_name(p), "My");
         assert_eq!(vault_name(Path::new("/x/plain")), "plain");
         assert_eq!(vault_name(Path::new("/x/.vault")), ".vault");
+    }
+
+    #[test]
+    fn ensure_dir_refuses_symlinks_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        ensure_dir(&real).unwrap();
+        ensure_dir(&real).unwrap();
+        assert!(check_dir(&real).unwrap());
+        assert!(!check_dir(&dir.path().join("none")).unwrap());
+
+        let outside = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        assert!(matches!(
+            ensure_dir(&link),
+            Err(SyncError::UnsafePackageDir(_))
+        ));
+        assert!(matches!(
+            check_dir(&link),
+            Err(SyncError::UnsafePackageDir(_))
+        ));
+
+        let file = dir.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        assert!(matches!(
+            ensure_dir(&file),
+            Err(SyncError::UnsafePackageDir(_))
+        ));
     }
 }

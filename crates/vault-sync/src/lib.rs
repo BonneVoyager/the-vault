@@ -40,5 +40,10 @@ pub use cloud::{CloudError, CloudHooks, NoopHooks};
 pub use error::{SaveBlocked, SyncError};
 pub use event::SyncEvent;
 pub use package::VAULT_FILE_NAME;
-pub use synced::{DOWNLOAD_TIMEOUT, LastWritten, LockedSummary, SyncedVault};
+pub use synced::{
+    DOWNLOAD_TIMEOUT, LastWritten, LockOutcome, LockedSummary, MAX_VAULT_FILE_SIZE, SyncedVault,
+};
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use synced::{before_next_primary_write_for_tests, fail_next_dir_syncs_for_tests};
 pub use watch::DEBOUNCE;

@@ -201,11 +201,41 @@ fn replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
+/// Escape characters that could act on a terminal when vault content is printed.
+/// C0 controls, DEL, C1 controls and bidi/format controls become `\u{XXXX}`;
+/// tab becomes a single space and line feed is kept.
+fn sanitize_for_terminal(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\t' => out.push(' '),
+            '\n' => out.push('\n'),
+            '\u{0}'..='\u{1f}'
+            | '\u{7f}'
+            | '\u{80}'..='\u{9f}'
+            | '\u{61c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{206a}'..='\u{206f}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}' => {
+                let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// What `get` prints for a field: secrets are masked unless `reveal` is set.
 fn display_value(item: &Item, f: &Field, reveal: bool) -> String {
     let raw = f.value.expose_secret();
     if reveal {
-        return raw.clone();
+        return sanitize_for_terminal(raw);
     }
     if f.name == "number" && item.tags.iter().any(|t| t == "card") {
         let digits: Vec<char> = raw.chars().filter(|c| !c.is_whitespace()).collect();
@@ -219,7 +249,7 @@ fn display_value(item: &Item, f: &Field, reveal: bool) -> String {
     }
     match f.kind {
         _ if f.kind.is_sensitive() => "********".to_owned(),
-        _ => raw.clone(),
+        _ => sanitize_for_terminal(raw),
     }
 }
 
@@ -267,13 +297,17 @@ fn find_item(vault: &UnlockedVault, key: &str) -> Result<Uuid> {
         .collect();
     match hits.as_slice() {
         [one] => Ok(one.id),
-        [] => bail!("no item matches {key:?}"),
+        [] => bail!("no item matches \"{}\"", sanitize_for_terminal(key)),
         many => {
             let list: Vec<String> = many
                 .iter()
-                .map(|i| format!("{} {}", i.id, i.title))
+                .map(|i| format!("{} {}", i.id, sanitize_for_terminal(&i.title)))
                 .collect();
-            bail!("ambiguous title {key:?}; candidates:\n{}", list.join("\n"))
+            bail!(
+                "ambiguous title \"{}\"; candidates:\n{}",
+                sanitize_for_terminal(key),
+                list.join("\n")
+            )
         }
     }
 }
@@ -367,7 +401,7 @@ fn run_attach(cli: &Cli, cmd: &AttachCmd) -> Result<()> {
                 println!(
                     "{}  {}  {}  {}",
                     a.id,
-                    a.name,
+                    sanitize_for_terminal(&a.name),
                     a.size,
                     state_str(sv.attachment_state(a.id))
                 );
@@ -551,10 +585,14 @@ fn run(cli: Cli) -> Result<()> {
                 .get(find_item(vault, id_or_title)?)
                 .context("item vanished")?;
             println!("id:    {}", item.id);
-            println!("title: {}", item.title);
-            println!("tags:  {}", item.tags.join(", "));
+            println!("title: {}", sanitize_for_terminal(&item.title));
+            println!("tags:  {}", sanitize_for_terminal(&item.tags.join(", ")));
             for f in &item.fields {
-                println!("{}: {}", f.name, display_value(item, f, *reveal));
+                println!(
+                    "{}: {}",
+                    sanitize_for_terminal(&f.name),
+                    display_value(item, f, *reveal)
+                );
             }
         }
         Cmd::List {
@@ -574,12 +612,13 @@ fn run(cli: Cli) -> Result<()> {
                 let user = item
                     .field("username")
                     .filter(|f| !f.kind.is_sensitive())
-                    .map(|f| f.value.expose_secret().as_str())
+                    .map(|f| sanitize_for_terminal(f.value.expose_secret()))
                     .filter(|u| !u.is_empty());
-                let tags = item.tags.join(",");
+                let tags = sanitize_for_terminal(&item.tags.join(","));
+                let title = sanitize_for_terminal(&item.title);
                 match user {
-                    Some(u) => println!("{short}  {}  {u}  [{tags}]", item.title),
-                    None => println!("{short}  {}  [{tags}]", item.title),
+                    Some(u) => println!("{short}  {title}  {u}  [{tags}]"),
+                    None => println!("{short}  {title}  [{tags}]"),
                 }
             }
         }
@@ -614,7 +653,7 @@ fn run(cli: Cli) -> Result<()> {
             let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             println!(
                 "{} ({}s remaining)",
-                totp.code(secs),
+                sanitize_for_terminal(&totp.code(secs)),
                 totp.seconds_remaining(secs)
             );
         }
@@ -693,6 +732,26 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_escapes_controls_and_format_chars() {
+        assert_eq!(sanitize_for_terminal("a\tb"), "a b");
+        assert_eq!(sanitize_for_terminal("a\nb"), "a\nb");
+        assert_eq!(sanitize_for_terminal("a\rb"), "a\\u{d}b");
+        assert_eq!(sanitize_for_terminal("\u{9b}31m"), "\\u{9b}31m");
+        assert_eq!(sanitize_for_terminal("a\u{2028}b"), "a\\u{2028}b");
+        assert_eq!(sanitize_for_terminal("\u{feff}x"), "\\u{feff}x");
+        for c in [
+            '\u{61c}', '\u{180e}', '\u{206a}', '\u{206f}', '\u{fff9}', '\u{fffb}',
+        ] {
+            let out = sanitize_for_terminal(&c.to_string());
+            assert!(out.starts_with("\\u{"), "{c:?} -> {out}");
+        }
+        assert_eq!(
+            sanitize_for_terminal("Plain \u{e9}\u{4e16}"),
+            "Plain \u{e9}\u{4e16}"
+        );
+    }
 
     fn item(card: bool, fname: &str, fkind: FieldKind, v: &str) -> Item {
         let mut i = Item::new("t", Uuid::nil(), 0);

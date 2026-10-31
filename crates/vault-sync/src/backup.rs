@@ -13,7 +13,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::atomic::{Mode, write_atomic};
+use crate::atomic::{Mode, rename_no_replace, write_atomic_stat};
 use crate::error::SyncError;
 use crate::package::{self, backups_dir, ensure_dir, file_name, vault_name};
 
@@ -299,10 +299,15 @@ pub fn retain(
 // Files
 
 /// Every snapshot and conflict package of the vault package at `package`, newest first. A
-/// missing backups directory is an empty list.
+/// missing backups directory is an empty list; a symlinked one is
+/// [`SyncError::UnsafePackageDir`].
 pub(crate) fn list_backups(package: &Path) -> Result<Vec<BackupInfo>, SyncError> {
     let dir = backups_dir(package);
     let name = vault_name(package);
+    // Never list (and so never let retention delete in) a symlinked `backups/`.
+    if !package::check_dir(&dir)? {
+        return Ok(Vec::new());
+    }
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -342,23 +347,24 @@ pub(crate) fn list_backups(package: &Path) -> Result<Vec<BackupInfo>, SyncError>
 }
 
 /// Atomically write `bytes` as a new snapshot taken at `now`; never overwrites an existing
-/// file (same-second collisions get the next `-N`).
+/// file (same-second collisions get the next `-N`). Returns the path and the directory fsync
+/// outcome: an inner `Err` means the file IS there but not confirmed durable.
 pub(crate) fn write_snapshot(
     package: &Path,
     bytes: &[u8],
     now: SystemTime,
     kind: BackupKind,
-) -> Result<PathBuf, SyncError> {
+) -> Result<(PathBuf, Result<(), SyncError>), SyncError> {
     let dir = backups_dir(package);
     ensure_dir(&dir)?;
     let name = vault_name(package);
     let stamp = format_stamp(now);
     for seq in 1..=1000 {
         let path = dir.join(snapshot_file_name(&name, &stamp, kind, seq));
-        match write_atomic(&path, bytes, Mode::NoReplace) {
-            Ok(()) => {
+        match write_atomic_stat(&path, bytes, Mode::NoReplace) {
+            Ok(written) => {
                 tracing::info!(path = %path.display(), size = bytes.len(), "took backup");
-                return Ok(path);
+                return Ok((path, written.dir_sync));
             }
             Err(SyncError::AlreadyExists(_)) => continue,
             Err(e) => return Err(e),
@@ -440,14 +446,13 @@ fn move_conflict(
         } else {
             dir.join(format!("{CONFLICT_PREFIX}{stamp}-{n}-{target}"))
         };
-        match fs::symlink_metadata(&dst) {
-            Ok(_) => continue,
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(SyncError::io(&dst, e)),
+        // Same filesystem (a sibling of our package, or a file inside it). Atomic and never
+        // replacing: a name taken meanwhile (another device absorbing too) moves on to `-N-`.
+        match rename_no_replace(src, &dst) {
+            Ok(()) => {}
+            Err(SyncError::AlreadyExists(_)) => continue,
+            Err(e) => return Err(e),
         }
-        // Same filesystem (a sibling of our package, or a file inside it), so this is an
-        // atomic rename.
-        fs::rename(src, &dst).map_err(|e| SyncError::io(src, e))?;
         tracing::info!(from = %src.display(), to = %dst.display(), "absorbed conflicted copy");
         return Ok(dst);
     }

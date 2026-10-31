@@ -225,7 +225,7 @@ fn lock_while_dirty_preserves_the_edit_in_an_unsaved_backup() {
     v.save().unwrap();
     insert(&mut v, "never saved");
     let events = v.subscribe();
-    v.lock();
+    let _ = v.lock();
 
     let unsaved = unsaved_backups(&v);
     assert_eq!(unsaved.len(), 1, "{unsaved:?}");
@@ -252,12 +252,12 @@ fn save_then_lock_takes_no_unsaved_backup() {
     insert(&mut v, "x");
     v.save().unwrap();
     let events = v.subscribe();
-    v.lock();
+    let _ = v.lock();
     assert!(unsaved_backups(&v).is_empty());
     assert_eq!(events.try_iter().count(), 0);
     // Clean and never edited: same.
     v.unlock(&pw()).unwrap();
-    v.lock();
+    let _ = v.lock();
     assert!(unsaved_backups(&v).is_empty());
 }
 
@@ -277,7 +277,7 @@ fn stale_vault_tmp_is_removed_only_while_unlocked() {
     let mut v = SyncedVault::open(&package, DEV_A, Arc::new(NoopHooks)).unwrap();
     v.unlock(&pw()).unwrap();
     assert!(stale.exists(), "younger than 1 h must stay");
-    v.lock();
+    let _ = v.lock();
     v.set_prune_clock_offset_for_tests(two_hours);
     v.backups().unwrap();
     assert!(stale.exists(), "nothing is cleaned while locked");

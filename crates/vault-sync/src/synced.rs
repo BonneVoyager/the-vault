@@ -30,6 +30,29 @@ use crate::watch::Watcher;
 /// How long `open` waits for the cloud provider to materialise the file (03 §7).
 pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Largest vault file (`vault.bin`, a backup or a conflicted copy) that is read (03 §2):
+/// 64 MiB. Larger files are refused with [`SyncError::PrimaryTooLarge`] before parsing, so a
+/// planted or corrupt file cannot make us allocate without bound.
+pub const MAX_VAULT_FILE_SIZE: u64 = 64 * 1024 * 1024;
+
+/// What [`SyncedVault::lock`] did with the in-memory vault before dropping it (03 §8).
+#[derive(Debug)]
+pub enum LockOutcome {
+    /// Nothing needed preserving: the vault was already locked, or clean with its state on
+    /// disk.
+    Clean,
+    /// Unsaved state is in this [`BackupKind::Unsaved`] file (written now, or an existing one
+    /// that already held all of it). It opens with the password of the locked session. If
+    /// only the directory fsync after writing it failed, this is still returned (the bytes
+    /// are on disk) but the file is snapshotted, not confirmed durable; a
+    /// [`SyncEvent::Error`] says so.
+    Snapshotted(PathBuf),
+    /// Unsaved state could NOT be preserved (the Unsaved backup failed with this error) and
+    /// is gone: the vault is locked regardless. [`SyncEvent::Error`] was emitted too. The app
+    /// must not tell the user their changes were kept.
+    Unpreserved(SyncError),
+}
+
 /// Fingerprint of the bytes most recently written to (or read from) the primary file, used to
 /// recognise our own writes echoing back through the watcher (03 §2 step 6, §3 steps 1-2).
 ///
@@ -125,6 +148,9 @@ pub struct SyncedVault {
     /// Last `ForeignVault` / `Error` reported per sibling, with the bytes' hash, so a file
     /// that keeps firing watcher events is reported once until it changes or disappears.
     sibling_reports: HashMap<PathBuf, ([u8; 32], reconcile::SiblingReport)>,
+    /// The primary was found missing while unlocked ([`SyncEvent::PrimaryMissing`] emitted,
+    /// vault marked dirty). Cleared when the primary is read or written again, and on lock.
+    primary_missing: bool,
     /// Added to the clock by orphan cleanup. Always zero unless the `test-support` feature is
     /// on (file ages count from ctime, which tests cannot set back).
     prune_clock_offset: Duration,
@@ -189,10 +215,19 @@ impl SyncedVault {
             save_blocked: None,
             locked_fallback: None,
             sibling_reports: HashMap::new(),
+            primary_missing: false,
             prune_clock_offset: Duration::ZERO,
         };
-        if let Err(e) = this.write(&bytes, Mode::NoReplace) {
-            // Only our own empty directory; never anything that appeared inside it meanwhile.
+        let written = match this.write(&bytes, Mode::NoReplace) {
+            Ok(durable) => durable.map_err(|e| (e, true)),
+            Err(e) => Err((e, false)),
+        };
+        if let Err((e, ours_on_disk)) = written {
+            // Our own file (written, but its directory entry not known durable) and our own
+            // directory; never anything else that appeared inside it meanwhile.
+            if ours_on_disk && let Err(rm) = fs::remove_file(&this.file) {
+                tracing::warn!(path = %this.file.display(), error = %rm, "could not remove vault file after failed create");
+            }
             if let Err(rm) = fs::remove_dir(&this.path) {
                 tracing::warn!(path = %this.path.display(), error = %rm, "could not remove package after failed create");
             }
@@ -252,7 +287,7 @@ impl SyncedVault {
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 return Err(SyncError::NoVault(file));
             }
-            Err(e) => return Err(SyncError::io(&file, e)),
+            Err(e) => return Err(read_error(&file, e)),
         };
         drop(read_lock);
         let last_written = Some(fingerprint(Some(&meta), &bytes));
@@ -282,6 +317,7 @@ impl SyncedVault {
             save_blocked: None,
             locked_fallback: None,
             sibling_reports: HashMap::new(),
+            primary_missing: false,
             prune_clock_offset: Duration::ZERO,
         })
     }
@@ -379,6 +415,12 @@ impl SyncedVault {
         // Stale tmp cleanup runs only while unlocked (03 §1.1 "never while locked").
         self.prune_stale_tmp(SystemTime::now() + self.prune_clock_offset);
         self.after_unlock();
+        // Unlocked over a primary that is gone: what we just opened is the only copy.
+        if !disk_read
+            && matches!(fs::symlink_metadata(&self.file), Err(e) if e.kind() == ErrorKind::NotFound)
+        {
+            self.note_primary_missing();
+        }
         // Orphan cleanup once per unlock, only when memory provably matches what is on disk:
         // the primary was read, nothing is pending a write, saving is allowed.
         if disk_read && !self.dirty && !self.key_mismatch && self.save_blocked.is_none() {
@@ -400,26 +442,66 @@ impl SyncedVault {
     /// Drop the unlocked vault (zeroizing its keys and items). The app is expected to `save`
     /// first (03 §8 "Autosave"); `lock` itself never writes the primary.
     ///
-    /// Unsaved edits are not lost (03 §8): when the vault is dirty (a save failed or was not
-    /// attempted), or saving is impossible (a [`SyncEvent::KeyMismatch`] stands, or
-    /// [`SyncError::SaveBlocked`] applies, dirty or not: our last saved state is then no longer
-    /// on disk either), the in-memory vault is first written, encrypted, to the backups
-    /// directory as `<name>-<timestamp>-unsaved.vault.bin` ([`BackupKind::Unsaved`], never
-    /// pruned; [`SyncEvent::BackupTaken`]). It opens with the password that unlocked this
-    /// session. A clean vault that can be saved (the usual save-then-lock) writes nothing.
-    pub fn lock(&mut self) {
-        if let Some(vault) = &self.unlocked
-            && (self.dirty || self.key_mismatch || self.save_blocked.is_some())
-            && !self.newest_unsaved_covers(vault)
+    /// Unsaved edits are preserved when possible (03 §8): when the vault is dirty (a save
+    /// failed or was not attempted), the primary is missing (checked here too, so this holds
+    /// without a watcher), or saving is
+    /// impossible (a [`SyncEvent::KeyMismatch`] stands, or [`SyncError::SaveBlocked`] applies,
+    /// dirty or not: our last saved state is then no longer on disk either), the in-memory
+    /// vault is first written, encrypted, to the backups directory as
+    /// `<name>-<timestamp>-unsaved.vault.bin` ([`BackupKind::Unsaved`], never pruned;
+    /// [`SyncEvent::BackupTaken`]), unless the newest Unsaved file already holds all of it. It
+    /// opens with the password that unlocked this session. A clean vault that can be saved
+    /// (the usual save-then-lock) writes nothing.
+    ///
+    /// Always locks. The returned [`LockOutcome`] says whether anything needed preserving and
+    /// whether that worked; on [`LockOutcome::Unpreserved`] the unsaved state is lost.
+    #[must_use = "the app must not claim unsaved changes were kept on LockOutcome::Unpreserved"]
+    pub fn lock(&mut self) -> LockOutcome {
+        // Without a watcher nothing may have noticed a deleted primary yet; a stat is cheap.
+        if self.unlocked.is_some()
+            && !self.primary_missing
+            && matches!(fs::symlink_metadata(&self.file), Err(e) if e.kind() == ErrorKind::NotFound)
         {
-            let bytes = vault.serialize();
-            if let Err(e) = self.snapshot(&bytes, SystemTime::now(), BackupKind::Unsaved) {
-                tracing::error!(error = %e, "could not preserve unsaved vault before locking");
-                self.emit(SyncEvent::Error(format!(
-                    "unsaved changes could not be preserved: {e}"
-                )));
-            }
+            self.note_primary_missing();
         }
+        let outcome = match &self.unlocked {
+            Some(vault)
+                if self.dirty
+                    || self.key_mismatch
+                    || self.save_blocked.is_some()
+                    || self.primary_missing =>
+            {
+                match self.newest_unsaved_covering(vault) {
+                    Some(path) => LockOutcome::Snapshotted(path),
+                    None => {
+                        let bytes = vault.serialize();
+                        match self.snapshot_unconfirmed(
+                            &bytes,
+                            SystemTime::now(),
+                            BackupKind::Unsaved,
+                        ) {
+                            Ok((path, Ok(()))) => LockOutcome::Snapshotted(path),
+                            Ok((path, Err(e))) => {
+                                tracing::warn!(path = %path.display(), error = %e, "unsaved backup written but not confirmed durable");
+                                self.emit(SyncEvent::Error(format!(
+                                    "unsaved changes were written to {} but may not be durable: {e}",
+                                    path.display()
+                                )));
+                                LockOutcome::Snapshotted(path)
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "could not preserve unsaved vault before locking");
+                                self.emit(SyncEvent::Error(format!(
+                                    "unsaved changes could not be preserved: {e}"
+                                )));
+                                LockOutcome::Unpreserved(e)
+                            }
+                        }
+                    }
+                }
+            }
+            _ => LockOutcome::Clean,
+        };
         // A corrupt primary seen while unlocked was scheduled for rewrite only through `dirty`,
         // which locking discards; carry it over so the next unlock still rewrites the file.
         if std::mem::take(&mut self.dirty_from_corrupt) {
@@ -428,33 +510,32 @@ impl SyncedVault {
         self.unlocked = None;
         self.dirty = false;
         self.key_mismatch = false;
+        self.primary_missing = false;
+        outcome
     }
 
-    /// Whether the newest [`BackupKind::Unsaved`] file already holds everything in `vault`
+    /// The newest [`BackupKind::Unsaved`] file if it already holds everything in `vault`
     /// (same key and slots, and merging `vault` into it changes nothing), so locking again
     /// need not write another. Byte comparison cannot work: every `serialize` uses fresh
     /// nonces. Any failure to read or open it counts as "not covered", and so does an evicted
     /// (cloud-only) file: `lock` must not block on a download, so it writes a new one.
-    fn newest_unsaved_covers(&self, vault: &UnlockedVault) -> bool {
-        let Ok(list) = backup::list_backups(&self.path) else {
-            return false;
-        };
-        let Some(newest) = list.iter().find(|b| b.kind == BackupKind::Unsaved) else {
-            return false;
-        };
+    fn newest_unsaved_covering(&self, vault: &UnlockedVault) -> Option<PathBuf> {
+        let list = backup::list_backups(&self.path).ok()?;
+        let newest = list.into_iter().find(|b| b.kind == BackupKind::Unsaved)?;
         if self.hooks.is_evicted(&newest.path) {
-            return false;
+            return None;
         }
         let Ok(Some(ReadParsed {
             parsed: Ok(locked), ..
         })) = self.read_parsed(&newest.path)
         else {
-            return false;
+            return None;
         };
-        let Ok(mut copy) = locked.unlock_with_key(&vault.export_vault_key(), self.device_id) else {
-            return false;
-        };
-        copy.slots().eq(vault.slots()) && copy.merge_from(vault).is_ok_and(|r| !r.changed())
+        let mut copy = locked
+            .unlock_with_key(&vault.export_vault_key(), self.device_id)
+            .ok()?;
+        (copy.slots().eq(vault.slots()) && copy.merge_from(vault).is_ok_and(|r| !r.changed()))
+            .then_some(newest.path)
     }
 
     pub fn vault(&self) -> Option<&UnlockedVault> {
@@ -520,9 +601,21 @@ impl SyncedVault {
         let bytes = vault.serialize();
         let item_count = vault.items().count();
         let locked = LockedVault::parse(&bytes)?;
-        self.write(&bytes, Mode::Replace)?;
+        // A primary that went missing is recreated without replacing: if a peer's file lands
+        // meanwhile, `AlreadyExists` leaves us dirty and the next save merges it instead.
+        let mode = if self.primary_missing {
+            Mode::NoReplace
+        } else {
+            Mode::Replace
+        };
+        run_before_primary_write();
+        let durable = self.write(&bytes, mode)?;
+        // The file on disk is now ours either way.
         self.locked = locked;
         self.locked_fallback = None;
+        // The rename happened but the directory fsync failed (03 §2 step 5): not known
+        // durable, so stay dirty and let the next save write (and fsync) again.
+        durable?;
         self.dirty = false;
         self.dirty_from_corrupt = false;
         let first = std::mem::take(&mut self.first_save_after_unlock);
@@ -544,16 +637,22 @@ impl SyncedVault {
     }
 
     /// Steps 2-6 of 03 §2. `create` uses [`Mode::NoReplace`] so a file that appeared after its
-    /// existence check is never clobbered; `save` uses [`Mode::Replace`].
-    fn write(&mut self, bytes: &[u8], mode: Mode) -> Result<(), SyncError> {
-        let tmp_stat = write_atomic_stat(&self.file, bytes, mode)?;
+    /// existence check is never clobbered; `save` uses [`Mode::Replace`] (`NoReplace` while the
+    /// primary is missing).
+    ///
+    /// Outer `Err`: nothing was written. Inner `Err`: `bytes` ARE the primary now (recorded as
+    /// such), but the directory fsync failed, so the write is not known durable; the caller
+    /// must keep a retry pending.
+    fn write(&mut self, bytes: &[u8], mode: Mode) -> Result<Result<(), SyncError>, SyncError> {
+        let written = write_atomic_stat(&self.file, bytes, mode)?;
         self.last_written = Some(fingerprint_after_write(
             &self.file,
-            tmp_stat.as_ref(),
+            written.tmp_stat.as_ref(),
             bytes,
         ));
+        self.primary_missing = false;
         tracing::debug!(path = %self.file.display(), size = bytes.len(), "saved vault");
-        Ok(())
+        Ok(written.dir_sync)
     }
 
     /// 03 §2 step 7 / §4: snapshot `bytes` (just written) if the newest snapshot is an hour
@@ -594,18 +693,33 @@ impl SyncedVault {
     }
 
     /// Write a snapshot, announce it, then run retention (whose failures are only logged).
+    /// A directory fsync failure after the write is an error here (see
+    /// [`SyncedVault::snapshot_unconfirmed`]).
     fn snapshot(
         &self,
         bytes: &[u8],
         now: SystemTime,
         kind: BackupKind,
     ) -> Result<PathBuf, SyncError> {
-        let path = backup::write_snapshot(&self.path, bytes, now, kind)?;
+        let (path, durable) = self.snapshot_unconfirmed(bytes, now, kind)?;
+        durable?;
+        Ok(path)
+    }
+
+    /// [`SyncedVault::snapshot`], reporting the directory fsync separately: an inner `Err`
+    /// means the snapshot file exists (and was announced) but is not confirmed durable.
+    fn snapshot_unconfirmed(
+        &self,
+        bytes: &[u8],
+        now: SystemTime,
+        kind: BackupKind,
+    ) -> Result<(PathBuf, Result<(), SyncError>), SyncError> {
+        let (path, durable) = backup::write_snapshot(&self.path, bytes, now, kind)?;
         self.emit(SyncEvent::BackupTaken(path.clone()));
         if let Err(e) = backup::apply_retention(&self.path, now, self.retention_multiplier, &path) {
             tracing::warn!(error = %e, "backup retention failed");
         }
-        Ok(path)
+        Ok((path, durable))
     }
 
     /// Snapshots, unsaved copies and absorbed conflict packages in `<name>.vault/backups/`,
@@ -747,7 +861,15 @@ impl SyncedVault {
         // Like `save`: no other writer between our read of the current primary and the
         // replace. Released before `after_unlock`, whose conflict absorption saves (and locks).
         let write_lock = PackageLock::exclusive(&self.path)?;
-        match self.read_parsed(&self.file)? {
+        let current = match self.read_parsed(&self.file) {
+            // Not a vault this app wrote; too large to keep a copy of. Restoring replaces it.
+            Err(SyncError::PrimaryTooLarge(p)) => {
+                tracing::warn!(path = %p.display(), "primary is oversized; restoring without a pre-restore copy");
+                None
+            }
+            r => r?,
+        };
+        match current {
             Some(ReadParsed {
                 bytes: current,
                 parsed: Ok(_),
@@ -774,7 +896,7 @@ impl SyncedVault {
             }
         }
 
-        self.write(&bytes, Mode::Replace)?;
+        let durable = self.write(&bytes, Mode::Replace)?;
         drop(write_lock);
         self.locked = locked;
         self.locked_fallback = None;
@@ -783,6 +905,11 @@ impl SyncedVault {
         self.save_blocked = None;
         self.rewrite_on_unlock = false;
         self.install(vault);
+        if let Err(e) = durable {
+            // The restore took effect but is not known durable: the next save rewrites it.
+            self.dirty = true;
+            self.emit_error(e);
+        }
         // Restoring from locked is an unlock: absorb conflicted copies queued meanwhile.
         self.after_unlock();
         tracing::info!(path = %self.path.display(), from = %backup.display(), "restored vault from backup");
@@ -860,6 +987,38 @@ impl SyncedVault {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static BEFORE_PRIMARY_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Tests only: run `f` once on this thread inside the next dirty `save`, after its pre-write
+/// read and merge and right before the primary is written (another device's write landing
+/// in that window).
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn before_next_primary_write_for_tests(f: impl FnOnce() + 'static) {
+    BEFORE_PRIMARY_WRITE.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+
+/// Tests only: make the next `n` directory fsyncs on this thread fail with EIO (03 §2 step 5).
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn fail_next_dir_syncs_for_tests(n: u32) {
+    crate::atomic::inject_dir_sync_failures(n);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn run_before_primary_write() {
+    if let Some(f) = BEFORE_PRIMARY_WRITE.with(|h| h.borrow_mut().take()) {
+        f();
+    }
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn run_before_primary_write() {}
+
 /// A file read through the cloud hooks, with its parse result.
 pub(crate) struct ReadParsed {
     pub(crate) bytes: Vec<u8>,
@@ -868,13 +1027,14 @@ pub(crate) struct ReadParsed {
 
 impl SyncedVault {
     /// `ensure_downloaded` → read → parse (03 §7: download before every read of the primary
-    /// or a conflicted copy). `Ok(None)` when the file does not exist.
+    /// or a conflicted copy). `Ok(None)` when the file does not exist;
+    /// [`SyncError::PrimaryTooLarge`] beyond [`MAX_VAULT_FILE_SIZE`].
     pub(crate) fn read_parsed(&self, path: &Path) -> Result<Option<ReadParsed>, SyncError> {
         self.hooks.ensure_downloaded(path, DOWNLOAD_TIMEOUT)?;
-        let bytes = match fs::read(path) {
-            Ok(b) => b,
+        let bytes = match read_with_stat(path) {
+            Ok((b, _)) => b,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(SyncError::io(path, e)),
+            Err(e) => return Err(read_error(path, e)),
         };
         let parsed = LockedVault::parse(&bytes);
         Ok(Some(ReadParsed { bytes, parsed }))
@@ -899,13 +1059,40 @@ fn read_with_stat_hooked(
     path: &Path,
     between: impl FnOnce(),
 ) -> std::io::Result<(Vec<u8>, fs::Metadata)> {
-    use std::io::Read;
     let mut file = fs::File::open(path)?;
     between();
     let meta = file.metadata()?;
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
-    file.read_to_end(&mut bytes)?;
+    let bytes = read_capped(&mut file, &meta)?;
     Ok((bytes, meta))
+}
+
+/// Read all of `file` (whose `fstat` is `meta`), refusing more than [`MAX_VAULT_FILE_SIZE`]
+/// bytes with [`ErrorKind::FileTooLarge`] (see [`read_error`]): checked against the stat
+/// before reading, and enforced while reading in case the file grows.
+pub(crate) fn read_capped(file: &mut fs::File, meta: &fs::Metadata) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let too_large = || std::io::Error::new(ErrorKind::FileTooLarge, "vault file too large");
+    if meta.len() > MAX_VAULT_FILE_SIZE {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    file.by_ref()
+        .take(MAX_VAULT_FILE_SIZE + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_VAULT_FILE_SIZE {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
+/// A read error on vault file `path` as a [`SyncError`]: `FileTooLarge` (from
+/// [`read_capped`]) becomes [`SyncError::PrimaryTooLarge`].
+pub(crate) fn read_error(path: &Path, e: std::io::Error) -> SyncError {
+    if e.kind() == ErrorKind::FileTooLarge {
+        SyncError::PrimaryTooLarge(path.to_owned())
+    } else {
+        SyncError::io(path, e)
+    }
 }
 
 /// Fingerprint right after our own atomic write. The stat comes from `path` (the rename may
@@ -988,11 +1175,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.bin");
         let ours = b"ours".to_vec();
-        let tmp_stat = write_atomic_stat(&path, &ours, Mode::Replace).unwrap();
+        let tmp_stat = write_atomic_stat(&path, &ours, Mode::Replace)
+            .unwrap()
+            .tmp_stat;
         let lw = fingerprint_after_write(&path, tmp_stat.as_ref(), &ours);
         assert!(lw.stat_matches(&fs::metadata(&path).unwrap()), "{lw:?}");
 
-        let tmp_stat = write_atomic_stat(&path, &ours, Mode::Replace).unwrap();
+        let tmp_stat = write_atomic_stat(&path, &ours, Mode::Replace)
+            .unwrap()
+            .tmp_stat;
         let other = dir.path().join("other");
         fs::write(&other, b"thei").unwrap();
         fs::rename(&other, &path).unwrap();

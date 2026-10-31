@@ -436,6 +436,12 @@ pub fn pill(message: impl Into<SharedString>, cx: &App) -> Div {
         .child(message.into())
 }
 
+/// [`pill`] in the danger colour, for toasts about edits that could not be kept.
+pub fn danger_pill(message: impl Into<SharedString>, cx: &App) -> Div {
+    let danger = cx.theme().danger;
+    pill(message, cx).border_color(danger).text_color(danger)
+}
+
 /// Label and level (0 weak, 1 fair, 2 good, 3 strong) for an entropy estimate.
 pub fn strength_label(bits: f64) -> (&'static str, u8) {
     match bits {

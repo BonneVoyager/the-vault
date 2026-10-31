@@ -36,12 +36,12 @@ Everything in `.backups/` is a complete, independently-openable vault file. Back
 2. write bytes to <name>.vault/.vault.bin.tmp-<rand>   (O_CREAT|O_EXCL, mode 0600)
 3. fsync(tmp)
 4. rename(tmp, <name>.vault/vault.bin)             atomic on APFS / HFS+ / ext4
-5. fsync(package dir)                              best-effort; ignore ENOTSUP
+5. fsync(package dir)                              ignore ENOTSUP/EOPNOTSUPP/EINVAL/ENOSYS (unsupported); any other error → Err, vault stays dirty
 6. record (mtime, ctime, inode, size, blake3(bytes)) as `last_written`   (V-05: mtime+size alone misses a same-size write within one timestamp tick on coarse filesystems)
 7. maybe_backup(bytes)                             §4
 ```
 
-Steps 1–7 run under an exclusive advisory lock on `<name>.vault/.lock` (flock), taken before the pre-write merge's read and released after the rename, so two processes (the app and the CLI, or two CLI commands) cannot interleave a read-modify-write and lose items (V-02). Never write in place. Never truncate-then-write. If step 4 fails, delete the tmp and surface the error; the old file is intact.
+Steps 1–7 run under an exclusive advisory lock on `<name>.vault/.lock` (flock), taken before the pre-write merge's read and released after the rename, so two processes (the app and the CLI, or two CLI commands) cannot interleave a read-modify-write and lose items (V-02). On volumes that do not support locking (ENOTSUP/ENOLCK) or where the lock file cannot be created for permission reasons, the save proceeds without the lock and logs a warning once; concurrent writers are then unprotected (accepted). Step 5 ignores only ENOTSUP/EINVAL from the directory fsync; any other error is surfaced and the vault stays dirty. Step 4 uses a native no-replace rename (`renameatx_np(RENAME_EXCL)` via `rustix`) for backups and blobs, with the hard-link fallback only where that is unsupported. Reads of `vault.bin` are capped (64 MiB) and refuse larger files with a typed error before parsing. Never write in place. Never truncate-then-write. If step 4 fails, delete the tmp and surface the error; the old file is intact.
 
 ## 3. Watching and reacting to external changes
 
@@ -167,7 +167,7 @@ impl SyncedVault {
     pub fn open(path: &Path, device_id: Uuid, hooks: Arc<dyn CloudHooks>) -> Result<Self, SyncError>;  // locked
     pub fn unlock(&mut self, password: &SecretString) -> Result<(), SyncError>;
     pub fn unlock_with_kek(&mut self, slot: Uuid, kek: &SecretVec<u8>) -> Result<(), SyncError>;
-    pub fn lock(&mut self);                                                                 // zeroizes key, drops items; unsaved edits are snapshotted to a backup first
+    pub fn lock(&mut self) -> LockOutcome;   // zeroizes key, drops items; unsaved edits are snapshotted to an Unsaved backup first; the outcome says Clean | Snapshotted(path) | Unpreserved(error) so the app never claims edits were kept when they were not
     pub fn vault(&self) -> Option<&UnlockedVault>;
     pub fn edit<R>(&mut self, f: impl FnOnce(&mut UnlockedVault) -> R) -> Result<R, SyncError>; // marks dirty; Err when locked
     pub fn start_watching(&mut self) -> Result<(), SyncError>;                              // explicit; watcher thread + debouncer

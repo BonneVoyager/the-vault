@@ -32,8 +32,9 @@ fn tmp_path(path: &Path) -> PathBuf {
 pub(crate) enum Mode {
     /// `rename(tmp, target)`: atomically replaces an existing target (`save`).
     Replace,
-    /// `link(tmp, target)` then unlink tmp: fails with [`SyncError::AlreadyExists`] if the
-    /// target appeared since the caller checked (`create`), never clobbering it.
+    /// `renameatx_np(tmp, target, RENAME_EXCL)` (or, where unsupported, `link` then unlink
+    /// tmp): fails with [`SyncError::AlreadyExists`] if the target appeared since the caller
+    /// checked (`create`, backups, blobs), never clobbering it.
     NoReplace,
 }
 
@@ -60,22 +61,86 @@ impl Drop for TmpGuard<'_> {
     }
 }
 
-/// Write `bytes` to a fresh tmp file (O_CREAT|O_EXCL, 0600), fsync it, move it to `path` per
-/// `mode`, then best-effort fsync the directory. On any failure the tmp is removed and `path`
-/// is untouched.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), SyncError> {
-    write_atomic_with(path, bytes, mode, |src, dst| fs::hard_link(src, dst)).map(drop)
+/// The filesystem calls `write_atomic` makes after the tmp is written, injectable so tests can
+/// simulate volumes without native no-replace rename or hard links, and directory fsync
+/// failures.
+#[derive(Clone, Copy)]
+struct FsOps {
+    /// `rename(from, to)` that fails with `EEXIST` instead of replacing `to`.
+    rename_exclusive: fn(&Path, &Path) -> std::io::Result<()>,
+    /// `link(from, to)`; fails with `EEXIST` if `to` exists.
+    hard_link: fn(&Path, &Path) -> std::io::Result<()>,
+    /// fsync of the directory at the given path.
+    sync_dir: fn(&Path) -> std::io::Result<()>,
 }
 
-/// [`write_atomic`], returning the `fstat` of the tmp handle taken after its fsync and before
-/// the rename (`None` if that fstat failed). Rename and link keep the inode, mtime and size,
-/// so a later stat of `path` that disagrees shows the file was replaced since.
+const REAL_FS: FsOps = FsOps {
+    rename_exclusive,
+    hard_link: |src, dst| fs::hard_link(src, dst),
+    sync_dir: |dir| File::open(dir).and_then(|d| d.sync_all()),
+};
+
+/// `renameatx_np(from, to, RENAME_EXCL)` on macOS (`renameat2(RENAME_NOREPLACE)` on Linux):
+/// atomic, never replaces `to`.
+fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(std::io::Error::from)
+}
+
+/// Whether `e` from a syscall means "this volume does not support that operation" (ENOTSUP,
+/// EOPNOTSUPP, EINVAL, ENOSYS or `Unsupported`), as opposed to a real failure.
+fn is_unsupported(e: &std::io::Error) -> bool {
+    use rustix::io::Errno;
+    e.kind() == ErrorKind::Unsupported
+        || e.raw_os_error().is_some_and(|c| {
+            [Errno::NOTSUP, Errno::OPNOTSUPP, Errno::INVAL, Errno::NOSYS]
+                .iter()
+                .any(|n| n.raw_os_error() == c)
+        })
+}
+
+/// 03 §2 step 5: a directory fsync error that is ignored (the filesystem cannot fsync a
+/// directory: ENOTSUP / EOPNOTSUPP / EINVAL, or anything std classifies as `Unsupported`,
+/// which includes ENOSYS). Anything else (EIO, ENOSPC, EACCES, ...) is surfaced.
+pub(crate) fn dir_sync_ignorable(e: &std::io::Error) -> bool {
+    use rustix::io::Errno;
+    e.kind() == ErrorKind::Unsupported
+        || e.raw_os_error().is_some_and(|c| {
+            [Errno::NOTSUP, Errno::OPNOTSUPP, Errno::INVAL]
+                .iter()
+                .any(|n| n.raw_os_error() == c)
+        })
+}
+
+/// What [`write_atomic_stat`] returns once the target is in place.
+pub(crate) struct Written {
+    /// `fstat` of the tmp handle after its fsync, before the rename (`None` if it failed).
+    pub(crate) tmp_stat: Option<fs::Metadata>,
+    /// Outcome of the directory fsync (step 5). `Err` means the new file IS at `path` (the
+    /// rename happened) but its directory entry may not be durable yet: callers must treat
+    /// the write as not done (retry), never roll it back.
+    pub(crate) dir_sync: Result<(), SyncError>,
+}
+
+/// Write `bytes` to a fresh tmp file (O_CREAT|O_EXCL, 0600), fsync it, move it to `path` per
+/// `mode`, then fsync the directory. On any failure before the move the tmp is removed and
+/// `path` is untouched. A directory fsync failure other than "unsupported" is returned as an
+/// error although `path` already holds the new file.
+#[cfg(test)]
+fn write_atomic(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), SyncError> {
+    write_atomic_with(path, bytes, mode, REAL_FS)?.dir_sync
+}
+
+/// [`write_atomic`], reporting the directory fsync separately (see [`Written`]) together
+/// with the tmp handle's `fstat` taken after its fsync and before the rename. Rename and link
+/// keep the inode, mtime and size, so a later stat of `path` that disagrees shows the file
+/// was replaced since.
 pub(crate) fn write_atomic_stat(
     path: &Path,
     bytes: &[u8],
     mode: Mode,
-) -> Result<Option<fs::Metadata>, SyncError> {
-    write_atomic_with(path, bytes, mode, |src, dst| fs::hard_link(src, dst))
+) -> Result<Written, SyncError> {
+    write_atomic_with(path, bytes, mode, REAL_FS)
 }
 
 /// [`write_atomic`] with the content streamed by `fill` instead of passed as a slice. `fill`
@@ -86,22 +151,20 @@ pub(crate) fn write_atomic_stream(
     mode: Mode,
     fill: impl FnOnce(&mut File, &Path) -> Result<(), SyncError>,
 ) -> Result<(), SyncError> {
-    write_atomic_inner(path, mode, fill, |src, dst| fs::hard_link(src, dst)).map(drop)
+    write_atomic_inner(path, mode, fill, REAL_FS)?.dir_sync
 }
 
-/// [`write_atomic`] with the hard-link call injectable, so tests can simulate filesystems
-/// without hard links.
 fn write_atomic_with(
     path: &Path,
     bytes: &[u8],
     mode: Mode,
-    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
-) -> Result<Option<fs::Metadata>, SyncError> {
+    ops: FsOps,
+) -> Result<Written, SyncError> {
     write_atomic_inner(
         path,
         mode,
         |file, tmp| file.write_all(bytes).map_err(|e| SyncError::io(tmp, e)),
-        link,
+        ops,
     )
 }
 
@@ -109,8 +172,8 @@ fn write_atomic_inner(
     path: &Path,
     mode: Mode,
     fill: impl FnOnce(&mut File, &Path) -> Result<(), SyncError>,
-    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
-) -> Result<Option<fs::Metadata>, SyncError> {
+    ops: FsOps,
+) -> Result<Written, SyncError> {
     let tmp = tmp_path(path);
     let mut file = open_tmp(&tmp).map_err(|e| SyncError::io(&tmp, e))?;
     let mut guard = TmpGuard {
@@ -128,34 +191,110 @@ fn write_atomic_inner(
             fs::rename(&tmp, path).map_err(|e| SyncError::io(path, e))?;
             guard.defuse();
         }
-        Mode::NoReplace => match link(&tmp, path) {
-            // The guard now unlinks the tmp name; the data lives on under `path`.
-            Ok(()) => {}
+        // Native atomic no-replace rename first (03 §2 step 4). Only where the volume does not
+        // support it, a hard link (equally atomic: `link` never replaces). If neither is
+        // supported the write fails: there is no check-then-rename fallback, which could
+        // clobber a file created between the check and the rename.
+        Mode::NoReplace => match (ops.rename_exclusive)(&tmp, path) {
+            Ok(()) => guard.defuse(),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                 return Err(SyncError::AlreadyExists(path.to_owned()));
             }
-            Err(e) => {
-                // exFAT, some SMB mounts: no hard links. Fall back to check-then-rename, which
-                // reopens a narrow race window but is the best these filesystems allow.
-                tracing::warn!(path = %path.display(), error = %e, "hard link unsupported; falling back to rename");
-                match fs::symlink_metadata(path) {
-                    Ok(_) => return Err(SyncError::AlreadyExists(path.to_owned())),
-                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) if is_unsupported(&e) => {
+                tracing::warn!(path = %path.display(), error = %e, "no-replace rename unsupported; using a hard link");
+                match (ops.hard_link)(&tmp, path) {
+                    // The guard now unlinks the tmp name; the data lives on under `path`.
+                    Ok(()) => {}
+                    Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                        return Err(SyncError::AlreadyExists(path.to_owned()));
+                    }
                     Err(e) => return Err(SyncError::io(path, e)),
                 }
-                fs::rename(&tmp, path).map_err(|e| SyncError::io(path, e))?;
-                guard.defuse();
             }
+            Err(e) => return Err(SyncError::io(path, e)),
         },
     }
     drop(guard);
 
-    // Step 5: best-effort; some filesystems refuse to fsync a directory (ENOTSUP, EINVAL).
+    // Step 5: some filesystems cannot fsync a directory (ENOTSUP, EINVAL); that alone is
+    // ignored. Any other failure is reported: the rename is done, but not known durable.
     let dir = parent_dir(path);
-    if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
-        tracing::debug!(dir = %dir.display(), error = %e, "directory fsync skipped");
+    let synced = match take_injected_dir_sync_failure() {
+        Some(e) => Err(e),
+        None => (ops.sync_dir)(dir),
+    };
+    let dir_sync = match synced {
+        Ok(()) => Ok(()),
+        Err(e) if dir_sync_ignorable(&e) => {
+            tracing::debug!(dir = %dir.display(), error = %e, "directory fsync unsupported; skipped");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "directory fsync failed");
+            Err(SyncError::io(dir, e))
+        }
+    };
+    Ok(Written { tmp_stat, dir_sync })
+}
+
+/// Rename `src` (a file or a directory) to `dst` without ever replacing `dst`: the native
+/// exclusive rename, or where the volume lacks it, for a file only, a hard link followed by
+/// unlinking `src`. [`SyncError::AlreadyExists`] if `dst` exists; fails closed (no
+/// check-then-rename) when neither primitive is available.
+pub(crate) fn rename_no_replace(src: &Path, dst: &Path) -> Result<(), SyncError> {
+    rename_no_replace_with(src, dst, REAL_FS)
+}
+
+fn rename_no_replace_with(src: &Path, dst: &Path, ops: FsOps) -> Result<(), SyncError> {
+    match (ops.rename_exclusive)(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            Err(SyncError::AlreadyExists(dst.to_owned()))
+        }
+        Err(e) if is_unsupported(&e) && fs::symlink_metadata(src).is_ok_and(|m| m.is_file()) => {
+            tracing::warn!(path = %dst.display(), error = %e, "no-replace rename unsupported; using a hard link");
+            match (ops.hard_link)(src, dst) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    return Err(SyncError::AlreadyExists(dst.to_owned()));
+                }
+                Err(e) => return Err(SyncError::io(dst, e)),
+            }
+            if let Err(e) = fs::remove_file(src) {
+                // `dst` holds the data; a leftover `src` is only a duplicate name.
+                tracing::warn!(path = %src.display(), error = %e, "could not unlink the source after linking");
+            }
+            Ok(())
+        }
+        Err(e) => Err(SyncError::io(src, e)),
     }
-    Ok(tmp_stat)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static DIR_SYNC_FAILURES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Tests only: make the next `n` directory fsyncs on this thread fail with EIO.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn inject_dir_sync_failures(n: u32) {
+    DIR_SYNC_FAILURES.with(|c| c.set(n));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn take_injected_dir_sync_failure() -> Option<std::io::Error> {
+    DIR_SYNC_FAILURES.with(|c| {
+        let n = c.get();
+        (n > 0).then(|| {
+            c.set(n - 1);
+            std::io::Error::from_raw_os_error(rustix::io::Errno::IO.raw_os_error())
+        })
+    })
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn take_injected_dir_sync_failure() -> Option<std::io::Error> {
+    None
 }
 
 fn open_tmp(tmp: &Path) -> std::io::Result<File> {
@@ -261,23 +400,177 @@ mod tests {
         Err(std::io::Error::from(ErrorKind::Unsupported))
     }
 
+    fn enotsup(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(
+            rustix::io::Errno::NOTSUP.raw_os_error(),
+        ))
+    }
+
+    const NO_EXCL_RENAME: FsOps = FsOps {
+        rename_exclusive: enotsup,
+        ..REAL_FS
+    };
+
     #[test]
-    fn no_replace_falls_back_to_rename_without_hard_links() {
+    fn exclusive_rename_on_this_volume() {
+        // The real primitive on the test volume (APFS on macOS): moves, then refuses.
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::write(&a, b"a").unwrap();
+        rename_exclusive(&a, &b).unwrap();
+        assert!(!a.exists());
+        fs::write(&a, b"a2").unwrap();
+        let e = rename_exclusive(&a, &b).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::AlreadyExists, "{e:?}");
+        assert_eq!(fs::read(&b).unwrap(), b"a");
+        assert_eq!(fs::read(&a).unwrap(), b"a2");
+    }
+
+    #[test]
+    fn no_replace_falls_back_to_hard_link_without_exclusive_rename() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("a.vault");
-        write_atomic_with(&target, b"ours", Mode::NoReplace, unsupported).unwrap();
+        write_atomic_with(&target, b"ours", Mode::NoReplace, NO_EXCL_RENAME).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"ours");
+        assert!(leftovers(dir.path()).is_empty());
+
+        let err = write_atomic_with(&target, b"again", Mode::NoReplace, NO_EXCL_RENAME)
+            .err()
+            .unwrap();
+        assert!(matches!(err, SyncError::AlreadyExists(_)), "{err:?}");
         assert_eq!(fs::read(&target).unwrap(), b"ours");
         assert!(leftovers(dir.path()).is_empty());
     }
 
     #[test]
-    fn no_replace_fallback_refuses_existing_target() {
+    fn no_replace_fails_closed_without_any_atomic_primitive() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("a.vault");
-        fs::write(&target, b"theirs").unwrap();
-        let err = write_atomic_with(&target, b"ours", Mode::NoReplace, unsupported).unwrap_err();
+        let ops = FsOps {
+            rename_exclusive: unsupported,
+            hard_link: unsupported,
+            ..REAL_FS
+        };
+        let err = write_atomic_with(&target, b"ours", Mode::NoReplace, ops)
+            .err()
+            .unwrap();
+        assert!(matches!(err, SyncError::Io { .. }), "{err:?}");
+        assert!(!target.exists());
+        assert!(leftovers(dir.path()).is_empty());
+    }
+
+    /// The target is created by someone else after any check could have run (inside the
+    /// "rename" call itself): it is reported as `AlreadyExists` and kept.
+    #[test]
+    fn no_replace_keeps_a_target_created_concurrently() {
+        fn racing_link(src: &Path, dst: &Path) -> std::io::Result<()> {
+            fs::write(dst, b"theirs")?;
+            fs::hard_link(src, dst)
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.vault");
+        let ops = FsOps {
+            rename_exclusive: enotsup,
+            hard_link: racing_link,
+            ..REAL_FS
+        };
+        let err = write_atomic_with(&target, b"ours", Mode::NoReplace, ops)
+            .err()
+            .unwrap();
         assert!(matches!(err, SyncError::AlreadyExists(_)), "{err:?}");
         assert_eq!(fs::read(&target).unwrap(), b"theirs");
         assert!(leftovers(dir.path()).is_empty());
+
+        fn racing_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
+            fs::write(dst, b"theirs2")?;
+            rename_exclusive(src, dst)
+        }
+        let target = dir.path().join("b.vault");
+        let ops = FsOps {
+            rename_exclusive: racing_rename,
+            ..REAL_FS
+        };
+        let err = write_atomic_with(&target, b"ours", Mode::NoReplace, ops)
+            .err()
+            .unwrap();
+        assert!(matches!(err, SyncError::AlreadyExists(_)), "{err:?}");
+        assert_eq!(fs::read(&target).unwrap(), b"theirs2");
+        assert!(leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn rename_no_replace_moves_files_and_directories_and_never_clobbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, dst) = (dir.path().join("src"), dir.path().join("dst"));
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("f"), b"1").unwrap();
+        rename_no_replace(&src, &dst).unwrap();
+        assert!(dst.join("f").is_file() && !src.exists());
+
+        fs::create_dir(&src).unwrap();
+        let err = rename_no_replace(&src, &dst).unwrap_err();
+        assert!(matches!(err, SyncError::AlreadyExists(_)), "{err:?}");
+        assert!(src.exists() && dst.join("f").is_file());
+
+        // Without the native primitive: files go through a hard link, directories fail closed.
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::write(&a, b"a").unwrap();
+        rename_no_replace_with(&a, &b, NO_EXCL_RENAME).unwrap();
+        assert!(!a.exists());
+        assert_eq!(fs::read(&b).unwrap(), b"a");
+        fs::write(&a, b"a2").unwrap();
+        let err = rename_no_replace_with(&a, &b, NO_EXCL_RENAME).unwrap_err();
+        assert!(matches!(err, SyncError::AlreadyExists(_)), "{err:?}");
+        assert_eq!(fs::read(&b).unwrap(), b"a");
+        let err =
+            rename_no_replace_with(&src, &dir.path().join("new"), NO_EXCL_RENAME).unwrap_err();
+        assert!(matches!(err, SyncError::Io { .. }), "{err:?}");
+        assert!(src.exists());
+    }
+
+    #[test]
+    fn dir_sync_classifier() {
+        use rustix::io::Errno;
+        let os = |e: Errno| std::io::Error::from_raw_os_error(e.raw_os_error());
+        // std reports ENOSYS as `Unsupported`, which is ignored too.
+        for e in [Errno::NOTSUP, Errno::OPNOTSUPP, Errno::INVAL, Errno::NOSYS] {
+            assert!(dir_sync_ignorable(&os(e)), "{e:?}");
+        }
+        assert!(dir_sync_ignorable(&ErrorKind::Unsupported.into()));
+        for e in [Errno::IO, Errno::NOSPC, Errno::ACCESS, Errno::ROFS] {
+            assert!(!dir_sync_ignorable(&os(e)), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn dir_sync_error_is_reported_after_the_rename() {
+        fn eio(_: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(
+                rustix::io::Errno::IO.raw_os_error(),
+            ))
+        }
+        fn einval(_: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(
+                rustix::io::Errno::INVAL.raw_os_error(),
+            ))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.vault");
+        let ops = FsOps {
+            sync_dir: eio,
+            ..REAL_FS
+        };
+        let w = write_atomic_with(&target, b"new", Mode::Replace, ops).unwrap();
+        assert!(matches!(w.dir_sync, Err(SyncError::Io { .. })));
+        // The rename is not rolled back.
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert!(leftovers(dir.path()).is_empty());
+
+        let ops = FsOps {
+            sync_dir: einval,
+            ..REAL_FS
+        };
+        let w = write_atomic_with(&target, b"newer", Mode::Replace, ops).unwrap();
+        assert!(w.dir_sync.is_ok());
     }
 }

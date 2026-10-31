@@ -10,13 +10,14 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use vault_core::{Header, LockedVault, Slot, SlotKind, UnlockedVault, Uuid, VaultError};
 
-use super::{DOWNLOAD_TIMEOUT, SyncedVault, fingerprint};
+use super::attachments::blob_budget;
+use super::{DOWNLOAD_TIMEOUT, SyncedVault, fingerprint, read_capped, read_error};
 use crate::attachments;
 use crate::backup;
 use crate::cloud::CloudError;
@@ -104,8 +105,17 @@ impl SyncedVault {
     /// is emitted for the former. `save` propagates it rather than overwriting a version it
     /// has not merged.
     pub(super) fn reconcile_primary(&mut self) -> Result<bool, SyncError> {
-        let Some(bytes) = self.read_primary_if_changed()? else {
-            return Ok(false);
+        let bytes = match self.read_primary_if_changed() {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(false),
+            // Never a file we wrote: handled like a corrupt primary (03 §3 step 3), never
+            // parsed or adopted; ours is kept and rewrites it on the next save.
+            Err(SyncError::PrimaryTooLarge(path)) => {
+                tracing::warn!(path = %path.display(), "primary exceeds the vault file size cap");
+                self.mark_corrupt();
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
         };
         let Some(theirs) = self.vet_primary(&bytes) else {
             return Ok(false);
@@ -175,20 +185,34 @@ impl SyncedVault {
         let mut file = match fs::File::open(&self.file) {
             Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                // Mid-replace by another writer, or deleted; the next event will tell.
+                // Deleted (or a provider's delete-then-create). Nothing to merge, but our
+                // in-memory copy is now the only one: make sure it gets written.
                 tracing::debug!(path = %self.file.display(), "primary missing");
+                self.note_primary_missing();
                 return Ok(None);
             }
             Err(e) => return Err(SyncError::io(&self.file, e)),
         };
+        self.primary_missing = false;
         let meta = file.metadata().map_err(|e| SyncError::io(&self.file, e))?;
         if self.last_written.is_some_and(|lw| lw.stat_matches(&meta)) {
             return Ok(None);
         }
-        // Step 2: hash check.
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|e| SyncError::io(&self.file, e))?;
+        // Step 2: hash check, on at most `MAX_VAULT_FILE_SIZE` bytes.
+        let bytes = match read_capped(&mut file, &meta) {
+            Ok(b) => b,
+            Err(e) => {
+                if e.kind() == ErrorKind::FileTooLarge {
+                    // Remember the stat (with a hash nothing matches), so repeated events for
+                    // this same file stop at step 1 instead of reporting it again.
+                    let mut seen = fingerprint(Some(&meta), &[]);
+                    seen.size = meta.len();
+                    seen.hash = [0; 32];
+                    self.last_written = Some(seen);
+                }
+                return Err(read_error(&self.file, e));
+            }
+        };
         let unchanged = self
             .last_written
             .is_some_and(|lw| lw.hash == *blake3::hash(&bytes).as_bytes());
@@ -352,9 +376,14 @@ impl SyncedVault {
         if fs::symlink_metadata(&inner).is_err() && !self.hooks.is_evicted(&inner) {
             if kind != ConflictKind::Generic {
                 // Blobs that arrived after the package was absorbed (or before its
-                // `vault.bin`): take the ones we lack. The remnant stays where it is: a
-                // `vault.bin` arriving later must still find it there to be merged.
-                match self.copy_missing_blobs(path) {
+                // `vault.bin`): take the ones we lack, but only those our own items
+                // reference (nothing here is authenticated). The remnant stays where it is:
+                // a `vault.bin` arriving later must still find it there to be merged.
+                let wanted = match &self.unlocked {
+                    Some(ours) => blob_budget(&[ours]),
+                    None => Default::default(),
+                };
+                match self.copy_missing_blobs(path, &wanted) {
                     Ok(0) => {}
                     Ok(n) => {
                         tracing::info!(path = %path.display(), copied = n, "copied blobs from a conflicted package without vault.bin")
@@ -370,8 +399,13 @@ impl SyncedVault {
             return;
         };
         // Blobs first, so a merged reference never reaches disk ahead of its blob. On failure
-        // the package stays where it is and is retried on its next event or unlock.
-        match self.copy_missing_blobs(path) {
+        // the package stays where it is and is retried on its next event or unlock. Only
+        // blobs that the opened (authenticated) copy or ours reference.
+        let wanted = match &self.unlocked {
+            Some(ours) => blob_budget(&[ours, &opened]),
+            None => blob_budget(&[&opened]),
+        };
+        match self.copy_missing_blobs(path, &wanted) {
             Ok(0) => {}
             Ok(n) => {
                 tracing::info!(path = %path.display(), copied = n, "copied attachment blobs from conflicted package")
@@ -567,6 +601,20 @@ impl SyncedVault {
         theirs.unlock_with_key(&key, self.device_id)
     }
 
+    /// The primary is gone while we hold the vault unlocked: mark dirty so the next (auto)save
+    /// recreates it and `lock` snapshots it meanwhile; report [`SyncEvent::PrimaryMissing`]
+    /// once until the primary is seen or written again. Nothing to do while locked.
+    pub(super) fn note_primary_missing(&mut self) {
+        if self.unlocked.is_none() {
+            return;
+        }
+        self.dirty = true;
+        if !std::mem::replace(&mut self.primary_missing, true) {
+            tracing::warn!(path = %self.file.display(), "primary is missing; will rewrite it from memory");
+            self.emit(SyncEvent::PrimaryMissing);
+        }
+    }
+
     /// 03 §3 step 3: report, keep in-memory state, and make the next save rewrite the file.
     pub(super) fn mark_corrupt(&mut self) {
         if self.unlocked.is_some() {
@@ -583,7 +631,7 @@ impl SyncedVault {
         self.emit(SyncEvent::CloudUnavailable);
     }
 
-    fn emit_error(&self, e: SyncError) {
+    pub(super) fn emit_error(&self, e: SyncError) {
         // Every cloud failure is reported as CloudUnavailable where it happens (e.g. the
         // pre-merge in a `save` called from `poll`); do not repeat it as an Error.
         if let SyncError::Cloud(e) = &e {

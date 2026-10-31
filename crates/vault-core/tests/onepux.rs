@@ -246,3 +246,43 @@ fn odd_month_year_kept_raw_and_empty_section_is_none() {
     assert_eq!(f.value.expose_secret(), "20291");
     assert_eq!(f.section, None);
 }
+
+#[test]
+fn duplicate_field_names_are_deduplicated_in_linear_time() {
+    let fields: Vec<Value> = (0..5000)
+        .map(|i| json!({"title": "dup", "id": format!("i{i}"), "value": {"string": format!("v{i}")}}))
+        .collect();
+    let data = export(vec![json!({
+        "uuid": "a", "createdAt": 1, "updatedAt": 2, "state": "active", "categoryUuid": "001",
+        "overview": {"title": "Many"},
+        "details": {"sections": [{"title": "S", "fields": fields}]}
+    })]);
+    let bytes = archive(&data);
+    let start = std::time::Instant::now();
+    let items = import_1pux(&bytes, Uuid::nil(), NOW).unwrap();
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    let item = &items[0];
+    assert_eq!(item.fields.len(), 5000);
+    let names: Vec<&str> = item.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(&names[..4], ["dup", "dup (2)", "dup (3)", "dup (4)"]);
+    assert_eq!(names[4999], "dup (5000)");
+    let unique: std::collections::HashSet<_> = names.iter().collect();
+    assert_eq!(unique.len(), 5000);
+}
+
+#[test]
+fn literal_suffixed_name_does_not_collide_with_generated_suffix() {
+    let f =
+        |id: &str, title: &str, v: &str| json!({"title": title, "id": id, "value": {"string": v}});
+    let data = export(vec![json!({
+        "uuid": "a", "createdAt": 1, "updatedAt": 2, "state": "active", "categoryUuid": "001",
+        "overview": {"title": "T"},
+        "details": {"sections": [{"title": "S", "fields": [
+            f("1", "x (2)", "literal"), f("2", "x", "first"), f("3", "x", "second"), f("4", "x", "third"),
+        ]}]}
+    })]);
+    let items = import_1pux(&archive(&data), Uuid::nil(), NOW).unwrap();
+    let names: Vec<&str> = items[0].fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["x (2)", "x", "x (3)", "x (4)"]);
+    assert_eq!(val(&items[0], "x (2)"), "literal");
+}

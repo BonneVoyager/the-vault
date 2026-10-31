@@ -15,7 +15,7 @@ use crossbeam_channel::Receiver;
 use gpui::{Context, SharedString, Task};
 use serde::{Deserialize, Serialize};
 use vault_core::{KdfParams, SecretString, Uuid, VaultError};
-use vault_sync::{SyncError, SyncEvent, SyncedVault, VAULT_FILE_NAME};
+use vault_sync::{LockOutcome, SyncError, SyncEvent, SyncedVault, VAULT_FILE_NAME};
 
 use crate::biometric::{self, Biometrics};
 use crate::clipboard::Clipboard;
@@ -178,6 +178,8 @@ pub struct Toast {
     pub shown_at: Instant,
     pub place: ToastPlace,
     pub ttl: Duration,
+    /// Drawn in the danger colour: something the user must not miss (data at risk).
+    pub danger: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -624,6 +626,29 @@ impl AppState {
     }
 
     /// Shows a toast and schedules its dismissal after `ttl`.
+    /// Whether a danger toast (unsaved edits lost) is still up.
+    pub fn danger_toast_showing(&self) -> bool {
+        self.toast
+            .as_ref()
+            .is_some_and(|t| t.danger && t.shown_at.elapsed() < t.ttl)
+    }
+
+    /// The one setter for `toast`. A danger toast that has not expired is never replaced
+    /// by an ordinary one: the newer text is appended to it instead, so the warning stays
+    /// up for its full time. Returns whether `toast` became the toast shown.
+    pub(super) fn set_toast(&mut self, toast: Toast) -> bool {
+        if !toast.danger && self.danger_toast_showing() {
+            if let Some(current) = self.toast.as_mut()
+                && !current.message.contains(toast.message.as_ref())
+            {
+                current.message = format!("{} {}", current.message, toast.message).into();
+            }
+            return false;
+        }
+        self.toast = Some(toast);
+        true
+    }
+
     pub fn toast_at(
         &mut self,
         message: impl Into<SharedString>,
@@ -632,12 +657,17 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let shown_at = Instant::now();
-        self.toast = Some(Toast {
+        let shown = self.set_toast(Toast {
             message: message.into(),
             shown_at,
             place,
             ttl,
+            danger: false,
         });
+        if !shown {
+            cx.notify();
+            return;
+        }
         self.toast_dismiss = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(ttl).await;
             this.update(cx, |this, cx| {
@@ -721,12 +751,13 @@ impl AppState {
                             this.show_onboarding = true;
                         }
                         Outcome::Locked => {
-                            vault.lock();
+                            let outcome = vault.lock();
+                            this.report_lock(None, &outcome);
                             this.install(vault, true);
                             this.screen = Screen::Unlock;
                         }
                         // Dropping zeroizes the keys.
-                        Outcome::Closed => vault.lock(),
+                        Outcome::Closed => this.report_lock(None, &vault.lock()),
                     }
                 }
                 Err(e) if outcome != Outcome::Closed => {
@@ -761,7 +792,7 @@ impl AppState {
             },
             |this, (mut vault, result, cleaned), outcome| match (outcome, result) {
                 // The user switched or closed the vault meanwhile; dropping zeroizes it.
-                (Outcome::Closed, _) => vault.lock(),
+                (Outcome::Closed, _) => this.report_lock(None, &vault.lock()),
                 (Outcome::Fresh, Ok(())) => {
                     this.vault = Some(vault);
                     this.unlocked();
@@ -769,11 +800,12 @@ impl AppState {
                     this.stale_cleaned(cleaned);
                     // The unlock merged the file on disk: our enclave slot may be gone.
                     if this.recheck_touch_slot() {
-                        this.toast = Some(Toast::window(touch_id::SLOT_GONE));
+                        this.set_toast(Toast::window(touch_id::SLOT_GONE));
                     }
                 }
                 (Outcome::Locked, Ok(())) => {
-                    vault.lock();
+                    let outcome = vault.lock();
+                    this.report_lock(None, &outcome);
                     this.vault = Some(vault);
                     this.password_unlocked(false);
                     this.stale_cleaned(cleaned);
@@ -886,9 +918,11 @@ impl AppState {
     pub fn lock(&mut self, cx: &mut Context<Self>) {
         self.lock_gen = self.lock_gen.wrapping_add(1);
         // Overlays of the unlocked session go first, so a "could not save" toast set
-        // below survives onto the unlock screen.
-        self.toast = None;
-        self.toast_dismiss = None;
+        // below survives onto the unlock screen. A standing danger toast stays.
+        if !self.danger_toast_showing() {
+            self.toast = None;
+            self.toast_dismiss = None;
+        }
         self.settings_open = false;
         self.close_backup_windows(cx);
         self.close_item_windows(cx);
@@ -897,16 +931,15 @@ impl AppState {
             Some(vault) if vault.is_dirty() => Some(vault.save()),
             _ => None,
         };
-        if let Some(e) = saved.and_then(|r| self.record_save(r)) {
-            // Locking wins over keeping unsaved edits: an auto-lock must not be vetoed
-            // by a failing disk. `lock` below writes the dirty vault to the backups folder
-            // as an Unsaved backup (03 §8), so the user learns where the edits went.
-            self.toast = Some(Toast::window(lock_save_failed(&e)));
-        }
+        // Locking wins over keeping unsaved edits: an auto-lock must not be vetoed by a
+        // failing disk. `lock` below tries to write the dirty vault to the backups folder
+        // as an Unsaved backup (03 §8); the toast says what really happened.
+        let save_error = saved.and_then(|r| self.record_save(r));
         if let Some(vault) = self.vault.as_mut() {
             // The watcher keeps running: vault-sync needs it to see changes made while
             // locked, and it holds no key material.
-            vault.lock();
+            let outcome = vault.lock();
+            self.report_lock(save_error.as_deref(), &outcome);
         }
         if !self.locked {
             self.touch.auto = TouchAuto::OnActivation;
@@ -1086,10 +1119,41 @@ fn error_message(e: &SyncError) -> String {
     }
 }
 
-/// Toast when the save right before a lock failed. The dirty vault still reaches disk:
-/// `SyncedVault::lock` writes it to the backups folder as an Unsaved backup (03 §8).
-fn lock_save_failed(e: &str) -> String {
-    format!("Could not save before locking ({e}). Your changes were kept in the backups folder.")
+/// Lock toast: unsaved edits went to an Unsaved backup.
+pub const LOCK_KEPT: &str = "Unsaved changes were kept in the backups folder.";
+/// Lock toast (danger): unsaved edits could be neither saved nor backed up.
+pub const LOCK_LOST: &str = "Could not save or back up your unsaved changes before locking.";
+
+/// The toast for a lock. `save_error` is a failed save right before it; `outcome` is what
+/// `SyncedVault::lock` did with unsaved edits (03 §8). Preservation is claimed only for
+/// [`LockOutcome::Snapshotted`]; a clean lock after a good save shows nothing.
+fn lock_toast(save_error: Option<&str>, outcome: &LockOutcome) -> Option<Toast> {
+    match (outcome, save_error) {
+        (LockOutcome::Snapshotted(_), None) => Some(Toast::window(LOCK_KEPT)),
+        (LockOutcome::Snapshotted(_), Some(e)) => Some(Toast::window(format!(
+            "Could not save before locking ({e}). {LOCK_KEPT}"
+        ))),
+        (LockOutcome::Unpreserved(_), _) => Some(Toast::danger(LOCK_LOST)),
+        // Not expected (a failed save leaves the vault dirty); still say the save failed.
+        (LockOutcome::Clean, Some(e)) => Some(Toast::window(format!(
+            "Could not save before locking ({e})."
+        ))),
+        (LockOutcome::Clean, None) => None,
+    }
+}
+
+impl AppState {
+    /// Shows [`lock_toast`] for a `SyncedVault::lock` outcome, if there is one. The
+    /// `SyncEvent::Error` vault-sync also emits for an Unpreserved lock must not replace
+    /// the danger toast (see the event handler).
+    pub(super) fn report_lock(&mut self, save_error: Option<&str>, outcome: &LockOutcome) {
+        if let LockOutcome::Unpreserved(e) = outcome {
+            eprintln!("vault: unsaved changes lost at lock: {e}");
+        }
+        if let Some(toast) = lock_toast(save_error, outcome) {
+            self.set_toast(toast);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,8 @@ mod kdbx;
 #[cfg(feature = "kdbx")]
 pub use kdbx::import_kdbx;
 
+use std::collections::{HashMap, HashSet};
+
 use secrecy::SecretString;
 use thiserror::Error;
 use uuid::Uuid;
@@ -196,26 +198,41 @@ fn arr_of<'a>(v: &'a serde_json::Value, key: &str) -> &'a [serde_json::Value] {
         .map_or(&[][..], Vec::as_slice)
 }
 
-/// Makes `name` unique among `item.fields` by suffixing ` (2)`, ` (3)`, ...
-fn unique_name(item: &Item, name: &str) -> String {
-    if item.field(name).is_none() {
-        return name.to_owned();
+/// Field names already used on one item, plus the next suffix to try per base name, so that
+/// de-duplication is linear in the number of fields.
+#[derive(Default)]
+struct UsedNames {
+    used: HashSet<String>,
+    next_suffix: HashMap<String, u32>,
+}
+
+impl UsedNames {
+    /// Makes `name` unique by suffixing ` (2)`, ` (3)`, ... and records the result.
+    fn claim(&mut self, name: &str) -> String {
+        if self.used.insert(name.to_owned()) {
+            return name.to_owned();
+        }
+        let n = self.next_suffix.entry(name.to_owned()).or_insert(2);
+        loop {
+            let candidate = format!("{name} ({n})");
+            *n += 1;
+            if self.used.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
     }
-    (2u32..)
-        .map(|n| format!("{name} ({n})"))
-        .find(|c| item.field(c).is_none())
-        .expect("unbounded range")
 }
 
 fn push_field(
     item: &mut Item,
+    names: &mut UsedNames,
     name: &str,
     kind: FieldKind,
     value: &str,
     section: Option<&str>,
     now: Millis,
 ) {
-    let name = unique_name(item, name);
+    let name = names.claim(name);
     let mut f = Field::new(name, kind, SecretString::new(value.to_owned()), now);
     f.section = section.filter(|s| !s.is_empty()).map(str::to_owned);
     item.fields.push(f);
@@ -314,6 +331,7 @@ fn convert_1pux_item(src: &serde_json::Value, device_id: Uuid, now: Millis) -> I
         .map(str::to_owned)
         .collect();
     add_template_tag(&mut item, template);
+    let mut names = UsedNames::default();
 
     for lf in arr_of(details, "loginFields") {
         let value = str_of(lf, "value");
@@ -321,18 +339,42 @@ fn convert_1pux_item(src: &serde_json::Value, device_id: Uuid, now: Millis) -> I
             continue;
         }
         match str_of(lf, "designation") {
-            "username" => push_field(&mut item, "username", FieldKind::Text, value, None, now),
-            "password" => push_field(&mut item, "password", FieldKind::Password, value, None, now),
+            "username" => push_field(
+                &mut item,
+                &mut names,
+                "username",
+                FieldKind::Text,
+                value,
+                None,
+                now,
+            ),
+            "password" => push_field(
+                &mut item,
+                &mut names,
+                "password",
+                FieldKind::Password,
+                value,
+                None,
+                now,
+            ),
             _ => {}
         }
     }
     let url = str_of(overview, "url");
     if !url.is_empty() {
-        push_field(&mut item, "url", FieldKind::Url, url, None, now);
+        push_field(&mut item, &mut names, "url", FieldKind::Url, url, None, now);
     }
     let notes = str_of(details, "notesPlain");
     if !notes.is_empty() {
-        push_field(&mut item, "notes", FieldKind::Notes, notes, None, now);
+        push_field(
+            &mut item,
+            &mut names,
+            "notes",
+            FieldKind::Notes,
+            notes,
+            None,
+            now,
+        );
     }
 
     for section in arr_of(details, "sections") {
@@ -344,7 +386,7 @@ fn convert_1pux_item(src: &serde_json::Value, device_id: Uuid, now: Millis) -> I
             };
             let name = if name.is_empty() { "field" } else { name };
             if let Some((name, kind, val)) = f.get("value").and_then(|v| section_value(v, name)) {
-                push_field(&mut item, &name, kind, &val, Some(title), now);
+                push_field(&mut item, &mut names, &name, kind, &val, Some(title), now);
             }
         }
     }

@@ -25,7 +25,7 @@ Pre-release and not yet signed or notarized. It is built and reviewed by an agen
 ## Security in brief
 
 - Master password goes through Argon2id, calibrated to at least 500 ms on your machine
-- Each item is encrypted with XChaCha20-Poly1305 and authenticated metadata, so swapped or rolled-back items are detected
+- Each item is encrypted with XChaCha20-Poly1305 and authenticated metadata, so swapped or rolled-back items are detected (replacing the whole file with an older complete copy is not; see the threat model)
 - The manifest is encrypted, and subkeys are derived with HKDF
 - Vault encryption uses RustCrypto crates, with no custom primitives; KeePass import uses the `keepass` parser
 - The file leaks only the item count, item UUIDs, last-modified times, and creation time

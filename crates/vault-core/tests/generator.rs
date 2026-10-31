@@ -190,3 +190,25 @@ fn strength() {
     assert!((strength_bits("abcd") - 4.0 * 26f64.log2()).abs() < 1e-9);
     assert!(strength_bits("aA1!aA1!") > strength_bits("aaaaaaaa"));
 }
+
+#[test]
+fn strength_penalises_repetition() {
+    assert!(strength_bits("aaaaaaaaaaa") < 20.0);
+    assert!(strength_bits("abcabcabcabc") < 30.0);
+    assert!(strength_bits("abcabcabcabc") > strength_bits("abc"));
+    // Ordinary passwords, including ones with a doubled letter, are unchanged.
+    let expected = 10.0 * 94f64.log2();
+    assert!((strength_bits("Password1!") - expected).abs() < 0.1);
+    for _ in 0..50 {
+        let pw = password(&PasswordSpec::default());
+        let s = pw.expose_secret();
+        let naive = 20.0 * 94f64.log2();
+        let got = strength_bits(s);
+        assert!(got <= naive + 1e-9, "{got} for a generated password");
+        // Without a run of 3 (or a tiled unit, impossible at this length) nothing is penalised.
+        let cs: Vec<char> = s.chars().collect();
+        if !cs.windows(3).any(|w| w[0] == w[1] && w[1] == w[2]) {
+            assert!((got - naive).abs() < 0.1, "{got} for a run-free password");
+        }
+    }
+}

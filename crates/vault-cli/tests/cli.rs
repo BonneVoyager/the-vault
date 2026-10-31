@@ -617,3 +617,58 @@ fn export_force_is_atomic_and_refuses_symlink() {
         .collect();
     assert_eq!(names.len(), 3, "no temp left: {names:?}");
 }
+
+#[test]
+fn terminal_control_characters_are_escaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("t.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    let evil = "Evil\u{1b}[31mRED\u{202e}rtl";
+    ok(&vault(
+        &f,
+        PW,
+        &["add", "--title", evil, "--username", "u\u{7}x"],
+    ));
+    ok(&vault(&f, PW, &["add", "--title", "Plain Title"]));
+    ok(&vault(
+        &f,
+        PW,
+        &["add", "--title", "Notes", "--notes", "line1\nline2\rX"],
+    ));
+    let notes = ok(&vault(&f, PW, &["get", "--reveal", "Notes"]));
+    assert!(notes.contains("notes: line1\nline2\\u{d}X"), "{notes}");
+    let miss = vault(&f, PW, &["get", "no\u{1b}[2Jmatch"]);
+    let err = String::from_utf8_lossy(&miss.stderr);
+    assert!(!err.contains('\u{1b}') && err.contains("\\u{1b}"), "{err}");
+    let escaped = "Evil\\u{1b}[31mRED\\u{202e}rtl";
+
+    let list = ok(&vault(&f, PW, &["list"]));
+    assert!(list.contains(escaped), "{list}");
+    assert!(list.contains("u\\u{7}x"), "{list}");
+    assert!(list.contains("Plain Title"), "{list}");
+    assert!(
+        !list.contains('\u{1b}') && !list.contains('\u{202e}'),
+        "{list}"
+    );
+
+    let get = ok(&vault(&f, PW, &["get", "--reveal", "Plain Title"]));
+    assert!(get.contains("title: Plain Title"), "{get}");
+    let get = ok(&vault(&f, PW, &["get", "--reveal", evil]));
+    assert!(get.contains(escaped), "{get}");
+    assert!(get.contains("u\\u{7}x"), "{get}");
+    assert!(
+        !get.contains('\u{1b}') && !get.contains('\u{202e}'),
+        "{get}"
+    );
+
+    let src = dir.path().join("a\u{1b}[2Jb.bin");
+    std::fs::write(&src, b"x").unwrap();
+    ok(&vault(
+        &f,
+        PW,
+        &["attach", "add", "Plain Title", src.to_str().unwrap()],
+    ));
+    let al = ok(&vault(&f, PW, &["attach", "list", "Plain Title"]));
+    assert!(al.contains("a\\u{1b}[2Jb.bin"), "{al}");
+    assert!(!al.contains('\u{1b}'), "{al}");
+}

@@ -329,7 +329,7 @@ fn unknown_attachment_and_locked_are_errors() {
         "{err:?}"
     );
     v.save().unwrap();
-    v.lock();
+    let _ = v.lock();
     assert!(matches!(
         v.open_attachment(item, id),
         Err(SyncError::Locked)
@@ -456,7 +456,7 @@ fn prune_skips_clean_saves_and_locked_vaults() {
     assert!(orphan.exists());
 
     // Locked: save refuses and the directory is not touched.
-    v.lock();
+    let _ = v.lock();
     assert!(matches!(v.save(), Err(SyncError::Locked)));
     assert!(orphan.exists());
 
@@ -473,7 +473,7 @@ fn orphan_cleanup_runs_once_at_unlock() {
     let orphan = v.attachments_dir().join(blob_file_name(Uuid::from_u128(1)));
     fs::write(&orphan, b"x").unwrap();
     v.set_prune_clock_offset_for_tests(2 * DAY);
-    v.lock();
+    let _ = v.lock();
     assert!(orphan.exists(), "never while locked");
 
     let events = v.subscribe();
@@ -485,7 +485,7 @@ fn orphan_cleanup_runs_once_at_unlock() {
     // Not when the unlocked state may not match disk: here the primary is now a newer format
     // (saving is blocked, its references are unknown).
     fs::write(&orphan, b"x").unwrap();
-    v.lock();
+    let _ = v.lock();
     let file = path.join(vault_sync::VAULT_FILE_NAME);
     let mut newer = fs::read(&file).unwrap();
     newer[4..6].copy_from_slice(&0xFFFFu16.to_be_bytes());
@@ -495,7 +495,7 @@ fn orphan_cleanup_runs_once_at_unlock() {
 
     // Nor when the primary is missing: the unlock opens the copy held in memory, but what is
     // on disk (a peer's references) is unknown.
-    v.lock();
+    let _ = v.lock();
     fs::remove_file(&file).unwrap();
     v.unlock(&pw()).unwrap();
     assert!(orphan.exists());
@@ -808,7 +808,7 @@ fn conflict_package_does_not_replace_existing_blobs() {
     let id = add(&mut a, item, b"ours");
     a.save().unwrap();
     let ours = fs::read(blob(&a, id)).unwrap();
-    a.lock();
+    let _ = a.lock();
 
     let conflict = dir
         .path()

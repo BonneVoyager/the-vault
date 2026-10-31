@@ -25,7 +25,7 @@ Protects against:
 - Stolen or lost laptop (vault at rest)
 - Compromised cloud storage account (attacker gets the file)
 - Offline brute force of the master password (Argon2id, calibrated ≥ 500 ms on the user's machine)
-- Tampering with the vault file: modified items, swapped items between vaults, deleted/rolled-back items (per-item AEAD with AAD + encrypted manifest)
+- Tampering with the vault file: modified items, swapped items between vaults, deleted or rolled-back individual items, a replaced or re-stamped header (per-item AEAD with AAD + encrypted manifest + header digest). Replacing the WHOLE file with an older complete copy is NOT detected (no external freshness anchor); the old copy is itself authentic and opens. Accepted limit.
 - Casual clipboard snooping (concealed pasteboard type, current-host-only so nothing reaches Universal Clipboard, auto-clear)
 - Weak or reused item passwords (local audit: weak < 40 bits, reused across items; master password minimum 50 bits)
 
