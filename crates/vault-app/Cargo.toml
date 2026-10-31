@@ -43,6 +43,9 @@ env_logger = "0.11.8"
 # `log::warn!` for the debug-only screen-capture escape hatch (root.rs). Already in the
 # graph via gpui and env_logger.
 log = "^0.4.34"
+# Custom item icons: reads PNG/JPEG headers with limits, scales to 128 px and re-encodes
+# as PNG. Same version as the copy gpui already pulls in (no second copy in Cargo.lock).
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
 # Wipes decrypted attachment previews and copy buffers. Already in the graph via vault-core.
 zeroize = "^1.8.1"
 

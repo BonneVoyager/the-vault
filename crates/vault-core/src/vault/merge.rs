@@ -218,8 +218,9 @@ fn ours_wins_metadata(ours: &Item, theirs: &Item) -> bool {
     }
 }
 
-/// Both sides live. Metadata (`kind`, `title`, `favorite`, `tags`, `extras`, `device_id`)
-/// comes from the winner per [`ours_wins_metadata`]. Fields are keyed by `name`: a field on
+/// Both sides live. Metadata (`title`, `favorite`, `tags`, `icon`, `extras`, `device_id`)
+/// comes from the winner per [`ours_wins_metadata`]; the icon (v1.2) is never merged at a
+/// finer grain. Fields are keyed by `name`: a field on
 /// one side only is taken; a field on both sides is taken from the greater field
 /// `modified_at`, tie -> greater owning-item `device_id`, tie -> ours. Field order is the
 /// winner's, followed by the loser's extra fields in the loser's order. History is the union
@@ -329,6 +330,7 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
         device_id: winner.device_id,
         favorite: winner.favorite,
         tags: winner.tags.clone(),
+        icon: winner.icon.clone(),
         fields,
         history,
         attachments,
@@ -413,6 +415,7 @@ pub fn item_eq(a: &Item, b: &Item) -> bool {
         && a.device_id == b.device_id
         && a.favorite == b.favorite
         && a.tags == b.tags
+        && a.icon == b.icon
         && a.modified_at == b.modified_at
         && a.extras == b.extras
         && a.fields.len() == b.fields.len()

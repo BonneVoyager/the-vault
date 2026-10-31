@@ -19,7 +19,35 @@ gpui_kit_assets::icon_assets!(
         WandSparkles,
         FingerprintPattern,
         ScanQrCode,
-        Trash
+        Trash,
+        // Item icon symbols (icon::SYMBOLS) not in gpui-kit's default set.
+        Landmark,
+        Wallet,
+        ShoppingCart,
+        Gift,
+        Mail,
+        MessageCircle,
+        Shield,
+        Users,
+        House,
+        Briefcase,
+        GraduationCap,
+        Cloud,
+        Server,
+        Database,
+        Code,
+        Bug,
+        Wifi,
+        Smartphone,
+        Gamepad2,
+        Music,
+        Film,
+        Camera,
+        Image,
+        MapPin,
+        Car,
+        Plane,
+        Coffee
     ]
 );
 
@@ -54,6 +82,14 @@ impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         if let Some((_, bytes)) = EMBEDDED.iter().find(|(p, _)| *p == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
+        }
+        // Brand logos are generated from the bundled pack on demand; gpui caches the
+        // rasterised tile per path and size, so this runs once per logo and size.
+        if let Some(slug) = path
+            .strip_prefix(crate::icon::BRAND_ASSET_PREFIX)
+            .and_then(|p| p.strip_suffix(".svg"))
+        {
+            return Ok(crate::icon::brand_svg(slug).map(|svg| Cow::Owned(svg.into_bytes())));
         }
         if let Some(bytes) = ExtraIcons.load(path)? {
             return Ok(Some(bytes));
@@ -108,6 +144,12 @@ mod tests {
         let wheel = std::str::from_utf8(&wheel).unwrap();
         assert!(wheel.starts_with("<svg"));
         assert!(wheel.len() < 2048, "a small vector, not a frame animation");
+        let brand = AppAssets
+            .load("brand/github.svg")
+            .unwrap()
+            .expect("brand logo");
+        assert!(brand.starts_with(b"<svg"));
+        assert!(AppAssets.load("brand/no-such-brand.svg").unwrap().is_none());
         let listed = AppAssets.list("icon/").unwrap();
         for path in [APP_ICON_SPOKELESS, APP_ICON_WHEEL] {
             assert!(listed.iter().any(|p| p == path), "{path} listed");

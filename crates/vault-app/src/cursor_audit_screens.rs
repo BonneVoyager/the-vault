@@ -103,7 +103,7 @@ fn app(
 /// Window height that shows the whole detail and editor columns.
 const TALL: f32 = 1400.;
 /// Window height for states that add a popover, menu or sheet: enough for it.
-const SHORT: f32 = 900.;
+const SHORT: f32 = 960.;
 
 /// The main window over the populated vault, the login selected, with two
 /// attachments.
@@ -432,6 +432,31 @@ fn edit_field_generator(cx: &mut TestAppContext) {
         Case {
             label: "field generator",
             targets: &["gen-use", "gen-copy", "gen-regenerate"],
+            disabled: &["move-up-0", &last_down],
+        },
+        &mut vcx,
+    );
+}
+
+#[gpui::test]
+fn edit_icon_picker(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mut vcx) = main_window(dir.path(), SHORT, cx);
+    state.update(&mut vcx, |s, cx| {
+        s.begin_edit(cx);
+        s.set_icon_picker(true, cx);
+    });
+    let last_down = last_move_down(&state, &vcx);
+    audit(
+        Case {
+            label: "icon picker",
+            targets: &[
+                "edit-icon",
+                "icon-auto",
+                "icon-symbol",
+                "icon-color",
+                "icon-image",
+            ],
             disabled: &["move-up-0", &last_down],
         },
         &mut vcx,

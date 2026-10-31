@@ -34,7 +34,8 @@ use crate::attachment::validate_ref;
 use crate::crypto::{KEY_LEN, NONCE_LEN, WRAPPED_KEY_LEN};
 use crate::error::VaultError;
 use crate::item::{
-    AttachmentRef, AttachmentTombstone, Extras, Field, FieldKind, HistoryEntry, Item, Millis,
+    AttachmentRef, AttachmentTombstone, Extras, Field, FieldKind, HistoryEntry, Item, ItemIcon,
+    Millis,
 };
 use crate::kdf::KdfParams;
 
@@ -1039,6 +1040,32 @@ fn attachment_tombstone_from_value(value: Value) -> Result<AttachmentTombstone, 
     Ok(AttachmentTombstone { id, removed_at })
 }
 
+/// `ItemPlain.icon` (01 §4, v1.2): `{ "kind": tstr, "value": tstr, "color": tstr }` plus
+/// preserved unknown keys. `color` is emitted only when `Some`.
+fn icon_to_value(i: &ItemIcon) -> Value {
+    let mut known = vec![("kind", text(&i.kind)), ("value", text(&i.value))];
+    if let Some(c) = &i.color {
+        known.push(("color", text(c)));
+    }
+    build_map(known, &i.extras)
+}
+
+/// Strict on types (same policy as `attachment_from_value`): the value must be a map with
+/// text `kind` and `value`; `color` may be absent or null, otherwise text. Anything else is
+/// `Malformed`, which fails the whole unlock like any other malformed item payload.
+fn icon_from_value(value: Value) -> Result<ItemIcon, VaultError> {
+    let mut m = MapReader::new("icon", value)?;
+    let kind = as_text(m.required("kind")?, "icon.kind")?;
+    let value = as_text(m.required("value")?, "icon.value")?;
+    let color = opt_text(m.take("color"), "icon.color")?;
+    Ok(ItemIcon {
+        kind,
+        value,
+        color,
+        extras: m.finish(),
+    })
+}
+
 fn field_to_value(f: &Field) -> Value {
     build_map(
         vec![
@@ -1096,8 +1123,9 @@ fn history_from_value(value: Value) -> Result<HistoryEntry, VaultError> {
 /// `attachments` is always written (as `[]` when the item has none); `removed_attachments`
 /// (`[{ "id": bytes(16), "removed_at": u64 }]`) and `removed_history` (`[u64]`, stamps
 /// newest first) are optional keys written only when non-empty, so files without removals
-/// keep their v1 byte layout. No `kind` key is written (removed 2026-10-30); one read from
-/// an older file is in `item.extras` and is re-emitted from there, unchanged.
+/// keep their v1 byte layout. `icon` (v1.2, `{ "kind", "value", "color"? }` plus extras) is
+/// likewise written only when `Some`. No `kind` key is written (removed 2026-10-30); one read
+/// from an older file is in `item.extras` and is re-emitted from there, unchanged.
 pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
     // NOTE: the `ciborium::Value` tree built here holds plaintext field values and attachment
     // keys as ordinary `String`s / `Vec<u8>`s and cannot be zeroized; only the encoded output
@@ -1128,6 +1156,9 @@ pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
             Value::Array(item.attachments.iter().map(attachment_to_value).collect()),
         ),
     ];
+    if let Some(icon) = &item.icon {
+        known.push(("icon", icon_to_value(icon)));
+    }
     if !item.removed_attachments.is_empty() {
         known.push((
             "removed_attachments",
@@ -1200,6 +1231,12 @@ pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<
             .map(|s| as_u64(s, "item.removed_history[]"))
             .collect::<Result<Vec<_>, _>>()?,
     };
+    // Optional (v1.2): missing or null is "no icon"; any other non-map or wrongly typed
+    // value is Malformed, like a bad `attachments` entry.
+    let icon = match m.take("icon") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(icon_from_value(v)?),
+    };
     Ok(Item {
         id,
         title,
@@ -1207,6 +1244,7 @@ pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<
         device_id,
         favorite,
         tags,
+        icon,
         fields,
         history,
         attachments,

@@ -104,6 +104,7 @@ AAD = `vault_id || item.id || modified_at_be64 || format_version_be16`.
   "device_id":   bytes(16)      device that made the latest change
   "favorite":    bool
   "tags":        [tstr]
+  "icon":        { "kind": tstr, "value": tstr, "color": tstr (optional) }   (v1.2, optional, no version bump; app-interpreted icon choice, e.g. kind "symbol" | "logo" | "image"; core validates types only; unknown keys inside the map are preserved; writers omit the key when there is no icon, readers treat missing or null as none; merge treats it as item metadata that travels with the metadata winner)
   "fields":      [Field]
   "attachments": [AttachmentRef]   (v1.1, empty in v1)
   "removed_attachments": [{ "id": bytes(16), "removed_at": u64 }]   (v1.1, optional; tombstones so a removal survives merge, cap 64 newest, purged with item tombstones)
@@ -197,7 +198,7 @@ Phase 1 must commit:
 
 `FORMAT_VERSION` bumps only on incompatible layout changes. Adding optional CBOR map keys is **not** a bump; readers ignore unknown keys, writers preserve unknown keys they read (store them as `Vec<(Value, Value)>` extras on each struct). This is how v1.1 adds attachments without a bump. New enum strings (slot kind, item kind, field kind) are also **not** a bump: readers preserve them as described in §2 and §4.
 
-Every `FORMAT_VERSION` keeps its fixtures under `tests/fixtures/` forever, and a test opens every fixture in that directory with the current reader. `v1-forward.vault` carries an opaque slot, an unknown item kind, an unknown field kind, and unknown keys at every level.
+Every `FORMAT_VERSION` keeps its fixtures under `tests/fixtures/` forever, and a test opens every fixture in that directory with the current reader. `v1-forward.vault` carries an opaque slot, an unknown item kind, an unknown field kind, and unknown keys at every level. `v1-icon.vault` carries a symbol icon with a colour, a logo icon without one, and an icon-less item.
 
 ## 10. Non-goals of the format
 

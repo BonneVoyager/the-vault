@@ -35,10 +35,13 @@ pub struct Item {
     pub device_id: Uuid,
     pub favorite: bool,
     pub tags: Vec<String>,
+    pub icon: Option<ItemIcon>,  // v1.2; app-interpreted, set through `update` (which restamps)
     pub fields: Vec<Field>,
     pub history: Vec<HistoryEntry>,
     pub modified_at: Millis,
 }
+
+pub struct ItemIcon { pub kind: String, pub value: String, pub color: Option<String>, pub extras: Extras }   // Clone, PartialEq, Debug; nothing secret; 01 §4
 
 pub struct Field {
     pub name: String,

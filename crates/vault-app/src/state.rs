@@ -27,6 +27,7 @@ use crate::{cloud, persist};
 mod attachments;
 mod edit;
 mod generator;
+mod icon_images;
 mod kdbx;
 mod prefs;
 mod qr;
@@ -44,6 +45,7 @@ pub use edit::{ADDABLE_KINDS, EditBuffer, Navigation, kind_name};
 pub use generator::{
     CharClass, GenTab, Generator, GeneratorTarget, LENGTH_RANGE, SEPARATORS, WORDS_RANGE,
 };
+pub use icon_images::IconImages;
 pub use kdbx::KdbxImportUi;
 pub use prefs::LoginRow;
 pub use qr::QrScanner;
@@ -396,6 +398,8 @@ pub struct AppState {
     pub item_windows: Vec<(Uuid, gpui::AnyWindowHandle)>,
     /// Detail ▸ Attachments: pending adds, preview, confirms.
     pub attachments: AttachmentsUi,
+    /// Decoded custom image icons and pending icon reference removals.
+    pub icon_images: IconImages,
     attach_store: Arc<dyn AttachmentStore>,
 
     pub screen: Screen,
@@ -491,6 +495,7 @@ impl AppState {
             backup_windows: Vec::new(),
             item_windows: Vec::new(),
             attachments: AttachmentsUi::default(),
+            icon_images: IconImages::default(),
             #[cfg(not(test))]
             attach_store: attachments::sync_store(),
             #[cfg(test)]
@@ -927,6 +932,9 @@ impl AppState {
         self.close_backup_windows(cx);
         self.close_item_windows(cx);
         self.clear_attachments(cx);
+        // Image icons added by an unsaved edit lose their references before the save.
+        self.abandon_icon_adds(cx);
+        self.clear_icon_images(cx);
         let saved = match self.vault.as_mut() {
             Some(vault) if vault.is_dirty() => Some(vault.save()),
             _ => None,
@@ -968,6 +976,7 @@ impl AppState {
     /// Locks and forgets the current vault, then shows the choose-vault screen (⌘O).
     pub fn close_vault(&mut self, cx: &mut Context<Self>) {
         self.lock(cx);
+        self.forget_icon_drops();
         if let Some(vault) = self.vault.as_mut() {
             vault.stop_watching();
         }

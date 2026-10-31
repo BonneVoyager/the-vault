@@ -12,6 +12,7 @@ use vault_core::{
 };
 
 use super::{AppState, ChooseIntent, Filter, FocusTarget, Mode};
+use crate::icon::{self, Move, PickerCell, PickerCursor};
 use crate::templates::Template;
 use crate::text;
 
@@ -39,6 +40,13 @@ pub struct EditBuffer {
     /// `replaced_at` stamps of password-history entries the user removed in this edit.
     /// Applied on Save (core `remove_history_entry`), dropped on Cancel.
     pub removed_history: Vec<Millis>,
+    /// The icon picker popover: `Some(cursor)` while open. `item.icon` holds the choice.
+    pub icon_picker: Option<PickerCursor>,
+    /// Image icons sealed during this edit: their references are already on the stored
+    /// item (hidden). Save keeps the one `item.icon` names; Cancel removes them all.
+    pub icon_added: Vec<Uuid>,
+    /// A chosen image is being checked, scaled and sealed.
+    pub icon_loading: bool,
 }
 
 impl EditBuffer {
@@ -55,7 +63,23 @@ impl EditBuffer {
             remote_title: false,
             tag_draft: String::new(),
             removed_history: Vec::new(),
+            icon_picker: None,
+            icon_added: Vec::new(),
+            icon_loading: false,
         }
+    }
+
+    /// Image attachments Save removes: the image the item had when editing began and the
+    /// images added in this edit, minus the one `item.icon` names now. So a replaced
+    /// image, and an image given up for Automatic, a symbol or a colour, lose their
+    /// reference in the same vault edit that writes the icon.
+    pub fn icon_refs_dropped_on_save(&self) -> Vec<Uuid> {
+        let original = self.original.icon.as_ref().and_then(icon::image_attachment);
+        let kept = self.item.icon.as_ref().and_then(icon::image_attachment);
+        super::icon_images::minus(
+            original.into_iter().chain(self.icon_added.iter().copied()),
+            kept,
+        )
     }
 
     /// Password-history entries still shown: the item's history minus pending removals.
@@ -126,6 +150,7 @@ impl EditBuffer {
     pub fn has_changes(&self) -> bool {
         self.item.title != self.original.title
             || self.item.tags != self.original.tags
+            || self.item.icon != self.original.icon
             || self.draft_adds_tag()
             || !self.removed_history.is_empty()
             || self.item.fields.len() != self.original.fields.len()
@@ -422,12 +447,16 @@ fn apply_edit(
     }
     let title_changed = item.title != original.title;
     let tags_changed = item.tags != original.tags;
+    let icon_changed = item.icon != original.icon;
     v.update(id, now, |it| {
         if title_changed {
             it.title = item.title;
         }
         if tags_changed {
             it.tags = item.tags;
+        }
+        if icon_changed {
+            it.icon = item.icon;
         }
         let mut stored = std::mem::take(&mut it.fields);
         let mut fields = Vec::with_capacity(item.fields.len());
@@ -498,6 +527,39 @@ fn remove_history(
     Ok(())
 }
 
+/// Removes the image-icon attachment references `ids` from item `id` (Save, see
+/// [`EditBuffer::icon_refs_dropped_on_save`]). One already gone (a merge removed it) is
+/// skipped. The blobs go with orphan cleanup.
+fn drop_icon_attachments(
+    v: &mut UnlockedVault,
+    id: Uuid,
+    ids: &[Uuid],
+    now: u64,
+) -> Result<(), VaultError> {
+    for a in ids {
+        if v.get(id).is_some_and(|it| it.attachment(*a).is_some()) {
+            v.remove_attachment_ref(id, *a, now)?;
+        }
+    }
+    Ok(())
+}
+
+/// Save: when item `id`'s icon is an image whose attachment reference is gone (removed
+/// on another device between the add and Save, say), clears the icon rather than write
+/// a dangling one.
+fn clear_dangling_image_icon(v: &mut UnlockedVault, id: Uuid, now: u64) -> Result<(), VaultError> {
+    let dangling = v.get(id).is_some_and(|it| {
+        it.icon
+            .as_ref()
+            .and_then(icon::image_attachment)
+            .is_some_and(|a| it.attachment(a).is_none())
+    });
+    if dangling {
+        v.update(id, now, |it| it.icon = None)?;
+    }
+    Ok(())
+}
+
 /// Flattens `SyncedVault::edit(|v| core_call)` into one error message.
 pub(super) fn edit_result<T>(
     r: Result<Result<T, VaultError>, vault_sync::SyncError>,
@@ -557,6 +619,66 @@ impl AppState {
         });
     }
 
+    /// Opens (on the current choice) or closes the icon picker. Not an edit by itself.
+    pub fn set_icon_picker(&mut self, open: bool, cx: &mut Context<Self>) {
+        if let Some(b) = self.edit_buffer_mut() {
+            b.icon_picker = open.then(|| PickerCursor::for_icon(b.item.icon.as_ref()));
+            cx.notify();
+        }
+    }
+
+    /// Arrow key in the open icon picker.
+    pub fn icon_picker_move(&mut self, m: Move, cx: &mut Context<Self>) {
+        if let Some(cursor) = self.edit_buffer_mut().and_then(|b| b.icon_picker.as_mut()) {
+            *cursor = cursor.step(m);
+            cx.notify();
+        }
+    }
+
+    /// Enter in the open icon picker: choose the cell under the cursor.
+    pub fn icon_picker_choose(&mut self, cx: &mut Context<Self>) {
+        if let Some(cell) = self
+            .edit_buffer()
+            .and_then(|b| b.icon_picker)
+            .map(PickerCursor::cell)
+        {
+            self.choose_icon(cell, cx);
+        }
+    }
+
+    /// A click or Enter on a picker cell: Automatic clears the icon, a symbol sets kind
+    /// `symbol` (keeping a chosen colour), a colour recolours a symbol or tints the letter.
+    /// Part of the edit: saved or discarded with it. The picker stays open.
+    pub fn choose_icon(&mut self, cell: PickerCell, cx: &mut Context<Self>) {
+        if cell == PickerCell::Image {
+            // "Drop or choose image…": the open panel; the icon changes once the image is sealed.
+            if let Some(cursor) = self.edit_buffer_mut().and_then(|b| b.icon_picker.as_mut()) {
+                *cursor = PickerCursor::at(cell);
+            }
+            self.pick_icon_image(cx);
+            cx.notify();
+            return;
+        }
+        self.edit(cx, |b| {
+            let current = b.item.icon.as_ref();
+            b.item.icon = match cell {
+                PickerCell::Automatic => icon::choose_automatic(),
+                PickerCell::Symbol(i) => match icon::SYMBOLS.get(i) {
+                    Some((_, name, _)) => icon::choose_symbol(current, *name),
+                    None => current.cloned(),
+                },
+                PickerCell::Color(i) => match icon::PALETTE.get(i) {
+                    Some(c) => icon::choose_color(current, *c),
+                    None => current.cloned(),
+                },
+                PickerCell::Image => current.cloned(),
+            };
+            if let Some(cursor) = b.icon_picker.as_mut() {
+                *cursor = PickerCursor::at(cell);
+            }
+        });
+    }
+
     /// The guard (§2.3): returns true if `nav` may proceed now. Leaving an edit with no
     /// changes just ends it; with changes, the inline "Discard changes?" prompt appears and
     /// the navigation waits for [`Self::discard_changes`].
@@ -564,7 +686,7 @@ impl AppState {
         match self.edit_buffer() {
             None => true,
             Some(b) if !b.has_changes() => {
-                self.mode = Mode::View;
+                self.end_edit(cx);
                 true
             }
             Some(_) => {
@@ -580,7 +702,7 @@ impl AppState {
         let Some(nav) = self.discard_prompt.take() else {
             return;
         };
-        self.mode = Mode::View;
+        self.end_edit(cx);
         match nav {
             Navigation::Select(id) => self.select(id, cx),
             Navigation::Offset(d) => self.select_offset(d, cx),
@@ -669,11 +791,28 @@ impl AppState {
             return;
         }
         if self.is_editing() {
-            self.mode = Mode::View;
+            self.end_edit(cx);
             self.generator_target = None;
             self.request_focus(FocusTarget::Detail, cx);
             cx.notify();
         }
+    }
+
+    /// Ends the edit without saving. Image icons it added lose their references again
+    /// (see `icon_images`: the blobs go with orphan cleanup).
+    pub(super) fn end_edit(&mut self, cx: &mut Context<Self>) {
+        self.abandon_icon_adds(cx);
+        self.mode = Mode::View;
+        self.icon_images.invalidate();
+    }
+
+    /// Removes the references of image icons the edit in progress added (Cancel, lock).
+    pub(super) fn abandon_icon_adds(&mut self, cx: &mut Context<Self>) {
+        let Some(b) = self.edit_buffer_mut() else {
+            return;
+        };
+        let (item, added) = (b.item.id, std::mem::take(&mut b.icon_added));
+        self.drop_icon_refs(item, added, cx);
     }
 
     /// ⌘S / Save: validate, write through core, mark dirty and schedule the autosave.
@@ -687,6 +826,7 @@ impl AppState {
         };
         let (keys, original) = (buffer.keys.clone(), buffer.original.clone());
         let removed = buffer.removed_history.clone();
+        let icon_drops = buffer.icon_refs_dropped_on_save();
         let mut item = match buffer.finished() {
             Ok(item) => item,
             Err(e) => {
@@ -709,7 +849,10 @@ impl AppState {
                 // History removals first, so `apply_edit`'s field diff (and a changed
                 // password's new history entry) runs on the trimmed history.
                 remove_history(v, item.id, &removed, now)?;
-                apply_edit(v, item, &keys, &original, now)
+                let id = apply_edit(v, item, &keys, &original, now)?;
+                drop_icon_attachments(v, id, &icon_drops, now)?;
+                clear_dangling_image_icon(v, id, now)?;
+                Ok(id)
             })
         };
         let id = match edit_result(result) {

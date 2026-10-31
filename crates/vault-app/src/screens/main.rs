@@ -8,8 +8,9 @@ pub(crate) mod attachments;
 pub(crate) mod detail;
 mod editor;
 mod generator;
+pub mod icon_view;
 mod list;
-pub use list::avatar;
+pub use icon_view::item_tile;
 #[cfg(test)]
 pub use {detail::detail_placeholder, list::list_placeholder};
 mod prompts;

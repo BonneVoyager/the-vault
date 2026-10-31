@@ -7383,6 +7383,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-macos",
  "gpui-pre-platform",
+ "image",
  "log",
  "rand 0.8.8",
  "serde",

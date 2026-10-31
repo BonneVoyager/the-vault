@@ -2,10 +2,9 @@
 //! group headers, empty and no-results states.
 
 use gpui::{
-    Anchor, AnyElement, App, Context, Entity, FocusHandle, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, div, list, prelude::FluentBuilder as _,
-    px, rgb,
+    Anchor, AnyElement, App, Context, Entity, FocusHandle, FontWeight, InteractiveElement as _,
+    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Window, div, list, prelude::FluentBuilder as _, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::DropdownMenu as _;
@@ -14,6 +13,7 @@ use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 
 use super::MainScreen;
+use super::icon_view::item_tile;
 
 use crate::actions::{LIST_CONTEXT, SortAlphabetical, SortRecentlyModified};
 use crate::audit::Issue;
@@ -26,28 +26,6 @@ use crate::ui::{self, Clickable as _};
 const ROW_HEIGHT: f32 = 56.;
 const HEADER_HEIGHT: f32 = 26.;
 const AVATAR: f32 = 32.;
-
-/// Letter-avatar backgrounds; white text reads on all of them in both appearances.
-const PALETTE: [u32; 8] = [
-    0x3B6CF0, 0x30A46C, 0xE5484D, 0xC2790A, 0x8E4EC6, 0x12A594, 0xD6409F, 0xE5622E,
-];
-
-/// The 32 px (or `size`) rounded letter avatar for an item.
-pub fn avatar(id: vault_core::Uuid, title: &str, size: f32) -> gpui::Div {
-    let color: Hsla = rgb(PALETTE[listing::avatar_slot(id, PALETTE.len())]).into();
-    div()
-        .flex_shrink_0()
-        .size(px(size))
-        .rounded(px(size / 4.))
-        .bg(color)
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_color(gpui::white())
-        .font_weight(FontWeight::SEMIBOLD)
-        .when(size > 36., |d| d.text_lg())
-        .child(listing::avatar_letter(title))
-}
 
 /// Apple-style red circle with a white "!" (password warnings).
 pub fn alert_dot(size: f32, cx: &App) -> gpui::Div {
@@ -142,7 +120,7 @@ fn render_row(
                             (true, false) => row.bg(theme.primary.opacity(0.14)),
                             _ => row.hover(|st| st.bg(theme.accent)),
                         })
-                        .child(avatar(id, &title, AVATAR))
+                        .child(item_tile(item, Some(s), AVATAR, cx))
                         .child(
                             ui::v_flex()
                                 .flex_1()

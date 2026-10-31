@@ -16,6 +16,7 @@ Pre-release and not yet signed or notarized. It is built and reviewed by an agen
 - Password and passphrase generator
 - Tags, search, and weak or reused password warnings (local audit)
 - File attachments, encrypted per file, up to 100 MB each
+- Item icons: automatic brand logos from a bundled, offline icon pack, or a symbol, colour, or custom image chosen per item
 - Sync through any folder (iCloud Drive, Dropbox, NAS) with field-level merge and conflict-copy absorption
 - Rotating encrypted backups
 - Import from CSV, 1Password (1PUX), and KeePass (KDBX 3/4, with optional key file)
@@ -108,6 +109,10 @@ specs/                the specs
 - [specs/](specs/): start with `00-overview.md`, then the spec for the crate you touch (format, core API, sync, macOS, UI)
 - [docs/research/](docs/research/): research notes behind scoping decisions
 - [CLAUDE.md](CLAUDE.md): working rules for contributors and agents
+
+## Credits
+
+- Brand logos come from [Simple Icons](https://simpleicons.org) (CC0 1.0), regenerated with `scripts/fetch-brand-icons.sh`; brands remain trademarks of their owners.
 
 ## License
 

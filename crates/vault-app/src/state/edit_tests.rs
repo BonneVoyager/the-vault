@@ -684,3 +684,103 @@ fn guard_prompts_when_only_a_history_removal_is_pending(cx: &mut TestAppContext)
         assert_eq!(stored(s, gh).history.len(), 2);
     });
 }
+
+#[gpui::test]
+fn icon_picker_choices_are_part_of_the_edit(cx: &mut TestAppContext) {
+    use crate::icon::{IconSpec, Move, PALETTE, PickerCell, SYMBOLS, resolve};
+    let dir = tempfile::tempdir().unwrap();
+    let (state, gh, _) = setup(dir.path(), cx);
+    state.update(cx, |s, cx| {
+        s.select(gh, cx);
+        s.begin_edit(cx);
+        // Opening the picker starts on "Automatic" and is not a change.
+        s.set_icon_picker(true, cx);
+        let b = s.edit_buffer().unwrap();
+        assert_eq!(b.icon_picker.unwrap().cell(), PickerCell::Automatic);
+        assert!(!b.has_changes());
+
+        // Keyboard: down to the first symbol, right once, Enter.
+        s.icon_picker_move(Move::Down, cx);
+        s.icon_picker_move(Move::Right, cx);
+        s.icon_picker_choose(cx);
+        let b = s.edit_buffer().unwrap();
+        let icon = b.item.icon.clone().unwrap();
+        assert_eq!(
+            (icon.kind.as_str(), icon.value.as_str()),
+            ("symbol", SYMBOLS[1].0)
+        );
+        assert!(b.has_changes());
+
+        // A colour recolours the symbol.
+        s.choose_icon(PickerCell::Color(1), cx);
+        let item = s.edit_buffer().unwrap().item.clone();
+        assert_eq!(
+            resolve(&item),
+            IconSpec::Symbol {
+                name: SYMBOLS[1].1,
+                color: PALETTE[1]
+            }
+        );
+        s.save_edit(cx);
+        let saved = stored(s, gh).icon.unwrap();
+        assert_eq!(saved.kind, "symbol");
+        assert_eq!(saved.color.as_deref(), Some("#30A46C"));
+
+        // Back to automatic clears the icon; saved too.
+        s.begin_edit(cx);
+        assert_eq!(
+            s.edit_buffer().unwrap().icon_picker,
+            None,
+            "a new edit starts closed"
+        );
+        s.choose_icon(PickerCell::Automatic, cx);
+        s.save_edit(cx);
+        assert_eq!(stored(s, gh).icon, None);
+
+        // Colour only on an automatic icon: a tinted letter. Cancel discards it.
+        s.begin_edit(cx);
+        s.choose_icon(PickerCell::Color(2), cx);
+        let icon = s.edit_buffer().unwrap().item.icon.clone().unwrap();
+        assert_eq!(
+            (icon.kind.as_str(), icon.color.as_deref()),
+            ("letter", Some("#E5484D"))
+        );
+        s.cancel_edit(cx);
+        assert_eq!(stored(s, gh).icon, None);
+    });
+}
+
+#[gpui::test]
+fn icon_change_keeps_fields_and_unknown_icons_survive_other_edits(cx: &mut TestAppContext) {
+    use crate::icon::PickerCell;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, gh, _) = setup(dir.path(), cx);
+    state.update(cx, |s, cx| {
+        // A newer app's image icon, set behind the editor's back.
+        let mut image = vault_core::ItemIcon::new("image", "att-1");
+        image.color = Some("#123456".into());
+        let set = image.clone();
+        s.vault
+            .as_mut()
+            .unwrap()
+            .edit(|v| v.update(gh, 20, move |it| it.icon = Some(set)))
+            .unwrap()
+            .unwrap();
+        s.select(gh, cx);
+        let before = stored(s, gh);
+        // A title edit leaves the unknown icon untouched.
+        s.begin_edit(cx);
+        s.set_edit_title("GitHub 2".into(), cx);
+        s.save_edit(cx);
+        assert_eq!(stored(s, gh).icon, Some(image));
+        // An icon-only edit keeps every field stamp.
+        s.begin_edit(cx);
+        s.choose_icon(PickerCell::Symbol(0), cx);
+        s.save_edit(cx);
+        let after = stored(s, gh);
+        assert_eq!(after.icon.unwrap().kind, "symbol");
+        for (a, b) in after.fields.iter().zip(&before.fields) {
+            assert_eq!(a.modified_at, b.modified_at);
+        }
+    });
+}

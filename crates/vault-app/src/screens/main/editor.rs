@@ -100,6 +100,9 @@ fn drop_line(from: usize, target: usize) -> DropLine {
     }
 }
 
+/// Icon tile in the edit header: the read-mode header's size, so it does not jump.
+const HEADER_TILE: f32 = 44.;
+
 pub struct Editor {
     state: Entity<AppState>,
     generator: Entity<GeneratorView>,
@@ -115,6 +118,8 @@ pub struct Editor {
     rows: Vec<Row>,
     /// Row key whose grip started the current drag (dimmed while a drag is active).
     dragging: Rc<Cell<Option<u64>>>,
+    /// Focus of the open icon picker (arrow keys and Enter move and choose).
+    icon_focus: gpui::FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -166,6 +171,7 @@ impl Editor {
             tag_count: 0,
             rows: Vec::new(),
             dragging: Rc::default(),
+            icon_focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
     }
@@ -667,6 +673,13 @@ impl Render for Editor {
         let header = ui::h_flex()
             .debug_selector(|| "editor-header".into())
             .gap(px(8.))
+            .child(super::icon_view::picker_trigger(
+                &self.state,
+                &self.icon_focus,
+                &gpui::Focusable::focus_handle(&self.title, cx),
+                HEADER_TILE,
+                cx,
+            ))
             .child(
                 div()
                     .flex_1()

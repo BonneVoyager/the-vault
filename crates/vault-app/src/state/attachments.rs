@@ -266,7 +266,7 @@ pub struct AttachmentsUi {
     pub reading: Option<Uuid>,
     pub preview: Option<Preview>,
     /// The selected item and its blob states while the vault is inside an attachment task.
-    held: Option<(Item, Vec<(Uuid, AttachmentState)>)>,
+    pub(super) held: Option<(Item, Vec<(Uuid, AttachmentState)>)>,
     /// Bumped by `clear`; a read started under an older ticket is dropped.
     ticket: u64,
     /// Set by `clear`: an in-flight "Save decrypted copy" stops and deletes its temp file.
@@ -480,7 +480,7 @@ impl AppState {
     }
 
     /// Snapshot of the selected item and its blob states, shown while the vault is away.
-    fn hold_selected(&mut self) {
+    pub(super) fn hold_selected(&mut self) {
         self.attachments.held = self.selected_item().cloned().map(|item| {
             let states = item
                 .attachments
@@ -494,11 +494,24 @@ impl AppState {
     /// Puts the vault back after an attachment task. After a lock or vault switch it does
     /// what `lock` could not while the vault was in the task: save pending edits (a Remove
     /// whose autosave had not run, say), then lock. Fresh: resume a lost autosave.
-    fn return_vault(&mut self, mut vault: SyncedVault, outcome: Outcome, cx: &mut Context<Self>) {
+    pub(super) fn return_vault(
+        &mut self,
+        mut vault: SyncedVault,
+        outcome: Outcome,
+        cx: &mut Context<Self>,
+    ) {
         if outcome == Outcome::Fresh {
             self.vault = Some(vault);
+            self.flush_icon_drops(cx);
             self.resume_autosave(cx);
             return;
+        }
+        if outcome == Outcome::Locked {
+            // Icon references an edit dropped while the vault was in the task.
+            let now = text::now_millis();
+            for (item, id) in std::mem::take(&mut self.icon_images.drops) {
+                let _ = self.attach_store.remove(&mut vault, item, id, now);
+            }
         }
         let saved = vault.is_dirty().then(|| vault.save());
         let save_error = match outcome {
@@ -515,7 +528,7 @@ impl AppState {
 
     /// An autosave that fired while the vault was in a task found nothing to save and
     /// cleared its timer: start a new one if edits are still unsaved.
-    fn resume_autosave(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn resume_autosave(&mut self, cx: &mut Context<Self>) {
         if !self.locked && self.vault.as_ref().is_some_and(SyncedVault::is_dirty) {
             self.schedule_autosave(cx);
         }
@@ -528,7 +541,7 @@ impl AppState {
 
     /// The row's Remove button (edit mode): show the inline confirm.
     pub fn request_remove_attachment(&mut self, id: Uuid, cx: &mut Context<Self>) {
-        if self.can_remove_attachments() {
+        if self.can_remove_attachments() && self.shown_attachment(id).is_some() {
             self.attachments.remove_confirm = Some(id);
             cx.notify();
         }
@@ -688,10 +701,35 @@ impl AppState {
         self.start_read(request.id, ReadPurpose::Save(request.path), cx);
     }
 
-    /// Name and size of attachment `id` on the shown item.
+    /// Name and size of attachment `id` on the shown item. An icon image is not an
+    /// attachment to the user: `None`, so it can be neither previewed nor saved.
     fn shown_attachment(&self, id: Uuid) -> Option<(String, u64)> {
-        let a = self.shown_item()?.attachments.iter().find(|a| a.id == id)?;
+        let item = self.shown_item()?;
+        let a = item.attachments.iter().find(|a| a.id == id)?;
+        if self.is_hidden_attachment(item, a) {
+            return None;
+        }
         Some((a.name.clone(), a.size))
+    }
+
+    /// True when attachment `r` of `item` is an icon image, and so never listed, counted,
+    /// previewed or saved: the item's image icon ([`crate::icon::is_icon_attachment`]), or
+    /// an image added as the icon by the edit in progress and not saved yet.
+    pub fn is_hidden_attachment(&self, item: &Item, r: &vault_core::AttachmentRef) -> bool {
+        crate::icon::is_icon_attachment(item, r)
+            || self
+                .edit_buffer()
+                .is_some_and(|b| b.item.id == item.id && b.icon_added.contains(&r.id))
+    }
+
+    /// The attachments of `item` the user sees, in order.
+    pub fn visible_attachments<'a>(
+        &'a self,
+        item: &'a Item,
+    ) -> impl Iterator<Item = &'a vault_core::AttachmentRef> + 'a {
+        item.attachments
+            .iter()
+            .filter(move |a| !self.is_hidden_attachment(item, a))
     }
 
     /// Decrypts attachment `id` of the selected item for `purpose`, off the main thread.
@@ -962,7 +1000,7 @@ fn consume(
 
 /// Reads the whole decrypted stream into a zeroizing buffer, checking `cancel` (lock)
 /// between chunks. `Ok(None)` = cancelled; the partial buffer is wiped.
-fn read_all(
+pub(super) fn read_all(
     reader: &mut dyn Read,
     size: u64,
     cancel: &AtomicBool,

@@ -33,6 +33,13 @@
 //! references, an empty file and a 3-chunk file (2 MiB + 7 bytes), whose sealed blobs live
 //! under `v1-attach.vault.attachments/<id hex>.bin`. The blob contents are deterministic
 //! (`attach_pattern`) so the test can verify the decrypted bytes.
+//!
+//! `v1-icon.vault` (01 §4 `ItemPlain.icon`, v1.2, no version bump) holds three items written
+//! by a post-2026-10-31 build: a `symbol` icon with a colour, a `logo` icon without one, and
+//! an item with no icon (so no `icon` key at all). Like `v1-stamped` it was created after
+//! stamp-at-create, so its header carries `slots_modified_at`, and after the item-kind
+//! removal, so its items carry no legacy `kind` extra. Password: `correct horse battery
+//! staple` (`PASSWORD`), KDF `KdfParams::for_tests()`.
 
 use std::io::Cursor;
 
@@ -40,8 +47,8 @@ use ciborium::Value;
 use vault_core::attachment::{CHUNK_SIZE, blob_file_name, new_ref, open, seal};
 use vault_core::format::VaultFile;
 use vault_core::{
-    ExposeSecret, Field, FieldKind, Item, KdfParams, LockedVault, OpaqueSlot, SecretString, Slot,
-    SlotKind, TamperKind, UnlockedVault, Uuid, VaultError,
+    ExposeSecret, Field, FieldKind, Item, ItemIcon, KdfParams, LockedVault, OpaqueSlot,
+    SecretString, Slot, SlotKind, TamperKind, UnlockedVault, Uuid, VaultError,
 };
 
 /// Parse, edit the structure, re-encode (same as `common::rewrite`, kept local because this
@@ -79,6 +86,25 @@ const ATTACH_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/v1-attach.vault.attachments"
 );
+
+/// `v1-icon.vault`: the three items, in insertion order.
+const ICON_SYMBOL_ID: [u8; 16] = [0x08; 16];
+const ICON_LOGO_ID: [u8; 16] = [0x09; 16];
+const ICON_NONE_ID: [u8; 16] = [0x0C; 16];
+const ICON_AT: u64 = T0 + 60;
+
+fn icon_symbol() -> ItemIcon {
+    ItemIcon {
+        kind: "symbol".into(),
+        value: "key.fill".into(),
+        color: Some("#3B82F6".into()),
+        extras: Vec::new(),
+    }
+}
+
+fn icon_logo() -> ItemIcon {
+    ItemIcon::new("logo", "github.com")
+}
 
 fn attach_pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
@@ -406,6 +432,74 @@ fn v1_attach_refs_and_blobs_open() {
     }
 }
 
+/// Builds `v1-icon.vault` (see the module docs). Separate from the other regenerators so
+/// their bytes are not churned.
+#[test]
+#[ignore]
+fn regenerate_icon_fixture() {
+    let mut vault = new_vault();
+    let specs: [([u8; 16], &str, Option<ItemIcon>); 3] = [
+        (ICON_SYMBOL_ID, "Symbol icon", Some(icon_symbol())),
+        (ICON_LOGO_ID, "Logo icon", Some(icon_logo())),
+        (ICON_NONE_ID, "No icon", None),
+    ];
+    for (id, title, icon) in specs {
+        let mut item = Item::new(title, device(), ICON_AT);
+        item.id = Uuid::from_bytes(id);
+        item.icon = icon;
+        item.tags = vec!["login".into()];
+        item.fields = vec![
+            field("username", FieldKind::Text, "someone@example.com", ICON_AT),
+            field("password", FieldKind::Password, "hunter2", ICON_AT),
+        ];
+        vault.insert(item, ICON_AT);
+    }
+    std::fs::write(format!("{FIXTURE_DIR}/v1-icon.vault"), vault.serialize()).unwrap();
+}
+
+#[test]
+fn v1_icon_opens_with_all_three_shapes() {
+    let bytes = std::fs::read(format!("{FIXTURE_DIR}/v1-icon.vault")).unwrap();
+    let locked = LockedVault::parse(&bytes).unwrap();
+    check_kdf(&locked);
+    let vault = locked.unlock(&pw()).unwrap();
+    assert_eq!(vault.items().count(), 3);
+    let expected = [
+        (ICON_SYMBOL_ID, "Symbol icon", Some(icon_symbol())),
+        (ICON_LOGO_ID, "Logo icon", Some(icon_logo())),
+        (ICON_NONE_ID, "No icon", None),
+    ];
+    for (id, title, icon) in expected {
+        let item = vault.get(Uuid::from_bytes(id)).unwrap();
+        assert_eq!(item.title, title);
+        assert_eq!(item.icon, icon, "{title}");
+        assert!(
+            item.extras.is_empty(),
+            "{title}: written after the kind removal"
+        );
+        assert_eq!(item.modified_at, ICON_AT);
+        assert_fields(
+            item,
+            &[
+                ("username", FieldKind::Text, "someone@example.com"),
+                ("password", FieldKind::Password, "hunter2"),
+            ],
+        );
+    }
+    // A save by this build keeps every icon exactly.
+    let again = LockedVault::parse(&vault.serialize())
+        .unwrap()
+        .unlock(&pw())
+        .unwrap();
+    for (id, _, icon) in [
+        (ICON_SYMBOL_ID, "", Some(icon_symbol())),
+        (ICON_LOGO_ID, "", Some(icon_logo())),
+        (ICON_NONE_ID, "", None),
+    ] {
+        assert_eq!(again.get(Uuid::from_bytes(id)).unwrap().icon, icon);
+    }
+}
+
 fn check_kdf(locked: &LockedVault) {
     let k = locked.kdf_params();
     assert_eq!((k.m_cost_kib, k.t_cost, k.p_cost), (8192, 1, 1));
@@ -659,9 +753,12 @@ fn every_fixture_in_the_directory_opens() {
         .collect();
     names.sort();
     assert!(
-        names.len() >= 5,
-        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-stamped; found {names:?}"
+        names.len() >= 6,
+        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-icon, v1-stamped; found {names:?}"
     );
+    // Written after the item-kind removal (no legacy `kind` extra) and after stamp-at-create
+    // (header carries `slots_modified_at`).
+    let post_removal = |name: &str| matches!(name, "v1-stamped.vault" | "v1-icon.vault");
     for name in &names {
         let bytes = std::fs::read(format!("{FIXTURE_DIR}/{name}")).unwrap();
         assert!(
@@ -677,9 +774,9 @@ fn every_fixture_in_the_directory_opens() {
             .unlock(&pw())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         // Every pre-2026-10-30 item carries a legacy `kind` entry, now an unknown key: it is
-        // never dropped and never resurfaces as anything else. (`v1-stamped` was written
-        // after the removal and has none.)
-        let legacy = name != "v1-stamped.vault";
+        // never dropped and never resurfaces as anything else. (`v1-stamped` and `v1-icon`
+        // were written after the removal and have none.)
+        let legacy = !post_removal(name);
         for item in vault.items_including_deleted().filter(|_| legacy) {
             let kinds: Vec<_> = item
                 .extras
@@ -692,12 +789,13 @@ fn every_fixture_in_the_directory_opens() {
                 "{name}: legacy kind is text"
             );
         }
-        // Only `v1-stamped` has had a slot mutation. A save by this build must neither invent
-        // the v1.1 stamp (old bytes would change on every round trip) nor lose it.
+        // Only `v1-stamped` (slot mutation) and `v1-icon` (created after stamp-at-create)
+        // carry the stamp. A save by this build must neither invent the v1.1 stamp (old bytes
+        // would change on every round trip) nor lose it.
         let committed = (file.header.slots_modified_at, file.header.slots_device_id);
         assert_eq!(
             committed.0.is_some(),
-            name == "v1-stamped.vault",
+            post_removal(name),
             "{name}: committed stamp"
         );
         // Whatever it holds, it must survive a save by this build, extras included.

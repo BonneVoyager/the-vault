@@ -22,7 +22,8 @@ use vault_core::{ExposeSecret, Field, FieldKind, HistoryEntry, Item};
 
 use super::MainScreen;
 use super::attachments;
-use super::list::{alert_dot, avatar};
+use super::icon_view::item_tile;
+use super::list::alert_dot;
 use super::prompts;
 use super::sync_banners;
 use crate::actions::{DETAIL_CONTEXT, DeleteItem, EditItem, ToggleFavorite};
@@ -252,8 +253,10 @@ fn onboarding(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
 impl MainScreen {
     pub(super) fn render_detail(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         // A selection change wipes the decrypted attachment preview before anything draws.
-        self.state
-            .update(cx, |s, cx| s.follow_attachment_selection(cx));
+        self.state.update(cx, |s, cx| {
+            s.follow_attachment_selection(cx);
+            s.load_icon_images(cx);
+        });
         let s = self.state.read(cx);
         let toast = s
             .toast
@@ -412,7 +415,7 @@ impl ReadDetail<'_> {
         let header = ui::h_flex()
             .debug_selector(|| "detail-header".into())
             .gap(px(14.))
-            .child(avatar(item.id, &item.title, 44.))
+            .child(item_tile(item, Some(s), 44., cx))
             .child(
                 ui::v_flex().flex_1().min_w_0().child(
                     div()

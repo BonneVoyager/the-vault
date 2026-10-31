@@ -41,7 +41,9 @@ pub fn section(
         .iter()
         .filter(|p| p.item == item.id)
         .collect();
-    if !editing && item.attachments.is_empty() && pending.is_empty() {
+    // Icon images are not attachments to the user (`AppState::is_hidden_attachment`).
+    let shown: Vec<&AttachmentRef> = s.visible_attachments(item).collect();
+    if !editing && shown.is_empty() && pending.is_empty() {
         return None;
     }
     let add = {
@@ -58,10 +60,7 @@ pub fn section(
     };
     let header = ui::h_flex().gap(px(8.)).child(section_title(cx)).child(add);
 
-    let rows = item
-        .attachments
-        .iter()
-        .map(|a| row(s, state, item.id, a, editing, cx));
+    let rows = shown.iter().map(|a| row(s, state, item.id, a, editing, cx));
     let pending_rows = pending.into_iter().map(|p| {
         let name = p.name.clone();
         row_shell(IconName::File, p.name.clone(), p.size, None, cx)
@@ -77,7 +76,7 @@ pub fn section(
             .gap(px(2.))
             .child(header)
             .when(
-                item.attachments.is_empty() && s.attachments.pending.is_empty(),
+                shown.is_empty() && s.attachments.pending.is_empty(),
                 |col| col.child(ui::muted("Drop files here or use Add file\u{2026}", cx).text_xs()),
             )
             .children(rows)
@@ -97,14 +96,16 @@ fn section_title(cx: &App) -> gpui::Div {
 
 /// Read-only item windows use the same attachment title and rows.
 pub(super) fn reference_section(s: &AppState, item: &Item, cx: &App) -> Option<AnyElement> {
-    if item.attachments.is_empty() {
+    let shown: Vec<&AttachmentRef> = s.visible_attachments(item).collect();
+    if shown.is_empty() {
         return None;
     }
     Some(
         ui::v_flex()
             .gap(px(2.))
             .child(section_title(cx))
-            .children(item.attachments.iter().map(|a| {
+            .children(shown.into_iter().map(|a| {
+                let selector = format!("reference-attachment {}", a.name);
                 row_shell(
                     if preview_kind(&a.name, a.size) == Some(PreviewKind::Text) {
                         IconName::FileText
@@ -116,6 +117,7 @@ pub(super) fn reference_section(s: &AppState, item: &Item, cx: &App) -> Option<A
                     tag_for(s.attachment_state(a.id)),
                     cx,
                 )
+                .debug_selector(move || selector.clone())
             }))
             .into_any_element(),
     )
@@ -444,11 +446,16 @@ pub fn save_sheet(s: &AppState, state: &Entity<AppState>, cx: &App) -> Option<An
 /// Backup viewer rows: the backup has references but no blobs, so every row is Missing
 /// and has no actions.
 pub fn backup_section(item: &Item, cx: &App) -> Option<AnyElement> {
-    if item.attachments.is_empty() {
+    let shown: Vec<&AttachmentRef> = item
+        .attachments
+        .iter()
+        .filter(|a| !crate::icon::is_icon_attachment(item, a))
+        .collect();
+    if shown.is_empty() {
         return None;
     }
     let theme = cx.theme();
-    let rows = item.attachments.iter().map(|a| {
+    let rows = shown.into_iter().map(|a| {
         let selector = format!("backup-attachment {} Missing", a.name);
         row_shell(
             IconName::File,

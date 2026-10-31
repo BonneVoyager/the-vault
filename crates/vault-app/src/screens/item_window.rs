@@ -325,6 +325,36 @@ mod tests {
         })
     }
 
+    /// The read-only attachment rows leave out the item's icon image.
+    #[gpui::test]
+    fn icon_blob_is_not_listed(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, _) = setup(dir.path(), cx);
+        state.update(cx, |s, _| {
+            s.vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| {
+                    let icon = vault_core::attachment::new_ref("icon.png", 900, 11).unwrap();
+                    let scan = vault_core::attachment::new_ref("scan.pdf", 900, 11).unwrap();
+                    let icon_id = icon.id;
+                    v.add_attachment_ref(plain, icon, 11)?;
+                    v.add_attachment_ref(plain, scan, 11)?;
+                    v.update(plain, 12, |it| {
+                        it.icon = Some(crate::icon::image_icon(icon_id))
+                    })
+                })
+                .unwrap()
+                .unwrap();
+            s.vault_changed();
+        });
+        let handle = open(&state, plain, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(handle, cx);
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("reference-attachment scan.pdf").is_some());
+        assert!(vcx.debug_bounds("reference-attachment icon.png").is_none());
+    }
+
     #[gpui::test]
     fn second_open_focuses_the_existing_window(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();

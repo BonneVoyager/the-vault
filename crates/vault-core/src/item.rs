@@ -239,6 +239,41 @@ pub struct AttachmentTombstone {
     pub removed_at: Millis,
 }
 
+/// An optional per-item icon choice (01 §4 `ItemPlain.icon`, v1.2, no version bump). Stored
+/// by the core and interpreted by the app: `kind` names how to read `value` (the app uses
+/// kinds such as `symbol`, `logo`, `image`), `color` is an optional app-defined colour, and
+/// the core validates nothing beyond CBOR types. Nothing here is secret, so `Debug` is
+/// derived. No `Eq`: `extras` holds `ciborium::Value`, which is only `PartialEq`.
+///
+/// Merge treats the icon as item metadata like `favorite` and `tags`: it travels with the
+/// metadata winner and a differing icon makes two items unequal. There is no setter on
+/// `UnlockedVault`; change it through [`crate::UnlockedVault::update`], which restamps the
+/// item unconditionally.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ItemIcon {
+    /// How the app should interpret `value` (e.g. `symbol`, `logo`, `image`). Opaque to core.
+    pub kind: String,
+    /// The icon reference in the form `kind` implies (symbol name, domain, image id, ...).
+    pub value: String,
+    /// Optional app-defined colour. Omitted from the file when `None`.
+    pub color: Option<String>,
+    /// Unknown keys preserved from the icon map (01 §9), so a newer app's additions survive
+    /// a read-write cycle by this build.
+    pub extras: Extras,
+}
+
+impl ItemIcon {
+    /// An icon with no colour and no extras.
+    pub fn new(kind: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            value: value.into(),
+            color: None,
+            extras: Vec::new(),
+        }
+    }
+}
+
 /// A decrypted item. `id` and `modified_at` are stored in plaintext on the record; everything
 /// else is inside the ciphertext.
 ///
@@ -256,6 +291,9 @@ pub struct Item {
     pub device_id: Uuid,
     pub favorite: bool,
     pub tags: Vec<String>,
+    /// Optional icon choice (v1.2). `None` for every file written before it existed; the
+    /// writer emits the key only when `Some`. Interpreted by the app, see [`ItemIcon`].
+    pub icon: Option<ItemIcon>,
     pub fields: Vec<Field>,
     pub history: Vec<HistoryEntry>,
     /// Attachment references (01 §4, v1.1). Empty for every v1 file. Add and remove through
@@ -287,6 +325,7 @@ impl Item {
             device_id,
             favorite: false,
             tags: Vec::new(),
+            icon: None,
             fields: Vec::new(),
             history: Vec::new(),
             attachments: Vec::new(),
@@ -321,6 +360,7 @@ impl fmt::Debug for Item {
             .field("device_id", &self.device_id)
             .field("favorite", &self.favorite)
             .field("tags", &self.tags)
+            .field("icon", &self.icon)
             .field(
                 "fields",
                 &format_args!("[{} fields redacted]", self.fields.len()),
@@ -411,9 +451,19 @@ mod tests {
                 Value::Text("secret-att-ext".into()),
             )],
         });
+        item.icon = Some(ItemIcon {
+            kind: "symbol".into(),
+            value: "key.fill".into(),
+            color: Some("#ff0000".into()),
+            extras: vec![(Value::Text("z".into()), Value::Integer(1.into()))],
+        });
         let s = format!(
             "{item:?} {:?} {:?} {:?}",
             item.fields[0], item.history[0], item.attachments[0]
+        );
+        assert!(
+            s.contains("key.fill"),
+            "icon is not secret: printed in full"
         );
         assert!(!s.contains("hunter"));
         assert!(!s.contains("secret-"));

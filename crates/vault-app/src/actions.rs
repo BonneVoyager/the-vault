@@ -89,6 +89,7 @@ pub const DETAIL_CONTEXT: &str = "ItemDetail";
 
 pub fn bind_keys(cx: &mut App) {
     let list = Some(LIST_CONTEXT);
+    crate::screens::icon_view::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-l", Lock, None),
         KeyBinding::new("cmd-o", OpenVault, None),

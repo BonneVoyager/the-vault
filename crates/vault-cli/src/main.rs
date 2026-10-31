@@ -11,9 +11,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use vault_core::{
-    CsvMapping, ExposeSecret, Field, FieldKind, Item, KdfParams, PassphraseSpec, PasswordSpec,
-    Query, SecretString, Totp, UnlockedVault, Uuid, VaultError, attachment::MAX_ATTACHMENT_SIZE,
-    export_csv, import_csv, passphrase, password, search, strength_bits,
+    CsvMapping, ExposeSecret, Field, FieldKind, Item, ItemIcon, KdfParams, PassphraseSpec,
+    PasswordSpec, Query, SecretString, Totp, UnlockedVault, Uuid, VaultError,
+    attachment::MAX_ATTACHMENT_SIZE, export_csv, import_csv, passphrase, password, search,
+    strength_bits,
 };
 use vault_sync::{AttachmentState, NoopHooks, SyncError, SyncedVault};
 
@@ -343,6 +344,57 @@ fn state_str(s: AttachmentState) -> &'static str {
     }
 }
 
+/// The attachment id that holds the item's custom image icon, if the icon is of kind `image`
+/// and its value is a UUID. Such an attachment is an implementation detail and stays hidden.
+fn icon_attachment_id(item: &Item) -> Option<Uuid> {
+    let icon = item.icon.as_ref()?;
+    if icon.kind != "image" {
+        return None;
+    }
+    Uuid::parse_str(&icon.value).ok()
+}
+
+/// Text after `Icon: ` in `get` output (unsanitized).
+fn icon_summary(item: &Item, icon: &ItemIcon) -> String {
+    let color = icon.color.as_deref();
+    match icon.kind.as_str() {
+        "symbol" => match color {
+            Some(c) => format!("symbol {} {c}", icon.value),
+            None => format!("symbol {}", icon.value),
+        },
+        "letter" => match color {
+            Some(c) => format!("letter {c}"),
+            None => "letter".to_owned(),
+        },
+        "logo" => format!("logo {}", icon.value),
+        "image" => match icon_attachment_id(item)
+            .and_then(|id| item.attachments.iter().find(|a| a.id == id))
+        {
+            Some(a) => format!("image ({} bytes)", a.size),
+            None => "image (blob missing)".to_owned(),
+        },
+        other => format!("{other} (unknown)"),
+    }
+}
+
+/// Drop attachment `id` from `item`. When it is the item's icon image, also clear `item.icon`
+/// so no dangling reference is written. Returns whether the icon was cleared.
+fn remove_attachment_and_icon(
+    v: &mut UnlockedVault,
+    item: Uuid,
+    id: Uuid,
+    now: u64,
+) -> Result<bool, VaultError> {
+    let clears_icon = v
+        .get(item)
+        .is_some_and(|it| icon_attachment_id(it) == Some(id));
+    v.remove_attachment_ref(item, id, now)?;
+    if clears_icon {
+        v.update(item, now, |it| it.icon = None)?;
+    }
+    Ok(clears_icon)
+}
+
 fn attach_get(sv: &SyncedVault, item: Uuid, id: Uuid, out: &Path) -> Result<()> {
     let known = sv
         .vault()
@@ -397,7 +449,8 @@ fn run_attach(cli: &Cli, cmd: &AttachCmd) -> Result<()> {
                 .vault()
                 .and_then(|v| v.get(item))
                 .context("item vanished")?;
-            for a in &it.attachments {
+            let hidden = icon_attachment_id(it);
+            for a in it.attachments.iter().filter(|a| Some(a.id) != hidden) {
                 println!(
                     "{}  {}  {}  {}",
                     a.id,
@@ -423,10 +476,15 @@ fn run_attach(cli: &Cli, cmd: &AttachCmd) -> Result<()> {
         } => {
             let mut sv = open_synced(&path, &pw)?;
             let item = synced_item(&sv, item)?;
-            sv.remove_attachment(item, *attachment_id, now_millis())
-                .map_err(sync_err)?;
+            let now = now_millis();
+            let clears_icon = sv
+                .edit(|v| remove_attachment_and_icon(v, item, *attachment_id, now))
+                .map_err(sync_err)??;
             sv.save().map_err(sync_err)?;
             println!("removed {attachment_id}");
+            if clears_icon {
+                println!("this was the item's icon image; the icon was cleared");
+            }
         }
     }
     Ok(())
@@ -587,6 +645,9 @@ fn run(cli: Cli) -> Result<()> {
             println!("id:    {}", item.id);
             println!("title: {}", sanitize_for_terminal(&item.title));
             println!("tags:  {}", sanitize_for_terminal(&item.tags.join(", ")));
+            if let Some(icon) = &item.icon {
+                println!("Icon: {}", sanitize_for_terminal(&icon_summary(item, icon)));
+            }
             for f in &item.fields {
                 println!(
                     "{}: {}",
@@ -784,5 +845,116 @@ mod tests {
         assert_eq!(display_value(&i, &i.fields[0], true), "4111 1111 1111 1234");
         let short = item(true, "number", FieldKind::Text, "12");
         assert_eq!(display_value(&short, &short.fields[0], false), "********");
+    }
+
+    fn with_icon(kind: &str, value: &str, color: Option<&str>) -> Item {
+        let mut i = Item::new("t", Uuid::nil(), 0);
+        let mut icon = ItemIcon::new(kind, value);
+        icon.color = color.map(str::to_owned);
+        i.icon = Some(icon);
+        i
+    }
+
+    fn icon_line(i: &Item) -> String {
+        sanitize_for_terminal(&icon_summary(i, i.icon.as_ref().unwrap()))
+    }
+
+    fn add_blob(i: &mut Item, size: u64) -> Uuid {
+        let r = vault_core::attachment::new_ref("pic.png", size, 1).unwrap();
+        let id = r.id;
+        i.attachments.push(r);
+        id
+    }
+
+    fn test_vault() -> UnlockedVault {
+        UnlockedVault::create(
+            &SecretString::new("pw".to_owned()),
+            KdfParams::for_tests(),
+            Uuid::nil(),
+        )
+    }
+
+    #[test]
+    fn icon_attachment_id_only_for_valid_image() {
+        let id = Uuid::new_v4();
+        let i = with_icon("image", &id.to_string(), None);
+        assert_eq!(icon_attachment_id(&i), Some(id));
+        assert_eq!(
+            icon_attachment_id(&with_icon("image", "not-a-uuid", None)),
+            None
+        );
+        assert_eq!(
+            icon_attachment_id(&with_icon("logo", &id.to_string(), None)),
+            None
+        );
+        assert_eq!(icon_attachment_id(&Item::new("t", Uuid::nil(), 0)), None);
+    }
+
+    #[test]
+    fn icon_lines_for_every_kind() {
+        let i = with_icon("symbol", "star", Some("#112233"));
+        assert_eq!(icon_line(&i), "symbol star #112233");
+        assert_eq!(icon_line(&with_icon("symbol", "star", None)), "symbol star");
+        assert_eq!(
+            icon_line(&with_icon("letter", "", Some("#AABBCC"))),
+            "letter #AABBCC"
+        );
+        assert_eq!(icon_line(&with_icon("logo", "github", None)), "logo github");
+        let mut i = with_icon("image", "x", None);
+        let id = add_blob(&mut i, 42);
+        i.icon = Some(ItemIcon::new("image", id.to_string()));
+        assert_eq!(icon_line(&i), "image (42 bytes)");
+        let gone = with_icon("image", &Uuid::new_v4().to_string(), None);
+        assert_eq!(icon_line(&gone), "image (blob missing)");
+        assert_eq!(
+            icon_line(&with_icon("image", "not-a-uuid", None)),
+            "image (blob missing)"
+        );
+        assert_eq!(
+            icon_line(&with_icon("hologram", "x", None)),
+            "hologram (unknown)"
+        );
+        assert_eq!(
+            icon_line(&with_icon("ev\u{1b}il", "x", None)),
+            "ev\\u{1b}il (unknown)"
+        );
+    }
+
+    #[test]
+    fn malformed_image_value_keeps_attachments_visible_and_icon_on_removal() {
+        let mut v = test_vault();
+        let mut i = with_icon("image", "not-a-uuid", None);
+        let a = add_blob(&mut i, 3);
+        let item = v.insert(i, 10);
+        let cleared = remove_attachment_and_icon(&mut v, item, a, 20).unwrap();
+        assert!(!cleared);
+        assert!(v.get(item).unwrap().icon.is_some());
+    }
+
+    #[test]
+    fn removing_icon_attachment_by_id_clears_icon() {
+        let mut v = test_vault();
+        let mut i = Item::new("t", Uuid::nil(), 0);
+        let icon_blob = add_blob(&mut i, 5);
+        let other = add_blob(&mut i, 6);
+        i.icon = Some(ItemIcon::new("image", icon_blob.to_string()));
+        let item = v.insert(i, 10);
+        // Listing hides only the icon blob.
+        let it = v.get(item).unwrap();
+        let hidden = icon_attachment_id(it);
+        let visible: Vec<Uuid> = it
+            .attachments
+            .iter()
+            .filter(|a| Some(a.id) != hidden)
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(visible, vec![other]);
+        // Removing a normal attachment leaves the icon alone.
+        assert!(!remove_attachment_and_icon(&mut v, item, other, 20).unwrap());
+        assert!(v.get(item).unwrap().icon.is_some());
+        // Removing the icon blob by id clears the icon.
+        assert!(remove_attachment_and_icon(&mut v, item, icon_blob, 30).unwrap());
+        let it = v.get(item).unwrap();
+        assert!(it.icon.is_none() && it.attachments.is_empty());
     }
 }

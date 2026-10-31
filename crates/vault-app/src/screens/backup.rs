@@ -25,7 +25,7 @@ use vault_core::{
     ExposeSecret as _, FieldKind, Item, LockedVault, SecretString, UnlockedVault, Uuid,
 };
 
-use super::main::avatar;
+use super::main::item_tile;
 use crate::state::{AppState, parse_totp};
 use crate::ui::Clickable as _;
 use crate::{listing, text, theme, ui};
@@ -299,7 +299,7 @@ impl BackupWindow {
                     .gap(px(10.))
                     .when(selected, |r| r.bg(theme.accent))
                     .hover(|r| r.bg(theme.accent.opacity(0.6)))
-                    .child(avatar(id, &item.title, 28.))
+                    .child(item_tile(item, None, 28., cx))
                     .child(
                         ui::v_flex()
                             .min_w_0()
@@ -408,7 +408,7 @@ impl BackupWindow {
             .child(
                 ui::h_flex()
                     .gap(px(12.))
-                    .child(avatar(item.id, &item.title, 40.))
+                    .child(item_tile(item, None, 40., cx))
                     .child(
                         div()
                             .flex_1()
@@ -681,6 +681,10 @@ mod tests {
                 let mut item = Item::new("Passport", device, 1);
                 item.attachments
                     .push(vault_core::attachment::new_ref("scan.pdf", 2_500_000, 1).unwrap());
+                // A custom image icon: its blob is hidden, and the tile is automatic.
+                let icon = vault_core::attachment::new_ref("icon.png", 900, 1).unwrap();
+                item.icon = Some(crate::icon::image_icon(icon.id));
+                item.attachments.push(icon);
                 v.insert(item, 1);
             })
             .unwrap();
@@ -696,6 +700,23 @@ mod tests {
                 .is_some()
         );
         assert!(vcx.debug_bounds("attachment-preview scan.pdf").is_none());
+        assert!(
+            vcx.debug_bounds("backup-attachment icon.png Missing")
+                .is_none(),
+            "icon blob hidden"
+        );
+        // The backup has no blobs: the tile is the automatic letter, never an image.
+        let item = state.read_with(&vcx, |s, _| {
+            s.unlocked_vault().unwrap().items().next().unwrap().clone()
+        });
+        let auto: &'static str = Box::leak(
+            format!(
+                "icon-tile {} fill white",
+                crate::icon::automatic(&item).describe()
+            )
+            .into_boxed_str(),
+        );
+        assert!(vcx.debug_bounds(auto).is_some(), "{auto}");
     }
 
     #[gpui::test]

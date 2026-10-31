@@ -460,3 +460,407 @@ fn history_trash_buttons_only_in_edit_mode(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("history-remove 0").is_none());
     assert!(vcx.debug_bounds("history-clear").is_none());
 }
+
+#[gpui::test]
+fn icon_picker_opens_from_the_tile_and_works_by_keyboard(cx: &mut TestAppContext) {
+    use crate::icon::{PALETTE, SYMBOLS};
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    let id = state.update(&mut vcx, |s, cx| {
+        let device = s.device_id();
+        let id = s
+            .vault
+            .as_mut()
+            .unwrap()
+            .edit(|v| {
+                let mut it = vault_core::Item::new("Work", device, 10);
+                it.fields = vec![vault_core::Field::new(
+                    "url",
+                    FieldKind::Url,
+                    SecretString::new("https://github.com/login".into()),
+                    10,
+                )];
+                v.insert(it, 10)
+            })
+            .unwrap();
+        s.vault_changed();
+        s.select(id, cx);
+        id
+    });
+    vcx.run_until_parked();
+    // Automatic: the GitHub logo, in the list row and the detail header (light appearance).
+    assert!(
+        vcx.debug_bounds("icon-tile logo github fill white")
+            .is_some(),
+        "automatic logo"
+    );
+
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let tile = vcx.debug_bounds("edit-icon").expect("edit-mode tile");
+    vcx.simulate_click(tile.center(), gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("icon-picker").is_some(), "picker open");
+    assert!(vcx.debug_bounds("icon-picker-automatic").is_some());
+    assert!(vcx.debug_bounds("icon-symbol 39").is_some(), "40 symbols");
+    assert!(vcx.debug_bounds("icon-color 7").is_some(), "8 swatches");
+
+    // Arrows move from "Automatic" to the second symbol; Enter picks it.
+    vcx.simulate_keystrokes("down right enter");
+    vcx.run_until_parked();
+    let icon = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().item.icon.clone());
+    assert_eq!(icon.as_ref().map(|i| i.value.as_str()), Some(SYMBOLS[1].0));
+
+    // A swatch click recolours it; the header tile follows.
+    let swatch = vcx.debug_bounds("icon-color 1").unwrap();
+    vcx.simulate_click(swatch.center(), gpui::Modifiers::none());
+    vcx.run_until_parked();
+    let want: &'static str = Box::leak(
+        format!(
+            "icon-tile symbol {:?} #{:06X} fill white",
+            SYMBOLS[1].1, PALETTE[1]
+        )
+        .into_boxed_str(),
+    );
+    assert!(vcx.debug_bounds(want).is_some(), "{want}");
+
+    // Esc closes the picker but not the edit.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("icon-picker").is_none(), "picker closed");
+    state.read_with(&vcx, |s, _| {
+        assert!(s.is_editing(), "Esc in the picker keeps editing");
+        assert_eq!(s.edit_buffer().unwrap().icon_picker, None);
+    });
+
+    vcx.simulate_keystrokes("cmd-s");
+    vcx.run_until_parked();
+    let saved = state.read_with(&vcx, |s, _| {
+        s.unlocked_vault().unwrap().get(id).unwrap().icon.clone()
+    });
+    assert_eq!(saved.unwrap().color.as_deref(), Some("#30A46C"));
+    assert!(
+        vcx.debug_bounds(want).is_some(),
+        "read-mode header shows the symbol"
+    );
+}
+
+/// Inserts `item` into the open vault and selects it; returns its id.
+fn insert_and_select(
+    state: &Entity<AppState>,
+    item: vault_core::Item,
+    vcx: &mut VisualTestContext,
+) -> Uuid {
+    let id = state.update(vcx, |s, cx| {
+        let id = s
+            .vault
+            .as_mut()
+            .unwrap()
+            .edit(|v| v.insert(item, 10))
+            .unwrap();
+        s.vault_changed();
+        s.select(id, cx);
+        id
+    });
+    vcx.run_until_parked();
+    id
+}
+
+fn title_focused(main: &Entity<MainScreen>, vcx: &mut VisualTestContext) -> bool {
+    vcx.update(|window, cx| {
+        let title = main.read(cx).editor.read(cx).title.clone();
+        gpui::Focusable::focus_handle(&title, cx).is_focused(window)
+    })
+}
+
+#[gpui::test]
+fn esc_in_the_icon_picker_returns_focus_to_the_title(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    insert_and_select(&state, vault_core::Item::new("Work", device, 10), &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    // Start somewhere else than the title (the popover would otherwise just restore it).
+    vcx.update(|window, cx| {
+        let tags = main.read(cx).editor.read(cx).tags.clone();
+        crate::ui::focus_input(&tags, window, cx);
+    });
+    vcx.run_until_parked();
+    assert!(!title_focused(&main, &mut vcx));
+    let tile = vcx.debug_bounds("edit-icon").unwrap();
+    vcx.simulate_click(tile.center(), gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("icon-picker").is_some());
+    assert!(!title_focused(&main, &mut vcx), "the picker has the focus");
+    vcx.simulate_keystrokes("down escape");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("icon-picker").is_none(), "closed");
+    assert!(
+        title_focused(&main, &mut vcx),
+        "focus is back on the title field"
+    );
+    state.read_with(&vcx, |s, _| {
+        assert!(s.is_editing());
+        assert!(!s.edit_buffer().unwrap().has_changes());
+    });
+}
+
+#[gpui::test]
+fn unknown_icon_kind_survives_picker_esc_and_cancel_untouched(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    let mut item = vault_core::Item::new("Future", device, 10);
+    let mut future = vault_core::ItemIcon::new("hologram", "spin:3");
+    future.color = Some("#123456".into());
+    item.icon = Some(future.clone());
+    let id = insert_and_select(&state, item, &mut vcx);
+    state.update(&mut vcx, |s, _| s.vault.as_mut().unwrap().save().unwrap());
+    vcx.run_until_parked();
+    let file = dir.path().join("t.vault").join(vault_sync::VAULT_FILE_NAME);
+    let bytes_before = std::fs::read(&file).unwrap();
+    let (stored_before, modified_before) = state.read_with(&vcx, |s, _| {
+        let it = s.unlocked_vault().unwrap().get(id).unwrap();
+        (it.icon.clone(), it.modified_at)
+    });
+    assert_eq!(stored_before.as_ref(), Some(&future));
+
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let tile = vcx.debug_bounds("edit-icon").unwrap();
+    vcx.simulate_click(tile.center(), gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("icon-picker").is_some());
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| {
+        let b = s.edit_buffer().expect("Esc in the picker keeps editing");
+        assert_eq!(b.item.icon.as_ref(), Some(&future));
+        assert!(!b.has_changes(), "opening and closing is not a change");
+    });
+    let cancel = vcx.debug_bounds("cancel-edit");
+    match cancel {
+        Some(b) => vcx.simulate_click(b.center(), gpui::Modifiers::none()),
+        None => vcx.dispatch_action(crate::actions::CancelEdit),
+    }
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| {
+        assert!(!s.is_editing());
+        assert!(s.discard_prompt.is_none(), "nothing to discard");
+        let it = s.unlocked_vault().unwrap().get(id).unwrap();
+        assert_eq!(it.icon, stored_before, "icon identical");
+        assert_eq!(it.modified_at, modified_before, "no change recorded");
+        assert!(!s.vault.as_ref().unwrap().is_dirty(), "nothing to save");
+    });
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        bytes_before,
+        "file untouched"
+    );
+}
+
+#[gpui::test]
+fn image_icon_draws_and_falls_back_to_automatic(cx: &mut TestAppContext) {
+    use crate::icon_image::test_images::png;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    let mut item = vault_core::Item::new("Bank", device, 10);
+    item.fields = vec![vault_core::Field::new(
+        "url",
+        FieldKind::Url,
+        SecretString::new("https://github.com".into()),
+        10,
+    )];
+    let id = insert_and_select(&state, item, &mut vcx);
+
+    // Chosen through the drop target on the edit tile.
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let path = dir.path().join("bank.png");
+    std::fs::write(&path, png(40, 20, [0, 90, 200, 255])).unwrap();
+    let tile = vcx.debug_bounds("edit-icon").unwrap().center();
+    let paths = gpui::ExternalPaths(vec![path].into());
+    vcx.simulate_event(gpui::FileDropEvent::Entered {
+        position: tile,
+        paths,
+    });
+    vcx.simulate_event(gpui::FileDropEvent::Submit { position: tile });
+    vcx.run_until_parked();
+    let a = state.read_with(&vcx, |s, _| {
+        *s.edit_buffer()
+            .unwrap()
+            .icon_added
+            .first()
+            .expect("the drop on the tile chose the image")
+    });
+    let shown: &'static str = Box::leak(format!("icon-tile image {a}").into_boxed_str());
+    assert!(
+        vcx.debug_bounds(shown).is_some(),
+        "edit tile shows the image"
+    );
+    // Not added as an ordinary attachment by the detail column's drop handler.
+    let refs = state.read_with(&vcx, |s, _| {
+        s.unlocked_vault()
+            .unwrap()
+            .get(id)
+            .unwrap()
+            .attachments
+            .len()
+    });
+    assert_eq!(refs, 1);
+    vcx.simulate_keystrokes("cmd-s");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds(shown).is_some(), "list row and header");
+
+    // Damage the blob and lock/unlock: the decode fails, the automatic logo shows.
+    let store = crate::state::attachments_fake();
+    state.update(&mut vcx, |s, cx| {
+        s.set_attachment_store(store.clone());
+        store.blobs.lock().unwrap().insert(a, b"not a png".to_vec());
+        s.lock(cx);
+        s.unlock(SecretString::new(PW.into()), cx);
+    });
+    vcx.run_until_parked();
+    state.update(&mut vcx, |s, cx| s.select(id, cx));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds(shown).is_none(), "no broken tile");
+    assert!(
+        vcx.debug_bounds("icon-tile logo github fill white")
+            .is_some(),
+        "automatic icon instead"
+    );
+}
+
+#[gpui::test]
+fn icon_blob_is_hidden_from_the_attachments_section(cx: &mut TestAppContext) {
+    use crate::state::AttachmentStore as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    let store = crate::state::attachments_fake();
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    let id = insert_and_select(&state, vault_core::Item::new("Bank", device, 10), &mut vcx);
+    state.update(&mut vcx, |s, cx| {
+        s.set_attachment_store(store.clone());
+        let vault = s.vault.as_mut().unwrap();
+        let icon = store
+            .add(vault, id, "icon.png", &mut &b"png"[..], 3, 11)
+            .unwrap();
+        vault
+            .edit(|v| v.update(id, 12, |it| it.icon = Some(crate::icon::image_icon(icon))))
+            .unwrap()
+            .unwrap();
+        s.vault_changed();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    // Only the icon blob: no section at all in read mode.
+    assert!(vcx.debug_bounds("attachments-section").is_none());
+    state.update(&mut vcx, |s, cx| {
+        let vault = s.vault.as_mut().unwrap();
+        store
+            .add(vault, id, "scan.pdf", &mut &b"pdf"[..], 3, 13)
+            .unwrap();
+        s.vault_changed();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("attachment-row scan.pdf 3 B Present")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("attachment-row icon.png 3 B Present")
+            .is_none()
+    );
+    // Edit mode lists the same.
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("attachment-row scan.pdf 3 B Present")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("attachment-row icon.png 3 B Present")
+            .is_none()
+    );
+    // Remove, Preview and Save refuse the icon blob even by id.
+    let icon = state.read_with(&vcx, |s, _| {
+        let it = s.unlocked_vault().unwrap().get(id).unwrap();
+        crate::icon::image_attachment(it.icon.as_ref().unwrap()).unwrap()
+    });
+    state.update(&mut vcx, |s, cx| {
+        s.request_remove_attachment(icon, cx);
+        assert!(s.attachments.remove_confirm.is_none());
+        s.toggle_attachment_preview(icon, cx);
+        assert!(s.attachments.reading.is_none() && s.attachments.preview.is_none());
+    });
+}
+
+#[gpui::test]
+fn choose_image_row_takes_a_drop_and_the_picker_stays_open(cx: &mut TestAppContext) {
+    use crate::icon_image::{MAX_INPUT_BYTES, Refusal, test_images::png};
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    let id = insert_and_select(&state, vault_core::Item::new("Bank", device, 10), &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let tile = vcx.debug_bounds("edit-icon").unwrap();
+    vcx.simulate_click(tile.center(), gpui::Modifiers::none());
+    vcx.run_until_parked();
+    let row = vcx.debug_bounds("icon-picker-image").expect("row").center();
+
+    let drop_on_row = |path: std::path::PathBuf, vcx: &mut VisualTestContext| {
+        vcx.simulate_event(gpui::FileDropEvent::Entered {
+            position: row,
+            paths: gpui::ExternalPaths(vec![path].into()),
+        });
+        vcx.simulate_event(gpui::FileDropEvent::Pending { position: row });
+        vcx.run_until_parked();
+        // A drag entering is not an outside mouse-down: the popover stays.
+        assert!(
+            vcx.debug_bounds("icon-picker").is_some(),
+            "open while dragging"
+        );
+        vcx.simulate_event(gpui::FileDropEvent::Submit { position: row });
+        vcx.run_until_parked();
+    };
+
+    // Same refusal as the tile: over 512 KB.
+    let big = dir.path().join("big.png");
+    let mut bytes = png(4, 4, [0, 0, 0, 255]);
+    bytes.resize(MAX_INPUT_BYTES as usize + 1, 0);
+    std::fs::write(&big, bytes).unwrap();
+    drop_on_row(big, &mut vcx);
+    state.read_with(&vcx, |s, _| {
+        assert_eq!(
+            s.toast.as_ref().map(|t| t.message.to_string()).as_deref(),
+            Some(Refusal::TooLarge.message())
+        );
+        assert!(s.edit_buffer().unwrap().icon_added.is_empty());
+    });
+
+    // Same prepare path as the tile: a 128 px PNG becomes the icon, picker still open.
+    let ok = dir.path().join("logo.png");
+    std::fs::write(&ok, png(300, 100, [10, 20, 30, 255])).unwrap();
+    drop_on_row(ok, &mut vcx);
+    let a = state.read_with(&vcx, |s, _| {
+        let b = s.edit_buffer().unwrap();
+        assert!(b.icon_picker.is_some(), "picker still open after the drop");
+        assert_eq!(b.icon_added.len(), 1);
+        b.icon_added[0]
+    });
+    assert!(vcx.debug_bounds("icon-picker").is_some());
+    let item = state.read_with(&vcx, |s, _| {
+        s.unlocked_vault().unwrap().get(id).unwrap().clone()
+    });
+    assert_eq!(
+        item.attachments.len(),
+        1,
+        "not also added as an ordinary attachment"
+    );
+    assert_eq!(item.attachments[0].id, a);
+    assert_eq!(item.attachments[0].name, crate::icon_image::ATTACHMENT_NAME);
+}

@@ -127,6 +127,7 @@ pub fn assert_item_eq(a: &Item, b: &Item) {
     assert_eq!(a.device_id, b.device_id);
     assert_eq!(a.favorite, b.favorite);
     assert_eq!(a.tags, b.tags);
+    assert_eq!(a.icon, b.icon);
     assert_eq!(a.modified_at, b.modified_at);
     assert_eq!(a.extras, b.extras);
     assert_eq!(a.fields.len(), b.fields.len());

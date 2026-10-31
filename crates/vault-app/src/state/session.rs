@@ -100,6 +100,7 @@ impl AppState {
     /// The vault's contents changed (unlock, edit): recompute the sidebar counts and the
     /// listing. Query, filter and sort changes only need [`Self::refresh`].
     pub fn vault_changed(&mut self) {
+        self.icon_images.invalidate();
         self.counts = self
             .unlocked_vault()
             .map(listing::counts)
