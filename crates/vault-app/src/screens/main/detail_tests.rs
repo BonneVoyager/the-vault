@@ -670,3 +670,208 @@ fn same_name_fields_render_and_reveal_separately(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("field-masked 0").is_none());
     assert!(vcx.debug_bounds("field-masked 1").is_some());
 }
+
+/// One item holding a single notes field with `note`; returns its id.
+fn note_item(
+    dir: &std::path::Path,
+    note: &str,
+    cx: &mut TestAppContext,
+) -> (Entity<AppState>, Uuid, VisualTestContext) {
+    let note = note.to_owned();
+    let (state, ids, mut vcx) = open_items(
+        dir,
+        move |device| {
+            let mut item = Item::new("Note", device, 1);
+            item.fields = vec![Field::new(
+                "notes",
+                FieldKind::Notes,
+                SecretString::new(note),
+                1,
+            )];
+            vec![item]
+        },
+        cx,
+    );
+    select(&state, ids[0], &mut vcx);
+    (state, ids[0], vcx)
+}
+
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+#[gpui::test]
+fn note_images_never_load_and_show_their_alt_text(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering;
+    let before = crate::screens::main::notes::IMAGE_RESOLVES.load(Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, _, mut vcx) = note_item(
+        dir.path(),
+        "Logo ![x](https://example.invalid/p.png) and ![y](/etc/hosts) and ![](file:///etc/passwd)",
+        cx,
+    );
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("field-notes 0").is_some());
+    assert!(
+        vcx.debug_bounds("note-text x").is_some(),
+        "alt text instead of an image"
+    );
+    assert!(vcx.debug_bounds("note-text y").is_some());
+    assert_eq!(
+        crate::screens::main::notes::IMAGE_RESOLVES.load(Ordering::SeqCst),
+        before,
+        "the image resolver was never asked: nothing fetched or read"
+    );
+}
+
+#[gpui::test]
+fn note_links_open_through_the_app_and_unsafe_schemes_do_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, _, mut vcx) = note_item(
+        dir.path(),
+        "See [site](https://example.com/a) or [evil](javascript:alert(1)) or [d](data:text/html,x).",
+        cx,
+    );
+    // The javascript: and data: links are plain text, never link elements.
+    assert!(vcx.debug_bounds("note-text evil").is_some());
+    assert!(vcx.debug_bounds("note-text d").is_some());
+    let evil = vcx.debug_bounds("note-text evil").unwrap().center();
+    vcx.simulate_click(evil, gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(vcx.cx.opened_url(), None, "javascript: does nothing");
+    // The web link opens through AppState::open_link.
+    let link = vcx
+        .debug_bounds("note-link https://example.com/a")
+        .expect("web link")
+        .center();
+    vcx.simulate_click(link, gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.cx.opened_url().as_deref(),
+        Some("https://example.com/a")
+    );
+    assert!(crate::screens::main::notes::is_web_link("HTTPS://x.y"));
+    assert!(!crate::screens::main::notes::is_web_link(
+        "javascript:alert(1)"
+    ));
+    assert!(!crate::screens::main::notes::is_web_link("/etc/hosts"));
+}
+
+#[gpui::test]
+fn raw_html_in_a_note_is_shown_literally(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = "<b>x</b><script>alert(1)</script>";
+    let (_state, _, mut vcx) = note_item(dir.path(), raw, cx);
+    assert!(
+        vcx.debug_bounds(leak(format!("note-literal {raw}")))
+            .is_some(),
+        "the paragraph shows its source, tags and all"
+    );
+    let block = "<div onclick=\"x()\">\nhi\n</div>";
+    let dir2 = tempfile::tempdir().unwrap();
+    let (_state, _, mut vcx) = note_item(dir2.path(), block, cx);
+    assert!(
+        vcx.debug_bounds(leak(format!("note-literal {block}")))
+            .is_some()
+    );
+}
+
+#[gpui::test]
+fn note_copy_is_raw_and_the_body_is_not_click_to_copy(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = "# Title\n\n- **one**\n- two";
+    let (state, id, mut vcx) = note_item(dir.path(), raw, cx);
+    let board = FakePasteboard::default();
+    state.update(&mut vcx, |s, _| s.set_pasteboard(Box::new(board.clone())));
+    // No copy-on-click area on the body: clicking it copies nothing.
+    assert!(vcx.debug_bounds("field-value 0").is_none());
+    let body = vcx.debug_bounds("field-notes 0").unwrap().center();
+    vcx.simulate_click(body, gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(board.contents(), None);
+    // The row's Copy button copies the stored Markdown unchanged.
+    let copy = vcx.debug_bounds("copy 0");
+    let field = state.read_with(&vcx, |s, _| {
+        s.unlocked_vault().unwrap().get(id).unwrap().fields[0].id
+    });
+    match copy {
+        Some(b) => vcx.simulate_click(b.center(), gpui::Modifiers::none()),
+        None => state.update(&mut vcx, |s, cx| {
+            s.copy(crate::state::CopyTarget::Field(field), cx)
+        }),
+    }
+    vcx.run_until_parked();
+    assert_eq!(board.contents().as_deref(), Some(raw));
+}
+
+#[gpui::test]
+fn long_note_renders_and_keeps_the_row_padding(cx: &mut TestAppContext) {
+    let mut note = String::new();
+    while note.len() < 50 * 1024 {
+        note.push_str(
+            "## Section\n\nSome **bold** text with a [link](https://example.com).\n\n- a\n- b\n\n",
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, _, mut vcx) = note_item(dir.path(), &note, cx);
+    vcx.run_until_parked();
+    let row = vcx.debug_bounds("field-row 0").expect("rendered");
+    let content = vcx.debug_bounds("field-content 0").unwrap();
+    assert_eq!(
+        content.top() - row.top(),
+        px(FIELD_ROW_PAD_Y),
+        "7 px padding"
+    );
+    assert!(
+        row.size.height > px(500.),
+        "no scroll box of its own: the row grows"
+    );
+}
+
+#[gpui::test]
+fn note_text_follows_the_text_size_setting(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, mut vcx) = note_item(dir.path(), "One\n\nTwo\n\nThree", cx);
+    let small = vcx.debug_bounds("field-notes 0").unwrap().size.height;
+    state.update(&mut vcx, |s, cx| {
+        s.update_settings(cx, |st| st.text_size = crate::state::TextSize::Larger)
+    });
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let large = vcx.debug_bounds("field-notes 0").unwrap().size.height;
+    assert!(large > small, "{small:?} -> {large:?}");
+}
+
+#[gpui::test]
+fn note_lines_lists_and_paragraphs_keep_their_shape(cx: &mut TestAppContext) {
+    let height = |note: &str, cx: &mut TestAppContext| {
+        let dir = tempfile::tempdir().unwrap();
+        let (_s, _, mut vcx) = note_item(dir.path(), note, cx);
+        vcx.debug_bounds("field-notes 0").unwrap().size.height
+    };
+    let one = height("PIN 1234", cx);
+    let two = height("PIN 1234\nDoor 5678", cx);
+    assert!(two > one * 1.5, "two lines, not one: {one:?} vs {two:?}");
+    // A list is still a list: one item per line, like the two-line paragraph.
+    let list = height("- PIN 1234\n- Door 5678", cx);
+    assert!(list > one * 1.5, "{list:?}");
+    // A blank line still makes two paragraphs (with the paragraph gap: taller).
+    let paragraphs = height("PIN 1234\n\nDoor 5678", cx);
+    assert!(paragraphs > two, "{paragraphs:?} vs {two:?}");
+    // CRLF: the same two lines of one paragraph (no paragraph gap).
+    let crlf = height("PIN 1234\r\nDoor 5678", cx);
+    assert_eq!(crlf, two, "CRLF renders like LF");
+    // The same URL twice: two link elements, no id clash.
+    let dir = tempfile::tempdir().unwrap();
+    let (_s, _, mut vcx) = note_item(
+        dir.path(),
+        "[a](https://example.com) and [b](https://example.com)",
+        cx,
+    );
+    assert!(vcx.debug_bounds("note-link https://example.com").is_some());
+    // A fenced block keeps its lines exactly (untouched by the line-break pass).
+    let fenced = height("```\nPIN 1234\nDoor 5678\n```", cx);
+    assert!(fenced > one * 1.5, "{fenced:?}");
+    let fenced_crlf = height("```\r\nPIN 1234\r\nDoor 5678\r\n```", cx);
+    assert_eq!(fenced_crlf, fenced, "a CRLF fence renders like an LF one");
+}

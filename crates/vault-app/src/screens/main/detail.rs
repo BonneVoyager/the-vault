@@ -722,10 +722,12 @@ impl ReadDetail<'_> {
                     .child(value.to_string())
                     .into_any_element()
             }
-            // Plain text: markdown is deliberately not rendered (§2.3).
+            // GFM Markdown (owner 2026-10-31; safety rules in `notes`).
             FieldKind::Notes => div()
-                .whitespace_normal()
-                .child(value.to_string())
+                .debug_selector(move || format!("field-notes {ix}"))
+                .w_full()
+                .min_w_0()
+                .child(super::notes::notes_view(("notes", ix), value, self.state))
                 .into_any_element(),
             // Rendered as a heading before this match (see `render_field`); unreachable.
             FieldKind::Section => div().into_any_element(),
@@ -743,14 +745,14 @@ impl ReadDetail<'_> {
             .into_any_element(),
         );
 
-        field_row(
-            ix,
-            field.name.clone().into(),
-            copy_on_click(ix, field.id, &field.name, shown, &self.actions, cx),
-            buttons,
-            cx,
-        )
-        .into_any_element()
+        // A rendered note is selectable text with links: no click-to-copy on its body
+        // (the row's Copy button copies the raw Markdown).
+        let value = if field.kind == FieldKind::Notes {
+            div().flex_1().min_w_0().child(shown).into_any_element()
+        } else {
+            copy_on_click(ix, field.id, &field.name, shown, &self.actions, cx).into_any_element()
+        };
+        field_row(ix, field.name.clone().into(), value, buttons, cx).into_any_element()
     }
 
     fn render_totp(&self, ix: usize, field: &Field, now_ms: u64, cx: &App) -> AnyElement {

@@ -386,6 +386,9 @@ fn rule(hit: &Hit) -> Expect {
         "edit-row" | "edit-tags" | "edit-tag-chips" | "attachments-edit" | "totp-hint" => {
             Expect::NotPointer
         }
+        // A rendered note (gpui-component's TextView): selectable text, not a click
+        // target. Its links are named `note-link-…` and must show the pointer.
+        "notes" | "backup-notes" | "text-view-scroll" => Expect::NotPointer,
         // Padding inside segmented controls, popovers and menus.
         "tabs" | "tabs-inner" | "content" | "items" | "popup-menu" => Expect::NotPointer,
         _ => Expect::Pointer,

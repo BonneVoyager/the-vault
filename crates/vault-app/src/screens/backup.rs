@@ -381,10 +381,25 @@ impl BackupWindow {
                 .flex_1()
                 .min_w_0()
                 .pt(px(3.))
-                .font_family(theme.mono_font_family.clone())
-                .text_sm()
-                .whitespace_normal()
-                .child(shown);
+                .map(|d| {
+                    if field.kind == FieldKind::Notes {
+                        // The same Markdown view as the main detail (`notes`).
+                        d.child(
+                            div()
+                                .debug_selector(move || format!("field-notes {ix}"))
+                                .child(super::main::notes::notes_view(
+                                    ("backup-notes", ix),
+                                    &shown,
+                                    &self.state,
+                                )),
+                        )
+                    } else {
+                        d.font_family(theme.mono_font_family.clone())
+                            .text_sm()
+                            .whitespace_normal()
+                            .child(shown)
+                    }
+                });
             let mut buttons: Vec<AnyElement> =
                 reveal.into_iter().map(|b| b.into_any_element()).collect();
             buttons.push(

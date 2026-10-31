@@ -320,7 +320,12 @@ impl AppState {
             self.show_toast("This item has no website", cx);
             return;
         };
-        match text::browser_url(&raw) {
+        self.open_link(&raw, cx);
+    }
+
+    /// Opens `raw` in the browser: the one path for "Open in browser" and links in notes.
+    pub fn open_link(&mut self, raw: &str, cx: &mut Context<Self>) {
+        match text::browser_url(raw) {
             Some(url) => cx.open_url(&url),
             None => self.show_toast("Can't open this link", cx),
         }

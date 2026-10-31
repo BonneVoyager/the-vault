@@ -10,6 +10,7 @@ mod editor;
 mod generator;
 pub mod icon_view;
 mod list;
+pub(crate) mod notes;
 pub use icon_view::item_tile;
 #[cfg(test)]
 pub use {detail::detail_placeholder, list::list_placeholder};
