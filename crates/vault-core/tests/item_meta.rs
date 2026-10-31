@@ -13,7 +13,9 @@ use common::*;
 use vault_core::format::{self, VaultFile};
 use vault_core::search::{Query, search};
 use vault_core::vault::merge::{item_eq, merge_items};
-use vault_core::{ExposeSecret, Field, FieldKind, Item, Uuid, VaultError, export_csv};
+use vault_core::{
+    ExposeSecret, FORMAT_VERSION, Field, FieldKind, Item, Uuid, VaultError, export_csv,
+};
 
 type Entries = Vec<(Value, Value)>;
 
@@ -45,7 +47,7 @@ fn reencode(item: &Item, edit: impl FnOnce(&mut Entries)) -> Result<Item, VaultE
     edit(&mut entries);
     let mut buf = Vec::new();
     ciborium::into_writer(&Value::Map(entries), &mut buf).unwrap();
-    format::decode_item_plain(&buf, item.id, item.modified_at)
+    format::decode_item_plain(&buf, item.id, item.modified_at, FORMAT_VERSION)
 }
 
 fn set_key(entries: &mut Entries, k: &str, v: Value) {
@@ -322,7 +324,7 @@ fn merge_keeps_the_minimum_created_at_and_never_counts_it_as_a_change() {
     assert_eq!(peer.get(id).unwrap().modified_at, stamp);
 
     // A merge that *does* change content stamps as usual and still carries the minimum.
-    peer.set_field(id, "username", secret("edited"), 5_000)
+    peer.set_field_named(id, "username", secret("edited"), 5_000)
         .unwrap();
     let r = va.merge_from(&peer).unwrap();
     assert_eq!(r.updated, 1);
@@ -396,7 +398,10 @@ fn section_field_round_trips_as_the_string_section() {
     assert_eq!(got.fields[0].kind_raw, None);
     assert_eq!(got.fields[0].kind_str(), "section");
     assert_eq!(got.fields[0].value.expose_secret(), "");
-    let loud = got.field("Loud heading").unwrap();
+    // `Item::field` skips headings (a label lookup must not hit a heading named like a
+    // value); the test helper finds any field by name.
+    assert!(got.field("Loud heading").is_none());
+    let loud = field_named(got, "Loud heading").unwrap();
     assert_eq!(loud.kind, FieldKind::Section);
     assert_eq!(loud.value.expose_secret(), "kept as given");
     assert!(item_eq(v.get(id).unwrap(), got));
@@ -546,8 +551,15 @@ fn set_field_on_a_section_is_allowed_and_writes_no_history() {
         1_000,
     ));
     let id = v.insert(item, 1_000);
+    let heading = v.get(id).unwrap().fields[0].id;
 
-    v.set_field(id, "Account", secret("renamed-value"), 2_000)
+    // A heading is never addressed by name (`set_field_named` skips sections), only by id.
+    assert_eq!(
+        v.set_field_named(id, "Account", secret("x"), 2_000)
+            .unwrap_err(),
+        VaultError::FieldNotFound
+    );
+    v.set_field(id, heading, secret("renamed-value"), 2_000)
         .unwrap();
     let got = v.get(id).unwrap();
     assert_eq!(got.fields[0].value.expose_secret(), "renamed-value");
@@ -556,13 +568,15 @@ fn set_field_on_a_section_is_allowed_and_writes_no_history() {
     assert!(got.history.is_empty(), "no history for a heading");
 
     // The password field next to it still records history, so the guard is kind-based.
-    v.set_field(id, "password", secret("pw-2"), 3_000).unwrap();
+    v.set_field_named(id, "password", secret("pw-2"), 3_000)
+        .unwrap();
     let got = v.get(id).unwrap();
     assert_eq!(got.history.len(), 1);
     assert_eq!(got.history[0].value.expose_secret(), "pw-1");
+    assert_eq!(got.history[0].field_id, Some(got.fields[1].id));
 
     // Clearing the heading's value back to empty: still no history.
-    v.set_field(id, "Account", secret(""), 4_000).unwrap();
+    v.set_field(id, heading, secret(""), 4_000).unwrap();
     assert_eq!(v.get(id).unwrap().history.len(), 1);
 }
 
@@ -578,7 +592,8 @@ fn section_merges_by_name_and_stamp_like_any_field() {
     let mut b = unlock(&a.serialize()).unwrap();
     b.set_device_id(Uuid::from_u128(0xBBBB));
 
-    // A renames the heading (a new field by name) at 2_000; B adds a second heading at 3_000.
+    // A renames the heading (an edit of the same field, FI-1) at 2_000; B adds a second
+    // heading at 3_000.
     a.update(id, 2_000, |i| i.fields[0].name = "Renamed heading".into())
         .unwrap();
     b.update(id, 3_000, |i| i.fields.push(section("Second", 3_000)))
@@ -587,18 +602,18 @@ fn section_merges_by_name_and_stamp_like_any_field() {
     assert_eq!(r.updated, 1);
     let got = a.get(id).unwrap();
     let names: Vec<&str> = got.fields.iter().map(|f| f.name.as_str()).collect();
-    // B won the metadata (3_000 > 2_000): B's order first, then A's extra field.
+    // B won the metadata (3_000 > 2_000): B's order; the heading keeps A's newer name.
     assert_eq!(
         names,
-        ["Heading", "username", "Second", "Renamed heading"],
-        "fields keyed by name; both headings survive"
+        ["Renamed heading", "username", "Second"],
+        "fields keyed by id: the rename travels, nothing is duplicated"
     );
     assert!(
         got.fields
             .iter()
             .filter(|f| f.kind == FieldKind::Section)
             .count()
-            == 3
+            == 2
     );
     let r = b.merge_from(&a).unwrap();
     assert_eq!(r.updated, 1);
@@ -607,14 +622,15 @@ fn section_merges_by_name_and_stamp_like_any_field() {
     a.merge_from(&b).unwrap();
     assert_vaults_eq(&a, &b);
 
-    // Same heading name on both sides, the newer stamp wins its value.
-    a.set_field(id, "Second", secret("a-val"), 4_000).unwrap();
-    b.set_field(id, "Second", secret("b-val"), 5_000).unwrap();
+    // Same heading on both sides (same id), the newer stamp wins its value.
+    let second = field_named(a.get(id).unwrap(), "Second").unwrap().id;
+    a.set_field(id, second, secret("a-val"), 4_000).unwrap();
+    b.set_field(id, second, secret("b-val"), 5_000).unwrap();
     a.merge_from(&b).unwrap();
     assert_eq!(
         a.get(id)
             .unwrap()
-            .field("Second")
+            .field_by_id(second)
             .unwrap()
             .value
             .expose_secret(),

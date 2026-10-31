@@ -59,7 +59,7 @@ mod macos {
     }
 
     pub fn suspended_center_still_delivers() {
-        let name = format!("dev.aurora.vault.test.{}", std::process::id());
+        let name = format!("dev.vault.app.test.{}", std::process::id());
         let ours = Arc::new(AtomicUsize::new(0));
         let ours2 = ours.clone();
         let sub = on_distributed_notification(&name, move || {

@@ -86,6 +86,7 @@ Output goes to `target/package/` as `Vault.app` and a `.dmg`. A signed build nee
 ## Known limitations
 
 - Attachments are not backed up. A restored backup may reference blobs that no longer exist, and the app shows them as missing.
+- Vault format 2 (fields identified by id; duplicate and empty field names allowed) is written for new vaults. A format 1 vault keeps its version until it is upgraded, which the app does automatically on the next password unlock (Touch ID must then be enabled again) and the CLI does with `vault upgrade`. Until then, an older build opening the same format 1 file still merges fields by name and can drop a second field with the same name.
 - HEIC images have no in-app preview.
 - No leaked-password checks, because the app never uses the network.
 - No YubiKey, hardware key, or key file support for unlocking a Vault file.

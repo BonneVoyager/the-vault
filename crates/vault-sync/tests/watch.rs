@@ -116,12 +116,19 @@ fn two_devices() -> (TempDir, PathBuf, SyncedVault, SyncedVault, Uuid) {
     (dir, package.join(VAULT_FILE_NAME), a, b, id)
 }
 
-fn field(v: &SyncedVault, id: Uuid, name: &str) -> Option<String> {
+/// The id of item `id`'s field labelled `name`, resolved once; every comparison after that
+/// goes by id (03 §5: fields are identified by `field.id`, never by name).
+fn fid(v: &SyncedVault, id: Uuid, name: &str) -> Uuid {
+    v.vault().unwrap().get(id).unwrap().field(name).unwrap().id
+}
+
+/// Value of field `field_id` of live item `id`.
+fn field(v: &SyncedVault, id: Uuid, field_id: Uuid) -> Option<String> {
     let item = v.vault()?.get(id)?;
     if item.is_deleted() {
         return None;
     }
-    Some(item.field(name)?.value.expose_secret().clone())
+    Some(item.field_by_id(field_id)?.value.expose_secret().clone())
 }
 
 fn is_deleted(v: &SyncedVault, id: Uuid) -> bool {
@@ -194,19 +201,20 @@ fn two_devices_converge_on_field_edits() {
     a.start_watching().unwrap();
     b.start_watching().unwrap();
     let (mut ea, mut eb) = (Events::new(&a), Events::new(&b));
+    let (user, pass) = (fid(&a, id, "username"), fid(&a, id, "password"));
 
-    a.edit(|v| v.set_field(id, "username", secret("alice@a"), T0 + 1_000))
+    a.edit(|v| v.set_field(id, user, secret("alice@a"), T0 + 1_000))
         .unwrap()
         .unwrap();
     a.save().unwrap();
-    b.edit(|v| v.set_field(id, "password", secret("b-pass"), T0 + 2_000))
+    b.edit(|v| v.set_field(id, pass, secret("b-pass"), T0 + 2_000))
         .unwrap()
         .unwrap();
     b.save().unwrap();
 
     let both = |v: &SyncedVault| {
-        field(v, id, "username").as_deref() == Some("alice@a")
-            && field(v, id, "password").as_deref() == Some("b-pass")
+        field(v, id, user).as_deref() == Some("alice@a")
+            && field(v, id, pass).as_deref() == Some("b-pass")
     };
     assert!(
         wait_until(|| {
@@ -225,8 +233,8 @@ fn two_devices_converge_on_field_edits() {
         let mut disk = on_disk(&path).unlock(&pw()).unwrap();
         disk.set_device_id(DEV_A);
         let item = disk.get(id).unwrap();
-        item.field("username").unwrap().value.expose_secret() == "alice@a"
-            && item.field("password").unwrap().value.expose_secret() == "b-pass"
+        item.field_by_id(user).unwrap().value.expose_secret() == "alice@a"
+            && item.field_by_id(pass).unwrap().value.expose_secret() == "b-pass"
     }));
     ea.pump();
     eb.pump();
@@ -235,34 +243,35 @@ fn two_devices_converge_on_field_edits() {
     assert!(!a.is_dirty() && !b.is_dirty());
 }
 
-fn delete_vs_edit(delete_at: u64, edit_at: u64) -> (SyncedVault, SyncedVault, Uuid, TempDir) {
+fn delete_vs_edit(delete_at: u64, edit_at: u64) -> (SyncedVault, SyncedVault, Uuid, Uuid, TempDir) {
     let (dir, _path, mut a, mut b, id) = two_devices();
+    let pass = fid(&a, id, "password");
     a.start_watching().unwrap();
     b.start_watching().unwrap();
     // Order of the writes on disk is fixed (A then B); the timestamps decide the winner.
     a.edit(|v| v.delete(id, delete_at)).unwrap().unwrap();
     a.save().unwrap();
-    b.edit(|v| v.set_field(id, "password", secret("edited"), edit_at))
+    b.edit(|v| v.set_field(id, pass, secret("edited"), edit_at))
         .unwrap()
         .unwrap();
     b.save().unwrap();
-    (a, b, id, dir)
+    (a, b, id, pass, dir)
 }
 
 #[test]
 fn edit_after_delete_wins() {
-    let (mut a, mut b, id, _dir) = delete_vs_edit(T0 + 1_000, T0 + 2_000);
+    let (mut a, mut b, id, pass, _dir) = delete_vs_edit(T0 + 1_000, T0 + 2_000);
     assert!(wait_until(|| {
         a.poll();
         b.poll();
-        field(&a, id, "password").as_deref() == Some("edited")
-            && field(&b, id, "password").as_deref() == Some("edited")
+        field(&a, id, pass).as_deref() == Some("edited")
+            && field(&b, id, pass).as_deref() == Some("edited")
     }));
 }
 
 #[test]
 fn delete_after_edit_wins() {
-    let (mut a, mut b, id, _dir) = delete_vs_edit(T0 + 2_000, T0 + 1_000);
+    let (mut a, mut b, id, _pass, _dir) = delete_vs_edit(T0 + 2_000, T0 + 1_000);
     assert!(wait_until(|| {
         a.poll();
         b.poll();
@@ -275,7 +284,8 @@ fn own_save_is_not_merged() {
     let (_dir, _path, mut a, _b, id) = two_devices();
     a.start_watching().unwrap();
     let mut ea = Events::new(&a);
-    a.edit(|v| v.set_field(id, "username", secret("x"), T0 + 1_000))
+    let user = fid(&a, id, "username");
+    a.edit(|v| v.set_field(id, user, secret("x"), T0 + 1_000))
         .unwrap()
         .unwrap();
     a.save().unwrap();
@@ -294,6 +304,156 @@ fn own_save_is_not_merged() {
         "{:?}",
         ea.seen
     );
+}
+
+/// Item `id`'s fields as `(id, name, value)`, or `None` if the item is gone or deleted.
+fn fields_of(v: &SyncedVault, id: Uuid) -> Option<Vec<(Uuid, String, String)>> {
+    let item = v.vault()?.get(id)?;
+    if item.is_deleted() {
+        return None;
+    }
+    Some(
+        item.fields
+            .iter()
+            .map(|f| (f.id, f.name.clone(), f.value.expose_secret().clone()))
+            .collect(),
+    )
+}
+
+/// Field ids and names only (never values) for assertion messages.
+fn names(v: &SyncedVault, id: Uuid) -> Option<Vec<(Uuid, String)>> {
+    fields_of(v, id).map(|f| f.into_iter().map(|(i, n, _)| (i, n)).collect())
+}
+
+/// Rename field `field_id` of item `id` to `name` through `update` (a rename is an edit of the
+/// same field, 02 "update").
+fn rename(v: &mut SyncedVault, id: Uuid, field_id: Uuid, name: &str, now: u64) {
+    v.edit(|v| {
+        v.update(id, now, |item| {
+            item.fields
+                .iter_mut()
+                .find(|f| f.id == field_id)
+                .unwrap()
+                .name = name.to_owned();
+        })
+    })
+    .unwrap()
+    .unwrap();
+}
+
+/// Poll both devices until `done` holds on each and neither is dirty.
+fn converge(
+    a: &mut SyncedVault,
+    b: &mut SyncedVault,
+    id: Uuid,
+    done: impl Fn(&SyncedVault) -> bool,
+) {
+    assert!(
+        wait_until(|| {
+            a.poll();
+            b.poll();
+            done(a) && done(b) && !a.is_dirty() && !b.is_dirty()
+        }),
+        "did not converge: A {:?} / B {:?}",
+        names(a, id),
+        names(b, id),
+    );
+}
+
+/// 03 §5: a rename on A and a value edit on B of the same field stay one field (same id, no
+/// "deleted + added" duplicate). Concurrently, the field is merged whole by `modified_at`
+/// (the later value edit carries the old name); once B has merged the rename, its next value
+/// edit keeps the new name, so both devices end with the new name and the new value.
+#[test]
+fn rename_and_value_edit_stay_one_field() {
+    let (_dir, _path, mut a, mut b, id) = two_devices();
+    let pass = fid(&a, id, "password");
+    a.start_watching().unwrap();
+    b.start_watching().unwrap();
+
+    // Concurrent: A renames at T0+1s, B (not yet aware) edits the value at T0+2s.
+    rename(&mut a, id, pass, "pin", T0 + 1_000);
+    a.save().unwrap();
+    b.edit(|v| v.set_field(id, pass, secret("b-pass"), T0 + 2_000))
+        .unwrap()
+        .unwrap();
+    b.save().unwrap();
+    let user = fid(&a, id, "username");
+    let expect_lww = |v: &SyncedVault| {
+        let Some(f) = fields_of(v, id) else {
+            return false;
+        };
+        f.len() == 2
+            && f.iter().any(|(i, ..)| *i == user)
+            && f.contains(&(pass, "password".into(), "b-pass".into()))
+    };
+    converge(&mut a, &mut b, id, expect_lww);
+
+    // Sequential: A renames again, B merges it, then B edits the value.
+    rename(&mut a, id, pass, "pin", T0 + 3_000);
+    a.save().unwrap();
+    assert!(wait_until(|| {
+        b.poll();
+        fields_of(&b, id).is_some_and(|f| f.iter().any(|(i, n, _)| *i == pass && n == "pin"))
+    }));
+    b.edit(|v| v.set_field(id, pass, secret("final"), T0 + 4_000))
+        .unwrap()
+        .unwrap();
+    b.save().unwrap();
+    let renamed_and_edited = |v: &SyncedVault| {
+        let Some(f) = fields_of(v, id) else {
+            return false;
+        };
+        f.len() == 2 && f.contains(&(pass, "pin".into(), "final".into()))
+    };
+    converge(&mut a, &mut b, id, renamed_and_edited);
+}
+
+/// 03 §5 `removed_fields`: A removes a field, B edits it strictly later without having seen the
+/// removal; the edit survives on both and the marker is dropped. A then removes it again
+/// (after B's edit): it is gone on both and stays gone.
+#[test]
+fn field_removal_vs_later_edit() {
+    let (_dir, _path, mut a, mut b, id) = two_devices();
+    let pass = fid(&a, id, "password");
+    a.start_watching().unwrap();
+    b.start_watching().unwrap();
+
+    a.edit(|v| v.remove_field(id, pass, T0 + 1_000))
+        .unwrap()
+        .unwrap();
+    a.save().unwrap();
+    b.edit(|v| v.set_field(id, pass, secret("b-edit"), T0 + 2_000))
+        .unwrap()
+        .unwrap();
+    b.save().unwrap();
+    let survived = |v: &SyncedVault| {
+        field(v, id, pass).as_deref() == Some("b-edit")
+            && v.vault()
+                .unwrap()
+                .get(id)
+                .unwrap()
+                .removed_fields
+                .iter()
+                .all(|t| t.id != pass)
+    };
+    converge(&mut a, &mut b, id, survived);
+
+    a.edit(|v| v.remove_field(id, pass, T0 + 3_000))
+        .unwrap()
+        .unwrap();
+    a.save().unwrap();
+    let gone = |v: &SyncedVault| {
+        let item = v.vault().unwrap().get(id).unwrap();
+        item.field_by_id(pass).is_none()
+            && item.removed_fields.iter().any(|t| t.id == pass)
+            && item.field_by_id(fid(v, id, "username")).is_some()
+    };
+    converge(&mut a, &mut b, id, gone);
+    // Stays gone: nothing re-adds it over a few more debounce windows.
+    drain_for(&mut a, 3);
+    drain_for(&mut b, 3);
+    assert!(gone(&a) && gone(&b));
 }
 
 /// B's unsaved state (one extra item) written as a sibling package named `name`; A absorbs it.

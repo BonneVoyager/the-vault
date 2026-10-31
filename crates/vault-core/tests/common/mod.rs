@@ -90,6 +90,7 @@ pub fn sample_item(i: u64, now: u64) -> Item {
         item.history.push(vault_core::HistoryEntry {
             value: secret(format!("old-{i}")),
             replaced_at: now.saturating_sub(100),
+            field_id: None,
         });
     }
     item
@@ -107,6 +108,7 @@ pub fn unlock(bytes: &[u8]) -> Result<UnlockedVault, vault_core::VaultError> {
 }
 
 pub fn assert_field_eq(a: &Field, b: &Field) {
+    assert_eq!(a.id, b.id, "field {}", a.name);
     assert_eq!(a.name, b.name);
     assert_eq!(a.kind, b.kind);
     assert_eq!(
@@ -139,9 +141,17 @@ pub fn assert_item_eq(a: &Item, b: &Item) {
     for (x, y) in a.history.iter().zip(&b.history) {
         assert_eq!(x.value.expose_secret(), y.value.expose_secret());
         assert_eq!(x.replaced_at, y.replaced_at);
+        assert_eq!(x.field_id, y.field_id);
     }
     assert_eq!(a.removed_attachments, b.removed_attachments);
     assert_eq!(a.removed_history, b.removed_history);
+    assert_eq!(a.removed_fields, b.removed_fields);
+}
+
+/// The first field named `name` regardless of kind (so section headings are found too; the
+/// production lookup [`Item::field`] skips them).
+pub fn field_named<'a>(item: &'a Item, name: &str) -> Option<&'a Field> {
+    item.fields.iter().find(|f| f.name == name)
 }
 
 pub fn assert_vaults_eq(a: &UnlockedVault, b: &UnlockedVault) {

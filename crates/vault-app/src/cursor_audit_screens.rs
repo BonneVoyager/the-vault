@@ -63,7 +63,7 @@ fn vault(dir: &Path) -> (SyncedVault, Uuid) {
                 field("notes", FieldKind::Notes, "line one\nline two"),
             ];
             let id = v.insert(gh, 1);
-            v.set_field(id, "password", SecretString::new("new".into()), 2)
+            v.set_field_named(id, "password", SecretString::new("new".into()), 2)
                 .unwrap();
             v.insert(
                 crate::templates::tagged(crate::templates::Template::Card, "Visa", device, 3),

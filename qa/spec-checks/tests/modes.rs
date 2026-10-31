@@ -14,9 +14,9 @@ fn m01_modes_report() {
     a.s.backup_now().unwrap();
     a.add_login("y", now_ms());
     let mut b = std::fs::read(primary(&pkg)).unwrap();
-    b[4..6].copy_from_slice(&2u16.to_be_bytes());
+    b[4..6].copy_from_slice(&3u16.to_be_bytes());
     std::fs::write(primary(&pkg), &b).unwrap();
-    a.s.lock(); // unsaved snapshot
+    let _ = a.s.lock(); // unsaved snapshot
     let mut lines = vec![];
     let mut walk = vec![pkg.clone()];
     while let Some(p) = walk.pop() {

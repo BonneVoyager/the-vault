@@ -100,7 +100,7 @@ fn changes_merged_in_while_editing_survive_save(cx: &mut TestAppContext) {
         let vault = s.vault.as_mut().unwrap();
         vault
             .edit(|v| {
-                v.set_field(gh, "password", secret("remote"), 50)?;
+                v.set_field_named(gh, "password", secret("remote"), 50)?;
                 v.update(gh, 50, |it| {
                     it.fields
                         .push(Field::new("pin", FieldKind::Text, secret("1234"), 50))
@@ -191,7 +191,7 @@ fn switch_vault_and_new_mode_clicks_are_guarded(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn validation_rejects_empty_title_and_duplicate_names(cx: &mut TestAppContext) {
+fn validation_rejects_an_empty_title(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (state, gh, _) = setup(dir.path(), cx);
     state.update(cx, |s, cx| {
@@ -206,10 +206,6 @@ fn validation_rejects_empty_title_and_duplicate_names(cx: &mut TestAppContext) {
         assert_eq!(stored(s, gh).title, "GitHub");
 
         s.set_edit_title("GitHub".into(), cx);
-        let key = s.edit_buffer().unwrap().keys[1];
-        s.set_edit_name(key, "username".into(), cx);
-        s.save_edit(cx);
-        assert!(s.edit_buffer().unwrap().error.is_some());
 
         // Removing every field is allowed.
         let keys = s.edit_buffer().unwrap().keys.clone();
@@ -457,7 +453,7 @@ fn untouched_raw_totp_is_not_rewritten_and_remote_update_survives(cx: &mut TestA
         s.vault
             .as_mut()
             .unwrap()
-            .edit(|v| v.set_field(gh, "totp", secret(remote), 60))
+            .edit(|v| v.set_field_named(gh, "totp", secret(remote), 60))
             .unwrap()
             .unwrap();
         let merged = stored(s, gh);
@@ -474,7 +470,7 @@ fn untouched_raw_totp_is_not_rewritten_and_remote_update_survives(cx: &mut TestA
         s.vault
             .as_mut()
             .unwrap()
-            .edit(|v| v.set_field(gh, "totp", secret(" jbswy3dpehpk3pxp "), 70))
+            .edit(|v| v.set_field_named(gh, "totp", secret(" jbswy3dpehpk3pxp "), 70))
             .unwrap()
             .unwrap();
         let before = stored(s, gh);
@@ -590,8 +586,8 @@ fn with_history(state: &Entity<AppState>, gh: Uuid, cx: &mut TestAppContext) {
             .as_mut()
             .unwrap()
             .edit(|v| {
-                v.set_field(gh, "password", secret("mid"), 20)?;
-                v.set_field(gh, "password", secret("new"), 30)
+                v.set_field_named(gh, "password", secret("mid"), 20)?;
+                v.set_field_named(gh, "password", secret("new"), 30)
             })
             .unwrap()
             .unwrap();
@@ -808,62 +804,143 @@ fn icon_change_keeps_fields_and_unknown_icons_survive_other_edits(cx: &mut TestA
 }
 
 #[gpui::test]
-fn duplicate_field_names_ignore_case(cx: &mut TestAppContext) {
+fn same_name_and_empty_name_fields_save(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (state, gh, _) = setup(dir.path(), cx);
     state.update(cx, |s, cx| {
         s.select(gh, cx);
         s.begin_edit(cx);
-        // The fixture has "username"; a second "Username" is the same name to ⌘⇧U.
-        let key = {
+        // The fixture has "username" (row 0) and "password" (row 1).
+        let keys = s.edit_buffer().unwrap().keys.clone();
+        s.set_edit_name(keys[1], "username".into(), cx);
+        let extra = {
             let mut key = 0;
             s.edit(cx, |b| key = b.add_field(FieldKind::Text));
             key
         };
-        s.set_edit_name(key, "Username".into(), cx);
-        s.save_edit(cx);
-        let err = s.edit_buffer().unwrap().error.clone().unwrap();
-        assert!(err.contains("Two fields are named"), "{err}");
-        assert!(s.is_editing());
-    });
-}
-
-#[gpui::test]
-fn pre_existing_case_only_duplicates_still_save(cx: &mut TestAppContext) {
-    let dir = tempfile::tempdir().unwrap();
-    let (state, gh, _) = setup(dir.path(), cx);
-    state.update(cx, |s, cx| {
-        // An older item (import, CLI) already holding "username" and "Username".
-        s.vault
-            .as_mut()
-            .unwrap()
-            .edit(|v| {
-                v.update(gh, 20, |it| {
-                    it.fields
-                        .push(Field::new("Username", FieldKind::Text, secret("dup"), 20))
-                })
-            })
-            .unwrap()
-            .unwrap();
-        s.vault_changed();
-        s.select(gh, cx);
-        // Editing something else saves: the collision was not made in this edit.
-        s.begin_edit(cx);
-        s.set_edit_title("GitHub 2".into(), cx);
+        s.set_edit_name(extra, String::new(), cx);
+        s.set_edit_value(extra, secret("loose value"), cx);
         s.save_edit(cx);
         assert!(
             !s.is_editing(),
             "{:?}",
             s.edit_buffer().and_then(|b| b.error.clone())
         );
-        assert_eq!(stored(s, gh).title, "GitHub 2");
+        let item = stored(s, gh);
+        let names: Vec<&str> = item.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names[..2],
+            ["username", "username"],
+            "two fields may share a name"
+        );
+        let empty = item
+            .fields
+            .iter()
+            .find(|f| f.name.is_empty())
+            .expect("empty name kept");
+        assert_eq!(empty.value.expose_secret(), "loose value");
+        // Name lookups take the first non-empty match, never the empty-named field.
+        assert_eq!(
+            crate::listing::username_field(&item)
+                .unwrap()
+                .value
+                .expose_secret(),
+            "chris"
+        );
+    });
+}
 
-        // Renaming one of them to another case-only twin is still refused.
+#[gpui::test]
+fn rename_keeps_the_id_and_delete_leaves_a_marker(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, gh, _) = setup(dir.path(), cx);
+    state.update(cx, |s, cx| {
+        s.select(gh, cx);
+        let before = stored(s, gh);
+        let (user_id, pw_id) = (before.fields[0].id, before.fields[1].id);
+        // Rename: same id, no removal marker (an edit, not delete + add).
         s.begin_edit(cx);
-        let key = s.edit_buffer().unwrap().keys[1]; // "password"
-        s.set_edit_name(key, "USERNAME".into(), cx);
+        let keys = s.edit_buffer().unwrap().keys.clone();
+        s.set_edit_name(keys[0], "Login".into(), cx);
         s.save_edit(cx);
-        let err = s.edit_buffer().unwrap().error.clone().unwrap();
-        assert!(err.contains("Two fields are named"), "{err}");
+        let item = stored(s, gh);
+        assert_eq!(item.fields[0].id, user_id);
+        assert_eq!(item.fields[0].name, "Login");
+        assert!(item.removed_fields.is_empty(), "no tombstone for a rename");
+        // Delete: the id gets a removed_fields marker (core).
+        s.begin_edit(cx);
+        let keys = s.edit_buffer().unwrap().keys.clone();
+        s.edit(cx, |b| b.remove_field(keys[1]));
+        s.save_edit(cx);
+        let item = stored(s, gh);
+        assert!(item.field_by_id(pw_id).is_none());
+        assert!(
+            item.removed_fields.iter().any(|t| t.id == pw_id),
+            "tombstoned"
+        );
+        // Reorder keeps ids.
+        s.begin_edit(cx);
+        let extra = {
+            let mut key = 0;
+            s.edit(cx, |b| key = b.add_field(FieldKind::Text));
+            key
+        };
+        s.edit(cx, |b| b.move_field(extra, 0));
+        s.save_edit(cx);
+        let item = stored(s, gh);
+        assert_eq!(item.fields[1].id, user_id, "moved down, same id");
+    });
+}
+
+#[test]
+fn new_rows_get_fresh_distinct_ids() {
+    let mut item = Item::new("x", Uuid::new_v4(), 1);
+    item.fields = vec![Field::new("a", FieldKind::Text, secret("1"), 1)];
+    let original = item.fields[0].id;
+    let mut b = EditBuffer::new(item);
+    let keys: Vec<u64> = (0..3).map(|_| b.add_field(FieldKind::Text)).collect();
+    let mut ids: Vec<Uuid> = keys.iter().map(|k| b.field(*k).unwrap().id).collect();
+    ids.push(original);
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "never copied from another row");
+}
+
+#[gpui::test]
+fn remote_rename_during_a_local_value_edit(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, gh, _) = setup(dir.path(), cx);
+    state.update(cx, |s, cx| {
+        s.select(gh, cx);
+        let user_id = stored(s, gh).fields[0].id;
+        s.begin_edit(cx);
+        let user = s.edit_buffer().unwrap().keys[0];
+        s.set_edit_value(user, secret("local value"), cx);
+        // Another device renames the same field (same id) meanwhile.
+        s.vault
+            .as_mut()
+            .unwrap()
+            .edit(|v| {
+                v.update(gh, 50, |it| {
+                    it.fields.iter_mut().find(|f| f.id == user_id).unwrap().name =
+                        "remote name".into();
+                })
+            })
+            .unwrap()
+            .unwrap();
+        let merged = stored(s, gh);
+        s.edit_buffer_mut().unwrap().mark_remote(&merged);
+        assert_eq!(
+            s.edit_buffer().unwrap().remote_fields,
+            vec![user],
+            "flagged as changed remotely"
+        );
+        s.save_edit(cx);
+        // Local wins whole: the row's name and value, on the same field id.
+        let after = stored(s, gh);
+        let f = after.field_by_id(user_id).expect("same id");
+        assert_eq!(f.name, "username");
+        assert_eq!(f.value.expose_secret(), "local value");
+        assert!(after.removed_fields.is_empty(), "no delete + add");
+        assert_eq!(after.fields.iter().filter(|f| f.id == user_id).count(), 1);
     });
 }

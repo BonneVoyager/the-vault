@@ -61,3 +61,5 @@ gpui = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"] 
 tempfile = "^3.13.0"
 # Builds a tiny .1pux archive in the import test. Same version and features as vault-core.
 zip = { version = "^2.2.0", default-features = false, features = ["deflate"] }
+# Same crate as above, plus its `test-support` hooks (injected save failures).
+vault-sync = { path = "../vault-sync", features = ["test-support"] }

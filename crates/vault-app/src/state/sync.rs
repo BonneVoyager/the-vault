@@ -698,8 +698,10 @@ mod tests {
     fn set_remote(other: &mut SyncedVault, id: Uuid, name: &str, value: &str) {
         other
             .edit(|v| {
+                // By id, found through core's name lookup (names are not identities).
+                let field = v.get(id).and_then(|it| it.field(name)).map(|f| f.id);
                 v.update(id, 20, |it| {
-                    if let Some(f) = it.fields.iter_mut().find(|f| f.name == name) {
+                    if let Some(f) = it.fields.iter_mut().find(|f| Some(f.id) == field) {
                         f.value = secret(value);
                     }
                 })

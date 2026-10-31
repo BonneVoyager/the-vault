@@ -2,7 +2,6 @@
 use spec_checks::dev::*;
 use spec_checks::*;
 use std::io::Read;
-use vault_core::*;
 
 fn hex(id: uuid::Uuid) -> String {
     id.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
@@ -207,7 +206,7 @@ fn a06_conflict_while_locked_deferred() {
     c.s.save().unwrap();
     drop(c);
     a.s.start_watching().unwrap();
-    a.s.lock();
+    let _ = a.s.lock();
     std::thread::sleep(std::time::Duration::from_millis(700));
     std::fs::copy(staging.join("vault.bin"), pkg.join("vault 2.bin")).unwrap();
     a.wait_for(3, |_| false);

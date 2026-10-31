@@ -8,7 +8,7 @@ Dependencies: `vault-core`, `notify` (+ `notify-debouncer-full`), `tempfile`, `f
 
 ```
 <dir>/
-  <name>.vault/                     a macOS package (directory shown as one icon; UTI dev.aurora.vault, LSTypeIsPackage)
+  <name>.vault/                     a macOS package (directory shown as one icon; UTI dev.vault.app, LSTypeIsPackage)
     vault.bin                       the vault file (format per 01, unchanged)
     attachments/<id hex>.bin        (v1.1)
     backups/
@@ -28,6 +28,8 @@ Everything in `.backups/` is a complete, independently-openable vault file. Back
 **Orphan cleanup**: after each `save` that wrote the file, and once after a successful unlock from locked (only when the primary was read, nothing is dirty and saving is not blocked), a blob whose id is referenced by no item (live or tombstoned) is deleted once it has been present locally for more than 24 h. "Present locally" is measured from `max(mtime, ctime)`: cloud providers preserve the source device's mtime, but ctime is set by the local kernel on create or rename and cannot be forged, so a peer's blob that arrives before its vault file always gets the full grace period. The same rule applies to stale tmp files (1 h). Cleanup never runs while locked. References are judged by this device's state after the pre-save merge; a reference a peer holds only in memory does not protect its blob once the grace period has passed (the app's 2 s autosave keeps that window theoretical). Deleting an item keeps its refs on the tombstone until `purge_tombstones_older_than`, so the other device learns about the deletion before the blob can go.
 
 **Limitation (owner decision 2026-10-29): attachments are not backed up.** Snapshots copy only the vault file. Restoring a backup may yield references whose blobs are gone; those show as `Missing`. Attachment size cap 100 MB per file.
+
+Provider label (2026-10-31, pure classifier in vault-sync `cloud`): under `~/Library/Mobile Documents/` is iCloud Drive. Under `~/Library/CloudStorage/<Prefix>-…`, the provider is the segment right after CloudStorage, cut at its first `-`: Dropbox, OneDrive, GoogleDrive shown as "Google Drive", Box, otherwise the raw prefix. `~/Dropbox` or `~/Dropbox (<team>)` is Dropbox. Otherwise iCloud Drive if `NSURLIsUbiquitousItemKey` is true, else "Local folder". Path rules come first because File Provider folders also report ubiquitous.
 
 ## 2. Writing — `SyncedVault::save`
 
@@ -98,13 +100,15 @@ Per item id in `ours ∪ theirs`:
 | both, one is tombstone | — | tombstone wins **if** `deleted_at ≥ other.modified_at`; otherwise the live item wins (edit after delete resurrects) |
 | both live | — | field-level merge below; metadata (title, kind, favorite, tags) taken from whichever item has the greater `modified_at`; tie → greater `device_id` bytes |
 
-Field-level merge, keyed by `field.name`:
+Field-level merge, keyed by `field.id` (2026-10-31; never by name):
 
 | ours | theirs | result |
 |---|---|---|
-| absent | present | take theirs |
-| present | absent | keep ours (field deletion is not tracked in v1; a removed field reappears if the other side still has it — accepted) |
-| both | — | greater `modified_at` wins; tie → greater `device_id` of the owning item; tie → ours |
+| absent | present | take theirs, unless our `removed_fields` carries a marker for that id with `removed_at ≥ modified_at` |
+| present | absent | keep ours, unless their `removed_fields` carries a marker for that id with `removed_at ≥ modified_at` |
+| both | — | greater `modified_at` wins whole (name, kind, value, section travel together, so a rename is an edit); tie → greater `device_id` of the owning item; tie → greater canonical CBOR bytes of the field (symmetric, so both devices converge in one round; bug hunt 2026-10-31) |
+
+`removed_fields` markers are unioned (greatest `removed_at` per id); a field edited strictly after its marker survives and the marker is dropped on both sides. Markers are never dropped by a local removal; a merge caps them at 64 by dropping, oldest first, only markers whose field neither side still holds. Accepted limit: a third device that was offline since before such a dropped marker can still bring that field back. The former "field deletion is not tracked" limit is closed. Metadata and both-tombstone ties (equal stamp and device id) are also broken by the greater canonical CBOR bytes of the item payload, so no "tie → ours" remains.
 
 `history` is merged by union on `(value, replaced_at)`, sorted, capped to 10 newest; `removed_history` stamps are unioned (cap 10 newest) and any history entry whose `replaced_at` is in the set is dropped, so a user's deletion of a history entry survives merge. A later `set_field` producing an entry with a stamp already in the set gets `max(now, stamp+1)`, which the monotone stamp rule guarantees anyway. Markers are keyed by stamp alone: if two devices change the same password in the same millisecond from the same base and one side deletes that history stamp before merging, the conflict-loser value is dropped with it. Accepted.
 
@@ -112,9 +116,9 @@ Field-level merge, keyed by `field.name`:
 
 Result item `modified_at = max(ours, theirs)`. Merged item takes `device_id` of whichever side supplied the winning metadata.
 
-**Header merge** (added 2026-10-30 after the bug hunt, V-01/V-03): the header carries `slots_modified_at`; `merge_from` takes the whole slot set and KDF parameters from whichever side has the greater stamp (tie → the side whose `slots_device_id` bytes are greater — the header records the device that last changed the slots next to the stamp — so both devices converge). When the other side wins, the in-memory vault key is replaced by theirs as well (their slots wrap their key); a later local slot change with a greater stamp wins back by LWW. A password change, slot add/remove, re-calibration or key rotation on one device therefore survives the other device's next save. The vault key is unchanged by a password change, so the other device keeps working with its cached key; a key rotation is detected as before (`KeyRotatedOnDisk`).
+**Header merge** (added 2026-10-30 after the bug hunt, V-01/V-03): the header carries `slots_modified_at`; `merge_from` takes the whole slot set, KDF parameters and `format_version` from the header that is greater by the tuple (`format_version`, `slots_modified_at`, `slots_device_id`); equal keeps ours (2026-10-31: the version ranks first because every slot AAD binds it, so a version 2 header always beats a version 1 header and an upgrade is never undone; the device id tie-break means both devices converge). When the other side wins, the in-memory vault key is replaced by theirs as well (their slots wrap their key); a later local slot change with a greater stamp wins back by LWW. A password change, slot add/remove, re-calibration or key rotation on one device therefore survives the other device's next save. The vault key is unchanged by a password change, so the other device keeps working with its cached key; a key rotation is detected as before (`KeyRotatedOnDisk`).
 
-Timestamps are monotone per item: every write stamps `max(now, previous + 1)`, so a clock that went backwards cannot resurrect a deleted item or let an older edit win. If a merge changes an item's content without changing its `modified_at` (possible when both sides carry the same timestamp), the merge bumps `modified_at` by one so the manifest check and the other device see the change. Two devices converge within two merge rounds.
+Timestamps are monotone per item: every write stamps `max(now, previous + 1)`, so a clock that went backwards cannot resurrect a deleted item or let an older edit win. If a merge changes an item's content without changing its `modified_at` (possible when both sides carry the same timestamp), the merge bumps `modified_at` by one so the manifest check and the other device see the change. Two devices converge within two merge rounds, or three when the `removed_fields` cap fires, since each side can apply the cap only after it has seen the peer drop the fields (2026-10-31).
 
 `merge_from` returns `MergeReport` and a bool-equivalent "anything changed" so `vault-sync` can skip the write when nothing moved.
 

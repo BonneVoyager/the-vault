@@ -576,10 +576,97 @@ fn section_rows_are_headings_without_actions(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("section-row 3 OTHER STUFF").is_some());
     // Copying it by index copies nothing (no toast claims a copy).
     state.update(&mut vcx, |s, cx| {
-        s.copy(crate::state::CopyTarget::Field(0), cx)
+        let first = s.selected_item().unwrap().fields[0].id;
+        s.copy(crate::state::CopyTarget::Field(first), cx)
     });
     state.read_with(&vcx, |s, _| {
         let toast = s.toast.as_ref().map(|t| t.message.to_string());
         assert_eq!(toast.as_deref(), Some("This item has no value"));
     });
+}
+
+#[gpui::test]
+fn empty_name_shows_the_value_alone_and_feeds_no_lookup(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open_items(
+        dir.path(),
+        |device| {
+            let mut item = Item::new("Loose", device, 1);
+            item.fields = vec![Field::new(
+                "",
+                FieldKind::Text,
+                SecretString::new("just a value".into()),
+                1,
+            )];
+            vec![item]
+        },
+        cx,
+    );
+    select(&state, ids[0], &mut vcx);
+    // The label column is there but empty (no placeholder text); the value shows.
+    assert!(vcx.debug_bounds("field-label-text 0 ").is_some());
+    assert!(vcx.debug_bounds("field-value 0").is_some());
+    state.update(&mut vcx, |s, cx| {
+        let item = s.selected_item().unwrap().clone();
+        assert_eq!(crate::listing::subtitle(&item), "");
+        assert!(crate::listing::username_field(&item).is_none());
+        s.copy(crate::state::CopyTarget::Username, cx);
+        let toast = s.toast.as_ref().map(|t| t.message.to_string());
+        assert_eq!(toast.as_deref(), Some("This item has no username"));
+    });
+}
+
+#[gpui::test]
+fn history_entries_name_their_field(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open(dir.path(), &[("Alpha", STRONG)], cx);
+    state.update(&mut vcx, |s, cx| {
+        s.vault
+            .as_mut()
+            .unwrap()
+            .edit(|v| v.set_field_named(ids[0], "password", SecretString::new("next".into()), 5))
+            .unwrap()
+            .unwrap();
+        s.vault_changed();
+        s.select(ids[0], cx);
+        s.toggle_history(cx);
+    });
+    vcx.run_until_parked();
+    let entry = state.read_with(&vcx, |s, _| s.selected_item().unwrap().history[0].clone());
+    assert!(entry.field_id.is_some(), "core records the field");
+    assert!(
+        vcx.debug_bounds("history-entry 0 Password").is_some(),
+        "shows which field it belonged to"
+    );
+}
+
+#[gpui::test]
+fn same_name_fields_render_and_reveal_separately(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open_items(
+        dir.path(),
+        |device| {
+            let mut item = Item::new("Twins", device, 1);
+            let pin =
+                |v: &str| Field::new("pin", FieldKind::Password, SecretString::new(v.into()), 1);
+            item.fields = vec![pin("1111"), pin("2222")];
+            vec![item]
+        },
+        cx,
+    );
+    select(&state, ids[0], &mut vcx);
+    for key in [
+        "field-label-text 0 Pin",
+        "field-label-text 1 Pin",
+        "field-masked 0",
+        "field-masked 1",
+    ] {
+        assert!(vcx.debug_bounds(key).is_some(), "{key}");
+    }
+    // Reveal is keyed by field id: the twin stays masked.
+    let first = state.read_with(&vcx, |s, _| s.selected_item().unwrap().fields[0].id);
+    state.update(&mut vcx, |s, cx| s.toggle_reveal(first, cx));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("field-masked 0").is_none());
+    assert!(vcx.debug_bounds("field-masked 1").is_some());
 }

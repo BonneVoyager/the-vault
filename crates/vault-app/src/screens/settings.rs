@@ -336,7 +336,7 @@ impl SettingsView {
             ));
         };
         let settings = &s.settings;
-        let provider = cloud::provider_label(&path).unwrap_or("Local folder");
+        let provider = cloud::provider_label(&path).unwrap_or_else(|| "Local folder".to_owned());
         let saved = s
             .sync
             .last_saved

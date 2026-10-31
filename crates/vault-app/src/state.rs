@@ -348,8 +348,8 @@ pub struct AppState {
     pub counts: Counts,
     /// Bumped whenever `listing` is recomputed, so views know to reset their list state.
     pub listing_version: u64,
-    /// Field names of the selected item whose values are revealed.
-    pub revealed: HashSet<String>,
+    /// Field ids of the selected item whose values are revealed.
+    pub revealed: HashSet<Uuid>,
     /// Password history disclosure of the selected item.
     pub history_open: bool,
     /// Bumped on every sidebar toggle; keys its slide. Visibility itself is
@@ -787,6 +787,7 @@ impl AppState {
         };
         let stale = self.stale_enrollment();
         let bio = self.biometrics.clone();
+        let (device_id, hooks) = (self.device_id, cloud::hooks());
         self.run_bg(
             Busy::Unlocking,
             cx,
@@ -797,9 +798,15 @@ impl AppState {
                     Ok(()) => touch_id::clean_stale(&mut vault, &*bio, stale),
                     Err(_) => None,
                 };
-                (vault, result, cleaned)
+                // A version 1 file moves to the current format now: it needs the password
+                // (only a password unlock has it; a Touch ID unlock never upgrades).
+                let upgraded = match result {
+                    Ok(()) => upgrade_format(&mut vault, &password, &*bio, device_id, hooks),
+                    Err(_) => None,
+                };
+                (vault, result, cleaned, upgraded)
             },
-            |this, (mut vault, result, cleaned), outcome| match (outcome, result) {
+            |this, (mut vault, result, cleaned, upgraded), outcome| match (outcome, result) {
                 // The user switched or closed the vault meanwhile; dropping zeroizes it.
                 (Outcome::Closed, _) => this.report_lock(None, &vault.lock()),
                 (Outcome::Fresh, Ok(())) => {
@@ -807,6 +814,7 @@ impl AppState {
                     this.unlocked();
                     this.password_unlocked(true);
                     this.stale_cleaned(cleaned);
+                    this.format_upgraded(upgraded);
                     // The unlock merged the file on disk: our enclave slot may be gone.
                     if this.recheck_touch_slot() {
                         this.set_toast(Toast::window(touch_id::SLOT_GONE));
@@ -818,6 +826,7 @@ impl AppState {
                     this.vault = Some(vault);
                     this.password_unlocked(false);
                     this.stale_cleaned(cleaned);
+                    this.format_upgraded(upgraded);
                 }
                 (_, Err(e)) => {
                     this.vault = Some(vault);
@@ -1099,6 +1108,134 @@ pub fn attachments_fake() -> Arc<attachments::fake::FakeStore> {
     attachments::fake::FakeStore::new()
 }
 
+/// Shown once after a password unlock moved a version 1 file to the current format.
+pub const UPGRADED: &str = "Vault upgraded to format 2. Touch ID needs to be enabled again.";
+
+/// What the unlock thread's format upgrade did.
+enum Upgrade {
+    /// Upgraded and saved.
+    Done,
+    /// The save reported an error but the upgraded file is on disk: `vault` was re-read
+    /// from it (so the app re-subscribes) and the upgrade counts as done.
+    DoneReopened,
+    /// Not saved. The in-memory upgrade was discarded: `vault` was re-read and re-unlocked
+    /// from disk (`reopened`, so the app re-subscribes to it), or, when even that failed,
+    /// locked. Touch ID is untouched; the next password unlock retries.
+    Failed {
+        error: String,
+        /// `None`: re-opened from disk. `Some`: could not be, so the vault was locked.
+        locked: Option<LockOutcome>,
+    },
+}
+
+/// Runs on the unlock thread after a successful password unlock: when the file is older
+/// than [`vault_core::FORMAT_VERSION`], `upgrade_format` (01 §9: re-wraps the password
+/// slots, drops enclave slots), save, and this Mac's Touch ID Keychain item goes (it can
+/// no longer open anything). `None` when the file is current.
+///
+/// A failed save must not leave the upgrade in memory, where the next edit's save would
+/// write format 2 without the Keychain cleanup, the policy reset or the toast: the
+/// upgraded instance is dropped (dropping writes nothing) and the file is opened and
+/// unlocked again with the password still in hand.
+fn upgrade_format(
+    vault: &mut SyncedVault,
+    password: &SecretString,
+    bio: &dyn Biometrics,
+    device_id: Uuid,
+    hooks: Arc<dyn vault_sync::CloudHooks>,
+) -> Option<Upgrade> {
+    let v = vault.vault()?;
+    if v.header().format_version >= vault_core::FORMAT_VERSION {
+        return None;
+    }
+    let vault_id = v.vault_id();
+    let result = vault
+        .edit(|v| v.upgrade_format(password, crate::text::now_millis()))
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()))
+        .and_then(|()| vault.save().map_err(|e| e.to_string()));
+    let done = |bio: &dyn Biometrics| {
+        if let Err(e) = bio.unenroll(vault_id) {
+            eprintln!("vault: could not remove the Touch ID Keychain item: {e}");
+        }
+        Some(Upgrade::Done)
+    };
+    let error = match result {
+        Ok(()) => return done(bio),
+        Err(e) => e,
+    };
+    // A failed save does not say whether the file was replaced (a directory fsync can
+    // fail after the rename): the file on disk decides.
+    let reopened = SyncedVault::open(vault.path(), device_id, hooks)
+        .and_then(|mut fresh| fresh.unlock(password).map(|()| fresh));
+    match reopened {
+        Ok(fresh) => {
+            let landed = fresh
+                .vault()
+                .is_some_and(|v| v.header().format_version >= vault_core::FORMAT_VERSION);
+            *vault = fresh;
+            if landed {
+                // The upgrade is on disk after all: finish it (Keychain, policy, toast).
+                return done(bio).map(|_| Upgrade::DoneReopened);
+            }
+            Some(Upgrade::Failed {
+                error,
+                locked: None,
+            })
+        }
+        // Cannot get back to the file's state: lock, so nothing upgraded is saved by a
+        // later edit (the lock's unsaved snapshot goes to backups/, never the file).
+        Err(_) => Some(Upgrade::Failed {
+            error,
+            locked: Some(vault.lock()),
+        }),
+    }
+}
+
+impl AppState {
+    /// `vault` is a new instance (re-opened from disk): its events and watcher, not the
+    /// dropped one's.
+    fn resubscribe(&mut self) {
+        if let Some(vault) = self.vault.as_ref() {
+            self.sync_events = Some(vault.subscribe());
+            self.attach_vault();
+        }
+    }
+
+    /// The unlock thread's format upgrade finished: on success forget this Mac's Touch ID
+    /// setup (its slot is gone) and say so once; on failure only say so.
+    fn format_upgraded(&mut self, result: Option<Upgrade>) {
+        match result {
+            None => {}
+            Some(done @ (Upgrade::Done | Upgrade::DoneReopened)) => {
+                if matches!(done, Upgrade::DoneReopened) {
+                    self.resubscribe();
+                }
+                self.touch_rotated();
+                self.set_toast(Toast::window(UPGRADED));
+            }
+            Some(Upgrade::Failed { error, locked }) => {
+                match locked {
+                    None => self.resubscribe(),
+                    Some(outcome) => {
+                        // The session cannot go on: show it locked, like `lock` would.
+                        self.report_lock(None, &outcome);
+                        self.locked = true;
+                        self.unlocked_with_password_at = None;
+                        self.clear_session();
+                        if self.screen == Screen::Main {
+                            self.screen = Screen::Unlock;
+                        }
+                    }
+                }
+                self.set_toast(Toast::window(format!(
+                    "Could not upgrade the vault format: {error}"
+                )));
+            }
+        }
+    }
+}
+
 /// Shown when a chosen folder is not a vault package.
 pub const NOT_A_PACKAGE: &str =
     "Not a vault package. Choose a “.vault” package that contains vault.bin.";
@@ -1172,3 +1309,7 @@ impl AppState {
 #[cfg(test)]
 #[path = "state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "state/upgrade_tests.rs"]
+mod upgrade_tests;

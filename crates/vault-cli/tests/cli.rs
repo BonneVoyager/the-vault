@@ -672,3 +672,40 @@ fn terminal_control_characters_are_escaped() {
     assert!(al.contains("a\\u{1b}[2Jb.bin"), "{al}");
     assert!(!al.contains('\u{1b}'), "{al}");
 }
+
+#[test]
+fn upgrade_v1_fixture_then_noop() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../vault-core/tests/fixtures/v1-basic.vault");
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("old.vault");
+    std::fs::create_dir(&f).unwrap();
+    std::fs::copy(&fixture, f.join("vault.bin")).unwrap();
+
+    let before = vault(&f, PW, &["list"]);
+    assert!(before.status.success());
+    let hint = String::from_utf8_lossy(&before.stderr);
+    assert!(
+        hint.contains("Vault is format 1; run `vault upgrade`"),
+        "{hint}"
+    );
+
+    let up = ok(&vault(&f, PW, &["upgrade"]));
+    assert!(up.contains("upgraded to version 2"), "{up}");
+    assert!(up.contains("Touch ID"), "{up}");
+
+    let after = vault(&f, PW, &["list"]);
+    assert!(after.status.success());
+    assert!(
+        !String::from_utf8_lossy(&after.stderr).contains("run `vault upgrade`"),
+        "hint must disappear"
+    );
+    let bytes_before = std::fs::read(f.join("vault.bin")).unwrap();
+    let again = ok(&vault(&f, PW, &["upgrade"]));
+    assert_eq!(
+        std::fs::read(f.join("vault.bin")).unwrap(),
+        bytes_before,
+        "no-op upgrade must not rewrite the file"
+    );
+    assert!(again.contains("already at version 2"), "{again}");
+}

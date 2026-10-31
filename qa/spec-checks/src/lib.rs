@@ -192,7 +192,6 @@ pub mod indep {
     /// Opens a file with a password using only the spec. Panics with a message naming the
     /// spec step that failed.
     pub fn open_file(bytes: &[u8], password: &str) -> Opened {
-        use unicode_normalization_free as _;
         let raw = split(bytes);
         let h = &raw.header;
         let vault_id = bytes_of(get(h, "vault_id").unwrap());
@@ -240,25 +239,30 @@ pub mod indep {
         Opened { vault_key, item_key, manifest_key, vault_id, items, manifest }
     }
 }
-mod unicode_normalization_free {}
 
 // ---------------------------------------------------------------------------
 // Item snapshots for equality across devices (Item has no PartialEq by spec).
 // ---------------------------------------------------------------------------
 use secrecy::ExposeSecret;
 pub fn snap_item(i: &vault_core::Item) -> String {
+    // 2026-10-31: field identity is `id` (01 §4); the snapshot includes ids, removed_fields,
+    // created_at, icon and history field_id so equality covers the new merge state.
     let mut fields: Vec<String> = i
         .fields
         .iter()
-        .map(|f| format!("{}|{:?}|{:?}|{}|{}|{:?}", f.name, f.kind, f.kind_raw, f.value.expose_secret(), f.modified_at, f.section))
+        .map(|f| format!("{}|{}|{:?}|{:?}|{}|{}|{:?}", f.id, f.name, f.kind, f.kind_raw, f.value.expose_secret(), f.modified_at, f.section))
         .collect();
     fields.sort();
-    let hist: Vec<String> = i.history.iter().map(|h| format!("{}@{}", h.value.expose_secret(), h.replaced_at)).collect();
+    let order: Vec<String> = i.fields.iter().map(|f| f.id.to_string()).collect();
+    let hist: Vec<String> = i.history.iter().map(|h| format!("{}@{}#{:?}", h.value.expose_secret(), h.replaced_at, h.field_id)).collect();
+    let mut rf: Vec<String> = i.removed_fields.iter().map(|t| format!("{}@{}", t.id, t.removed_at)).collect();
+    rf.sort();
     let mut tags = i.tags.clone();
     tags.sort();
+    let icon = i.icon.as_ref().map(|c| format!("{}:{}:{:?}", c.kind, c.value, c.color));
     format!(
-        "{}|{}|{:?}|{}|{:?}|{:?}|{:?}|ma={}",
-        i.id, i.title, i.deleted_at, i.favorite, tags, fields, hist, i.modified_at
+        "{}|{}|{:?}|{}|{:?}|{:?}|{:?}|rf={:?}|ca={:?}|icon={:?}|ma={}|order={}",
+        i.id, i.title, i.deleted_at, i.favorite, tags, fields, hist, rf, i.created_at, icon, i.modified_at, order.len()
     )
 }
 pub fn snap_vault(v: &vault_core::UnlockedVault) -> Vec<String> {
@@ -407,4 +411,132 @@ pub mod dev {
         let b = std::fs::read(primary(pkg)).unwrap();
         vault_core::LockedVault::parse(&b).unwrap().unlock(&pw(PW)).unwrap()
     }
+}
+
+// ---------------------------------------------------------------------------
+// 2026-10-31 additions: hand-built files (independent writer), UUIDv5, fixtures.
+// ---------------------------------------------------------------------------
+pub fn fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/vault-core/tests/fixtures")
+}
+pub fn fixture(name: &str) -> Vec<u8> {
+    std::fs::read(fixtures_dir().join(name)).unwrap_or_else(|_| panic!("fixture {name} committed"))
+}
+/// Password of every committed fixture (01 §8).
+pub const FIXTURE_PW: &str = "correct horse battery staple";
+
+/// RFC 8949 §4.2.1 canonical form: map keys sorted by encoded bytes, recursively.
+pub fn canon(v: Value) -> Value {
+    match v {
+        Value::Map(e) => {
+            let mut e: Vec<(Value, Value)> = e.into_iter().map(|(k, v)| (canon(k), canon(v))).collect();
+            e.sort_by_key(|(k, _)| enc(k));
+            Value::Map(e)
+        }
+        Value::Array(a) => Value::Array(a.into_iter().map(canon).collect()),
+        o => o,
+    }
+}
+pub fn t(s: &str) -> Value {
+    Value::Text(s.into())
+}
+pub fn i(n: u64) -> Value {
+    Value::Integer(n.into())
+}
+pub fn map(e: Vec<(&str, Value)>) -> Value {
+    Value::Map(e.into_iter().map(|(k, v)| (t(k), v)).collect())
+}
+
+/// UUIDv5 (RFC 4122 §4.3) computed directly with SHA-1, independent of the `uuid` crate's v5.
+pub fn uuid5(ns: &[u8; 16], name: &[u8]) -> [u8; 16] {
+    use sha1::Digest;
+    let mut h = sha1::Sha1::new();
+    h.update(ns);
+    h.update(name);
+    let d = h.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&d[..16]);
+    b[6] = (b[6] & 0x0f) | 0x50;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    b
+}
+/// 01 §9: UUIDv5(namespace = item id, "field:" || name || ":" || ordinal).
+pub fn derived_field_id(item_id: &[u8; 16], name: &str, ordinal: usize) -> uuid::Uuid {
+    let mut n = b"field:".to_vec();
+    n.extend_from_slice(name.as_bytes());
+    n.push(b':');
+    n.extend_from_slice(ordinal.to_string().as_bytes());
+    uuid::Uuid::from_bytes(uuid5(item_id, &n))
+}
+
+/// A field map as 01 §4 describes it. `id: None` omits the key (version 1 shape).
+pub fn field_v(id: Option<[u8; 16]>, name: &str, kind: &str, value: &str, ma: u64) -> Value {
+    let mut e = vec![("name", t(name)), ("kind", t(kind)), ("value", t(value)), ("modified_at", i(ma)), ("section", Value::Null)];
+    if let Some(id) = id {
+        e.push(("id", Value::Bytes(id.to_vec())));
+    }
+    map(e)
+}
+/// A minimal ItemPlain map (01 §4).
+pub fn item_plain(title: &str, device: [u8; 16], fields: Vec<Value>) -> Value {
+    map(vec![
+        ("title", t(title)),
+        ("deleted_at", Value::Null),
+        ("device_id", Value::Bytes(device.to_vec())),
+        ("favorite", Value::Bool(false)),
+        ("tags", Value::Array(vec![])),
+        ("fields", Value::Array(fields)),
+        ("attachments", Value::Array(vec![])),
+        ("history", Value::Array(vec![])),
+    ])
+}
+
+/// Independent writer: seals items and the manifest with the spec AADs under `vault_key`, for the
+/// given header (kept byte-for-byte; the digest is recomputed from it when it is stamped).
+pub fn build_file(version: u16, header: &Value, vault_key: &[u8], items: &[([u8; 16], u64, Value)]) -> Vec<u8> {
+    use rand::RngCore;
+    let vault_id = bytes_of(get(header, "vault_id").unwrap());
+    let item_key = indep::hkdf(vault_key, &vault_id, "vault/item/v1");
+    let manifest_key = indep::hkdf(vault_key, &vault_id, "vault/manifest/v1");
+    let mut body = vec![];
+    let mut pairs: Vec<([u8; 16], u64)> = vec![];
+    for (id, ma, pt) in items {
+        let mut nonce = [0u8; 24];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let ct = indep::seal(&item_key, &nonce, &enc(&canon(pt.clone())), &indep::item_aad(&vault_id, id, *ma, version));
+        body.push(canon(map(vec![
+            ("t", t("item")),
+            ("id", Value::Bytes(id.to_vec())),
+            ("modified_at", i(*ma)),
+            ("nonce", Value::Bytes(nonce.to_vec())),
+            ("ct", Value::Bytes(ct)),
+        ])));
+        pairs.push((*id, *ma));
+    }
+    pairs.sort();
+    let man = Value::Array(pairs.iter().map(|(id, ma)| Value::Array(vec![Value::Bytes(id.to_vec()), i(*ma)])).collect());
+    let digest = indep::header_digest(header);
+    let mut nonce = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let ct = indep::seal(&manifest_key, &nonce, &enc(&man), &indep::manifest_aad(&vault_id, items.len() as u32, version, digest.as_deref()));
+    body.push(canon(map(vec![("t", t("manifest")), ("nonce", Value::Bytes(nonce.to_vec())), ("ct", Value::Bytes(ct))])));
+    join(version, header, &body)
+}
+
+/// Starting points for hand-built files: (version, header, vault_key) of an empty file.
+/// v1: the committed unstamped `v1-empty.vault`; v2: a fresh core-made vault (stamped).
+pub fn empty_base(version: u16) -> (u16, Value, Vec<u8>) {
+    let b = if version == 1 {
+        fixture("v1-empty.vault")
+    } else {
+        vault_core::UnlockedVault::create(&pw(FIXTURE_PW), vault_core::KdfParams::for_tests(), uuid::Uuid::new_v4()).serialize()
+    };
+    let raw = split(&b);
+    assert_eq!(raw.version, version);
+    let o = indep::open_file(&b, FIXTURE_PW);
+    (raw.version, raw.header, o.vault_key)
+}
+
+pub fn version_of(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes([bytes[4], bytes[5]])
 }

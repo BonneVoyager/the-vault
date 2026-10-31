@@ -374,6 +374,7 @@ fn convert(entry: &Entry, device_id: Uuid, now: Millis) -> Item {
                         .last_modification
                         .and_then(|time| u64::try_from(time.and_utc().timestamp_millis()).ok())
                         .unwrap_or(now),
+                    field_id: None,
                 })
             })
             .collect();

@@ -7,7 +7,9 @@ use ciborium::Value;
 use common::*;
 use vault_core::vault::HISTORY_CAP;
 use vault_core::vault::merge::item_eq;
-use vault_core::{ExposeSecret, HistoryEntry, UnlockedVault, Uuid, VaultError, format};
+use vault_core::{
+    ExposeSecret, FORMAT_VERSION, HistoryEntry, UnlockedVault, Uuid, VaultError, format,
+};
 
 /// A vault with one item whose password was changed `n` times at 2_001..=2_000+n, so history
 /// holds `n` entries stamped 2_001..=2_000+n (newest first) plus none from the sample.
@@ -15,7 +17,7 @@ fn vault_with_history(n: u64) -> (UnlockedVault, Uuid) {
     let mut v = new_vault();
     let id = v.insert(sample_item(1, 1_000), 1_000);
     for i in 1..=n {
-        v.set_field(id, "password", secret(format!("pw-{i}")), 2_000 + i)
+        v.set_field_named(id, "password", secret(format!("pw-{i}")), 2_000 + i)
             .unwrap();
     }
     (v, id)
@@ -98,6 +100,7 @@ fn remove_history_entry_records_stamp_and_restamps() {
         item.history.push(HistoryEntry {
             value: secret("twin"),
             replaced_at: 2_003,
+            field_id: None,
         });
     })
     .unwrap();
@@ -235,7 +238,7 @@ fn removed_history_cbor_shape_and_absent_when_empty() {
         edit(&mut entries);
         let mut buf = Vec::new();
         ciborium::into_writer(&Value::Map(entries), &mut buf).unwrap();
-        format::decode_item_plain(&buf, item.id, item.modified_at)
+        format::decode_item_plain(&buf, item.id, item.modified_at, FORMAT_VERSION)
     };
     let null = reencode(&|e| {
         for (k, val) in e.iter_mut() {
@@ -303,7 +306,8 @@ fn removed_entry_stays_removed_after_merge_both_ways() {
     // loses to A's at 2_010, but A removed stamp 2_002 so the loser never lands.
     let (mut a, mut b) = two_copies(&v);
     a.remove_history_entry(id, 2_002, 5_000).unwrap();
-    a.set_field(id, "password", secret("a-new"), 2_010).unwrap();
+    a.set_field_named(id, "password", secret("a-new"), 2_010)
+        .unwrap();
     b.update(id, 2_002, |item| {
         let f = item
             .fields
@@ -345,11 +349,13 @@ fn set_field_never_reuses_a_removed_stamp() {
     let (v, id) = vault_with_history(3);
     let (mut a, mut b) = two_copies(&v);
     a.remove_history_entry(id, 2_003, 5_000).unwrap();
-    b.set_field(id, "password", secret("b1"), 2_500).unwrap();
+    b.set_field_named(id, "password", secret("b1"), 2_500)
+        .unwrap();
     a.merge_from(&b).unwrap();
     b.merge_from(&a).unwrap();
     for (v, now) in [(&mut a, 100u64), (&mut b, 100)] {
-        v.set_field(id, "password", secret("again"), now).unwrap();
+        v.set_field_named(id, "password", secret("again"), now)
+            .unwrap();
         let item = v.get(id).unwrap();
         let newest = item.history[0].replaced_at;
         assert_eq!(newest, item.field("password").unwrap().modified_at);
@@ -378,7 +384,7 @@ fn set_field_never_reuses_a_removed_stamp() {
         v.get(id).unwrap().field("password").unwrap().modified_at,
         2_001
     );
-    v.set_field(id, "password", secret("x"), 100).unwrap();
+    v.set_field_named(id, "password", secret("x"), 100).unwrap();
     let item = v.get(id).unwrap();
     assert_eq!(item.history[0].replaced_at, 2_003, "2_002 skipped");
     assert_eq!(item.field("password").unwrap().modified_at, 2_003);

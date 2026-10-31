@@ -24,7 +24,7 @@ fn v01_same_size_forged_mtime_detected() {
         let pkg = d.path().join("ss.vault");
         let mut a = Dev::create(&pkg);
         let id = a.add_login("x", now_ms());
-        a.s.edit(|v| v.set_field(id, "username", pw("AAAA"), now_ms())).unwrap().unwrap();
+        a.s.edit(|v| v.set_field_named(id, "username", pw("AAAA"), now_ms())).unwrap().unwrap();
         a.s.save().unwrap();
         let mtime = std::fs::metadata(primary(&pkg)).unwrap().modified().unwrap();
         let size = std::fs::metadata(primary(&pkg)).unwrap().len();
@@ -32,7 +32,7 @@ fn v01_same_size_forged_mtime_detected() {
         std::thread::sleep(Duration::from_millis(700));
         // B writes a same-length value; the file length stays the same
         let mut b = Dev::open(&pkg);
-        b.s.edit(|v| v.set_field(id, "username", pw("BBBB"), now_ms() + 5)).unwrap().unwrap();
+        b.s.edit(|v| v.set_field_named(id, "username", pw("BBBB"), now_ms() + 5)).unwrap().unwrap();
         let bytes = b.v().serialize();
         drop(b);
         assert_eq!(bytes.len() as u64, size, "test setup: same size");
@@ -95,7 +95,7 @@ fn v02_cloud_hooks() {
     assert!(matches!(st, vault_sync::AttachmentState::NotDownloaded), "evicted blob -> NotDownloaded, got {st:?}");
     // primary download times out during save's pre-write merge -> no overwrite, CloudUnavailable
     let before = std::fs::read(primary(&pkg)).unwrap();
-    s.edit(|v| v.set_field(item, "username", pw("new"), now_ms())).unwrap().unwrap();
+    s.edit(|v| v.set_field_named(item, "username", pw("new"), now_ms())).unwrap().unwrap();
     let r = s.save();
     let mut evs = vec![];
     s.poll();

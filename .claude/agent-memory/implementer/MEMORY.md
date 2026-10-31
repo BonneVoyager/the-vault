@@ -1,4 +1,4 @@
-- [vault-sync structure](vault-sync-structure.md) — package layout, lock.rs, state model, rand pin, delete_backup, looks_rotated, scan fixes (FsOps, LockOutcome, read cap)
+- [vault-sync structure](vault-sync-structure.md) — package layout, lock.rs, state model, rand pin, delete_backup, looks_rotated, scan fixes (FsOps, LockOutcome, read cap); field-id test helpers (FI-4)
 - [objc2 patterns](objc2-patterns.md) — objc2 0.6/0.3.2 API shapes, observers, NSPasteboard, NSURL, Security/LAContext, SMAppService, CG capture, NSBitmapImageRep lazy decode, rqrr, NSColor accent
 - [vault-macos layout](vault-macos-layout.md) — modules incl. appearance.rs, biometric.rs, login_item.rs, qr.rs (screen + image file), panel.rs (choose_file), cfg split, no vault-sync dep, device_id fallback, entitlement need
 - [notify watcher](notify-watcher.md) — poll() design, single recursive parent watch + NoCache (stream-restart cost), FSEvents quirks, tests

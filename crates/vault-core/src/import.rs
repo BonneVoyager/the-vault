@@ -417,6 +417,9 @@ fn convert_1pux_item(src: &serde_json::Value, device_id: Uuid, now: Millis) -> I
         .map(|(replaced_at, v)| HistoryEntry {
             value: SecretString::new(v.as_str().to_owned()),
             replaced_at,
+            // Imported history is not tied to a field id (lead decision: importers only
+            // gain ids through `Field::new`, nothing else changes).
+            field_id: None,
         })
         .collect();
     item

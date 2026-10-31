@@ -34,8 +34,9 @@ pub enum CopyTarget {
     Username,
     Password,
     Totp,
-    /// `item.fields[i]`; a TOTP field copies its current code.
-    Field(usize),
+    /// The field with this id (01 §4: names are not unique); a TOTP field copies its
+    /// current code, a section copies nothing.
+    Field(Uuid),
     /// `item.history[i]`.
     History(usize),
 }
@@ -253,8 +254,8 @@ impl AppState {
                 first_of(item, FieldKind::Totp).and_then(totp_code),
                 "one-time code",
             ),
-            CopyTarget::Field(i) => (
-                item.fields.get(i).and_then(|f| match f.kind {
+            CopyTarget::Field(field) => (
+                item.field_by_id(field).and_then(|f| match f.kind {
                     FieldKind::Totp => totp_code(f),
                     // A heading has nothing to copy.
                     FieldKind::Section => None,
@@ -325,10 +326,10 @@ impl AppState {
         }
     }
 
-    /// Reveal toggle for one field (password, card number).
-    pub fn toggle_reveal(&mut self, name: &str, cx: &mut Context<Self>) {
-        if !self.revealed.remove(name) {
-            self.revealed.insert(name.to_owned());
+    /// Reveal toggle for one field (password, card number), by field id.
+    pub fn toggle_reveal(&mut self, field: Uuid, cx: &mut Context<Self>) {
+        if !self.revealed.remove(&field) {
+            self.revealed.insert(field);
         }
         cx.notify();
     }
@@ -338,12 +339,12 @@ impl AppState {
         if !self.main_active() {
             return;
         }
-        let name = self
+        let field = self
             .selected_item()
             .and_then(|item| first_of(item, FieldKind::Password))
-            .map(|f| f.name.clone());
-        if let Some(name) = name {
-            self.toggle_reveal(&name, cx);
+            .map(|f| f.id);
+        if let Some(field) = field {
+            self.toggle_reveal(field, cx);
         }
     }
 
@@ -467,7 +468,8 @@ mod tests {
                 .unwrap()
         });
         let expected = parse_totp(&SecretString::new(TOTP_URI.into())).unwrap();
-        for target in [CopyTarget::Totp, CopyTarget::Field(totp_ix)] {
+        let totp_id = state.read_with(cx, |s, _| s.selected_item().unwrap().fields[totp_ix].id);
+        for target in [CopyTarget::Totp, CopyTarget::Field(totp_id)] {
             board.set("");
             state.update(cx, |s, cx| s.copy(target, cx));
             let copied = board.contents().unwrap();
@@ -491,7 +493,8 @@ mod tests {
             s.select(gh, cx);
             s.toggle_reveal_password(cx);
             s.toggle_history(cx);
-            assert!(s.revealed.contains("password"));
+            let pw = s.selected_item().unwrap().field("password").unwrap().id;
+            assert!(s.revealed.contains(&pw));
             assert!(s.history_open);
             s.select(note, cx);
             assert!(s.revealed.is_empty(), "selection change hides secrets");
@@ -499,7 +502,8 @@ mod tests {
 
             s.select(gh, cx);
             s.toggle_reveal_password(cx);
-            assert!(s.revealed.contains("password"));
+            let pw = s.selected_item().unwrap().field("password").unwrap().id;
+            assert!(s.revealed.contains(&pw));
             s.lock(cx);
             assert!(s.revealed.is_empty(), "lock hides secrets");
         });

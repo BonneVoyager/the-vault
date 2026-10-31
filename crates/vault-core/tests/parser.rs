@@ -35,12 +35,12 @@ fn bad_magic() {
 fn unsupported_version() {
     let mut b = good();
     b[4] = 0;
-    b[5] = 2;
-    assert_eq!(parse(&b).unwrap_err(), VaultError::UnsupportedVersion(2));
+    b[5] = 3;
+    assert_eq!(parse(&b).unwrap_err(), VaultError::UnsupportedVersion(3));
     b[4] = 0xFF;
     assert_eq!(
         parse(&b).unwrap_err(),
-        VaultError::UnsupportedVersion(0xFF02)
+        VaultError::UnsupportedVersion(0xFF03)
     );
     // Version 0 never existed; the AADs bind the prefix version so it must be rejected early.
     b[4] = 0;

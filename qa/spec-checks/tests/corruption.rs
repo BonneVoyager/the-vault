@@ -185,3 +185,87 @@ fn c04_noncanonical_header_tolerated_or_rejected() {
     let r = try_open(f);
     assert!(!matches!(r, Err(_)), "panic");
 }
+
+// ---------------------------------------------------------------------------------------------
+// 2026-10-31 additions: new fixtures and hostile shapes of the version 2 keys.
+// ---------------------------------------------------------------------------------------------
+
+/// Every cut offset and 600 seeded bit flips on v2-basic and v1-meta (01 §9 fixtures): never Ok
+/// with different contents, never a panic.
+#[test]
+fn c10_sweeps_on_new_fixtures() {
+    use rand::{Rng, SeedableRng};
+    let mut bad = vec![];
+    for name in ["v2-basic.vault", "v1-meta.vault", "v1-icon.vault"] {
+        let b = fixture(name);
+        let open = |m: Vec<u8>| std::panic::catch_unwind(move || LockedVault::parse(&m).and_then(|l| l.unlock(&pw(FIXTURE_PW))).map(|u| snap_vault(&u)).map_err(|_| ())).map_err(|_| ());
+        let orig = open(b.clone()).unwrap().unwrap();
+        for cut in 0..b.len() {
+            match open(b[..cut].to_vec()) {
+                Err(()) => bad.push(format!("{name} cut {cut}: PANIC")),
+                Ok(Ok(_)) => bad.push(format!("{name} cut {cut}: accepted")),
+                Ok(Err(())) => {}
+            }
+        }
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
+        for _ in 0..600 {
+            let mut m = b.clone();
+            let pos = rng.gen_range(0..m.len());
+            m[pos] ^= 1 << rng.gen_range(0..8);
+            match open(m) {
+                Err(()) => bad.push(format!("{name} flip at {pos}: PANIC")),
+                Ok(Ok(s)) if s != orig => bad.push(format!("{name} flip at {pos}: accepted with different contents")),
+                _ => {}
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Hostile authenticated payloads (a device holding the key, or a buggy peer): removed_fields,
+/// history field_id and icon with wrong types or huge sizes must be refused or bounded, never a
+/// panic or a hang. (Only the key holder can produce these; checked for robustness.)
+#[test]
+fn c11_hostile_v2_item_payloads() {
+    let (ver, h, key) = empty_base(2);
+    let fid = *Uuid::new_v4().as_bytes();
+    let base = || item_plain("x", [1; 16], vec![field_v(Some(fid), "a", "text", "v", 10)]);
+    let many: Vec<Value> = (0..200_000u64).map(|k| map(vec![("id", Value::Bytes(Uuid::new_v4().as_bytes().to_vec())), ("removed_at", i(k))])).collect();
+    let cases: Vec<(&str, &str, Value)> = vec![
+        ("removed_fields text", "removed_fields", t("x")),
+        ("removed_fields entry without id", "removed_fields", Value::Array(vec![map(vec![("removed_at", i(1))])])),
+        ("removed_fields id 3 bytes", "removed_fields", Value::Array(vec![map(vec![("id", Value::Bytes(vec![1, 2, 3])), ("removed_at", i(1))])])),
+        ("removed_fields removed_at text", "removed_fields", Value::Array(vec![map(vec![("id", Value::Bytes(vec![1; 16])), ("removed_at", t("1"))])])),
+        ("removed_fields 200k entries", "removed_fields", Value::Array(many)),
+        ("history field_id text", "history", Value::Array(vec![map(vec![("value", t("old")), ("replaced_at", i(5)), ("field_id", t("nope"))])])),
+        ("history field_id 15 bytes", "history", Value::Array(vec![map(vec![("value", t("old")), ("replaced_at", i(5)), ("field_id", Value::Bytes(vec![0; 15]))])])),
+        ("marker for a present field, later stamp", "removed_fields", Value::Array(vec![map(vec![("id", Value::Bytes(fid.to_vec())), ("removed_at", i(99))])])),
+    ];
+    let mut report = vec![];
+    for (name, k, val) in cases {
+        let mut pt = base();
+        set(&mut pt, k, val);
+        let id = *Uuid::new_v4().as_bytes();
+        let f = build_file(ver, &h, &key, &[(id, 100, pt)]);
+        let t0 = std::time::Instant::now();
+        let r = with_timeout(30, move || {
+            std::panic::catch_unwind(|| {
+                LockedVault::parse(&f).and_then(|l| l.unlock(&pw(FIXTURE_PW))).map(|u| {
+                    let it = u.get(Uuid::from_bytes(id)).unwrap();
+                    (it.removed_fields.len(), it.fields.len(), u.serialize().len())
+                })
+            })
+            .map_err(|_| ())
+        });
+        let el = t0.elapsed();
+        match r {
+            None => report.push(format!("HANG {name}")),
+            Some(Err(())) => report.push(format!("PANIC {name}")),
+            Some(Ok(res)) => eprintln!("INFO {name}: {:?} in {el:?}", res.map_err(|e| format!("{e:?}").chars().take(80).collect::<String>())),
+        }
+        if el.as_secs() > 10 {
+            report.push(format!("SLOW {name}: {el:?}"));
+        }
+    }
+    assert!(report.is_empty(), "{}", report.join("\n"));
+}

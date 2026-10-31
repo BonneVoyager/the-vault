@@ -28,7 +28,9 @@ secrecy = "^0.8.0"
 # Canonical CBOR encoding/decoding (01 §1-§4).
 ciborium = "^0.2.2"
 serde = { version = "^1.0.210", features = ["derive"] }
-uuid = { version = "^1.10.0", features = ["v4", "serde"] }
+# `v5` for the deterministic field-id migration of v1 files (01 §9); pulls only `sha1_smol`,
+# which is already in the lockfile.
+uuid = { version = "^1.10.0", features = ["v4", "v5", "serde"] }
 # Password NFC normalisation before Argon2 (01 §2).
 unicode-normalization = "^0.1.24"
 thiserror = "^2.0.3"

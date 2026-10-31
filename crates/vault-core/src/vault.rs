@@ -26,7 +26,7 @@
 //! tell which device's slot set is newer. `create` stamps too (01 §2), so only files written
 //! before v1.1 lack the stamp; the key is only ever written once it is set.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use secrecy::{SecretString, SecretVec};
@@ -40,7 +40,8 @@ use crate::format::{
     item_aad, manifest_aad, slot_aad,
 };
 use crate::item::{
-    AttachmentRef, AttachmentTombstone, Extras, FieldKind, HistoryEntry, Item, Millis,
+    AttachmentRef, AttachmentTombstone, Extras, FieldKind, FieldTombstone, HistoryEntry, Item,
+    Millis,
 };
 use crate::kdf::KdfParams;
 
@@ -51,6 +52,11 @@ pub use merge::MergeReport;
 pub const HISTORY_CAP: usize = 10;
 /// Maximum number of attachment removal markers kept per item (newest first).
 pub const ATTACHMENT_TOMBSTONE_CAP: usize = 64;
+/// Target number of field removal markers (`removed_fields`, 01 §4) per item, newest first.
+/// Applied only inside the merge, and only over markers whose field is absent on both input
+/// sides (so the peer just merged cannot bring the field back); local removals never
+/// truncate the list, which may therefore exceed this until a merge has seen both sides.
+pub const FIELD_TOMBSTONE_CAP: usize = 64;
 
 /// The error for a mutation naming an id that is not in the vault. 01 §7 has no dedicated
 /// variant for this, so it reuses `Malformed` (interpretation; see package P4a notes). The
@@ -133,12 +139,6 @@ fn verify_password_slots(
     let kek = crypto::derive_kek(password, &header.kdf)?;
     let vault_key = unwrap_any_password_slot(header, &kek).ok_or(VaultError::WrongPassword)?;
     Ok((kek, vault_key))
-}
-
-/// The error for `set_field` naming a field the item does not have. Field names are not
-/// secrets (they are keys such as `"username"`), so the name is included.
-fn unknown_field(id: Uuid, name: &str) -> VaultError {
-    VaultError::Malformed(format!("unknown field {name:?} on item {id}"))
 }
 
 /// A parsed vault: header and raw records, no key material.
@@ -297,7 +297,7 @@ impl LockedVault {
                 TamperKind::Item(rec.id),
             );
             let plain = crypto::open(&keys.item_key, &rec.nonce, &aad, &rec.ct).ok_or(on_fail)?;
-            let item = format::decode_item_plain(&plain, rec.id, rec.modified_at)?;
+            let item = format::decode_item_plain(&plain, rec.id, rec.modified_at, version)?;
             pairs.push((rec.id, rec.modified_at));
             items.insert(rec.id, item);
             if !rec.extras.is_empty() {
@@ -509,17 +509,19 @@ impl UnlockedVault {
     /// drops the old record's unknown plaintext extras, since the new body is not the record
     /// they came with.
     ///
-    /// Field names are expected to be unique within an item (01 §4) but this is not enforced:
-    /// duplicates are tolerated and written as-is; `Item::field`, `set_field`, `update`'s
-    /// diffing and the merge all use the first field with a given name.
+    /// Field names need not be unique within an item and may be empty; fields are identified
+    /// by [`crate::Field::id`], which **must** be unique within the item (the parser rejects
+    /// duplicates). A field whose id has a removal marker on the item is treated as re-added:
+    /// it is stamped past the marker and the marker is dropped (see
+    /// [`UnlockedVault::update`]).
     ///
     /// # Panics
     ///
     /// If `item.attachments` holds a reference that fails
     /// [`crate::attachment::validate_ref`] (size over the cap or a nonce count that does not
-    /// match the size). Such a reference can never match a blob, and writing it would make
-    /// the vault fail to parse on the next unlock. References from
-    /// [`crate::attachment::new_ref`] or a parsed vault always pass; use
+    /// match the size), or if two fields share an id. Either would make the vault fail to
+    /// parse on the next unlock. References from [`crate::attachment::new_ref`], fields from
+    /// [`crate::Field::new`] and parsed vaults always pass; use
     /// [`UnlockedVault::try_insert`] to get the error instead.
     pub fn insert(&mut self, item: Item, now: Millis) -> Uuid {
         match self.try_insert(item, now) {
@@ -528,12 +530,15 @@ impl UnlockedVault {
         }
     }
 
-    /// [`UnlockedVault::insert`] that reports an invalid attachment reference as
-    /// `Malformed` instead of panicking. Nothing is inserted on error.
+    /// [`UnlockedVault::insert`] that reports an invalid attachment reference or a duplicate
+    /// field id as `Malformed` instead of panicking. Nothing is inserted on error.
     pub fn try_insert(&mut self, mut item: Item, now: Millis) -> Result<Uuid, VaultError> {
         check_attachment_refs(&item)?;
+        check_field_ids(&item)?;
         merge::normalize_attachment_tombstones(&mut item.removed_attachments);
         merge::normalize_removed_history(&mut item.removed_history);
+        reconcile_field_tombstones(&mut item, now);
+        merge::normalize_field_tombstones(&mut item.removed_fields);
         let id = item.id;
         let mut floor = now;
         if let Some(existing) = self.items.get(&id) {
@@ -545,14 +550,25 @@ impl UnlockedVault {
         Ok(id)
     }
 
-    /// Edit an item in place through `f`, then restamp it (02 "update"):
+    /// Edit an item in place through `f`, then restamp it (02 "update"). Fields are diffed
+    /// **by id** against the pre-call copy:
     ///
-    /// - A field (matched by `name` against the pre-call copy) whose `value`, `kind` or
-    ///   `section` changed while `f` left its `modified_at` untouched is bumped to
-    ///   `stamp(now, previous field modified_at)`. A field whose name is not in the pre-call
-    ///   copy counts as new: it gets `stamp(carried if non-zero else now, previous item
-    ///   modified_at)`.
-    /// - `item.modified_at = max(stamp(now, previous), all field.modified_at, deleted_at)`.
+    /// - A field whose `name`, `kind`, `value`, `section` (or extras) changed while `f` left
+    ///   its `modified_at` untouched is bumped to `stamp(now, previous field modified_at)`.
+    ///   A rename is therefore an edit of the same field, not a delete plus an add.
+    /// - A field whose id is not in the pre-call copy counts as new: it gets
+    ///   `stamp(carried if non-zero else now, previous item modified_at)`.
+    /// - A field id that is in the pre-call copy but not after `f` was removed: the item
+    ///   gets a [`FieldTombstone`] for it (01 §4 `removed_fields`) stamped at the item's new
+    ///   floor, lifted to the removed field's own `modified_at` if that was ahead, so a merge
+    ///   with a peer that still holds the field drops it (03 §5) instead of bringing it back.
+    ///   Prefer [`UnlockedVault::remove_field`] for a single removal.
+    /// - A field present after `f` whose id has a removal marker (re-added by id, e.g. an
+    ///   undo) wins: it is stamped `stamp(now, marker.removed_at)` if it was not already past
+    ///   the marker, and the marker is dropped. Only a strictly newer stamp makes the field
+    ///   survive on every peer.
+    /// - `item.modified_at = max(stamp(now, previous), all field.modified_at, deleted_at,
+    ///   new markers)`.
     ///
     /// where `stamp(now, prev) = max(now, prev + 1)` (see [`stamp`]). The spec formula is
     /// `max(fields, deleted_at, now)`; the strictly-advancing floor is added so a mutation
@@ -560,16 +576,16 @@ impl UnlockedVault {
     /// from in a merge, instead of tying on `(modified_at, device_id)` and losing.
     /// - `item.device_id = self.device_id`.
     ///
-    /// `f` may change `id`; the change is ignored (the item stays under `id`). Duplicate
-    /// field names are tolerated, not deduplicated; the diff matches each post-call field
-    /// against the *first* pre-call field with the same name.
+    /// `f` may change `id`; the change is ignored (the item stays under `id`). Changing a
+    /// *field's* id is a removal of the old id plus a new field. Duplicate field names are
+    /// fine; duplicate field ids are an error.
     ///
     /// # Errors
     ///
     /// `Malformed("unknown item ..")` if `id` is not in the vault (the error enum has no
     /// dedicated variant yet). `Malformed("attachment ..")` if `f` left an attachment
-    /// reference that fails [`crate::attachment::validate_ref`]; the item is then restored
-    /// to its pre-call state.
+    /// reference that fails [`crate::attachment::validate_ref`], `Malformed("duplicate field
+    /// id ..")` if two fields share an id; the item is then restored to its pre-call state.
     pub fn update<F: FnOnce(&mut Item)>(
         &mut self,
         id: Uuid,
@@ -581,14 +597,14 @@ impl UnlockedVault {
         let before = item.clone();
         f(item);
         item.id = id;
-        if let Err(e) = check_attachment_refs(item) {
+        if let Err(e) = check_attachment_refs(item).and_then(|()| check_field_ids(item)) {
             *item = before;
             return Err(e);
         }
         merge::normalize_attachment_tombstones(&mut item.removed_attachments);
         merge::normalize_removed_history(&mut item.removed_history);
         for field in &mut item.fields {
-            match before.fields.iter().find(|b| b.name == field.name) {
+            match before.field_by_id(field.id) {
                 Some(prev) => {
                     if field.modified_at == prev.modified_at
                         && !merge::field_content_eq(field, prev)
@@ -606,31 +622,44 @@ impl UnlockedVault {
                 }
             }
         }
-        restamp(item, stamp(now, before.modified_at), device_id);
+        let mut floor = stamp(now, before.modified_at);
+        for prev in &before.fields {
+            if item.field_by_id(prev.id).is_none() {
+                let removed_at = floor.max(prev.modified_at);
+                floor = removed_at;
+                item.removed_fields.push(FieldTombstone {
+                    id: prev.id,
+                    removed_at,
+                });
+            }
+        }
+        reconcile_field_tombstones(item, now);
+        merge::normalize_field_tombstones(&mut item.removed_fields);
+        restamp(item, floor, device_id);
         Ok(())
     }
 
-    /// Replace the value of an existing field and stamp it `stamp(now, field.modified_at)`
-    /// (strictly advancing, see [`stamp`]). For a [`FieldKind::Password`] field the previous value is
-    /// pushed onto `history` as `(value, replaced_at = that stamp)`; history is kept
-    /// newest-first and capped at [`HISTORY_CAP`]. Every other kind, including a
-    /// [`FieldKind::Section`] heading (allowed, though its value is ignored), writes nothing
-    /// to history. If that stamp is in the item's
-    /// `removed_history` (a deleted entry's stamp, 03 §5) the stamp is advanced past it so
-    /// the new entry is not dropped by the next merge; under the monotone stamp rule this
-    /// never triggers (every removed stamp is an earlier password stamp of this item and
-    /// the field already sits at or past it), it only guards a field whose timestamp was
-    /// moved back by hand through `update`. The item is restamped as in
-    /// [`UnlockedVault::update`].
+    /// Replace the value of the field with id `field_id` and stamp it `stamp(now,
+    /// field.modified_at)` (strictly advancing, see [`stamp`]). For a [`FieldKind::Password`]
+    /// field the previous value is pushed onto `history` as `(value, replaced_at = that
+    /// stamp, field_id)`; history is kept newest-first and capped at [`HISTORY_CAP`]. Every
+    /// other kind, including a [`FieldKind::Section`] heading (allowed, though its value is
+    /// ignored), writes nothing to history. If that stamp is in the item's `removed_history`
+    /// (a deleted entry's stamp, 03 §5) the stamp is advanced past it so the new entry is
+    /// not dropped by the next merge; under the monotone stamp rule this never triggers
+    /// (every removed stamp is an earlier password stamp of this item and the field already
+    /// sits at or past it), it only guards a field whose timestamp was moved back by hand
+    /// through `update`. The item is restamped as in [`UnlockedVault::update`].
     ///
     /// # Errors
     ///
-    /// `Malformed("unknown item ..")` / `Malformed("unknown field ..")`; a missing field is not
-    /// created (interpretation: callers add fields through `update`).
+    /// `Malformed("unknown item ..")` if `id` is not in the vault; [`VaultError::FieldNotFound`]
+    /// if the item has no field with `field_id`. A missing field is not created
+    /// (interpretation: callers add fields through `update`).
     pub fn set_field(
         &mut self,
         id: Uuid,
-        name: &str,
+        field_id: Uuid,
         value: SecretString,
         now: Millis,
     ) -> Result<(), VaultError> {
@@ -640,8 +669,8 @@ impl UnlockedVault {
         let field = item
             .fields
             .iter_mut()
-            .find(|f| f.name == name)
-            .ok_or_else(|| unknown_field(id, name))?;
+            .find(|f| f.id == field_id)
+            .ok_or(VaultError::FieldNotFound)?;
         let previous = std::mem::replace(&mut field.value, value);
         let mut at = stamp(now, field.modified_at);
         if field.kind == FieldKind::Password {
@@ -654,10 +683,83 @@ impl UnlockedVault {
             item.history.push(HistoryEntry {
                 value: previous,
                 replaced_at: at,
+                field_id: Some(field_id),
             });
             merge::normalize_history(&mut item.history);
         }
         restamp(item, item_floor, device_id);
+        Ok(())
+    }
+
+    /// [`UnlockedVault::set_field`] addressed by label: the one non-section field whose
+    /// `name` equals `name` ASCII case-insensitively (the same rule as [`Item::field`]). A
+    /// convenience for importers, the CLI and tests; the app should address fields by id.
+    ///
+    /// # Errors
+    ///
+    /// `Malformed("unknown item ..")`; [`VaultError::FieldNotFound`] if no non-section field
+    /// has that name (an empty `name` matches nothing); [`VaultError::AmbiguousField`] if
+    /// more than one does, since names are not unique. Nothing is changed on error.
+    pub fn set_field_named(
+        &mut self,
+        id: Uuid,
+        name: &str,
+        value: SecretString,
+        now: Millis,
+    ) -> Result<(), VaultError> {
+        let field_id = self.resolve_field_name(id, name)?;
+        self.set_field(id, field_id, value, now)
+    }
+
+    /// The id of the single non-section field of item `id` named `name` (ASCII
+    /// case-insensitive, empty never matches).
+    fn resolve_field_name(&self, id: Uuid, name: &str) -> Result<Uuid, VaultError> {
+        let item = self.items.get(&id).ok_or_else(|| unknown_item(id))?;
+        let mut matches = item.fields.iter().filter(|f| {
+            f.kind != FieldKind::Section && !name.is_empty() && f.name.eq_ignore_ascii_case(name)
+        });
+        let first = matches.next().ok_or(VaultError::FieldNotFound)?;
+        if matches.next().is_some() {
+            return Err(VaultError::AmbiguousField);
+        }
+        Ok(first.id)
+    }
+
+    /// Remove the field with id `field_id` from item `id`, leave a [`FieldTombstone`] with
+    /// `removed_at` = the item's new stamp (lifted to the removed field's own `modified_at`
+    /// if that was ahead, so the marker always covers it), and restamp the item like every
+    /// other mutation. The marker is what keeps the removal across a merge: a peer that
+    /// still carries the field drops it because `removed_at >= field.modified_at` (03 §5),
+    /// while a peer that edited the field strictly later keeps it and drops the marker.
+    /// Markers are kept newest first, one per id, capped at [`FIELD_TOMBSTONE_CAP`] only by a
+    /// merge that finds the field absent on both sides (never by a local removal), and
+    /// purged by [`UnlockedVault::purge_tombstones_older_than`]. History entries that
+    /// mention the field are left alone.
+    ///
+    /// # Errors
+    ///
+    /// `Malformed("unknown item ..")`; [`VaultError::FieldNotFound`].
+    pub fn remove_field(
+        &mut self,
+        id: Uuid,
+        field_id: Uuid,
+        now: Millis,
+    ) -> Result<(), VaultError> {
+        let device_id = self.device_id;
+        let item = self.items.get_mut(&id).ok_or_else(|| unknown_item(id))?;
+        let idx = item
+            .fields
+            .iter()
+            .position(|f| f.id == field_id)
+            .ok_or(VaultError::FieldNotFound)?;
+        let removed = item.fields.remove(idx);
+        let floor = stamp(now, item.modified_at).max(removed.modified_at);
+        item.removed_fields.push(FieldTombstone {
+            id: field_id,
+            removed_at: floor,
+        });
+        merge::normalize_field_tombstones(&mut item.removed_fields);
+        restamp(item, floor, device_id);
         Ok(())
     }
 
@@ -836,11 +938,12 @@ impl UnlockedVault {
     }
 
     /// Drop every item tombstone with `deleted_at < cutoff` (strictly older) and, on every
-    /// remaining item, every attachment removal marker with `removed_at < cutoff` and every
-    /// `removed_history` stamp `< cutoff`. Returns how many *items* were removed. Live items
-    /// are otherwise never touched (dropping a marker does not restamp the item: it changes
-    /// nothing a peer could observe except that a stale copy of the reference or history
-    /// entry could come back, which is the same trade-off as for item tombstones).
+    /// remaining item, every attachment or field removal marker with `removed_at < cutoff`
+    /// and every `removed_history` stamp `< cutoff`. Returns how many *items* were removed.
+    /// Live items are otherwise never touched (dropping a marker does not restamp the item:
+    /// it changes nothing a peer could observe except that a stale copy of the reference,
+    /// field or history entry could come back, which is the same trade-off as for item
+    /// tombstones).
     ///
     /// **Choose `cutoff` conservatively.** A tombstone is the only thing that stops a peer's
     /// stale *live* copy from coming back: once it is purged, a merge from a device that has
@@ -857,8 +960,57 @@ impl UnlockedVault {
         for item in self.items.values_mut() {
             item.removed_attachments.retain(|t| t.removed_at >= cutoff);
             item.removed_history.retain(|s| *s >= cutoff);
+            item.removed_fields.retain(|t| t.removed_at >= cutoff);
         }
         before - self.items.len()
+    }
+
+    /// Move a vault read from an older-format file up to [`FORMAT_VERSION`] (01 §9). A save
+    /// never changes the prefix version on its own: the version is bound into every slot
+    /// AAD (01 §2), so relabelling the file means re-wrapping every slot, and the core holds
+    /// a KEK only for the credential it was given. This verifies `password`, re-wraps the
+    /// `vault_key` (unchanged) into every `password` slot under the new version's AAD with
+    /// fresh nonces, sets `header.format_version`, and stamps the header (03 §5) so the
+    /// upgraded slot set wins the header merge. Items and the manifest are sealed under the
+    /// new version's AADs on the next `serialize`.
+    ///
+    /// **`enclave`, `recovery` and opaque slots are dropped**, exactly as by
+    /// [`UnlockedVault::rotate_vault_key`] and for the same reason: their KEKs are not
+    /// derivable from the password, so they cannot be re-wrapped here, and under the new
+    /// AAD they would silently fail. Re-enroll Touch ID afterwards. Call this only when
+    /// `header().format_version < FORMAT_VERSION`; otherwise it is a no-op that does not
+    /// even run the KDF.
+    ///
+    /// Payload-wise there is nothing to migrate: the reader already derived stable field ids
+    /// for a version 1 file and the writer emits them under either version. An older build
+    /// refuses the upgraded file with `UnsupportedVersion`.
+    ///
+    /// # Errors
+    ///
+    /// `WrongPassword` if `password` unwraps no password slot; `NoUsableSlot` if there is
+    /// none. The vault is then unchanged.
+    pub fn upgrade_format(
+        &mut self,
+        password: &SecretString,
+        now: Millis,
+    ) -> Result<(), VaultError> {
+        if self.header.format_version >= FORMAT_VERSION {
+            return Ok(());
+        }
+        let kek = self.verify_password(password)?;
+        let vault_id = self.header.vault_id;
+        self.header
+            .slots
+            .retain(|s| s.is_key_of(SlotKind::Password));
+        for slot in self.header.slots.iter_mut().filter_map(Slot::as_key_mut) {
+            let nonce = crypto::random_nonce();
+            let aad = slot_aad(FORMAT_VERSION, vault_id, slot.id, &slot.kind);
+            slot.wrapped_key = crypto::wrap_key(&kek, &nonce, &aad, &self.keys.vault_key);
+            slot.nonce = nonce;
+        }
+        self.header.format_version = FORMAT_VERSION;
+        self.bump_slots_stamp(now);
+        Ok(())
     }
 
     /// Plaintext `(id, kind)` of every key slot, in header order, opaque slots included (as
@@ -1142,6 +1294,42 @@ fn check_attachment_refs(item: &Item) -> Result<(), VaultError> {
         }
     }
     Ok(())
+}
+
+/// Every field id on `item` must be unique: the parser rejects duplicates (every operation
+/// addresses fields by id), so writing them now would brick the vault on the next unlock.
+fn check_field_ids(item: &Item) -> Result<(), VaultError> {
+    let mut seen = BTreeSet::new();
+    if let Some(dup) = item
+        .fields
+        .iter()
+        .map(|f| f.id)
+        .find(|id| !seen.insert(*id))
+    {
+        return Err(VaultError::Malformed(format!(
+            "duplicate field id {dup} on item {}",
+            item.id
+        )));
+    }
+    Ok(())
+}
+
+/// A live field whose id has a removal marker on the same item was re-added by id (an undo,
+/// or an `insert` of a caller-built item). The field wins locally, but only a stamp strictly
+/// past the marker makes it win on every peer too (the merge drops a field with
+/// `removed_at >= modified_at`), so such a field is lifted to `stamp(now, removed_at)` when
+/// it is not already past the marker, and the marker is dropped. The caller restamps the
+/// item afterwards, which picks the lifted field stamp up.
+fn reconcile_field_tombstones(item: &mut Item, now: Millis) {
+    for field in &mut item.fields {
+        if let Some(t) = item.removed_fields.iter().find(|t| t.id == field.id)
+            && field.modified_at <= t.removed_at
+        {
+            field.modified_at = stamp(now, t.removed_at);
+        }
+    }
+    let live: BTreeSet<Uuid> = item.fields.iter().map(|f| f.id).collect();
+    item.removed_fields.retain(|t| !live.contains(&t.id));
 }
 
 /// The timestamp a local mutation gets: `max(now, previous + 1)`. Every mutation therefore

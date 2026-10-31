@@ -34,7 +34,7 @@ struct RecentFile {
     vaults: Vec<PathBuf>,
 }
 
-/// `~/Library/Application Support/dev.aurora.vault`, if the platform has one.
+/// `~/Library/Application Support/dev.vault.app`, if the platform has one.
 pub fn support_dir() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join(vault_macos::BUNDLE_ID))
 }

@@ -362,7 +362,7 @@ pub fn pick_path(directories: bool, prompt: &str, cx: &App) -> Task<Option<PathB
 }
 
 /// Open panel for a `<name>.vault` package. gpui 0.3.10 has no content-type filter, so
-/// both files and folders are selectable: a bundled app with the `dev.aurora.vault` UTI
+/// both files and folders are selectable: a bundled app with the `dev.vault.app` UTI
 /// shows packages as single items, an unbundled run shows them as folders. The caller
 /// validates the pick (`SyncedVault::open` refuses non-packages).
 pub fn pick_vault_package(cx: &App) -> Task<Option<PathBuf>> {

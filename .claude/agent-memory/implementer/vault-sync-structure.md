@@ -36,3 +36,7 @@ Scan fixes (2026-10-30, external static-scan findings #2/#3/#5/#6/#15/#18/#19): 
 
 **Why:** future phase-3 work (watcher, backups, conflicts) builds on these seams.
 **How to apply:** extend synced.rs rather than restructure; keep `locked` in sync with disk when adding watcher reloads.
+
+Field ids (FI-4, 2026-10-31): vault-sync src has no field-level logic (merge is core `merge_from`); only tests touch fields. Core `set_field(item, field_id, ..)` by id, `set_field_named` by label, `remove_field(item, field_id, now)`, `Item::field_by_id`. tests/watch.rs helpers `fid` (resolve label once) + `field(v, id, field_id)`; `converge(a, b, id, pred)`. 03 §5 merges a field WHOLE by modified_at, so a concurrent rename vs value edit cannot yield new-name+new-value; only the sequential case does. Use `cargo fmt -p vault-sync`, not `--all` (other crates are edited concurrently).
+
+Provider label (2026-10-31): pure `vault_sync::classify_location(path, home, is_ubiquitous)` + `SyncLocation` in src/cloud.rs; vault-app `cloud::provider_label` (Option<String>) calls it with `dirs::home_dir` and `vault_macos::is_in_icloud` as the fallback. Gotcha: macOS reports File Provider items (~/Library/CloudStorage/Dropbox etc.) as NSURLIsUbiquitousItem = true, so the ubiquity check must come after the path rules. vault-macos `cloud_provider`/`is_dropbox` still have the old order and match "Dropbox" anywhere (now unused by the app). vault-app tests take ~4.5 min: run them in the background.

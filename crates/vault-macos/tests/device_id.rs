@@ -7,7 +7,7 @@ use vault_macos::device_id_in;
 #[test]
 fn stable_across_calls_and_mode_0600() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("nested").join("dev.aurora.vault");
+    let dir = tmp.path().join("nested").join("dev.vault.app");
     let a = device_id_in(&dir).unwrap();
     let b = device_id_in(&dir).unwrap();
     assert_eq!(a, b);

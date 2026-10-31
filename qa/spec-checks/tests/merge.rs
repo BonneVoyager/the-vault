@@ -72,7 +72,7 @@ fn m02_tombstone_rules() {
     // delete later than edit -> deleted
     let mut n = Net::new(2);
     let id = seeded(&mut n, 100);
-    n.devs[1].set_field(id, "username", pw("b"), 150).unwrap();
+    n.devs[1].set_field_named(id, "username", pw("b"), 150).unwrap();
     n.devs[0].delete(id, 200).unwrap();
     n.pull(0, 1);
     n.pull(1, 0);
@@ -83,7 +83,7 @@ fn m02_tombstone_rules() {
     let mut n = Net::new(2);
     let id = seeded(&mut n, 100);
     n.devs[0].delete(id, 200).unwrap();
-    n.devs[1].set_field(id, "username", pw("late"), 300).unwrap();
+    n.devs[1].set_field_named(id, "username", pw("late"), 300).unwrap();
     n.pull(0, 1);
     n.pull(1, 0);
     for d in &n.devs {
@@ -104,8 +104,8 @@ fn m02_tombstone_rules() {
 fn m03_field_level_lww() {
     let mut n = Net::new(2);
     let id = seeded(&mut n, 100);
-    n.devs[0].set_field(id, "username", pw("from-a"), 200).unwrap();
-    n.devs[1].set_field(id, "password", pw("from-b"), 210).unwrap();
+    n.devs[0].set_field_named(id, "username", pw("from-a"), 200).unwrap();
+    n.devs[1].set_field_named(id, "password", pw("from-b"), 210).unwrap();
     n.pull(0, 1);
     n.pull(1, 0);
     for d in &n.devs {
@@ -119,8 +119,8 @@ fn m03_field_level_lww() {
     // same field: greater modified_at wins regardless of merge direction
     let mut n = Net::new(2);
     let id = seeded(&mut n, 100);
-    n.devs[0].set_field(id, "username", pw("newer"), 400).unwrap();
-    n.devs[1].set_field(id, "username", pw("older"), 300).unwrap();
+    n.devs[0].set_field_named(id, "username", pw("newer"), 400).unwrap();
+    n.devs[1].set_field_named(id, "username", pw("older"), 300).unwrap();
     n.pull(0, 1);
     n.pull(1, 0);
     for d in &n.devs {
@@ -129,8 +129,8 @@ fn m03_field_level_lww() {
     // same field, same stamp: tie -> greater device_id of the owning item
     let mut n = Net::new(2);
     let id = seeded(&mut n, 100);
-    n.devs[0].set_field(id, "username", pw("A"), 500).unwrap();
-    n.devs[1].set_field(id, "username", pw("B"), 500).unwrap();
+    n.devs[0].set_field_named(id, "username", pw("A"), 500).unwrap();
+    n.devs[1].set_field_named(id, "username", pw("B"), 500).unwrap();
     let (da, db) = (n.devs[0].device_id(), n.devs[1].device_id());
     n.pull(0, 1);
     n.pull(1, 0);
@@ -173,7 +173,7 @@ fn m05_history_and_removed_history() {
     let mut n = Net::new(2);
     let id = seeded(&mut n, 100);
     for i in 0..15u64 {
-        n.devs[0].set_field(id, "password", pw(&format!("p{}", i + 1)), 1_000 + i).unwrap();
+        n.devs[0].set_field_named(id, "password", pw(&format!("p{}", i + 1)), 1_000 + i).unwrap();
     }
     let h = &n.devs[0].get(id).unwrap().history;
     assert_eq!(h.len(), 10, "history cap 10");
@@ -181,12 +181,12 @@ fn m05_history_and_removed_history() {
     assert!(!h.iter().any(|e| e.value.expose_secret() == "p0"), "oldest dropped");
     // text field change does not push history
     let before = n.devs[0].get(id).unwrap().history.len();
-    n.devs[0].set_field(id, "username", pw("x"), 2_000).unwrap();
+    n.devs[0].set_field_named(id, "username", pw("x"), 2_000).unwrap();
     assert_eq!(n.devs[0].get(id).unwrap().history.len(), before);
     // B diverges with its own password change -> union
     n.pull(1, 0);
-    n.devs[1].set_field(id, "password", pw("b-pass"), 3_000).unwrap();
-    n.devs[0].set_field(id, "password", pw("a-pass"), 3_001).unwrap();
+    n.devs[1].set_field_named(id, "password", pw("b-pass"), 3_000).unwrap();
+    n.devs[0].set_field_named(id, "password", pw("a-pass"), 3_001).unwrap();
     n.pull(0, 1);
     n.pull(1, 0);
     let ha: Vec<_> = n.devs[0].get(id).unwrap().history.iter().map(|e| (e.value.expose_secret().clone(), e.replaced_at)).collect();
@@ -229,7 +229,7 @@ fn m06_attachment_refs_merge() {
     }
     n.devs[0].remove_attachment_ref(id, r1id, 300).unwrap();
     // B touches the item later (field edit) but still holds the ref
-    n.devs[1].set_field(id, "username", pw("later"), 400).unwrap();
+    n.devs[1].set_field_named(id, "username", pw("later"), 400).unwrap();
     n.pull(1, 0);
     n.pull(0, 1);
     for d in &n.devs {
@@ -253,7 +253,7 @@ fn m07_monotone_stamps() {
     let mut n = Net::new(1);
     let id = seeded(&mut n, 1_000);
     let ma0 = n.devs[0].get(id).unwrap().modified_at;
-    n.devs[0].set_field(id, "username", pw("back"), 10).unwrap();
+    n.devs[0].set_field_named(id, "username", pw("back"), 10).unwrap();
     let it = n.devs[0].get(id).unwrap();
     let f = it.fields.iter().find(|f| f.name == "username").unwrap();
     assert!(f.modified_at > 1_000, "field stamp moved forward despite clock going back: {}", f.modified_at);
@@ -347,10 +347,10 @@ fn m10_random_scripts_converge() {
                     let _ = n.devs[d].update(id, now, |it| it.favorite = !it.favorite);
                 }
                 4 | 5 => {
-                    let _ = n.devs[d].set_field(id, "password", pw(&format!("p{d}-{now}")), now);
+                    let _ = n.devs[d].set_field_named(id, "password", pw(&format!("p{d}-{now}")), now);
                 }
                 6 => {
-                    let _ = n.devs[d].set_field(id, "username", pw(&format!("u{d}-{now}")), now);
+                    let _ = n.devs[d].set_field_named(id, "username", pw(&format!("u{d}-{now}")), now);
                 }
                 _ => {
                     let o = rng.gen_range(0..nd);
@@ -404,8 +404,8 @@ fn m10_random_scripts_converge() {
 fn m11_equal_stamp_content_change_visible() {
     let mut n = Net::new(3);
     let id = seeded(&mut n, 100);
-    n.devs[0].set_field(id, "username", pw("A"), 500).unwrap();
-    n.devs[1].set_field(id, "username", pw("B"), 500).unwrap();
+    n.devs[0].set_field_named(id, "username", pw("A"), 500).unwrap();
+    n.devs[1].set_field_named(id, "username", pw("B"), 500).unwrap();
     n.pull(2, 0);
     n.pull(2, 1); // C may now hold the tie winner with ma 500
     n.pull(0, 2);

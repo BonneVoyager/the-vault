@@ -642,7 +642,7 @@ mod tests {
                     field("notes", FieldKind::Notes, "line one\nline two"),
                 ];
                 let id = v.insert(gh, 1);
-                v.set_field(id, "password", SecretString::new("new".into()), 2)
+                v.set_field_named(id, "password", SecretString::new("new".into()), 2)
                     .unwrap();
                 let mut card =
                     crate::templates::tagged(crate::templates::Template::Card, "Visa", device, 3);
@@ -840,7 +840,8 @@ mod tests {
         state.update(&mut vcx, |s, cx| s.toggle_history(cx));
         vcx.run_until_parked();
         state.read_with(&vcx, |s, _| {
-            assert!(s.revealed.contains("password"));
+            let pw = s.selected_item().unwrap().field("password").unwrap().id;
+            assert!(s.revealed.contains(&pw));
             assert!(s.selected_item().unwrap().favorite);
             assert_eq!(s.counts.favorites, 1);
         });

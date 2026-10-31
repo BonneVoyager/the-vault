@@ -112,24 +112,30 @@ impl EditBuffer {
         self.removed_history.extend(stamps);
     }
 
+    /// The field row `field` started as when editing began (same field id), if any. A row
+    /// added in this edit has a fresh id and no original.
+    fn original_of(&self, field: &Field) -> Option<&Field> {
+        self.original.field_by_id(field.id)
+    }
+
     /// Recomputes the "changed remotely" marks against `stored`, the item as it is in the
     /// vault after a merge. A row is marked when the user changed it here and the stored
-    /// field (looked up by its name when editing began) no longer matches `original`.
+    /// field with the same id no longer matches `original` (or is gone).
     pub fn mark_remote(&mut self, stored: &Item) {
-        let original = &self.original;
         self.remote_fields = self
             .keys
             .iter()
             .zip(&self.item.fields)
             .filter_map(|(key, field)| {
-                let of = usize::try_from(*key)
-                    .ok()
-                    .and_then(|k| original.fields.get(k))?;
+                let of = self.original_of(field)?;
                 let touched = !same_field(field, of);
-                let remote = stored.field(&of.name).is_none_or(|sf| !same_field(sf, of));
+                let remote = stored
+                    .field_by_id(of.id)
+                    .is_none_or(|sf| !same_field(sf, of));
                 (touched && remote).then_some(*key)
             })
             .collect();
+        let original = &self.original;
         self.remote_title = self.item.title != original.title && stored.title != original.title;
     }
 
@@ -276,46 +282,27 @@ impl EditBuffer {
         push_tag(&mut item.tags, &self.tag_draft);
         // Only rows the user added or changed: an untouched field must stay byte-identical,
         // or `apply_edit` would see a change and overwrite a value merged in meanwhile.
-        for (key, f) in self.keys.iter().zip(item.fields.iter_mut()) {
-            let untouched = usize::try_from(*key)
-                .ok()
-                .and_then(|k| self.original.fields.get(k))
+        for f in item.fields.iter_mut() {
+            let untouched = self
+                .original
+                .field_by_id(f.id)
                 .is_some_and(|of| same_field(f, of));
             if f.kind != FieldKind::Totp || untouched {
                 continue;
             }
             f.value = normalize_totp(&f.value, &item.title);
         }
-        // Whether row `i`'s name was added or changed in this edit.
-        let name_touched: Vec<bool> = self
-            .keys
-            .iter()
-            .zip(&item.fields)
-            .map(|(key, f)| {
-                usize::try_from(*key)
-                    .ok()
-                    .and_then(|k| self.original.fields.get(k))
-                    .is_none_or(|of| of.name.trim() != f.name.trim())
-            })
-            .collect();
-        for i in 0..item.fields.len() {
-            let name = item.fields[i].name.trim().to_owned();
-            if name.is_empty() {
-                return Err("Every field needs a name".into());
+        // Names are labels (01 §4, field ids 2026-10-31): two fields may share one and a
+        // name may be empty. Only surrounding spaces are trimmed, and only on rows whose
+        // name changed, so an untouched field stays byte-identical.
+        for f in item.fields.iter_mut() {
+            let changed = self
+                .original
+                .field_by_id(f.id)
+                .is_none_or(|of| of.name != f.name);
+            if changed {
+                f.name = f.name.trim().to_owned();
             }
-            // Exact duplicates are always refused. Names equal but for case are refused
-            // too, like every app-side name lookup ("Username" and "username" are the
-            // same field to ⌘⇧U and the subtitle), but only when this edit added or
-            // renamed one of them: an older item already holding both still saves.
-            let clash = item.fields[..i].iter().enumerate().any(|(j, f)| {
-                f.name == name
-                    || (f.name.to_lowercase() == name.to_lowercase()
-                        && (name_touched[i] || name_touched[j]))
-            });
-            if clash {
-                return Err(format!("Two fields are named \u{201c}{name}\u{201d}").into());
-            }
-            item.fields[i].name = name;
         }
         Ok(item)
     }
@@ -441,40 +428,36 @@ pub enum Navigation {
 
 /// Writes an edit over the stored item, touching only what the user changed.
 ///
-/// The buffer is diffed against `original` (the item as editing began), row by row via
-/// the row keys: key `k < original.fields.len()` started life as `original.fields[k]`.
-/// Untouched fields keep whatever the stored item has now, so a change merged in while
-/// editing survives. Changed fields start from the stored field (keeping its extras),
-/// with the stored stamp if the name is unchanged so `update`'s diff bumps exactly them;
-/// a renamed or added field counts as new. Fields added to the stored item meanwhile are
-/// kept; fields the user removed are dropped.
+/// Rows map to stored fields by field id (01 §4): a row whose id was in `original` is
+/// that field, a row with a fresh id is new. Untouched fields keep whatever the stored
+/// item has now, so a change merged in while editing survives. A changed field starts
+/// from the stored field with its id (keeping its stamp and extras) and takes the name,
+/// kind and value from the row; core's `update` bumps it, so a rename is an edit, not a
+/// delete and add. A field the user removed is left out, and `update` writes its
+/// `removed_fields` marker. Fields added to the stored item meanwhile are kept.
 ///
-/// A changed password goes through `set_field` first, under its original name, so the old
-/// value lands in the history even when the field was also renamed (02 `set_field`).
+/// A changed password goes through `set_field` first, by id, so the old value lands in
+/// the history (with its `field_id`) even when the field was also renamed.
 fn apply_edit(
     v: &mut UnlockedVault,
     item: Item,
-    keys: &[u64],
     original: &Item,
     now: u64,
 ) -> Result<Uuid, VaultError> {
     let id = item.id;
-    let source = |key: u64| {
-        usize::try_from(key)
-            .ok()
-            .and_then(|k| original.fields.get(k))
-    };
-    for (key, f) in keys.iter().zip(&item.fields) {
-        let Some(of) = source(*key) else { continue };
+    for f in &item.fields {
+        let Some(of) = original.field_by_id(f.id) else {
+            continue;
+        };
         let changed_password = of.kind == FieldKind::Password
             && f.kind == FieldKind::Password
             && of.value.expose_secret() != f.value.expose_secret();
         let stored_password = v
             .get(id)
-            .and_then(|it| it.field(&of.name))
+            .and_then(|it| it.field_by_id(f.id))
             .is_some_and(|s| s.kind == FieldKind::Password);
         if changed_password && stored_password {
-            v.set_field(id, &of.name, f.value.clone(), now)?;
+            v.set_field(id, f.id, f.value.clone(), now)?;
         }
     }
     let title_changed = item.title != original.title;
@@ -492,47 +475,47 @@ fn apply_edit(
         }
         let mut stored = std::mem::take(&mut it.fields);
         let mut fields = Vec::with_capacity(item.fields.len());
-        for (key, bf) in keys.iter().zip(item.fields) {
-            let Some(of) = source(*key) else {
+        for bf in item.fields {
+            let take = |stored: &mut Vec<Field>| {
+                stored
+                    .iter()
+                    .position(|s| s.id == bf.id)
+                    .map(|p| stored.remove(p))
+            };
+            let Some(of) = original.field_by_id(bf.id) else {
+                // Added in this edit (a fresh id): new; the save stamps it.
                 fields.push(Field {
                     modified_at: 0,
                     ..bf
                 });
                 continue;
             };
-            let unchanged = same_field(&bf, of);
-            let renamed = bf.name != of.name;
-            let sf = stored
-                .iter()
-                .position(|s| s.name == of.name)
-                .map(|p| stored.remove(p));
-            if unchanged {
-                // Removed remotely while untouched here: stays removed.
+            let sf = take(&mut stored);
+            if same_field(&bf, of) {
+                // Untouched: whatever is stored now (removed remotely: stays removed).
                 fields.extend(sf);
                 continue;
             }
-            let mut f = match sf {
+            fields.push(match sf {
+                // Same id, same stamp: `update` sees the change and bumps it.
                 Some(s) => Field {
                     name: bf.name,
                     kind: bf.kind,
                     value: bf.value,
                     ..s
                 },
+                // Removed remotely but edited here: back, stamped past the marker.
                 None => Field {
                     modified_at: 0,
                     ..bf
                 },
-            };
-            if renamed {
-                f.modified_at = 0;
-            }
-            fields.push(f);
+            });
         }
         // Added to the stored item meanwhile (not in the original): keep.
         fields.extend(
             stored
                 .into_iter()
-                .filter(|s| !original.fields.iter().any(|o| o.name == s.name)),
+                .filter(|s| original.field_by_id(s.id).is_none()),
         );
         it.fields = fields;
     })?;
@@ -858,7 +841,7 @@ impl AppState {
         let Some(buffer) = self.edit_buffer_mut() else {
             return;
         };
-        let (keys, original) = (buffer.keys.clone(), buffer.original.clone());
+        let original = buffer.original.clone();
         let removed = buffer.removed_history.clone();
         let icon_drops = buffer.icon_refs_dropped_on_save();
         let mut item = match buffer.finished() {
@@ -883,7 +866,7 @@ impl AppState {
                 // History removals first, so `apply_edit`'s field diff (and a changed
                 // password's new history entry) runs on the trimmed history.
                 remove_history(v, item.id, &removed, now)?;
-                let id = apply_edit(v, item, &keys, &original, now)?;
+                let id = apply_edit(v, item, &original, now)?;
                 drop_icon_attachments(v, id, &icon_drops, now)?;
                 clear_dangling_image_icon(v, id, now)?;
                 Ok(id)

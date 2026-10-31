@@ -214,7 +214,8 @@ fn canonical_cbor_item_plain() {
             "attachments"
         ]
     );
-    let back = format::decode_item_plain(&plain, item.id, item.modified_at).unwrap();
+    let back =
+        format::decode_item_plain(&plain, item.id, item.modified_at, FORMAT_VERSION).unwrap();
     assert_item_eq(&item, &back);
 }
 

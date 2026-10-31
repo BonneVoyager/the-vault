@@ -452,7 +452,9 @@ fn old_file_without_attachments_key_still_parses() {
     entries.retain(|(k, _)| k != &ciborium::Value::Text("attachments".into()));
     let mut bytes = Vec::new();
     ciborium::into_writer(&v, &mut bytes).unwrap();
-    let back = vault_core::format::decode_item_plain(&bytes, item.id, 1).unwrap();
+    let back =
+        vault_core::format::decode_item_plain(&bytes, item.id, 1, vault_core::FORMAT_VERSION)
+            .unwrap();
     assert!(back.attachments.is_empty());
 }
 
@@ -462,14 +464,17 @@ fn parser_rejects_inconsistent_refs() {
     let r = new_ref("a", 5, 1).unwrap();
     v.add_attachment_ref(id, r, 10).unwrap();
     let plain_ok = vault_core::format::encode_item_plain(v.get(id).unwrap());
-    assert!(vault_core::format::decode_item_plain(&plain_ok, id, 10).is_ok());
+    assert!(
+        vault_core::format::decode_item_plain(&plain_ok, id, 10, vault_core::FORMAT_VERSION)
+            .is_ok()
+    );
 
     // Too many nonces for the size.
     let mut bad = v.get(id).unwrap().clone();
     bad.attachments[0].chunk_nonces.push([0; 24]);
     let plain = vault_core::format::encode_item_plain(&bad);
     assert!(matches!(
-        vault_core::format::decode_item_plain(&plain, id, 10),
+        vault_core::format::decode_item_plain(&plain, id, 10, vault_core::FORMAT_VERSION),
         Err(vault_core::VaultError::Malformed(_))
     ));
     // Over the cap.
@@ -478,7 +483,7 @@ fn parser_rejects_inconsistent_refs() {
     bad.attachments[0].chunk_nonces = vec![[0; 24]; 96];
     let plain = vault_core::format::encode_item_plain(&bad);
     assert!(matches!(
-        vault_core::format::decode_item_plain(&plain, id, 10),
+        vault_core::format::decode_item_plain(&plain, id, 10, vault_core::FORMAT_VERSION),
         Err(vault_core::VaultError::Malformed(_))
     ));
 }

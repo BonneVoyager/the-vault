@@ -46,6 +46,22 @@
 //! and a `section` heading field followed by two text fields, and one with no `created_at`
 //! key at all. Stamped header, no legacy `kind` extra (same vintage as `v1-icon`). Password
 //! `correct horse battery staple` (`PASSWORD`), KDF `KdfParams::for_tests()`.
+//!
+//! # Format version 2 (field identity, FI-1, 2026-10-31)
+//!
+//! `FORMAT_VERSION` is 2: every field carries an `id`, items may carry `removed_fields`
+//! markers and history entries a `field_id` (01 §4, §9). **Every `v1-*.vault` above is
+//! frozen**: the reader opens them through the migration (each field gets
+//! `Field::derived_id`, see `tests/field_id.rs`) and a save keeps them at version 1. Their
+//! regenerators are kept as the record of how they were built but are *historical*: they
+//! refuse to run (`v1_regenerators_are_historical`) because `new_vault()` now creates a
+//! version 2 vault, so running one would silently replace a v1 fixture with a v2 file.
+//!
+//! `v2-basic.vault` is the first version 2 fixture: two items, one of which has two fields
+//! named `username`, a field with an empty name, a `removed_fields` marker and a history
+//! entry with `field_id`; the other is a plain note. Stamped header (created at version 2),
+//! no legacy `kind` extra. Password `correct horse battery staple` (`PASSWORD`), KDF
+//! `KdfParams::for_tests()`. Built by `regenerate_v2_basic_fixture`.
 
 use std::io::Cursor;
 
@@ -53,8 +69,8 @@ use ciborium::Value;
 use vault_core::attachment::{CHUNK_SIZE, blob_file_name, new_ref, open, seal};
 use vault_core::format::VaultFile;
 use vault_core::{
-    ExposeSecret, Field, FieldKind, Item, ItemIcon, KdfParams, LockedVault, OpaqueSlot,
-    SecretString, Slot, SlotKind, TamperKind, UnlockedVault, Uuid, VaultError,
+    ExposeSecret, FORMAT_VERSION, Field, FieldKind, Item, ItemIcon, KdfParams, LockedVault,
+    OpaqueSlot, SecretString, Slot, SlotKind, TamperKind, UnlockedVault, Uuid, VaultError,
 };
 
 /// Parse, edit the structure, re-encode (same as `common::rewrite`, kept local because this
@@ -105,6 +121,28 @@ const META_UNDATED_ID: [u8; 16] = [0x0E; 16];
 const META_AT: u64 = T0 + 70;
 /// The dated item's `created_at`: earlier than its stamp, as a real item's would be.
 const META_CREATED_AT: u64 = T0 - 86_400_000;
+
+/// `v2-basic.vault`: the two items and the field ids of the first one, in field order.
+const V2_DUPES_ID: [u8; 16] = [0x0F; 16];
+const V2_NOTE_ID: [u8; 16] = [0x10; 16];
+const V2_USERNAME_1: [u8; 16] = [0x21; 16];
+const V2_USERNAME_2: [u8; 16] = [0x22; 16];
+const V2_UNNAMED: [u8; 16] = [0x23; 16];
+const V2_PASSWORD: [u8; 16] = [0x24; 16];
+/// Removed after insertion; only its `removed_fields` marker is in the file.
+const V2_PIN: [u8; 16] = [0x25; 16];
+const V2_NOTES: [u8; 16] = [0x26; 16];
+const V2_AT: u64 = T0 + 80;
+
+/// Every `v1-*.vault` is frozen (see the module docs): `new_vault()` creates a version 2
+/// vault now, so a v1 regenerator must never run again. Each one calls this first.
+fn v1_regenerators_are_historical() {
+    if FORMAT_VERSION != 1 {
+        panic!(
+            "historical: this regenerator built a v1 fixture; FORMAT_VERSION is now {FORMAT_VERSION} and the v1 fixtures are frozen (01 §9)"
+        );
+    }
+}
 
 fn icon_symbol() -> ItemIcon {
     ItemIcon {
@@ -205,6 +243,7 @@ fn new_vault() -> UnlockedVault {
 #[test]
 #[ignore]
 fn regenerate_fixtures() {
+    v1_regenerators_are_historical();
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     std::fs::create_dir_all(dir).unwrap();
 
@@ -262,6 +301,7 @@ fn regenerate_fixtures() {
 #[test]
 #[ignore]
 fn regenerate_forward_fixture() {
+    v1_regenerators_are_historical();
     let mut vault = new_vault();
     vault.header_extras_mut().push(header_extra());
 
@@ -300,6 +340,7 @@ fn regenerate_forward_fixture() {
 #[test]
 #[ignore]
 fn regenerate_stamped_fixture() {
+    v1_regenerators_are_historical();
     let mut vault = new_vault();
     let mut item = Item::new("Stamped", device(), T0 + 45);
     item.id = Uuid::from_bytes(STAMPED_ITEM_ID);
@@ -372,6 +413,7 @@ fn v1_stamped_opens_and_its_header_is_digest_bound() {
 #[test]
 #[ignore]
 fn regenerate_attach_fixture() {
+    v1_regenerators_are_historical();
     std::fs::create_dir_all(ATTACH_DIR).unwrap();
     let mut vault = new_vault();
 
@@ -450,6 +492,7 @@ fn v1_attach_refs_and_blobs_open() {
 #[test]
 #[ignore]
 fn regenerate_icon_fixture() {
+    v1_regenerators_are_historical();
     let mut vault = new_vault();
     let specs: [([u8; 16], &str, Option<ItemIcon>); 3] = [
         (ICON_SYMBOL_ID, "Symbol icon", Some(icon_symbol())),
@@ -518,6 +561,7 @@ fn v1_icon_opens_with_all_three_shapes() {
 #[test]
 #[ignore]
 fn regenerate_meta_fixture() {
+    v1_regenerators_are_historical();
     let mut vault = new_vault();
 
     let mut dated = Item::new("Dated with section", device(), META_AT);
@@ -604,6 +648,146 @@ fn v1_meta_opens_with_created_at_and_section_heading() {
     );
 }
 
+/// Builds `v2-basic.vault` (see the module docs). The first version 2 fixture; the only
+/// regenerator that may still run.
+#[test]
+#[ignore]
+fn regenerate_v2_basic_fixture() {
+    let mut vault = new_vault();
+    assert_eq!(vault.header().format_version, 2);
+
+    let with_id = |id: [u8; 16], name: &str, kind: FieldKind, value: &str| -> Field {
+        let mut f = field(name, kind, value, V2_AT);
+        f.id = Uuid::from_bytes(id);
+        f
+    };
+    let mut dupes = Item::new("Duplicate names", device(), V2_AT);
+    dupes.id = Uuid::from_bytes(V2_DUPES_ID);
+    dupes.tags = vec!["login".into()];
+    dupes.fields = vec![
+        with_id(
+            V2_USERNAME_1,
+            "username",
+            FieldKind::Text,
+            "first@example.com",
+        ),
+        with_id(
+            V2_USERNAME_2,
+            "username",
+            FieldKind::Text,
+            "second@example.com",
+        ),
+        with_id(V2_UNNAMED, "", FieldKind::Text, "unnamed value"),
+        with_id(V2_PASSWORD, "password", FieldKind::Password, "hunter2"),
+        with_id(V2_PIN, "pin", FieldKind::Text, "0000"),
+    ];
+    let id = vault.insert(dupes, V2_AT);
+    // A password change records the field id in history; a removal leaves a marker.
+    vault
+        .set_field(
+            id,
+            Uuid::from_bytes(V2_PASSWORD),
+            secret("hunter3"),
+            V2_AT + 1,
+        )
+        .unwrap();
+    vault
+        .remove_field(id, Uuid::from_bytes(V2_PIN), V2_AT + 2)
+        .unwrap();
+
+    let mut note = Item::new("Plain note", device(), V2_AT);
+    note.id = Uuid::from_bytes(V2_NOTE_ID);
+    note.tags = vec!["note".into()];
+    note.fields = vec![with_id(
+        V2_NOTES,
+        "notes",
+        FieldKind::Notes,
+        "nothing special",
+    )];
+    vault.insert(note, V2_AT);
+
+    std::fs::write(format!("{FIXTURE_DIR}/v2-basic.vault"), vault.serialize()).unwrap();
+}
+
+#[test]
+fn v2_basic_opens_with_ids_duplicates_empty_name_marker_and_history_id() {
+    let bytes = std::fs::read(format!("{FIXTURE_DIR}/v2-basic.vault")).unwrap();
+    assert_eq!(&bytes[4..6], &[0, 2], "prefix version 2");
+    let locked = LockedVault::parse(&bytes).unwrap();
+    check_kdf(&locked);
+    assert_eq!(locked.header().format_version, 2);
+    let vault = locked.unlock(&pw()).unwrap();
+    assert_eq!(vault.items().count(), 2);
+
+    let dupes = vault.get(Uuid::from_bytes(V2_DUPES_ID)).unwrap();
+    assert_eq!(dupes.title, "Duplicate names");
+    assert!(dupes.extras.is_empty());
+    let ids: Vec<Uuid> = dupes.fields.iter().map(|f| f.id).collect();
+    assert_eq!(
+        ids,
+        [V2_USERNAME_1, V2_USERNAME_2, V2_UNNAMED, V2_PASSWORD].map(Uuid::from_bytes),
+        "explicit ids in field order; the pin is gone"
+    );
+    let names: Vec<&str> = dupes.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["username", "username", "", "password"]);
+    assert_eq!(
+        dupes.field("username").unwrap().id,
+        Uuid::from_bytes(V2_USERNAME_1),
+        "name lookup: first match"
+    );
+    assert_eq!(
+        dupes
+            .field_by_id(Uuid::from_bytes(V2_USERNAME_2))
+            .unwrap()
+            .value
+            .expose_secret(),
+        "second@example.com"
+    );
+    assert!(dupes.field("").is_none(), "an empty name never matches");
+    assert_eq!(
+        dupes
+            .field_by_id(Uuid::from_bytes(V2_UNNAMED))
+            .unwrap()
+            .value
+            .expose_secret(),
+        "unnamed value"
+    );
+    let password = dupes.field_by_id(Uuid::from_bytes(V2_PASSWORD)).unwrap();
+    assert_eq!(password.value.expose_secret(), "hunter3");
+    assert_eq!(password.modified_at, V2_AT + 1);
+    assert_eq!(dupes.history.len(), 1);
+    assert_eq!(dupes.history[0].value.expose_secret(), "hunter2");
+    assert_eq!(dupes.history[0].replaced_at, V2_AT + 1);
+    assert_eq!(
+        dupes.history[0].field_id,
+        Some(Uuid::from_bytes(V2_PASSWORD)),
+        "history carries the field id"
+    );
+    assert_eq!(
+        dupes.removed_fields,
+        vec![vault_core::FieldTombstone {
+            id: Uuid::from_bytes(V2_PIN),
+            removed_at: V2_AT + 2,
+        }]
+    );
+    assert_eq!(dupes.modified_at, V2_AT + 2);
+
+    let note = vault.get(Uuid::from_bytes(V2_NOTE_ID)).unwrap();
+    assert_eq!(note.fields.len(), 1);
+    assert_eq!(note.fields[0].id, Uuid::from_bytes(V2_NOTES));
+    assert_eq!(note.fields[0].value.expose_secret(), "nothing special");
+    assert!(note.removed_fields.is_empty());
+
+    // A save by this build keeps everything exactly, at version 2.
+    let again = vault.serialize();
+    assert_eq!(&again[4..6], &[0, 2]);
+    let reopened = LockedVault::parse(&again).unwrap().unlock(&pw()).unwrap();
+    let d2 = reopened.get(Uuid::from_bytes(V2_DUPES_ID)).unwrap();
+    assert_eq!(d2.fields.iter().map(|f| f.id).collect::<Vec<_>>(), ids);
+    assert_eq!(d2.history[0].field_id, Some(Uuid::from_bytes(V2_PASSWORD)));
+    assert_eq!(d2.removed_fields, dupes.removed_fields);
+}
+
 fn check_kdf(locked: &LockedVault) {
     let k = locked.kdf_params();
     assert_eq!((k.m_cost_kib, k.t_cost, k.p_cost), (8192, 1, 1));
@@ -617,8 +801,11 @@ fn assert_fields(item: &Item, expected: &[(&str, FieldKind, &str)]) {
         item.title
     );
     for (name, kind, value) in expected {
+        // By name regardless of kind: `Item::field` skips section headings.
         let f = item
-            .field(name)
+            .fields
+            .iter()
+            .find(|f| f.name == *name)
             .unwrap_or_else(|| panic!("missing field {name}"));
         assert_eq!(f.kind, *kind, "kind of {name}");
         assert_eq!(f.value.expose_secret(), value, "value of {name}");
@@ -857,27 +1044,62 @@ fn every_fixture_in_the_directory_opens() {
         .collect();
     names.sort();
     assert!(
-        names.len() >= 7,
-        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-icon, v1-meta, v1-stamped; found {names:?}"
+        names.len() >= 8,
+        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-icon, v1-meta, v1-stamped, v2-basic; found {names:?}"
     );
+    assert!(names.iter().any(|n| n.starts_with("v1-")));
+    assert!(names.iter().any(|n| n.starts_with("v2-")));
     // Written after the item-kind removal (no legacy `kind` extra) and after stamp-at-create
     // (header carries `slots_modified_at`).
-    let post_removal =
-        |name: &str| matches!(name, "v1-stamped.vault" | "v1-icon.vault" | "v1-meta.vault");
+    let post_removal = |name: &str| {
+        matches!(
+            name,
+            "v1-stamped.vault" | "v1-icon.vault" | "v1-meta.vault" | "v2-basic.vault"
+        )
+    };
     for name in &names {
         let bytes = std::fs::read(format!("{FIXTURE_DIR}/{name}")).unwrap();
-        assert!(
-            name.starts_with('v') && name.contains('-'),
-            "{name}: fixtures are named v<FORMAT_VERSION>-<name>.vault"
-        );
+        // The name's version is the file's prefix version, and every version this build
+        // reads has at least one fixture here (asserted above for 1 and 2).
+        let named_version: u16 = name
+            .strip_prefix('v')
+            .and_then(|r| r.split_once('-'))
+            .and_then(|(v, _)| v.parse().ok())
+            .unwrap_or_else(|| panic!("{name}: fixtures are named v<FORMAT_VERSION>-<name>.vault"));
         // The committed bytes are canonical: a structural parse -> to_bytes is byte-identical.
         let file = VaultFile::parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(file.to_bytes(), bytes, "{name}: structural round trip");
+        assert_eq!(
+            file.header.format_version, named_version,
+            "{name}: prefix version matches the name"
+        );
         let locked = LockedVault::parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
         check_kdf(&locked);
         let vault = locked
             .unlock(&pw())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
+        // Field identity (FI-1): a v1 file's fields get the documented derived ids (the
+        // full migration test is in `tests/field_id.rs`); every file's ids are unique.
+        for item in vault.items_including_deleted() {
+            let mut seen = std::collections::BTreeSet::new();
+            for (i, f) in item.fields.iter().enumerate() {
+                assert!(
+                    seen.insert(f.id),
+                    "{name}: duplicate field id in {}",
+                    item.title
+                );
+                if named_version == 1 {
+                    let ordinal = item.fields[..i].iter().filter(|e| e.name == f.name).count();
+                    assert_eq!(
+                        f.id,
+                        Field::derived_id(item.id, &f.name, ordinal),
+                        "{name}: derived id of {}/{}",
+                        item.title,
+                        f.name
+                    );
+                }
+            }
+        }
         // Every pre-2026-10-30 item carries a legacy `kind` entry, now an unknown key: it is
         // never dropped and never resurfaces as anything else. (`v1-stamped` and `v1-icon`
         // were written after the removal and have none.)
@@ -903,15 +1125,18 @@ fn every_fixture_in_the_directory_opens() {
             post_removal(name),
             "{name}: committed stamp"
         );
-        // Whatever it holds, it must survive a save by this build, extras included.
+        // Whatever it holds, it must survive a save by this build, extras included. A save
+        // never changes the prefix version (a v1 file stays v1; see `FORMAT_VERSION`).
         let again = vault.serialize();
+        let again_header = VaultFile::parse(&again).unwrap().header;
         assert_eq!(
-            {
-                let h = VaultFile::parse(&again).unwrap().header;
-                (h.slots_modified_at, h.slots_device_id)
-            },
+            (again_header.slots_modified_at, again_header.slots_device_id),
             committed,
             "{name}: a plain save keeps slots_modified_at / slots_device_id as committed"
+        );
+        assert_eq!(
+            again_header.format_version, named_version,
+            "{name}: a plain save keeps the format version"
         );
         let reopened = LockedVault::parse(&again)
             .unwrap_or_else(|e| panic!("{name}: re-parse: {e}"))
@@ -925,6 +1150,13 @@ fn every_fixture_in_the_directory_opens() {
             assert_eq!(
                 a.extras, b.extras,
                 "{name}: item {} extras after save",
+                a.title
+            );
+            // Ids are stable across the save (explicit on disk now, derived before).
+            assert_eq!(
+                a.fields.iter().map(|f| f.id).collect::<Vec<_>>(),
+                b.fields.iter().map(|f| f.id).collect::<Vec<_>>(),
+                "{name}: field ids of {} after save",
                 a.title
             );
         }

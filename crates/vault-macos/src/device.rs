@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::MacError;
 
 /// Application bundle identifier; also the Application Support subdirectory name.
-pub const BUNDLE_ID: &str = "dev.aurora.vault";
+pub const BUNDLE_ID: &str = "dev.vault.app";
 
 /// Environment variable that overrides the stored device id (same as `vault-cli`).
 pub const DEVICE_ID_ENV: &str = "VAULT_DEVICE_ID";
@@ -36,7 +36,7 @@ pub fn device_id() -> Uuid {
 /// Returns this machine's device id.
 ///
 /// `VAULT_DEVICE_ID` wins if set (an unparsable value is an error). Otherwise
-/// reads `<data_dir>/dev.aurora.vault/device_id`, creating it on first use.
+/// reads `<data_dir>/dev.vault.app/device_id`, creating it on first use.
 pub fn try_device_id() -> Result<Uuid, MacError> {
     if let Ok(v) = std::env::var(DEVICE_ID_ENV) {
         return v

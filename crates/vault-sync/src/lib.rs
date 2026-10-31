@@ -36,7 +36,7 @@ pub use backup::{
     BackupInfo, BackupKind, RETENTION_MULTIPLIER_DEFAULT, RETENTION_MULTIPLIER_MAX,
     RETENTION_MULTIPLIER_MIN, retain,
 };
-pub use cloud::{CloudError, CloudHooks, NoopHooks};
+pub use cloud::{CloudError, CloudHooks, NoopHooks, SyncLocation, classify_location};
 pub use error::{SaveBlocked, SyncError};
 pub use event::SyncEvent;
 pub use package::VAULT_FILE_NAME;

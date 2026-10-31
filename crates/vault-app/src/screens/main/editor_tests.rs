@@ -417,8 +417,8 @@ fn history_trash_buttons_only_in_edit_mode(cx: &mut TestAppContext) {
                     10,
                 )];
                 let id = v.insert(it, 10);
-                v.set_field(id, "password", SecretString::new("b".into()), 20)?;
-                v.set_field(id, "password", SecretString::new("c".into()), 30)?;
+                v.set_field_named(id, "password", SecretString::new("b".into()), 20)?;
+                v.set_field_named(id, "password", SecretString::new("c".into()), 30)?;
                 Ok::<_, vault_core::VaultError>(id)
             })
             .unwrap()
@@ -1254,7 +1254,7 @@ fn section_values_never_surface(cx: &mut TestAppContext) {
         ));
         // Copy targets: ⌘⇧U and copy-by-index copy nothing.
         s.copy(crate::state::CopyTarget::Username, cx);
-        s.copy(crate::state::CopyTarget::Field(0), cx);
+        s.copy(crate::state::CopyTarget::Field(item.fields[0].id), cx);
         // A section named "Number" on a card is not masked as a card number.
         let card = s.unlocked_vault().unwrap().get(card_id).unwrap().clone();
         assert!(!crate::listing::is_card_number(&card, &card.fields[0]));

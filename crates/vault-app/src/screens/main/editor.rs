@@ -266,11 +266,8 @@ impl Editor {
     ) -> Row {
         let section = field.kind == FieldKind::Section;
         let name = ui::text_input(
-            if section {
-                "Section name"
-            } else {
-                "Field name"
-            },
+            // A name may be left empty (01 §4): the value then stands alone.
+            if section { "Section name" } else { "Name" },
             window,
             cx,
         );
@@ -285,7 +282,12 @@ impl Editor {
             move |this, input, ev: &InputEvent, window, cx| {
                 if let InputEvent::Change = ev {
                     let mut text = ui::input_text(input, cx);
-                    if auto_cap && text.chars().next() != previous.chars().next() {
+                    // Only once a character is typed: clearing the name leaves the
+                    // rule armed for the next first character.
+                    if auto_cap
+                        && !text.is_empty()
+                        && text.chars().next() != previous.chars().next()
+                    {
                         auto_cap = false;
                         let capitalized = capitalize_first(&text);
                         if capitalized != text {
@@ -689,7 +691,10 @@ impl Render for Editor {
             if history_after == Some(row.key) {
                 let history: Vec<_> = buffer.history().collect();
                 rows.push(history_disclosure(
-                    &history,
+                    super::detail::History {
+                        entries: &history,
+                        fields: &buffer.item.fields,
+                    },
                     Some(buffer.removed_history.len()),
                     s,
                     &self.state,

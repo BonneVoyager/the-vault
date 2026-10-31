@@ -30,7 +30,9 @@ fn f01_layout_matches_spec() {
     let (v, _) = sample(3);
     let b = v.serialize();
     let raw = split(&b);
-    assert_eq!(raw.version, 1, "01 §1 format_version currently 1");
+    // Rewritten 2026-10-31: 01 §9 "Version 2 (2026-10-31) adds the required field id"; README
+    // "Vault format 2 ... is written for new vaults". (01 §1 still says "currently 1"; see report.)
+    assert_eq!(raw.version, 2, "01 §9 new vaults are format_version 2");
     let h = &raw.header;
     assert_eq!(bytes_of(get(h, "vault_id").unwrap()).len(), 16);
     let kdf = get(h, "kdf").unwrap();
@@ -92,7 +94,11 @@ fn f02_independent_crypto_opens_file() {
         for f in get(pt, "fields").unwrap().as_array().unwrap() {
             mx = mx.max(u64_of(get(f, "modified_at").unwrap()));
             let kind = get(f, "kind").unwrap().as_text().unwrap();
-            assert!(["text", "password", "totp", "url", "notes", "email", "date", "month_year"].contains(&kind));
+            assert!(["text", "password", "totp", "url", "notes", "email", "date", "month_year", "section"].contains(&kind));
+            // 01 §4 Field.id "required in version 2": bytes(16), random v4
+            let fid = bytes_of(get(f, "id").expect("01 §4: v2 field carries id"));
+            assert_eq!(fid.len(), 16, "field id is bytes(16)");
+            assert_eq!(fid[6] >> 4, 4, "Field::new id is a random v4 UUID");
         }
         if let Some(Value::Integer(d)) = get(pt, "deleted_at") {
             let d: i128 = (*d).into();
@@ -112,8 +118,8 @@ fn f03_parser_rejections() {
     m[0] = b'X';
     assert!(matches!(LockedVault::parse(&m), Err(VaultError::BadMagic)));
     let mut m = b.clone();
-    m[4..6].copy_from_slice(&2u16.to_be_bytes());
-    assert!(matches!(LockedVault::parse(&m), Err(VaultError::UnsupportedVersion(2))));
+    m[4..6].copy_from_slice(&3u16.to_be_bytes());
+    assert!(matches!(LockedVault::parse(&m), Err(VaultError::UnsupportedVersion(3))));
     let mut m = b.clone();
     m[6..10].copy_from_slice(&(b.len() as u32).to_be_bytes());
     assert!(LockedVault::parse(&m).is_err(), "header_len beyond EOF");
@@ -168,11 +174,11 @@ fn f05_item_nonce_and_modified_at_bound() {
     let mut n = bytes_of(get(&body[0], "nonce").unwrap());
     n[0] ^= 1;
     set(&mut body[0], "nonce", Value::Bytes(n));
-    assert!(matches!(unlock(&join(1, &raw.header, &body)), Err(VaultError::Tampered(TamperKind::Item(_)))));
+    assert!(matches!(unlock(&join(raw.version, &raw.header, &body)), Err(VaultError::Tampered(TamperKind::Item(_)))));
     let mut body = raw.body.clone();
     let ma = u64_of(get(&body[0], "modified_at").unwrap());
     set(&mut body[0], "modified_at", Value::Integer((ma + 1).into()));
-    let r = unlock(&join(1, &raw.header, &body));
+    let r = unlock(&join(raw.version, &raw.header, &body));
     assert!(matches!(r, Err(VaultError::Tampered(_))), "{:?}", r.err());
 }
 
@@ -181,49 +187,49 @@ fn f05_item_nonce_and_modified_at_bound() {
 fn f06_drop_rollback_duplicate_reorder() {
     let (mut v, ids) = sample(3);
     let old = v.serialize();
-    v.set_field(ids[1], "password", pw("new"), 50_000).unwrap();
+    v.set_field_named(ids[1], "password", pw("new"), 50_000).unwrap();
     let new = v.serialize();
     let rn = split(&new);
     let ro = split(&old);
     // drop
     let mut body = rn.body.clone();
     body.remove(0);
-    assert!(matches!(unlock(&join(1, &rn.header, &body)), Err(VaultError::Tampered(TamperKind::Manifest))), "drop");
+    assert!(matches!(unlock(&join(rn.version, &rn.header, &body)), Err(VaultError::Tampered(TamperKind::Manifest))), "drop");
     // rollback item 1 to old record (find by id)
     let idb = ids[1].as_bytes().to_vec();
     let pos_new = rn.body.iter().position(|r| get(r, "id").map(bytes_of) == Some(idb.clone())).unwrap();
     let old_rec = ro.body.iter().find(|r| get(r, "id").map(bytes_of) == Some(idb.clone())).unwrap().clone();
     let mut body = rn.body.clone();
     body[pos_new] = old_rec;
-    assert!(matches!(unlock(&join(1, &rn.header, &body)), Err(VaultError::Tampered(TamperKind::Manifest))), "rollback");
+    assert!(matches!(unlock(&join(rn.version, &rn.header, &body)), Err(VaultError::Tampered(TamperKind::Manifest))), "rollback");
     // duplicate
     let mut body = rn.body.clone();
     let d = body[0].clone();
     body.insert(0, d);
-    let r = unlock(&join(1, &rn.header, &body));
+    let r = unlock(&join(rn.version, &rn.header, &body));
     assert!(matches!(r, Err(VaultError::Tampered(_)) | Err(VaultError::Malformed(_))), "duplicate: {:?}", r.err());
     // swap manifests between serializations of the same vault: still valid (same content) -> must unlock
     let mut body = rn.body.clone();
     let n = body.len();
     let rn2 = split(&v.serialize());
     body[n - 1] = rn2.body[n - 1].clone();
-    assert!(unlock(&join(1, &rn.header, &body)).is_ok(), "manifest from another serialize of same state");
+    assert!(unlock(&join(rn.version, &rn.header, &body)).is_ok(), "manifest from another serialize of same state");
     // whole-file rollback (old file) is a valid older file: accepted by design.
     assert!(unlock(&old).is_ok());
     // manifest not last
     let mut body = rn.body.clone();
     let m = body.pop().unwrap();
     body.insert(0, m);
-    assert!(unlock(&join(1, &rn.header, &body)).is_err(), "manifest not last");
+    assert!(unlock(&join(rn.version, &rn.header, &body)).is_err(), "manifest not last");
     // no manifest
     let mut body = rn.body.clone();
     body.pop();
-    assert!(unlock(&join(1, &rn.header, &body)).is_err(), "no manifest");
+    assert!(unlock(&join(rn.version, &rn.header, &body)).is_err(), "no manifest");
     // two manifests
     let mut body = rn.body.clone();
     let m = body.last().unwrap().clone();
     body.push(m);
-    assert!(unlock(&join(1, &rn.header, &body)).is_err(), "two manifests");
+    assert!(unlock(&join(rn.version, &rn.header, &body)).is_err(), "two manifests");
 }
 
 /// 02 guarantee 7: moving an item record into a different vault -> Tampered(Item(id)).
@@ -235,14 +241,14 @@ fn f07_swap_item_into_other_vault() {
     let rb = split(&b.serialize());
     let mut body = rb.body.clone();
     body.insert(0, ra.body[0].clone());
-    match unlock(&join(1, &rb.header, &body)) {
+    match unlock(&join(rb.version, &rb.header, &body)) {
         Err(VaultError::Tampered(TamperKind::Item(x))) => assert_eq!(x, ids[0]),
         o => panic!("{:?}", o.err()),
     }
     // replace instead of insert (count unchanged)
     let mut body = rb.body.clone();
     body[0] = ra.body[0].clone();
-    assert!(matches!(unlock(&join(1, &rb.header, &body)), Err(VaultError::Tampered(TamperKind::Item(_)))));
+    assert!(matches!(unlock(&join(rb.version, &rb.header, &body)), Err(VaultError::Tampered(TamperKind::Item(_)))));
 }
 
 /// 01 §2: tampering with vault_id fails every slot; KDF tamper -> WrongPassword;
@@ -256,15 +262,15 @@ fn f08_header_tamper() {
     let mut id = bytes_of(get(&h, "vault_id").unwrap());
     id[3] ^= 0x40;
     set(&mut h, "vault_id", Value::Bytes(id));
-    assert!(matches!(unlock(&join(1, &h, &raw.body)), Err(VaultError::WrongPassword)), "vault_id tamper");
+    assert!(matches!(unlock(&join(raw.version, &h, &raw.body)), Err(VaultError::WrongPassword)), "vault_id tamper");
     let mut h = raw.header.clone();
     set(get_mut(&mut h, "kdf").unwrap(), "t_cost", Value::Integer(2.into()));
-    assert!(matches!(unlock(&join(1, &h, &raw.body)), Err(VaultError::WrongPassword)), "kdf tamper");
+    assert!(matches!(unlock(&join(raw.version, &h, &raw.body)), Err(VaultError::WrongPassword)), "kdf tamper");
     let mut h = raw.header.clone();
     let mut salt = bytes_of(get(get(&h, "kdf").unwrap(), "salt").unwrap());
     salt[0] ^= 1;
     set(get_mut(&mut h, "kdf").unwrap(), "salt", Value::Bytes(salt));
-    assert!(matches!(unlock(&join(1, &h, &raw.body)), Err(VaultError::WrongPassword)), "salt tamper");
+    assert!(matches!(unlock(&join(raw.version, &h, &raw.body)), Err(VaultError::WrongPassword)), "salt tamper");
     // every byte of the header region flipped: never Ok with different items, never panic
     let orig = snap_vault(&unlock(&b).unwrap());
     for pos in 4..(10 + raw.header_len as usize) {
@@ -388,11 +394,27 @@ fn f14_forward_fixture_preserved() {
     }
     let kinds: Vec<_> = get(hb, "slots").unwrap().as_array().unwrap().iter().map(|s| get(s, "kind").unwrap().clone()).collect();
     assert!(kinds.iter().any(|k| !["password", "enclave", "passkey", "recovery"].contains(&k.as_text().unwrap())), "fixture has an opaque slot");
-    // items: plaintext maps identical
+    // items: plaintext maps identical, except (rewritten 2026-10-31 for 01 §9) that a version 1
+    // file "merely gains explicit ids" on save: every field gains exactly an `id` key.
+    assert_eq!(rb.version, ra.version, "01 §9: a save never changes a file's version");
     assert_eq!(before.items.len(), after.items.len());
     for (id, _, pt) in &before.items {
         let a = after.items.iter().find(|(i, _, _)| i == id).unwrap();
-        assert_eq!(&a.2, pt, "ItemPlain preserved verbatim on re-serialize");
+        let mut want = pt.clone();
+        let mut got = a.2.clone();
+        for m in [&mut want, &mut got] {
+            if let Some(Value::Array(fs)) = get_mut(m, "fields") {
+                for f in fs.iter_mut() {
+                    if let Value::Map(e) = f {
+                        e.retain(|(k, _)| k.as_text() != Some("id"));
+                    }
+                }
+            }
+        }
+        assert_eq!(got, want, "ItemPlain preserved verbatim on re-serialize (apart from field ids)");
+        for f in get(&a.2, "fields").unwrap().as_array().unwrap() {
+            assert_eq!(bytes_of(get(f, "id").expect("v1 file gains explicit field ids on save")).len(), 16);
+        }
     }
     // unknown keys on item records / manifest record
     for (i, rec) in rb.body.iter().enumerate() {
@@ -429,7 +451,7 @@ fn f15_slot_kinds() {
         set(&mut slots[0], "kind", Value::Text("Password".into()));
     }
     set(get_mut(&mut h, "kdf").unwrap(), "m_cost", Value::Integer((1u32 << 20).into()));
-    let f = join(1, &h, &raw.body);
+    let f = join(raw.version, &h, &raw.body);
     let t = std::time::Instant::now();
     let r = with_timeout(20, move || LockedVault::parse(&f).and_then(|l| l.unlock(&pw(PW))).err());
     assert!(matches!(r, Some(Some(VaultError::NoUsableSlot))), "case-sensitive kind -> NoUsableSlot: {r:?}");
@@ -450,7 +472,7 @@ fn f15_slot_kinds() {
     if let Some(Value::Array(slots)) = get_mut(&mut h, "slots") {
         slots.insert(0, opaque.clone());
     }
-    let f = join(1, &h, &ru.body);
+    let f = join(ru.version, &h, &ru.body);
     let u = unlock(&f).expect("opaque slot is skipped at unlock");
     let out = split(&u.serialize());
     assert_eq!(get(&out.header, "slots").unwrap().as_array().unwrap()[0], opaque, "opaque slot re-emitted in original position");
@@ -460,12 +482,12 @@ fn f15_slot_kinds() {
         let s = slots[0].clone();
         slots.push(s);
     }
-    let r = LockedVault::parse(&join(1, &h, &raw.body)).and_then(|l| l.unlock(&pw(PW)));
+    let r = LockedVault::parse(&join(raw.version, &h, &raw.body)).and_then(|l| l.unlock(&pw(PW)));
     assert!(matches!(r, Err(VaultError::Malformed(_))), "duplicate slot id: {:?}", r.err());
     // zero slots: "at least one"
     let mut h = raw.header.clone();
     set(&mut h, "slots", Value::Array(vec![]));
-    assert!(LockedVault::parse(&join(1, &h, &raw.body)).and_then(|l| l.unlock(&pw(PW))).is_err());
+    assert!(LockedVault::parse(&join(raw.version, &h, &raw.body)).and_then(|l| l.unlock(&pw(PW))).is_err());
 }
 
 /// Hostile KDF parameters (01 §2 kdf map; 01 §6 calibration caps m_cost at 1 GiB): parse or
@@ -499,7 +521,7 @@ fn f16_hostile_kdf_params() {
     for (k, val) in cases {
         let mut h = raw.header.clone();
         set(get_mut(&mut h, "kdf").unwrap(), k, val.clone());
-        let f = join(1, &h, &raw.body);
+        let f = join(raw.version, &h, &raw.body);
         let t = std::time::Instant::now();
         let r = with_timeout(15, move || {
             std::panic::catch_unwind(|| LockedVault::parse(&f).and_then(|l| l.unlock(&pw(PW))).map(|_| ()))
@@ -536,7 +558,7 @@ fn f17_forward_preserved_through_edit_and_merge() {
         let it = a.items_including_deleted().find(|i| i.id == *id).unwrap();
         if let Some(f) = it.fields.iter().find(|f| f.kind_raw.is_some()) {
             let name = f.name.clone();
-            a.set_field(*id, &name, pw("edited-on-old-reader"), 9_000_000_000_000).unwrap();
+            a.set_field_named(*id, &name, pw("edited-on-old-reader"), 9_000_000_000_000).unwrap();
             touched.push((*id, name));
         }
         other.update(*id, 9_000_000_000_001, |i| i.title = format!("{} (b)", i.title)).unwrap();
@@ -597,7 +619,7 @@ fn f18_slot_splice_into_stamped_vault_is_tampered() {
             if let Some(Value::Array(s)) = get_mut(&mut h, "slots") {
                 if at_start { s.insert(0, slot.clone()) } else { s.push(slot.clone()) }
             }
-            let f = join(1, &h, &raw.body);
+            let f = join(raw.version, &h, &raw.body);
             let l = LockedVault::parse(&f).unwrap();
             let r1 = l.unlock(&pw(PW)).err();
             let r2 = l.unlock_with_kek(sid, &kek).err();

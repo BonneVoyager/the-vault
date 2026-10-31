@@ -112,17 +112,26 @@ fn unknown_ids_and_fields_are_errors() {
         VaultError::Malformed(m) if m.contains("unknown item")
     ));
     assert!(matches!(
-        v.set_field(missing, "username", secret("x"), 1).unwrap_err(),
+        v.set_field_named(missing, "username", secret("x"), 1).unwrap_err(),
         VaultError::Malformed(m) if m.contains("unknown item")
     ));
     assert!(matches!(
         v.delete(missing, 1).unwrap_err(),
         VaultError::Malformed(_)
     ));
-    assert!(matches!(
-        v.set_field(id, "nope", secret("x"), 1).unwrap_err(),
-        VaultError::Malformed(m) if m.contains("unknown field")
-    ));
+    assert_eq!(
+        v.set_field_named(id, "nope", secret("x"), 1).unwrap_err(),
+        VaultError::FieldNotFound
+    );
+    assert_eq!(
+        v.set_field(id, Uuid::from_u128(7), secret("x"), 1)
+            .unwrap_err(),
+        VaultError::FieldNotFound
+    );
+    assert_eq!(
+        v.remove_field(id, Uuid::from_u128(7), 1).unwrap_err(),
+        VaultError::FieldNotFound
+    );
     assert!(v.get(id).unwrap().field("nope").is_none(), "not created");
     assert_eq!(v.get(id).unwrap().modified_at, 1_000, "nothing stamped");
 }
@@ -132,7 +141,8 @@ fn set_field_password_pushes_history_newest_first_capped() {
     let (mut v, id) = vault_with_item(1_000);
     assert!(v.get(id).unwrap().history.is_empty());
 
-    v.set_field(id, "password", secret("pw-1"), 2_000).unwrap();
+    v.set_field_named(id, "password", secret("pw-1"), 2_000)
+        .unwrap();
     let item = v.get(id).unwrap();
     assert_eq!(
         item.field("password").unwrap().value.expose_secret(),
@@ -145,7 +155,7 @@ fn set_field_password_pushes_history_newest_first_capped() {
     assert_eq!(item.history[0].replaced_at, 2_000);
 
     for i in 2..=12u64 {
-        v.set_field(id, "password", secret(format!("pw-{i}")), 2_000 + i)
+        v.set_field_named(id, "password", secret(format!("pw-{i}")), 2_000 + i)
             .unwrap();
     }
     let item = v.get(id).unwrap();
@@ -170,7 +180,8 @@ fn set_field_password_pushes_history_newest_first_capped() {
     assert_eq!(item.modified_at, 2_012);
 
     // Non-password fields do not touch history.
-    v.set_field(id, "username", secret("u2"), 3_000).unwrap();
+    v.set_field_named(id, "username", secret("u2"), 3_000)
+        .unwrap();
     let item = v.get(id).unwrap();
     assert_eq!(item.history.len(), HISTORY_CAP);
     assert_eq!(item.field("username").unwrap().modified_at, 3_000);

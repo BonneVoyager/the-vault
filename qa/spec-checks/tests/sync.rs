@@ -66,7 +66,7 @@ fn s02_backup_policy() {
     let latest = std::fs::read(backups_dir(&pkg).join(newest)).unwrap();
     assert_eq!(latest, std::fs::read(primary(&pkg)).unwrap(), "snapshot = exact bytes just written");
     // first save after unlock -> snapshot
-    a.s.lock();
+    let _ = a.s.lock();
     a.s.unlock(&pw(PW)).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
     a.add_login("three", now_ms());
@@ -92,10 +92,10 @@ fn s03_two_handles_converge_via_watcher() {
     a.s.start_watching().unwrap();
     b.s.start_watching().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(700));
-    a.s.edit(|v| v.set_field(id, "username", pw("from-a"), now_ms())).unwrap().unwrap();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("from-a"), now_ms())).unwrap().unwrap();
     a.s.save().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(30));
-    b.s.edit(|v| v.set_field(id, "password", pw("from-b"), now_ms())).unwrap().unwrap();
+    b.s.edit(|v| v.set_field_named(id, "password", pw("from-b"), now_ms())).unwrap().unwrap();
     b.s.save().unwrap();
     let ok = a.wait_for(10, |_| false) || true;
     let _ = ok;
@@ -126,7 +126,7 @@ fn s04_delete_vs_edit_across_handles() {
         std::thread::sleep(std::time::Duration::from_millis(700));
         let (td, te) = if later_edit { (t0 + 1_000, t0 + 2_000) } else { (t0 + 2_000, t0 + 1_000) };
         a.s.edit(|v| v.delete(id, td)).unwrap().unwrap();
-        b.s.edit(|v| v.set_field(id, "username", pw("edited"), te)).unwrap().unwrap();
+        b.s.edit(|v| v.set_field_named(id, "username", pw("edited"), te)).unwrap().unwrap();
         a.s.save().unwrap();
         b.s.save().unwrap(); // pre-write merge
         a.wait_for(4, |_| false); // A learns B's write through its watcher (03 §3)
@@ -247,7 +247,7 @@ fn s08_corrupt_primary() {
     let got = a.wait_for(8, |e| e.iter().any(|x| x.contains("CorruptOnDisk")));
     assert!(got, "CorruptOnDisk; events {:?}", a.seen);
     assert!(a.v().get(id).is_some(), "in-memory intact");
-    a.s.edit(|v| v.set_field(id, "username", pw("after"), now_ms())).unwrap().unwrap();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("after"), now_ms())).unwrap().unwrap();
     let r = a.s.save();
     assert!(r.is_ok(), "next save rewrites a valid file: {r:?}");
     assert_eq!(val(&read_vault(&pkg), id, "username").as_deref(), Some("after"));
@@ -262,9 +262,9 @@ fn s09_save_blocked() {
     let id = a.add_login("x", now_ms());
     a.s.save().unwrap();
     let mut b = std::fs::read(primary(&pkg)).unwrap();
-    b[4..6].copy_from_slice(&2u16.to_be_bytes());
+    b[4..6].copy_from_slice(&3u16.to_be_bytes());
     std::fs::write(primary(&pkg), &b).unwrap();
-    a.s.edit(|v| v.set_field(id, "username", pw("blocked"), now_ms())).unwrap().unwrap();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("blocked"), now_ms())).unwrap().unwrap();
     let r = a.s.save();
     assert!(r.is_err(), "newer version on disk -> save refused");
     assert_eq!(std::fs::read(primary(&pkg)).unwrap(), b, "file untouched");
@@ -294,10 +294,10 @@ fn s09b_save_blocked_is_an_event() {
     a.s.start_watching().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(700));
     let mut b = std::fs::read(primary(&pkg)).unwrap();
-    b[4..6].copy_from_slice(&2u16.to_be_bytes());
+    b[4..6].copy_from_slice(&3u16.to_be_bytes());
     std::fs::write(primary(&pkg), &b).unwrap();
     a.wait_for(4, |_| false);
-    a.s.edit(|v| v.set_field(id, "username", pw("x2"), now_ms())).unwrap().unwrap();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("x2"), now_ms())).unwrap().unwrap();
     let r = a.s.save();
     a.drain();
     assert!(
@@ -318,9 +318,9 @@ fn s10_lock_with_unsaved_edits() {
     // then lock: unsaved edit must land in a backup.
     let id = a.add_login("unsaved-item", now_ms());
     let mut b = std::fs::read(primary(&pkg)).unwrap();
-    b[4..6].copy_from_slice(&2u16.to_be_bytes());
+    b[4..6].copy_from_slice(&3u16.to_be_bytes());
     std::fs::write(primary(&pkg), &b).unwrap();
-    a.s.lock();
+    let _ = a.s.lock();
     assert!(a.s.vault().is_none());
     let mut found = false;
     for e in std::fs::read_dir(backups_dir(&pkg)).unwrap() {
@@ -392,7 +392,7 @@ fn s13_changed_while_locked() {
     let mut a = Dev::create(&pkg);
     a.s.save().unwrap();
     a.s.start_watching().unwrap();
-    a.s.lock();
+    let _ = a.s.lock();
     std::thread::sleep(std::time::Duration::from_millis(700));
     let mut b = Dev::open(&pkg);
     let id = b.add_login("while-locked", now_ms());
@@ -415,7 +415,7 @@ fn s14_password_change_on_other_handle_survives() {
     let mut b = Dev::open(&pkg);
     a.s.start_watching().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(700));
-    a.s.edit(|v| v.set_field(id, "username", pw("a-unsaved"), now_ms())).unwrap().unwrap();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("a-unsaved"), now_ms())).unwrap().unwrap();
     b.s.edit(|v| v.change_password(&pw(PW), &pw("brand new pass"), KdfParams::for_tests(), now_ms())).unwrap().unwrap();
     b.s.save().unwrap();
     a.wait_for(5, |e| e.iter().any(|x| x.starts_with("Merged") || x.contains("Key")));
@@ -442,7 +442,7 @@ fn s15_key_rotated_elsewhere() {
     b.s.save().unwrap();
     let rotated = std::fs::read(primary(&pkg)).unwrap();
     a.wait_for(5, |e| e.iter().any(|x| x.contains("Key")));
-    a.s.edit(|v| v.set_field(id, "username", pw("mine"), now_ms())).unwrap().ok();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("mine"), now_ms())).unwrap().ok();
     let _ = a.s.save();
     let now = std::fs::read(primary(&pkg)).unwrap();
     let u = LockedVault::parse(&now).unwrap().unlock(&pw(PW)).unwrap();
@@ -490,7 +490,7 @@ fn s15c_key_rotation_documented_two_step_flow() {
     b.s.save().unwrap();
     // 03 §8: rotation elsewhere -> KeyRotatedOnDisk at detection (was KeyMismatch before the L3 fix)
     assert!(a.wait_for(8, |e| e.iter().any(|x| x.contains("KeyRotatedOnDisk") || x.contains("KeyMismatch"))), "{:?}", a.seen);
-    a.s.edit(|v| v.set_field(id, "username", pw("a-edit"), now_ms())).unwrap().unwrap();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("a-edit"), now_ms())).unwrap().unwrap();
     assert!(a.s.save().is_err(), "save refused while key mismatched");
     a.s.unlock(&pw(PW)).unwrap();
     a.drain();

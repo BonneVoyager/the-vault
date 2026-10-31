@@ -186,7 +186,7 @@ fn password_change_and_recalibration_on_b_survive_a_merge() {
         .unwrap();
     // A keeps editing with its (unchanged) key, as it would before the next sync.
     let id = a.items().next().unwrap().id;
-    a.set_field(id, "password", secret("edited on A"), T1 + 1)
+    a.set_field_named(id, "password", secret("edited on A"), T1 + 1)
         .unwrap();
 
     let b_disk = opens_with(&b.serialize(), &new_pw()).unwrap();
@@ -442,7 +442,7 @@ fn opaque_slots_and_kdf_extras_travel_with_the_header() {
 fn key_rotation_on_b_is_adopted_together_with_its_key() {
     let (mut a, mut b) = two_devices();
     let id = a.items().next().unwrap().id;
-    a.set_field(id, "password", secret("edited on A"), T1)
+    a.set_field_named(id, "password", secret("edited on A"), T1)
         .unwrap();
     b.rotate_vault_key(&pw(), T1 + 5).unwrap();
     let slots_b = b.header().slots.clone();

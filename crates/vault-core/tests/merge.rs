@@ -85,7 +85,7 @@ fn edit_after_delete_resurrects() {
     let (mut a, mut b, ids) = two_devices(2);
     let id = ids[0];
     a.delete(id, 2_000).unwrap();
-    b.set_field(id, "username", secret("resurrected"), 3_000)
+    b.set_field_named(id, "username", secret("resurrected"), 3_000)
         .unwrap();
 
     let report = a.merge_from(&b).unwrap();
@@ -109,9 +109,9 @@ fn edit_after_delete_resurrects() {
 fn field_level_merge_is_commutative() {
     let (mut a, mut b, ids) = two_devices(2);
     let id = ids[0];
-    a.set_field(id, "username", secret("alice-new"), 10_000)
+    a.set_field_named(id, "username", secret("alice-new"), 10_000)
         .unwrap();
-    b.set_field(id, "password", secret("bob-new-pw"), 11_000)
+    b.set_field_named(id, "password", secret("bob-new-pw"), 11_000)
         .unwrap();
 
     let a_snapshot = unlock(&a.serialize()).unwrap();
@@ -198,7 +198,9 @@ fn field_present_on_one_side_only_is_taken() {
     })
     .unwrap();
     b.update(id, 3_000, |i| {
-        i.fields.retain(|f| f.name != "notes"); // field removal is not tracked
+        // A removal through `update` leaves a `removed_fields` marker (FI-1), so the field
+        // does not come back from A's untouched copy.
+        i.fields.retain(|f| f.name != "notes");
         i.fields
             .push(Field::new("extra", FieldKind::Text, secret("e"), 3_000));
     })
@@ -208,13 +210,13 @@ fn field_present_on_one_side_only_is_taken() {
     let names: Vec<&str> = item.fields.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(
         names,
-        vec![
-            "username", "password", "totp", "url", "extra", "notes", "pin"
-        ],
-        "winner (B) order first, then A-only fields in A's order"
+        vec!["username", "password", "totp", "url", "extra", "pin"],
+        "winner (B) order first, then A-only fields in A's order; B's removal sticks"
     );
     assert_eq!(value(&a, id, "pin"), "0000");
     assert_eq!(value(&a, id, "extra"), "e");
+    assert_eq!(item.removed_fields.len(), 1, "the marker travels");
+    assert_eq!(item.removed_fields[0].removed_at, 3_000);
     assert_eq!(
         item.modified_at, 3_001,
         "B's content changed at max 3000 -> 3001"
@@ -226,11 +228,11 @@ fn history_union_and_cap() {
     let (mut a, mut b, ids) = two_devices(1);
     let id = ids[0];
     for i in 0..7u64 {
-        a.set_field(id, "password", secret(format!("a{i}")), 2_000 + i)
+        a.set_field_named(id, "password", secret(format!("a{i}")), 2_000 + i)
             .unwrap();
     }
     for i in 0..7u64 {
-        b.set_field(id, "password", secret(format!("b{i}")), 2_100 + i)
+        b.set_field_named(id, "password", secret(format!("b{i}")), 2_100 + i)
             .unwrap();
     }
     // One entry shared verbatim on both sides must not be duplicated.
@@ -238,6 +240,7 @@ fn history_union_and_cap() {
         i.history.push(HistoryEntry {
             value: secret("shared"),
             replaced_at: 1_999,
+            field_id: None,
         });
     })
     .unwrap();
@@ -245,6 +248,7 @@ fn history_union_and_cap() {
         i.history.push(HistoryEntry {
             value: secret("shared"),
             replaced_at: 1_999,
+            field_id: None,
         });
     })
     .unwrap();
@@ -279,9 +283,12 @@ fn history_union_and_cap() {
     // Smaller union: dedupe is exact on (value, replaced_at).
     let (mut a, mut b, ids) = two_devices(1);
     let id = ids[0];
-    a.set_field(id, "password", secret("x"), 2_000).unwrap();
-    b.set_field(id, "password", secret("x"), 2_000).unwrap();
-    b.set_field(id, "password", secret("y"), 2_001).unwrap();
+    a.set_field_named(id, "password", secret("x"), 2_000)
+        .unwrap();
+    b.set_field_named(id, "password", secret("x"), 2_000)
+        .unwrap();
+    b.set_field_named(id, "password", secret("y"), 2_001)
+        .unwrap();
     let b_snap = unlock(&b.serialize()).unwrap();
     a.merge_from(&b_snap).unwrap();
     let h = &a.get(id).unwrap().history;
@@ -325,8 +332,10 @@ fn merge_is_idempotent_and_identical_copies_are_unchanged() {
     assert_eq!(r.unchanged, 4);
     assert!(!r.changed());
 
-    a.set_field(ids[0], "username", secret("u"), 2_000).unwrap();
-    b.set_field(ids[0], "password", secret("p"), 2_001).unwrap();
+    a.set_field_named(ids[0], "username", secret("u"), 2_000)
+        .unwrap();
+    b.set_field_named(ids[0], "password", secret("p"), 2_001)
+        .unwrap();
     b.delete(ids[1], 2_002).unwrap();
     a.update(ids[2], 2_003, |i| i.title = "t".into()).unwrap();
     b.insert(sample_item(20, 2_004), 2_004);
@@ -380,7 +389,7 @@ fn vault_id_mismatch_is_an_error() {
 #[test]
 fn round_trip_after_merge() {
     let (mut a, mut b, ids) = two_devices(5);
-    a.set_field(ids[0], "password", secret("new"), 2_000)
+    a.set_field_named(ids[0], "password", secret("new"), 2_000)
         .unwrap();
     b.delete(ids[1], 2_001).unwrap();
     b.update(ids[2], 2_002, |i| {
@@ -390,7 +399,7 @@ fn round_trip_after_merge() {
     })
     .unwrap();
     a.delete(ids[3], 2_003).unwrap();
-    b.set_field(ids[3], "username", secret("back"), 2_004)
+    b.set_field_named(ids[3], "username", secret("back"), 2_004)
         .unwrap();
     b.insert(Item::new("fresh", Uuid::nil(), 2_005), 2_005);
 
@@ -470,7 +479,7 @@ fn skewed_set_field_and_update_survive_merge() {
     let (mut a, mut b, ids) = two_devices(2);
     let id = ids[0];
     // Fields were stamped 1000 (password 999); A's clock says 300.
-    a.set_field(id, "password", secret("skewed-pw"), 300)
+    a.set_field_named(id, "password", secret("skewed-pw"), 300)
         .unwrap();
     a.update(id, 200, |i| {
         i.fields[0].value = secret("skewed-user"); // username, timestamp not bumped by caller
@@ -545,7 +554,8 @@ fn update_on_tombstone_converges() {
     let id = ids[0];
     a.delete(id, 2_000).unwrap();
     a.update(id, 2_500, |i| i.title = "t".into()).unwrap();
-    b.set_field(id, "username", secret("alive"), 2_600).unwrap();
+    b.set_field_named(id, "username", secret("alive"), 2_600)
+        .unwrap();
     converge(&mut a, &mut b);
     assert!(!a.get(id).unwrap().is_deleted());
     assert_eq!(value(&a, id, "username"), "alive");
@@ -553,7 +563,7 @@ fn update_on_tombstone_converges() {
     // ... and *earlier* than the tombstone's deleted_at: stays deleted on both sides.
     let (mut a, mut b, ids) = two_devices(1);
     let id = ids[0];
-    b.set_field(id, "username", secret("too-late"), 1_500)
+    b.set_field_named(id, "username", secret("too-late"), 1_500)
         .unwrap();
     a.delete(id, 2_000).unwrap();
     a.update(id, 2_500, |i| i.title = "t".into()).unwrap();
@@ -565,13 +575,15 @@ fn update_on_tombstone_converges() {
 fn password_conflict_loser_lands_in_history_on_both_sides() {
     let (mut a, mut b, ids) = two_devices(1);
     let id = ids[0];
-    a.set_field(id, "password", secret("from-A"), 5_000)
+    a.set_field_named(id, "password", secret("from-A"), 5_000)
         .unwrap();
-    b.set_field(id, "password", secret("from-B"), 6_000)
+    b.set_field_named(id, "password", secret("from-B"), 6_000)
         .unwrap();
     // Non-password conflict: loser is simply dropped.
-    a.set_field(id, "username", secret("uA"), 5_000).unwrap();
-    b.set_field(id, "username", secret("uB"), 6_000).unwrap();
+    a.set_field_named(id, "username", secret("uA"), 5_000)
+        .unwrap();
+    b.set_field_named(id, "username", secret("uB"), 6_000)
+        .unwrap();
 
     converge(&mut a, &mut b);
     for v in [&a, &b] {
@@ -607,8 +619,10 @@ fn password_conflict_loser_lands_in_history_on_both_sides() {
     // Equal values on both sides are not a conflict and leave no history entry.
     let (mut a, mut b, ids) = two_devices(1);
     let id = ids[0];
-    a.set_field(id, "password", secret("same"), 5_000).unwrap();
-    b.set_field(id, "password", secret("same"), 6_000).unwrap();
+    a.set_field_named(id, "password", secret("same"), 5_000)
+        .unwrap();
+    b.set_field_named(id, "password", secret("same"), 6_000)
+        .unwrap();
     converge(&mut a, &mut b);
     assert!(
         !a.get(id)
@@ -628,9 +642,9 @@ fn merge_that_changes_content_advances_modified_at_and_defeats_rollback() {
     let id = ids[0];
     // Ours: username@10000, item@10000. Theirs: password@9000, item@9000. The merge takes
     // theirs' password but max(modified_at) stays at ours' 10000.
-    a.set_field(id, "username", secret("alice"), 10_000)
+    a.set_field_named(id, "username", secret("alice"), 10_000)
         .unwrap();
-    b.set_field(id, "password", secret("bob-pw"), 9_000)
+    b.set_field_named(id, "password", secret("bob-pw"), 9_000)
         .unwrap();
     let pre_merge = a.serialize();
     let b_snap = unlock(&b.serialize()).unwrap();
@@ -672,7 +686,8 @@ fn merge_that_changes_content_advances_modified_at_and_defeats_rollback() {
 
     // A merge whose result keeps ours' content untouched does not move the timestamp.
     let (mut a, b, ids) = two_devices(1);
-    a.set_field(ids[0], "username", secret("x"), 5_000).unwrap();
+    a.set_field_named(ids[0], "username", secret("x"), 5_000)
+        .unwrap();
     assert!(!a.merge_from(&b).unwrap().changed());
     assert_eq!(a.get(ids[0]).unwrap().modified_at, 5_000);
 }

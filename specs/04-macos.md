@@ -105,7 +105,7 @@ impl CloudHooks for ICloudHooks {
 }
 ```
 
-Detecting "is this path inside iCloud Drive": `NSURL.isUbiquitousItemKey` resource value. Dropbox needs nothing special (it keeps a real file on disk; smart sync placeholders are handled by the file provider transparently on 15+).
+Detecting "is this path inside iCloud Drive": `NSURL.isUbiquitousItemKey` resource value, used only as the last step of the provider label in 03 §1, because File Provider folders under `~/Library/CloudStorage` also report ubiquitous (bug fixed 2026-10-31). Dropbox needs nothing special (it keeps a real file on disk; smart sync placeholders are handled by the file provider transparently on 15+).
 
 ## 5. Idle and lock triggers
 

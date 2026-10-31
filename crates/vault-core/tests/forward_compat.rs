@@ -13,8 +13,8 @@ use common::*;
 use vault_core::format::{self, VaultFile};
 use vault_core::search::{Query, search};
 use vault_core::{
-    ExposeSecret, Field, FieldKind, Item, LockedVault, OpaqueSlot, SecretVec, Slot, SlotKind,
-    TamperKind, Uuid, VaultError, export_csv, merge,
+    ExposeSecret, FORMAT_VERSION, Field, FieldKind, Item, LockedVault, OpaqueSlot, SecretVec, Slot,
+    SlotKind, TamperKind, Uuid, VaultError, export_csv, merge,
 };
 
 fn t(s: &str) -> Value {
@@ -199,11 +199,13 @@ fn unknown_field_kinds_roundtrip_merge_search_and_export() {
 
     // set_field on an unknown-kind field behaves like text: no history entry.
     let mut v = reopened;
-    v.set_field(id, "licence", secret("NEW-1"), 30).unwrap();
+    v.set_field_named(id, "licence", secret("NEW-1"), 30)
+        .unwrap();
     let got = v.get(id).unwrap();
     assert_eq!(got.fields[0].value.expose_secret(), "NEW-1");
     assert!(got.history.is_empty());
-    v.set_field(id, "password", secret("pw2"), 31).unwrap();
+    v.set_field_named(id, "password", secret("pw2"), 31)
+        .unwrap();
     assert_eq!(v.get(id).unwrap().history.len(), 1);
 }
 
@@ -237,7 +239,7 @@ fn malformed_field_kinds_are_still_rejected_and_item_kind_is_just_an_extra() {
         ciborium::into_writer(&Value::Map(plain), &mut out).unwrap();
         out
     };
-    let decode = |b: &[u8]| format::decode_item_plain(b, Uuid::nil(), 1);
+    let decode = |b: &[u8]| format::decode_item_plain(b, Uuid::nil(), 1, 1);
 
     // Unknown field kind strings are fine; the item's `kind` string lands in extras.
     let item = decode(&base(
@@ -306,7 +308,8 @@ fn legacy_item_kind_round_trips_byte_identically_and_is_never_written() {
         let mut bytes = Vec::new();
         ciborium::into_writer(&Value::Map(legacy), &mut bytes).unwrap();
 
-        let got = format::decode_item_plain(&bytes, item.id, item.modified_at).unwrap();
+        let got =
+            format::decode_item_plain(&bytes, item.id, item.modified_at, FORMAT_VERSION).unwrap();
         assert_eq!(got.extras, vec![(t("kind"), t(raw))], "{raw:?}");
         assert_eq!(got.title, item.title);
         assert_eq!(got.tags, item.tags, "{raw:?}: tags untouched");
@@ -423,7 +426,7 @@ fn unknown_kind_strings_are_exact_matches_only() {
         out
     };
     for raw in ["", "Text", "text ", "number"] {
-        let got = format::decode_item_plain(&field(raw), item.id, 1).unwrap();
+        let got = format::decode_item_plain(&field(raw), item.id, 1, FORMAT_VERSION).unwrap();
         assert_eq!(got.fields[0].kind, FieldKind::Other, "{raw:?}");
         assert_eq!(got.fields[0].kind_raw.as_deref(), Some(raw));
         assert_eq!(got.fields[0].kind_str(), raw);

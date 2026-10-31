@@ -189,6 +189,30 @@ done
 ok "truncated vault: list/add fail cleanly, file untouched (unless reported above)"
 cp "$T/good.bin" "$VAULT_FILE/vault.bin"
 
+# ---- upgrade (01 §9 "the CLI exposes it as an explicit command"; README `vault upgrade`) ----------
+FIX="$ROOT/crates/vault-core/tests/fixtures"
+export FPW="correct horse battery staple"
+fv() { xxd -s 4 -l 2 -p "$1"; }
+mkdir -p "$T/up.vault"; cp "$FIX/v1-basic.vault" "$T/up.vault/vault.bin"
+[ "$(fv "$T/up.vault/vault.bin")" = "0001" ] && ok "fixture v1-basic is version 1" || bad "fixture version" "$(fv "$T/up.vault/vault.bin")"
+"$V" --vault "$T/up.vault" --password-env FPW list >"$T/o" 2>&1 && ok "v1 vault opens before upgrade" || bad "v1 list" "$(cat "$T/o")"
+"$V" --vault "$T/up.vault" --password-env FPW add --title AfterV1 --username z >"$T/o" 2>&1
+[ "$(fv "$T/up.vault/vault.bin")" = "0001" ] && ok "a save never changes a v1 file's version" || bad "add changed version" "$(fv "$T/up.vault/vault.bin")"
+cp "$T/up.vault/vault.bin" "$T/up-before.bin"
+BADPW="wrong horse battery staple" "$V" --vault "$T/up.vault" --password-env BADPW upgrade --allow-weak >"$T/o" 2>&1; rc=$?
+if [ $rc -ne 0 ] && [ $rc -ne 101 ] && cmp -s "$T/up-before.bin" "$T/up.vault/vault.bin" && ! grep -q "wrong horse" "$T/o"; then ok "upgrade with wrong password: clean error, file untouched"; else bad "upgrade wrong password" "rc=$rc $(cat "$T/o")"; fi
+"$V" --vault "$T/up.vault" --password-env FPW upgrade --allow-weak >"$T/o" 2>&1; rc=$?
+[ $rc -eq 0 ] && [ "$(fv "$T/up.vault/vault.bin")" = "0002" ] && ok "upgrade writes version 2" || bad "upgrade" "rc=$rc $(cat "$T/o")"
+"$V" --vault "$T/up.vault" --password-env FPW get AfterV1 >"$T/o" 2>&1 && ok "upgraded vault opens, items kept" || bad "after upgrade" "$(cat "$T/o")"
+cp "$T/up.vault/vault.bin" "$T/up-v2.bin"
+"$V" --vault "$T/up.vault" --password-env FPW upgrade --allow-weak >"$T/o" 2>&1; rc=$?
+[ $rc -eq 0 ] && cmp -s "$T/up-v2.bin" "$T/up.vault/vault.bin" && ok "second upgrade is a no-op (file bytes unchanged)" || { [ $rc -eq 0 ] && echo "INFO second upgrade rewrote the file: $(cat "$T/o")" || bad "second upgrade" "rc=$rc $(cat "$T/o")"; }
+"$V" --vault "$T/up.vault" --password-env FPW add --title AfterV2 >"$T/o" 2>&1
+"$V" --vault "$T/up.vault" --password-env FPW get AfterV2 --ids >"$T/o" 2>&1
+grep -qE '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-' "$T/o" && ok "get --ids prints v4 field ids" || bad "get --ids" "$(cat "$T/o")"
+"$V" --vault "$T/up.vault" --password-env FPW get AfterV1 --ids >"$T/o" 2>&1
+grep -qE '[0-9a-f]{8}-[0-9a-f]{4}-[45][0-9a-f]{3}-' "$T/o" && ok "get --ids on a migrated item" || bad "get --ids migrated" "$(cat "$T/o")"
+
 # ---- secrets in error output / leaking ----------------------------------------------------
 v get NoSuchItem >"$T/o" 2>&1
 grep -q "$MPW" "$T/o" && bad "error output contains the master password" || ok "no master password in error output"

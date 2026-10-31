@@ -5,7 +5,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleIdentifier</key>
-	<string>dev.aurora.vault</string>
+	<string>dev.vault.app</string>
 	<key>CFBundleName</key>
 	<string>Vault</string>
 	<key>CFBundleExecutable</key>
@@ -30,7 +30,7 @@
 	<array>
 		<dict>
 			<key>UTTypeIdentifier</key>
-			<string>dev.aurora.vault</string>
+			<string>dev.vault.app</string>
 			<key>UTTypeDescription</key>
 			<string>Vault package</string>
 			<key>UTTypeConformsTo</key>
@@ -56,7 +56,7 @@
 			<string>Vault package</string>
 			<key>LSItemContentTypes</key>
 			<array>
-				<string>dev.aurora.vault</string>
+				<string>dev.vault.app</string>
 			</array>
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>

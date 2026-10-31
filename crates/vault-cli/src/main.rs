@@ -11,8 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use vault_core::{
-    CsvMapping, ExposeSecret, Field, FieldKind, Item, ItemIcon, KdfParams, PassphraseSpec,
-    PasswordSpec, Query, SecretString, Totp, UnlockedVault, Uuid, VaultError,
+    CsvMapping, ExposeSecret, FORMAT_VERSION, Field, FieldKind, Item, ItemIcon, KdfParams,
+    PassphraseSpec, PasswordSpec, Query, SecretString, Totp, UnlockedVault, Uuid, VaultError,
     attachment::MAX_ATTACHMENT_SIZE, export_csv, import_csv, passphrase, password, search,
     strength_bits,
 };
@@ -49,6 +49,15 @@ enum Cmd {
         id_or_title: String,
         #[arg(long)]
         reveal: bool,
+        /// Show each field's id in a trailing column.
+        #[arg(long)]
+        ids: bool,
+    },
+    /// Upgrade the vault file to the current format version (drops non-password slots).
+    Upgrade {
+        /// Do not warn when the master password is under 50 bits of strength.
+        #[arg(long)]
+        allow_weak: bool,
     },
     /// List items.
     List {
@@ -287,15 +296,27 @@ fn stamp_lines(item: &Item) -> Vec<String> {
 }
 
 /// One `get` output line for a field. A section is a bare uppercased heading with no value.
-fn field_line(item: &Item, f: &Field, reveal: bool) -> String {
-    if f.kind == FieldKind::Section {
-        return sanitize_for_terminal(&f.name.to_uppercase());
+/// An empty name keeps the `name: value` shape (`: value`), so a value can never pass for a
+/// heading or another labelled line. With `show_id`, the field id trails.
+fn field_line(item: &Item, f: &Field, reveal: bool, show_id: bool) -> String {
+    let mut line = if f.kind == FieldKind::Section {
+        sanitize_for_terminal(&f.name.to_uppercase())
+    } else {
+        format!(
+            "{}: {}",
+            sanitize_for_terminal(&f.name),
+            display_value(item, f, reveal)
+        )
+    };
+    if show_id {
+        line.push_str(&format!("  (id {})", f.id));
     }
-    format!(
-        "{}: {}",
-        sanitize_for_terminal(&f.name),
-        display_value(item, f, reveal)
-    )
+    line
+}
+
+/// Hint for `list`/`get` when the vault file is older than this build writes.
+fn format_hint(v: &UnlockedVault) -> Option<&'static str> {
+    (v.header().format_version < FORMAT_VERSION).then_some("Vault is format 1; run `vault upgrade`")
 }
 
 /// What `get` prints for a field: secrets are masked unless `reveal` is set.
@@ -708,9 +729,13 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Get {
             id_or_title,
             reveal,
+            ids,
         } => {
             let sv = open_cli(&cli)?;
             let vault = sv.vault().context("vault is locked")?;
+            if let Some(h) = format_hint(vault) {
+                eprintln!("{h}");
+            }
             let item = vault
                 .get(find_item(vault, id_or_title)?)
                 .context("item vanished")?;
@@ -721,7 +746,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("Icon: {}", sanitize_for_terminal(&icon_summary(item, icon)));
             }
             for f in &item.fields {
-                println!("{}", field_line(item, f, *reveal));
+                println!("{}", field_line(item, f, *reveal, *ids));
             }
             for line in stamp_lines(item) {
                 println!("{line}");
@@ -734,6 +759,9 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             let sv = open_cli(&cli)?;
             let vault = sv.vault().context("vault is locked")?;
+            if let Some(h) = format_hint(vault) {
+                eprintln!("{h}");
+            }
             let q = Query {
                 text: query.as_deref().unwrap_or(""),
                 tag: tag.as_deref(),
@@ -748,6 +776,30 @@ fn run(cli: Cli) -> Result<()> {
                     Some(u) => println!("{short}  {title}  {u}  [{tags}]"),
                     None => println!("{short}  {title}  [{tags}]"),
                 }
+            }
+        }
+        Cmd::Upgrade { allow_weak } => {
+            let path = vault_path(&cli)?;
+            let pw = master_password(&cli, false)?;
+            let mut sv = open_synced(&path, &pw)?;
+            let version = sv
+                .vault()
+                .context("vault is locked")?
+                .header()
+                .format_version;
+            if version >= FORMAT_VERSION {
+                println!("already at version {FORMAT_VERSION}");
+            } else {
+                if !*allow_weak && strength_bits(pw.expose_secret()) < 50.0 {
+                    eprintln!(
+                        "warning: master password is under 50 bits of strength; pass --allow-weak to silence this"
+                    );
+                }
+                sv.edit(|v| v.upgrade_format(&pw, now_millis()))
+                    .map_err(sync_err)??;
+                sv.save().map_err(sync_err)?;
+                println!("upgraded to version {FORMAT_VERSION}");
+                println!("Non-password key slots were dropped; re-enable Touch ID in the app.");
             }
         }
         Cmd::Rm { id_or_title } => {
@@ -1039,11 +1091,11 @@ mod tests {
     #[test]
     fn section_renders_as_heading() {
         let i = item(false, "Login \u{1b}[31mdetails", FieldKind::Section, "");
-        let line = field_line(&i, &i.fields[0], true);
+        let line = field_line(&i, &i.fields[0], true, false);
         assert_eq!(line, "LOGIN \\u{1b}[31MDETAILS");
         assert!(!line.contains(':') && !line.contains("hidden"));
         let plain = item(false, "Work", FieldKind::Section, "");
-        assert_eq!(field_line(&plain, &plain.fields[0], false), "WORK");
+        assert_eq!(field_line(&plain, &plain.fields[0], false, false), "WORK");
     }
 
     #[test]
@@ -1094,5 +1146,36 @@ mod tests {
         assert_eq!(f.kind, FieldKind::Totp);
         assert_eq!(f.value.expose_secret(), uri);
         assert!(totp_field(&item(false, "totp", FieldKind::Section, "x")).is_none());
+    }
+
+    #[test]
+    fn empty_name_keeps_label_shape_and_ids_trail() {
+        let i = item(false, "", FieldKind::Text, "just-a-value");
+        let f = &i.fields[0];
+        assert_eq!(field_line(&i, f, false, false), ": just-a-value");
+        assert_eq!(
+            field_line(&i, f, false, true),
+            format!(": just-a-value  (id {})", f.id)
+        );
+        for v in ["LOGIN DETAILS", "password: hunter2"] {
+            let e = item(false, "", FieldKind::Text, v);
+            let line = field_line(&e, &e.fields[0], false, false);
+            assert_eq!(line, format!(": {v}"));
+            assert!(line.starts_with(": "));
+        }
+        let masked = item(false, "", FieldKind::Password, "hunter2");
+        assert_eq!(
+            field_line(&masked, &masked.fields[0], false, false),
+            ": ********"
+        );
+        assert_eq!(
+            field_line(&masked, &masked.fields[0], true, false),
+            ": hunter2"
+        );
+        let named = item(false, "user", FieldKind::Text, "v");
+        assert_eq!(
+            field_line(&named, &named.fields[0], false, false),
+            "user: v"
+        );
     }
 }

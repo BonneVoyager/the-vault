@@ -820,10 +820,10 @@ mod tests {
     #[test]
     fn names_follow_spec() {
         let id = Uuid::nil();
-        assert_eq!(service(), "dev.aurora.vault.enclave");
+        assert_eq!(service(), "dev.vault.app.enclave");
         assert_eq!(
             key_tag(id),
-            "dev.aurora.vault.enclave.00000000-0000-0000-0000-000000000000"
+            "dev.vault.app.enclave.00000000-0000-0000-0000-000000000000"
         );
     }
 }

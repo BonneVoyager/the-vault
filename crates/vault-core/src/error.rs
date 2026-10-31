@@ -1,6 +1,8 @@
-//! Error types per `specs/01-vault-format.md` §7, plus one documented extension:
-//! [`VaultError::NoUsableSlot`] (forward compatibility, 01 §9) is not in the §7 listing yet
-//! and is pending a spec amendment.
+//! Error types per `specs/01-vault-format.md` §7, plus documented extensions:
+//! [`VaultError::NoUsableSlot`] (forward compatibility, 01 §9) and the field-identity pair
+//! [`VaultError::FieldNotFound`] / [`VaultError::AmbiguousField`] (02 `set_field`,
+//! `set_field_named`, `remove_field`) are not in the §7 listing yet and are pending a spec
+//! amendment.
 
 use uuid::Uuid;
 
@@ -32,6 +34,16 @@ pub enum VaultError {
     /// An AEAD tag or the manifest cross-check failed.
     #[error("vault file has been tampered with: {0:?}")]
     Tampered(TamperKind),
+    /// A field operation named a field the item does not have: no field with that id
+    /// (`set_field`, `remove_field`) or no non-section field with that name
+    /// (`set_field_named`). Documented extension to the 01 §7 enum (field identity, FI-1).
+    #[error("no such field on this item")]
+    FieldNotFound,
+    /// `set_field_named` found more than one non-section field with that name (field names
+    /// are not unique since FI-1); address the field by id instead. Documented extension to
+    /// the 01 §7 enum.
+    #[error("more than one field has that name; address it by id")]
+    AmbiguousField,
 }
 
 /// Which part of the file failed its integrity check.

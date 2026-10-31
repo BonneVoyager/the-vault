@@ -107,7 +107,7 @@ fn pinned_totp(s: &AppState, id: Uuid) -> bool {
 struct ItemWindow {
     state: Entity<AppState>,
     id: Uuid,
-    revealed: HashSet<String>,
+    revealed: HashSet<Uuid>,
     history_open: bool,
     status_clear: Option<gpui::Task<()>>,
     status: Option<String>,
@@ -181,9 +181,9 @@ impl ItemWindow {
 
     fn act(&mut self, action: DetailAction, cx: &mut Context<Self>) {
         match action {
-            DetailAction::Reveal(name) => {
-                if !self.revealed.remove(&name) {
-                    self.revealed.insert(name);
+            DetailAction::Reveal(field) => {
+                if !self.revealed.remove(&field) {
+                    self.revealed.insert(field);
                 }
                 cx.notify();
             }
@@ -226,14 +226,16 @@ impl ItemWindow {
                 return;
             };
             match target {
-                CopyTarget::Field(ix) => item.fields.get(ix).and_then(|field| match field.kind {
-                    FieldKind::Totp => parse_totp(&field.value)
-                        .map(|totp| SecretString::new(totp.code(text::now_millis() / 1000))),
-                    // A heading has nothing to copy; its stored value never leaves the
-                    // vault (a stale index or a crafted vault must not reach it).
-                    FieldKind::Section => None,
-                    _ => Some(field.value.clone()),
-                }),
+                CopyTarget::Field(field) => {
+                    item.field_by_id(field).and_then(|field| match field.kind {
+                        FieldKind::Totp => parse_totp(&field.value)
+                            .map(|totp| SecretString::new(totp.code(text::now_millis() / 1000))),
+                        // A heading has nothing to copy; its stored value never leaves the
+                        // vault (a stale index or a crafted vault must not reach it).
+                        FieldKind::Section => None,
+                        _ => Some(field.value.clone()),
+                    })
+                }
                 CopyTarget::History(ix) => item.history.get(ix).map(|h| h.value.clone()),
                 _ => None,
             }
@@ -499,7 +501,15 @@ mod tests {
         cx.update(|cx| {
             let view = root.read(cx).unwrap().view().clone();
             let window = view.downcast::<ItemWindow>().unwrap();
-            window.update(cx, |w, cx| w.copy(CopyTarget::Field(0), cx));
+            let section = state
+                .read(cx)
+                .unlocked_vault()
+                .unwrap()
+                .get(plain)
+                .unwrap()
+                .fields[0]
+                .id;
+            window.update(cx, |w, cx| w.copy(CopyTarget::Field(section), cx));
         });
         cx.run_until_parked();
         assert_eq!(
@@ -511,7 +521,15 @@ mod tests {
         cx.update(|cx| {
             let view = root.read(cx).unwrap().view().clone();
             let window = view.downcast::<ItemWindow>().unwrap();
-            window.update(cx, |w, cx| w.copy(CopyTarget::Field(1), cx));
+            let next = state
+                .read(cx)
+                .unlocked_vault()
+                .unwrap()
+                .get(plain)
+                .unwrap()
+                .fields[1]
+                .id;
+            window.update(cx, |w, cx| w.copy(CopyTarget::Field(next), cx));
         });
         cx.run_until_parked();
         assert_eq!(board.contents().as_deref(), Some("hunter2"));

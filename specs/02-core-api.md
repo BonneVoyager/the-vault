@@ -38,14 +38,16 @@ pub struct Item {
     pub icon: Option<ItemIcon>,  // v1.2; app-interpreted, set through `update` (which restamps)
     pub created_at: Option<Millis>,  // v1.3; Item::new sets Some(now); merge keeps the minimum; not part of "changed"
     pub fields: Vec<Field>,
-    pub history: Vec<HistoryEntry>,
+    pub history: Vec<HistoryEntry>,   // HistoryEntry { value, replaced_at, field_id: Option<Uuid> }
+    pub removed_fields: Vec<FieldTombstone>,   // FieldTombstone { id, removed_at }; 03 §5
     pub modified_at: Millis,
 }
 
 pub struct ItemIcon { pub kind: String, pub value: String, pub color: Option<String>, pub extras: Extras }   // Clone, PartialEq, Debug; nothing secret; 01 §4
 
 pub struct Field {
-    pub name: String,
+    pub id: Uuid,                // stable identity (2026-10-31); random v4 from Field::new; derived for version 1 files (01 §9)
+    pub name: String,            // a label: not unique within an item, may be empty
     pub kind: FieldKind,         // Copy; `Other` for unknown; `is_sensitive()` = Password | Totp | Other (Section is never sensitive); ALL has 9 entries incl. Section
     pub kind_raw: Option<String>,// as on Item
     pub value: SecretString,     // secrecy; Display is redacted
@@ -90,7 +92,10 @@ impl UnlockedVault {
     // write — every mutation stamps modified_at = now and device_id = self.device_id
     pub fn insert(&mut self, item: Item, now: Millis) -> Uuid;
     pub fn update<F: FnOnce(&mut Item)>(&mut self, id: Uuid, now: Millis, f: F) -> Result<(), VaultError>;
-    pub fn set_field(&mut self, id: Uuid, name: &str, value: SecretString, now: Millis) -> Result<(), VaultError>;
+    pub fn set_field(&mut self, id: Uuid, field_id: Uuid, value: SecretString, now: Millis) -> Result<(), VaultError>;        // by field id (2026-10-31)
+    pub fn set_field_named(&mut self, id: Uuid, name: &str, value: SecretString, now: Millis) -> Result<(), VaultError>;  // first non-Section field matching the name ASCII case-insensitively; FieldNotFound / AmbiguousField
+    pub fn remove_field(&mut self, id: Uuid, field_id: Uuid, now: Millis) -> Result<(), VaultError>;   // writes a removed_fields marker
+    pub fn upgrade_format(&mut self, password: &SecretString, now: Millis) -> Result<(), VaultError>;   // version 1 → 2; drops non-password slots (01 §9); no-op when current
     pub fn delete(&mut self, id: Uuid, now: Millis) -> Result<(), VaultError>;    // tombstone, keeps id
     pub fn purge_tombstones_older_than(&mut self, cutoff: Millis) -> usize;
 
@@ -121,7 +126,7 @@ pub struct MergeReport { pub added: usize, pub updated: usize, pub deleted: usiz
 
 `set_field` on a `password`-kind field pushes the previous value onto `history` (cap 10).
 
-`update` recomputes `item.modified_at = max(all field.modified_at, deleted_at, now)` after `f` runs. If `f` changed a field's value without bumping that field's `modified_at`, `update` bumps it to `now` by diffing against the pre-call copy. This keeps field timestamps honest without making every caller remember.
+`update` recomputes `item.modified_at = max(all field.modified_at, deleted_at, now)` after `f` runs. It diffs fields by id against the pre-call copy: a field whose name, kind, value or section changed without a bumped `modified_at` is bumped to `now` (a rename is an edit, not a delete + add); an id that vanished gets a `removed_fields` marker stamped `now`; a re-added id is stamped past its marker and the marker dropped; a duplicate id within an item is rejected and the item restored. `Item::field(name)` returns the first non-Section field whose name matches ASCII case-insensitively (an empty name never matches); `Item::field_by_id(id)` is the identity lookup.
 
 ## `kdf`
 

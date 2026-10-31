@@ -109,10 +109,20 @@ impl FieldKind {
     }
 }
 
-/// One named value inside an item. `value` is the merge unit (03-sync.md).
+/// One named value inside an item. The field is the merge unit (03-sync.md §5), identified
+/// by [`Field::id`], never by name.
+///
+/// Since FI-1 (2026-10-31, format version 2) a field's identity is its random `id`: names
+/// are labels that may repeat within an item and may be empty. A rename is an edit of the
+/// same field, not a delete plus an add. Lookups by name ([`Item::field`],
+/// [`crate::UnlockedVault::set_field_named`]) are conveniences that pick the first
+/// non-section match ASCII case-insensitively and never match an empty name.
 #[derive(Clone)]
 pub struct Field {
-    /// Unique within the item, e.g. `"username"`, `"password"`, `"totp"`.
+    /// Stable identity, random v4 from [`Field::new`]. Written to the file always; a v1 file
+    /// without ids gets deterministic ones on read ([`Field::derived_id`]).
+    pub id: Uuid,
+    /// Display label, e.g. `"username"`, `"password"`, `"totp"`. Not unique, may be empty.
     pub name: String,
     pub kind: FieldKind,
     /// The exact on-disk `kind` string when `kind == FieldKind::Other` (01 §9), else `None`.
@@ -128,8 +138,10 @@ pub struct Field {
 }
 
 impl Field {
+    /// A field with a fresh random id.
     pub fn new(name: impl Into<String>, kind: FieldKind, value: SecretString, now: Millis) -> Self {
         Self {
+            id: Uuid::new_v4(),
             name: name.into(),
             kind,
             kind_raw: None,
@@ -151,11 +163,30 @@ impl Field {
             self.kind.as_str()
         }
     }
+
+    /// The id a field of a **format version 1** file gets when the file carries none (01 §9
+    /// "version 2 and migration"). Deterministic so that two devices reading the same v1 file
+    /// agree without talking: UUIDv5 with the owning item's id as the namespace over the
+    /// bytes `"field:" || name || ":" || ordinal`, where `ordinal` is the number of earlier
+    /// fields in that item with the same name (so the first `username` is ordinal 0, a
+    /// second one 1, ...), written as unpadded decimal ASCII. The name goes in as its UTF-8
+    /// bytes; an empty name yields `"field::0"`. The reader applies this only to fields
+    /// without an `id` key; the writer always emits ids, so a file saved by this build never
+    /// needs the derivation again.
+    pub fn derived_id(item_id: Uuid, name: &str, ordinal: usize) -> Uuid {
+        let mut input = Vec::with_capacity(6 + name.len() + 1 + 20);
+        input.extend_from_slice(b"field:");
+        input.extend_from_slice(name.as_bytes());
+        input.push(b':');
+        input.extend_from_slice(ordinal.to_string().as_bytes());
+        Uuid::new_v5(&item_id, &input)
+    }
 }
 
 impl fmt::Debug for Field {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Field")
+            .field("id", &self.id)
             .field("name", &self.name)
             .field("kind", &self.kind)
             .field("kind_raw", &self.kind_raw)
@@ -170,11 +201,17 @@ impl fmt::Debug for Field {
     }
 }
 
-/// A previous password value (01 §4). Capped at 10 per item by `set_field` (later package).
+/// A previous password value (01 §4). Capped at 10 per item by `set_field`.
 #[derive(Clone)]
 pub struct HistoryEntry {
     pub value: SecretString,
     pub replaced_at: Millis,
+    /// The [`Field::id`] whose value this was (format version 2, optional key `field_id`).
+    /// `None` for entries written before field ids existed and for entries a caller pushed
+    /// without one; `set_field` on a `password` field records it. Not part of the history
+    /// union key (`(value, replaced_at)`), so a v1 entry and its id-carrying twin dedupe to
+    /// the one with the id.
+    pub field_id: Option<Uuid>,
 }
 
 impl fmt::Debug for HistoryEntry {
@@ -182,8 +219,27 @@ impl fmt::Debug for HistoryEntry {
         f.debug_struct("HistoryEntry")
             .field("value", &"[REDACTED]")
             .field("replaced_at", &self.replaced_at)
+            .field("field_id", &self.field_id)
             .finish()
     }
+}
+
+/// Removal marker for a field (01 §4 `removed_fields`, format version 2). Written by
+/// [`crate::UnlockedVault::remove_field`] and by [`crate::UnlockedVault::update`] for every
+/// field id that disappeared, so that a merge with a peer that still carries the field
+/// drops it instead of resurrecting it (this closes the "field deletion resurrection" limit
+/// of 03 §5). A field edited *after* the removal (strictly greater `modified_at`) survives
+/// the merge and the marker is dropped. Holds no secret. Kept newest first and purged with
+/// the item tombstones. The cap [`crate::vault::FIELD_TOMBSTONE_CAP`] is applied only by a
+/// merge, and only over markers whose field is absent on both sides; a local removal never
+/// truncates the list, so it may sit over the cap until a merge has seen both sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FieldTombstone {
+    /// The removed field's id.
+    pub id: Uuid,
+    /// The item stamp of the removal (unix millis). A field whose `modified_at` is at or
+    /// before this is considered removed.
+    pub removed_at: Millis,
 }
 
 /// A reference to one encrypted attachment blob (01 §4 "Attachments (v1.1)"). Lives inside
@@ -330,6 +386,12 @@ pub struct Item {
     /// [`crate::UnlockedVault::remove_history_entry`] / `clear_history` so the item is
     /// restamped; a merge drops every history entry whose stamp is in this list.
     pub removed_history: Vec<Millis>,
+    /// Removal markers for fields (01 §4 `removed_fields`, format version 2), newest first,
+    /// one per id. Written only when
+    /// non-empty. Maintained by [`crate::UnlockedVault::update`] /
+    /// [`crate::UnlockedVault::remove_field`]; a merge drops every field whose id has a
+    /// marker with `removed_at >= field.modified_at`.
+    pub removed_fields: Vec<FieldTombstone>,
     /// Must equal `max(field.modified_at, deleted_at, metadata change)`; the writer maintains it.
     pub modified_at: Millis,
     /// Unknown `ItemPlain` keys preserved from the file (01 §9).
@@ -353,6 +415,7 @@ impl Item {
             attachments: Vec::new(),
             removed_attachments: Vec::new(),
             removed_history: Vec::new(),
+            removed_fields: Vec::new(),
             modified_at: now,
             extras: Vec::new(),
         }
@@ -362,9 +425,24 @@ impl Item {
         self.deleted_at.is_some()
     }
 
-    /// First field with this name, if any.
+    /// The first non-section field whose name equals `name` ASCII case-insensitively, if
+    /// any. A convenience for templates and importers that address fields by label (02
+    /// "search", 2026-10-31 rule); the field's identity is [`Field::id`], see
+    /// [`Item::field_by_id`]. Section headings ([`FieldKind::Section`]) never match, and an
+    /// empty `name` never matches anything (a field may have an empty name since FI-1, but
+    /// nothing looks one up that way).
     pub fn field(&self, name: &str) -> Option<&Field> {
-        self.fields.iter().find(|f| f.name == name)
+        if name.is_empty() {
+            return None;
+        }
+        self.fields
+            .iter()
+            .find(|f| f.kind != FieldKind::Section && f.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The field with this id, if any.
+    pub fn field_by_id(&self, id: Uuid) -> Option<&Field> {
+        self.fields.iter().find(|f| f.id == id)
     }
 
     /// The attachment reference with this id, if any.
@@ -395,6 +473,7 @@ impl fmt::Debug for Item {
             .field("attachments", &self.attachments)
             .field("removed_attachments", &self.removed_attachments)
             .field("removed_history", &self.removed_history)
+            .field("removed_fields", &self.removed_fields)
             .field("modified_at", &self.modified_at)
             .field(
                 "extras",
@@ -439,6 +518,56 @@ mod tests {
     }
 
     #[test]
+    fn derived_field_id_is_uuid_v5_over_the_documented_bytes() {
+        let item = Uuid::from_u128(0x1234);
+        let id = Field::derived_id(item, "username", 0);
+        assert_eq!(id, Uuid::new_v5(&item, b"field:username:0"));
+        assert_eq!(id.get_version_num(), 5);
+        assert_eq!(
+            Field::derived_id(item, "", 7),
+            Uuid::new_v5(&item, b"field::7"),
+            "empty name, unpadded decimal ordinal"
+        );
+        assert_ne!(
+            Field::derived_id(item, "username", 1),
+            id,
+            "ordinal matters"
+        );
+        assert_ne!(
+            Field::derived_id(Uuid::from_u128(0x5678), "username", 0),
+            id,
+            "item id is the namespace"
+        );
+        assert_ne!(
+            Field::derived_id(item, "Username", 0),
+            id,
+            "name is byte-exact"
+        );
+    }
+
+    #[test]
+    fn field_lookup_by_name_skips_sections_and_empty_names() {
+        let mut item = Item::new("t", Uuid::nil(), 1);
+        let s = SecretString::new("v".into());
+        item.fields
+            .push(Field::new("Password", FieldKind::Section, s.clone(), 1));
+        item.fields
+            .push(Field::new("", FieldKind::Text, s.clone(), 1));
+        item.fields
+            .push(Field::new("password", FieldKind::Password, s.clone(), 1));
+        item.fields
+            .push(Field::new("PASSWORD", FieldKind::Text, s, 1));
+        assert_eq!(item.field("Password").unwrap().id, item.fields[2].id);
+        assert!(item.field("").is_none(), "empty name never matches");
+        assert_eq!(item.field_by_id(item.fields[1].id).unwrap().name, "");
+        assert!(item.field_by_id(Uuid::nil()).is_none());
+        assert!(
+            Field::new("x", FieldKind::Text, SecretString::new("".into()), 1).id
+                != Field::new("x", FieldKind::Text, SecretString::new("".into()), 1).id
+        );
+    }
+
+    #[test]
     fn new_item_is_stamped_created_at_now() {
         let item = Item::new("t", Uuid::nil(), 1_234);
         assert_eq!(item.created_at, Some(1_234));
@@ -467,6 +596,7 @@ mod tests {
         item.history.push(HistoryEntry {
             value: SecretString::new("hunter1".to_owned()),
             replaced_at: 0,
+            field_id: Some(item.fields[0].id),
         });
         item.extras.push((
             Value::Text("attachments".into()),

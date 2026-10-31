@@ -9,7 +9,7 @@ All integers big-endian. All CBOR is canonical (RFC 8949 §4.2.1) so byte-equali
 ```
 offset  size   field
 0       4      magic              b"RVLT"
-4       2      format_version     u16, currently 1
+4       2      format_version     u16, 1 or 2 (§9; new vaults are written as 2 since 2026-10-31)
 6       4      header_len         u32
 10      N      header             CBOR map (plaintext)
 10+N    *      body               CBOR array of Record (to EOF)
@@ -53,7 +53,7 @@ Parsers reject: wrong magic, `format_version > SUPPORTED`, `header_len` beyond E
 - `passkey` slot (post-phase-5, macOS 15): extra keys `credential_id: bytes`, `prf_salt: bytes(32)` (random, static per slot), `rp_id: tstr`. KEK = `HKDF-SHA256(ikm = prf_output, salt = vault_id, info = "vault/slot/passkey/v1")` where `prf_output` is the 32-byte WebAuthn PRF result for `prf_salt` from the passkey assertion. The password slot stays; either factor unlocks. The PRF output must be identical on every device that holds the synced passkey; verify this before relying on cross-device unlock. Not yet implemented.
 - `recovery` slot (v2): reserved.
 
-AAD for unwrapping any slot: `magic || format_version || vault_id || slot.id || slot.kind`. Tampering with KDF params does not break unwrap (they're not in AAD by design — otherwise you can't rotate them); it just makes derivation produce the wrong KEK and the tag fails. Tampering with `vault_id` fails every slot. Once a file carries `slots_modified_at`, the KDF params and slots are additionally bound through the manifest's `header_digest` (§4), so tampering with them is detected via the manifest on the `unlock_with_key` path (`Tampered(Manifest)`); on the password path a KDF edit still surfaces as `WrongPassword` because the slot unwrap fails before the manifest is reached.
+AAD for unwrapping any slot: `magic || format_version || vault_id || slot.id || slot.kind`. The header's slots and `format_version` are therefore one unit: a merge adopts the format version together with the slots (03 §5; bug hunt 2026-10-31). Tampering with KDF params does not break unwrap (they're not in AAD by design — otherwise you can't rotate them); it just makes derivation produce the wrong KEK and the tag fails. Tampering with `vault_id` fails every slot. Once a file carries `slots_modified_at`, the KDF params and slots are additionally bound through the manifest's `header_digest` (§4), so tampering with them is detected via the manifest on the `unlock_with_key` path (`Tampered(Manifest)`); on the password path a KDF edit still surfaces as `WrongPassword` because the slot unwrap fails before the manifest is reached.
 
 Multiple `password` slots are allowed in the format but v1 UI exposes one.
 
@@ -111,23 +111,25 @@ AAD = `vault_id || item.id || modified_at_be64 || format_version_be16`.
   "removed_attachments": [{ "id": bytes(16), "removed_at": u64 }]   (v1.1, optional; tombstones so a removal survives merge, cap 64 newest, purged with item tombstones)
   "history":     [HistoryEntry]    last 10 password values, optional
   "removed_history": [u64]         optional; `replaced_at` stamps of history entries the user deleted (never the value), cap 10 newest, purged with item tombstones
+  "removed_fields": [{ "id": bytes(16), "removed_at": u64 }]   (version 2, optional; field removal tombstones, newest first, cap 64, written only when non-empty, purged with item tombstones; 03 §5)
 }
 
 Field = {
-  "name":        tstr           unique within item, e.g. "username", "password", "totp", "url", "notes", or user-defined
-  "kind":        "text" | "password" | "totp" | "url" | "notes" | "email" | "date" | "month_year" | "section"   ("number" removed 2026-10-30; an old "number" reads as an unknown kind and is preserved. "section" added 2026-10-31, new enum string, no bump: a visual heading; name is the heading text, value is empty and ignored (core stores it as given); never sensitive; skipped by CSV export and search; set_field on it writes no history; merges by name and stamp like any field; older readers keep it as an unknown kind)
+  "id":          bytes(16)      required in version 2 (2026-10-31); the field's stable identity, random v4; derived for version 1 files (§9)
+  "name":        tstr           a label, NOT unique within an item and may be empty (2026-10-31; was "unique within item" before field ids); e.g. "Username", "Password", "totp", "url", "notes", or user-defined
+  "kind":        "text" | "password" | "totp" | "url" | "notes" | "email" | "date" | "month_year" | "section"   ("number" removed 2026-10-30; an old "number" reads as an unknown kind and is preserved. "section" added 2026-10-31, new enum string, no bump: a visual heading; name is the heading text, value is empty and ignored (core stores it as given); never sensitive; skipped by CSV export and search; set_field on it writes no history; merges by id and stamp like any field; older readers keep it as an unknown kind)
   "value":       tstr           for "totp": full otpauth:// URI
   "modified_at": u64            unix millis
   "section":     tstr | null    optional grouping label
 }
 
-HistoryEntry = { "value": tstr, "replaced_at": u64 }
+HistoryEntry = { "value": tstr, "replaced_at": u64, "field_id": bytes(16) (version 2, optional; the field the value belonged to) }
 AttachmentRef = { "id": bytes(16), "name": tstr, "size": u64, "key": bytes(32), "chunk_nonces": [bytes(24)], "added_at": u64 }
 ```
 
 ### Attachments (v1.1, no version bump)
 
-One immutable encrypted blob per attachment at `<name>.vault.attachments/<id as 32 lowercase hex>.bin`. The item keeps only the `AttachmentRef` inside `ct`, so names, sizes and keys are encrypted and the reference is authenticated with the item. Replacing a file is a new id; blobs are never rewritten.
+One immutable encrypted blob per attachment at `<name>.vault/attachments/<id as 32 lowercase hex>.bin` (package layout, 03 §1). The item keeps only the `AttachmentRef` inside `ct`, so names, sizes and keys are encrypted and the reference is authenticated with the item. Replacing a file is a new id; blobs are never rewritten.
 
 ```
 chunk_size   = 1 MiB (1_048_576 bytes); the last chunk may be shorter; a 0-byte file has one empty chunk
@@ -198,6 +200,8 @@ Phase 1 must commit:
 ## 9. Versioning
 
 `FORMAT_VERSION` bumps only on incompatible layout changes. Adding optional CBOR map keys is **not** a bump; readers ignore unknown keys, writers preserve unknown keys they read (store them as `Vec<(Value, Value)>` extras on each struct). This is how v1.1 adds attachments without a bump. New enum strings (slot kind, item kind, field kind) are also **not** a bump: readers preserve them as described in §2 and §4.
+
+**Version 2** (2026-10-31) adds the required field `id`. A version 1 file is read by deriving each field's id deterministically: UUIDv5 with the item id as namespace over the bytes `"field:" || name || ":" || ordinal`, where ordinal is the number of earlier fields in that item with the same name, as unpadded decimal; ids present in a version 1 file are kept; a duplicate id within an item is Malformed. A save never changes a file's version, because every slot AAD binds the version (§2): a version 1 file stays version 1 and merely gains explicit ids, `removed_fields` and `field_id` as keys older builds preserve as extras. `UnlockedVault::upgrade_format(password, now)` moves a file to version 2 by re-wrapping the password slots; it drops enclave, recovery and opaque slots (same contract as `rotate_vault_key`), so Touch ID must be re-enrolled; the app runs it automatically on the next password unlock of a version 1 file and says so; the CLI exposes it as an explicit command. Every version keeps its fixtures: `v2-basic.vault` carries two same-named fields, an empty-named field, a `removed_fields` marker and a history entry with `field_id`; the version 1 regenerators are historical and refuse to run. A merge never lowers a file's version: the header with the greater `format_version` wins regardless of `slots_modified_at`, so an upgrade is never undone; a slot change made on the older version after another device's upgrade (a password change or Touch ID enrolment) is dropped by the merge and must be redone on the upgraded vault.
 
 Every `FORMAT_VERSION` keeps its fixtures under `tests/fixtures/` forever, and a test opens every fixture in that directory with the current reader. `v1-forward.vault` carries an opaque slot, an unknown item kind, an unknown field kind, and unknown keys at every level. `v1-icon.vault` carries a symbol icon with a colour, a logo icon without one, and an icon-less item. `v1-meta.vault` carries one item with `created_at` and a section heading followed by two text fields, and one item with no `created_at` key.
 

@@ -22,9 +22,9 @@ fn e01_dirty_merge_keeps_both() {
     let mut b = Dev::open(&pkg);
     a.s.start_watching().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(700));
-    a.s.edit(|v| v.set_field(id, "username", pw("a-dirty"), now_ms())).unwrap().unwrap();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("a-dirty"), now_ms())).unwrap().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
-    b.s.edit(|v| v.set_field(id, "password", pw("b-saved"), now_ms())).unwrap().unwrap();
+    b.s.edit(|v| v.set_field_named(id, "password", pw("b-saved"), now_ms())).unwrap().unwrap();
     let bid = b.add_login("b-new", now_ms());
     b.s.save().unwrap();
     a.wait_for(8, |e| e.iter().any(|x| x.starts_with("Merged")));
@@ -110,7 +110,7 @@ fn e04_forged_conflict_header_rejected() {
     set(&mut h, "slots_modified_at", Value::Integer((now_ms() + 10_000_000).into()));
     // attacker drops the slot list to only an opaque slot to lock the user out
     set(&mut h, "slots", Value::Array(vec![Value::Map(vec![(Value::Text("id".into()), Value::Bytes(vec![1; 16])), (Value::Text("kind".into()), Value::Text("evil".into()))])]));
-    let forged = join(1, &h, &raw.body);
+    let forged = join(raw.version, &h, &raw.body);
     a.s.start_watching().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(700));
     std::fs::write(pkg.join("vault 2.bin"), &forged).unwrap();
@@ -161,4 +161,46 @@ fn e06_header_stamp_monotone_under_skew() {
     let back = LockedVault::parse(&normal.serialize()).unwrap().unlock_with_key(&k, ahead.device_id()).unwrap();
     ahead.merge_from(&back).unwrap();
     assert!(LockedVault::parse(&ahead.serialize()).unwrap().unlock(&pw("p-final")).is_ok(), "latest password change lost to a skewed clock");
+}
+
+/// 03 §3 "Merge is idempotent and commutative, so a ping-pong between two devices converges in
+/// one round trip each", through vault-sync with two handles on one package. Same-millisecond
+/// edits of one field on both handles plus a later title edit on B (see merge_ids mi10): after
+/// several save/merge rounds both handles and the file should agree on the field value.
+#[test]
+fn e10_same_stamp_field_edit_converges_through_sync() {
+    use vault_core::*;
+    let d = tempdir();
+    let pkg = d.path().join("tie.vault");
+    let dev_a = uuid::Uuid::from_bytes([0xF0; 16]);
+    let dev_b = uuid::Uuid::from_bytes([0x10; 16]);
+    let mut a = SyncedVault::create(&pkg, &pw(PW), KdfParams::for_tests(), dev_a, hooks()).unwrap();
+    let t0 = now_ms();
+    let (id, fid) = a
+        .edit(|v| {
+            let mut it = Item::new("Tie", dev_a, t0);
+            it.fields.push(Field::new("username", FieldKind::Text, pw("u0"), t0));
+            let f = it.fields[0].id;
+            (v.insert(it, t0), f)
+        })
+        .unwrap();
+    a.save().unwrap();
+    let mut b = SyncedVault::open(&pkg, dev_b, hooks()).unwrap();
+    b.unlock(&pw(PW)).unwrap();
+    let t = t0 + 10_000;
+    a.edit(|v| v.set_field(id, fid, pw("from-A"), t)).unwrap().unwrap();
+    b.edit(|v| v.set_field(id, fid, pw("from-B"), t)).unwrap().unwrap();
+    b.edit(|v| v.update(id, t + 100, |it| it.title = "B title".into())).unwrap().unwrap();
+    b.save().unwrap();
+    for _ in 0..3 {
+        a.edit(|_| ()).unwrap();
+        a.save().unwrap();
+        b.edit(|_| ()).unwrap();
+        b.save().unwrap();
+    }
+    let get_v = |s: &SyncedVault| s.vault().unwrap().get(id).unwrap().field_by_id(fid).unwrap().value.expose_secret().clone();
+    let disk = read_vault(&pkg);
+    let on_disk = disk.get(id).unwrap().field_by_id(fid).unwrap().value.expose_secret().clone();
+    let (va, vb) = (get_v(&a), get_v(&b));
+    assert!(va == vb && vb == on_disk, "A shows {va:?}, B shows {vb:?}, file has {on_disk:?}");
 }

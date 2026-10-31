@@ -21,6 +21,12 @@
 //! `ItemPlain.kind` (item categories) was removed on 2026-10-30 without a version bump. The
 //! reader does not look for it, so an old file's `kind` entry is an ordinary unknown key that
 //! lands in `Item::extras` and is re-emitted verbatim; the writer never adds one.
+//!
+//! # Format version 2 (field identity, FI-1)
+//!
+//! Fields carry a required `id` (`bytes(16)`); a version 1 file's fields get deterministic
+//! derived ids on read ([`Field::derived_id`]) and explicit ones on the next save. The
+//! version in the prefix is otherwise unchanged by a save (see [`FORMAT_VERSION`]).
 
 use std::collections::BTreeSet;
 
@@ -34,18 +40,32 @@ use crate::attachment::validate_ref;
 use crate::crypto::{KEY_LEN, NONCE_LEN, WRAPPED_KEY_LEN};
 use crate::error::VaultError;
 use crate::item::{
-    AttachmentRef, AttachmentTombstone, Extras, Field, FieldKind, HistoryEntry, Item, ItemIcon,
-    Millis,
+    AttachmentRef, AttachmentTombstone, Extras, Field, FieldKind, FieldTombstone, HistoryEntry,
+    Item, ItemIcon, Millis,
 };
 use crate::kdf::KdfParams;
 
 /// Lowest format version this build reads. Version 0 never existed and is rejected.
+///
+/// Version 1 files differ from version 2 only inside the item payload: fields carry no
+/// `id`, so the reader derives one per field ([`Field::derived_id`]); see
+/// [`decode_item_plain`].
 pub const MIN_FORMAT_VERSION: u16 = 1;
 
 /// File magic.
 pub const MAGIC: [u8; 4] = *b"RVLT";
-/// The format version this build writes and the newest it reads.
-pub const FORMAT_VERSION: u16 = 1;
+/// The format version this build creates new vaults at and the newest it reads.
+///
+/// **Version 2 (FI-1, 2026-10-31):** every field carries a stable `id` (`bytes(16)`,
+/// required) and items may carry `removed_fields` tombstones; history entries may carry a
+/// `field_id`. The writer emits all three shapes regardless of the file's version, so a
+/// version 1 file saved by this build is still version 1 (older builds keep the new keys as
+/// extras) and only gains ids on disk; it is **not** silently relabelled as version 2,
+/// because the prefix version is bound into every slot AAD (01 §2) and re-wrapping an
+/// `enclave` slot needs a KEK the core does not hold. New vaults start at version 2;
+/// [`UnlockedVault::upgrade_format`](crate::UnlockedVault::upgrade_format) moves an
+/// older file up explicitly.
+pub const FORMAT_VERSION: u16 = 2;
 /// `magic(4) || format_version(2) || header_len(4)`.
 pub const PREFIX_LEN: usize = 10;
 /// The only KDF algorithm the format knows.
@@ -1066,9 +1086,12 @@ fn icon_from_value(value: Value) -> Result<ItemIcon, VaultError> {
     })
 }
 
+/// `Field` map (01 §4). `id` is always written (format version 2 shape, also into a version
+/// 1 file, where an older reader keeps it as an unknown key).
 fn field_to_value(f: &Field) -> Value {
     build_map(
         vec![
+            ("id", bytes(f.id.as_bytes())),
             ("name", text(&f.name)),
             ("kind", text(f.kind_str())),
             ("value", text(f.value.expose_secret())),
@@ -1079,8 +1102,26 @@ fn field_to_value(f: &Field) -> Value {
     )
 }
 
-fn field_from_value(value: Value) -> Result<Field, VaultError> {
+/// Canonical CBOR bytes of one field map (the exact bytes the writer emits for it inside
+/// `fields`). Used by the merge as the final, symmetric tie-break between two versions of
+/// the same field (03 §5). Holds the plaintext value, hence zeroizing.
+pub(crate) fn field_canonical_bytes(f: &Field) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(encode(&canonicalize(field_to_value(f))))
+}
+
+/// Decode one field. The returned `bool` is `true` when the map carried an `id`; otherwise
+/// (allowed for `format_version == 1` only) `Field::id` is `Uuid::nil()` and the caller
+/// derives it, see [`decode_item_plain`]. A version 2 field without an `id`, and a
+/// present-but-not-16-bytes `id` under any version, is `Malformed`.
+fn field_from_value(value: Value, format_version: u16) -> Result<(Field, bool), VaultError> {
     let mut m = MapReader::new("field", value)?;
+    let id = match m.take("id") {
+        Some(v) => Some(as_uuid(v, "field.id")?),
+        None if format_version >= 2 => {
+            return Err(malformed("field: missing key \"id\" (format version 2)"));
+        }
+        None => None,
+    };
     let name = as_text(m.required("name")?, "field.name")?;
     // Unknown kind strings (including the removed `"number"`) become `FieldKind::Other` +
     // `kind_raw` (01 §9); only a non-text `kind` is structural damage.
@@ -1090,30 +1131,97 @@ fn field_from_value(value: Value) -> Result<Field, VaultError> {
     let value = SecretString::new(as_text(m.required("value")?, "field.value")?);
     let modified_at = as_u64(m.required("modified_at")?, "field.modified_at")?;
     let section = opt_text(m.take("section"), "field.section")?;
-    Ok(Field {
-        name,
-        kind,
-        kind_raw,
-        value,
-        modified_at,
-        section,
-        extras: m.finish(),
-    })
+    Ok((
+        Field {
+            id: id.unwrap_or(Uuid::nil()),
+            name,
+            kind,
+            kind_raw,
+            value,
+            modified_at,
+            section,
+            extras: m.finish(),
+        },
+        id.is_some(),
+    ))
 }
 
+/// Decode `item.fields`. Fields of a version 1 file that carry no `id` get
+/// [`Field::derived_id`] with the ordinal counted over *all* earlier fields of the same
+/// name in the array (ids present or not, so the ordinal of a given field never depends on
+/// which of its siblings were already migrated). Ids must then be unique within the item;
+/// a duplicate (two explicit ids, or an explicit id colliding with a derived one) is
+/// `Malformed` because every operation addresses fields by id.
+fn fields_from_value(
+    value: Value,
+    item_id: Uuid,
+    format_version: u16,
+) -> Result<Vec<Field>, VaultError> {
+    let decoded = as_array(value, "item.fields")?
+        .into_iter()
+        .map(|f| field_from_value(f, format_version))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut fields = Vec::with_capacity(decoded.len());
+    for (i, (mut field, explicit)) in decoded.into_iter().enumerate() {
+        if !explicit {
+            let ordinal = fields[..i]
+                .iter()
+                .filter(|earlier: &&Field| earlier.name == field.name)
+                .count();
+            field.id = Field::derived_id(item_id, &field.name, ordinal);
+        }
+        fields.push(field);
+    }
+    let mut seen = BTreeSet::new();
+    if let Some(dup) = fields.iter().map(|f| f.id).find(|id| !seen.insert(*id)) {
+        return Err(malformed(format!("item.fields: duplicate field id {dup}")));
+    }
+    Ok(fields)
+}
+
+/// `HistoryEntry` map (01 §4). `field_id` (format version 2) is written only when `Some`.
 fn history_to_value(h: &HistoryEntry) -> Value {
-    Value::Map(vec![
+    let mut entries = vec![
         (text("value"), text(h.value.expose_secret())),
         (text("replaced_at"), Value::from(h.replaced_at)),
-    ])
+    ];
+    if let Some(id) = h.field_id {
+        entries.push((text("field_id"), bytes(id.as_bytes())));
+    }
+    Value::Map(entries)
 }
 
 fn history_from_value(value: Value) -> Result<HistoryEntry, VaultError> {
     let mut m = MapReader::new("history", value)?;
     let value = SecretString::new(as_text(m.required("value")?, "history.value")?);
     let replaced_at = as_u64(m.required("replaced_at")?, "history.replaced_at")?;
+    // Optional (format version 2): missing or null is "unknown field"; anything else must
+    // be 16 bytes.
+    let field_id = match m.take("field_id") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(as_uuid(v, "history.field_id")?),
+    };
     // HistoryEntry has no extras slot; unknown keys here are dropped.
-    Ok(HistoryEntry { value, replaced_at })
+    Ok(HistoryEntry {
+        value,
+        replaced_at,
+        field_id,
+    })
+}
+
+fn field_tombstone_to_value(t: &FieldTombstone) -> Value {
+    Value::Map(vec![
+        (text("id"), bytes(t.id.as_bytes())),
+        (text("removed_at"), Value::from(t.removed_at)),
+    ])
+}
+
+fn field_tombstone_from_value(value: Value) -> Result<FieldTombstone, VaultError> {
+    let mut m = MapReader::new("removed_field", value)?;
+    let id = as_uuid(m.required("id")?, "removed_field.id")?;
+    let removed_at = as_u64(m.required("removed_at")?, "removed_field.removed_at")?;
+    // No extras slot (like AttachmentTombstone); unknown keys here are dropped.
+    Ok(FieldTombstone { id, removed_at })
 }
 
 /// Canonical CBOR of `ItemPlain` (01 §4), ready to be sealed. The output is zeroized on drop;
@@ -1121,12 +1229,14 @@ fn history_from_value(value: Value) -> Result<HistoryEntry, VaultError> {
 /// limitation of using a generic CBOR model.
 ///
 /// `attachments` is always written (as `[]` when the item has none); `removed_attachments`
-/// (`[{ "id": bytes(16), "removed_at": u64 }]`) and `removed_history` (`[u64]`, stamps
-/// newest first) are optional keys written only when non-empty, so files without removals
-/// keep their v1 byte layout. `icon` (v1.2, `{ "kind", "value", "color"? }` plus extras) and
-/// `created_at` (v1.3, `u64` unix millis) are likewise written only when `Some`. No `kind`
-/// key is written (removed 2026-10-30); one read from an older file is in `item.extras` and
-/// is re-emitted from there, unchanged.
+/// (`[{ "id": bytes(16), "removed_at": u64 }]`), `removed_fields` (same shape, format
+/// version 2) and `removed_history` (`[u64]`, stamps newest first) are optional keys written
+/// only when non-empty, so files without removals keep their v1 byte layout. `icon` (v1.2,
+/// `{ "kind", "value", "color"? }` plus extras) and `created_at` (v1.3, `u64` unix millis)
+/// are likewise written only when `Some`. Every field carries its `id` and every history
+/// entry with a known field carries `field_id`, whatever the file's version. No `kind` key
+/// is written (removed 2026-10-30); one read from an older file is in `item.extras` and is
+/// re-emitted from there, unchanged.
 pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
     // NOTE: the `ciborium::Value` tree built here holds plaintext field values and attachment
     // keys as ordinary `String`s / `Vec<u8>`s and cannot be zeroized; only the encoded output
@@ -1185,11 +1295,30 @@ pub fn encode_item_plain(item: &Item) -> Zeroizing<Vec<u8>> {
             ),
         ));
     }
+    if !item.removed_fields.is_empty() {
+        known.push((
+            "removed_fields",
+            Value::Array(
+                item.removed_fields
+                    .iter()
+                    .map(field_tombstone_to_value)
+                    .collect(),
+            ),
+        ));
+    }
     Zeroizing::new(encode(&canonicalize(build_map(known, &item.extras))))
 }
 
-/// Decode a decrypted `ItemPlain`; `id` and `modified_at` come from the plaintext record.
-pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<Item, VaultError> {
+/// Decode a decrypted `ItemPlain`; `id` and `modified_at` come from the plaintext record and
+/// `format_version` from the file prefix (01 §9 "version 2 and migration"): under version 1
+/// a field without an `id` key gets [`Field::derived_id`] (see [`fields_from_value`]), under
+/// version 2 every field must carry one. Everything else reads the same under both.
+pub fn decode_item_plain(
+    plain: &[u8],
+    id: Uuid,
+    modified_at: Millis,
+    format_version: u16,
+) -> Result<Item, VaultError> {
     // NOTE: same limitation as `encode_item_plain`: the decoded `Value` tree is not zeroized.
     let mut m = MapReader::new("item", decode_exact(plain, "item")?)?;
     // `kind` is deliberately not taken: since 2026-10-30 it is an unknown key that stays in
@@ -1202,10 +1331,7 @@ pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<
         .into_iter()
         .map(|t| as_text(t, "item.tags[]"))
         .collect::<Result<Vec<_>, _>>()?;
-    let fields = as_array(m.required("fields")?, "item.fields")?
-        .into_iter()
-        .map(field_from_value)
-        .collect::<Result<Vec<_>, _>>()?;
+    let fields = fields_from_value(m.required("fields")?, id, format_version)?;
     let history = match m.take("history") {
         None | Some(Value::Null) => Vec::new(),
         Some(v) => as_array(v, "item.history")?
@@ -1235,6 +1361,15 @@ pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<
             .map(|s| as_u64(s, "item.removed_history[]"))
             .collect::<Result<Vec<_>, _>>()?,
     };
+    // Optional (format version 2; a version 1 file never has it, but the key is read under
+    // any version): missing or null is "no removals".
+    let removed_fields = match m.take("removed_fields") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => as_array(v, "item.removed_fields")?
+            .into_iter()
+            .map(field_tombstone_from_value)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     // Optional (v1.2): missing or null is "no icon"; any other non-map or wrongly typed
     // value is Malformed, like a bad `attachments` entry.
     let icon = match m.take("icon") {
@@ -1258,6 +1393,7 @@ pub fn decode_item_plain(plain: &[u8], id: Uuid, modified_at: Millis) -> Result<
         attachments,
         removed_attachments,
         removed_history,
+        removed_fields,
         modified_at,
         extras: m.finish(),
     })
@@ -1435,7 +1571,9 @@ mod tests {
         let aad = slot_aad(FORMAT_VERSION, vid, sid, &SlotKind::Password);
         assert_eq!(aad.len(), 4 + 2 + 16 + 16 + 8);
         assert_eq!(&aad[..4], b"RVLT");
-        assert_eq!(&aad[4..6], &[0, 1]);
+        assert_eq!(FORMAT_VERSION, 2);
+        assert_eq!(&aad[4..6], &[0, 2]);
+        assert_eq!(&slot_aad(1, vid, sid, &SlotKind::Password)[4..6], &[0, 1]);
         assert_eq!(&aad[6..22], vid.as_bytes());
         assert_eq!(&aad[22..38], sid.as_bytes());
         assert_eq!(&aad[38..], b"password");
@@ -1443,12 +1581,14 @@ mod tests {
         let aad = item_aad(FORMAT_VERSION, vid, sid, 0x0102);
         assert_eq!(aad.len(), 16 + 16 + 8 + 2);
         assert_eq!(&aad[32..40], &[0, 0, 0, 0, 0, 0, 1, 2]);
-        assert_eq!(&aad[40..], &[0, 1]);
+        assert_eq!(&aad[40..], &[0, 2]);
+        assert_eq!(&item_aad(1, vid, sid, 0x0102)[40..], &[0, 1]);
 
         let aad = manifest_aad(FORMAT_VERSION, vid, 3, None);
         assert_eq!(aad.len(), 16 + 4 + 2);
         assert_eq!(&aad[16..20], &[0, 0, 0, 3]);
-        assert_eq!(&aad[20..], &[0, 1]);
+        assert_eq!(&aad[20..], &[0, 2]);
+        assert_eq!(&manifest_aad(1, vid, 3, None)[20..], &[0, 1]);
         // vault_id || item_count_be32 || version_be16 || header_digest(32), stamped files only.
         let digest = [0xAB; HEADER_DIGEST_LEN];
         let with = manifest_aad(FORMAT_VERSION, vid, 3, Some(&digest));

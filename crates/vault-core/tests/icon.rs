@@ -9,7 +9,7 @@ use ciborium::Value;
 use common::*;
 use vault_core::format::{self, VaultFile};
 use vault_core::vault::merge::item_eq;
-use vault_core::{Item, ItemIcon, Uuid, VaultError};
+use vault_core::{FORMAT_VERSION, Item, ItemIcon, Uuid, VaultError};
 
 type Entries = Vec<(Value, Value)>;
 
@@ -54,7 +54,7 @@ fn reencode(item: &Item, edit: impl FnOnce(&mut Entries)) -> Result<Item, VaultE
     edit(&mut entries);
     let mut buf = Vec::new();
     ciborium::into_writer(&Value::Map(entries), &mut buf).unwrap();
-    format::decode_item_plain(&buf, item.id, item.modified_at)
+    format::decode_item_plain(&buf, item.id, item.modified_at, FORMAT_VERSION)
 }
 
 fn set_icon(entries: &mut Entries, v: Value) {

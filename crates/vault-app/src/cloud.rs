@@ -7,8 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vault_macos::CloudProvider;
-use vault_sync::CloudHooks;
+use vault_sync::{CloudHooks, SyncLocation};
 
 /// `vault_sync::CloudHooks` over `vault_macos::ICloudHooks`.
 #[derive(Default)]
@@ -52,12 +51,14 @@ pub fn hooks() -> Arc<dyn CloudHooks> {
     Arc::new(ICloudAdapter::new())
 }
 
-/// "iCloud Drive" / "Dropbox" for a vault file or folder; `None` for a local folder.
-pub fn provider_label(path: &Path) -> Option<&'static str> {
-    match vault_macos::cloud_provider(path) {
-        CloudProvider::ICloud => Some("iCloud Drive"),
-        CloudProvider::Dropbox => Some("Dropbox"),
-        CloudProvider::Local => None,
+/// "iCloud Drive", "Dropbox", "OneDrive", "Google Drive", … for a vault file or folder; `None`
+/// for a local folder. Classification is `vault_sync::classify_location` (path first, OS
+/// ubiquity flag only as a fallback, since File Provider folders also report ubiquitous).
+pub fn provider_label(path: &Path) -> Option<String> {
+    let home = dirs::home_dir();
+    match vault_sync::classify_location(path, home.as_deref(), || vault_macos::is_in_icloud(path)) {
+        SyncLocation::Local => None,
+        other => Some(other.label().to_owned()),
     }
 }
 
@@ -95,11 +96,11 @@ mod tests {
     fn provider_labels() {
         let icloud =
             Path::new("/Users/a/Library/Mobile Documents/com~apple~CloudDocs/Vaults/x.vault");
-        assert_eq!(provider_label(icloud), Some("iCloud Drive"));
-        assert_eq!(
-            provider_label(Path::new("/Users/a/Dropbox/x.vault")),
-            Some("Dropbox")
-        );
+        assert_eq!(provider_label(icloud).as_deref(), Some("iCloud Drive"));
+        let dropbox = Path::new("/Users/a/Library/CloudStorage/Dropbox/Vaults/x.vault");
+        assert_eq!(provider_label(dropbox).as_deref(), Some("Dropbox"));
+        let gdrive = Path::new("/Users/a/Library/CloudStorage/GoogleDrive-a@example.com/x.vault");
+        assert_eq!(provider_label(gdrive).as_deref(), Some("Google Drive"));
         assert_eq!(provider_label(Path::new("/tmp/x.vault")), None);
     }
 }

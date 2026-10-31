@@ -67,7 +67,7 @@ fn k03_enclave_slot_independent_unwrap() {
     let vid = bytes_of(get(&raw.header, "vault_id").unwrap());
     let s = get(&raw.header, "slots").unwrap().as_array().unwrap().iter().find(|s| get(s, "kind").unwrap().as_text() == Some("enclave")).unwrap().clone();
     assert_eq!(bytes_of(get(&s, "id").unwrap()), sid.as_bytes().to_vec());
-    let aad = indep::slot_aad(1, &vid, sid.as_bytes(), "enclave");
+    let aad = indep::slot_aad(raw.version, &vid, sid.as_bytes(), "enclave"); // ported 2026-10-31: was hard-coded 1
     let vk = indep::open(&[9; 32], &bytes_of(get(&s, "nonce").unwrap()), &bytes_of(get(&s, "wrapped_key").unwrap()), &aad).expect("enclave slot AAD per 01 §2");
     assert_eq!(vk, indep::open_file(&b, "pw").vault_key);
     // wrong kek / wrong slot id
@@ -113,7 +113,7 @@ fn k05_header_stamp_and_digest() {
     if let Value::Map(e) = &mut h {
         e.retain(|(k, _)| !matches!(k.as_text(), Some("slots_modified_at") | Some("slots_device_id")));
     }
-    let f = join(1, &h, &raw.body);
+    let f = join(raw.version, &h, &raw.body);
     let l = parse(&f);
     let r1 = l.unlock(&pw("pw2"));
     assert!(matches!(r1, Err(VaultError::Tampered(TamperKind::Manifest))), "stripped stamp via password: {:?}", r1.err());
@@ -122,20 +122,20 @@ fn k05_header_stamp_and_digest() {
     // re-stamped KDF with the stamp kept -> key path Tampered(Manifest), password path WrongPassword
     let mut h = raw.header.clone();
     set(get_mut(&mut h, "kdf").unwrap(), "t_cost", Value::Integer(2.into()));
-    let l = parse(&join(1, &h, &raw.body));
+    let l = parse(&join(raw.version, &h, &raw.body));
     assert!(matches!(l.unlock(&pw("pw2")), Err(VaultError::WrongPassword)));
     assert!(matches!(l.unlock_with_key(&v.export_vault_key(), v.device_id()), Err(VaultError::Tampered(TamperKind::Manifest))));
     // bump the stamp -> key path must detect
     let mut h = raw.header.clone();
     set(&mut h, "slots_modified_at", Value::Integer((u64::MAX >> 1).into()));
-    let l = parse(&join(1, &h, &raw.body));
+    let l = parse(&join(raw.version, &h, &raw.body));
     assert!(matches!(l.unlock_with_key(&v.export_vault_key(), v.device_id()), Err(VaultError::Tampered(TamperKind::Manifest))));
     // add an opaque slot with stamp -> detected via manifest
     let mut h = raw.header.clone();
     if let Some(Value::Array(s)) = get_mut(&mut h, "slots") {
         s.push(Value::Map(vec![(Value::Text("id".into()), Value::Bytes(vec![5; 16])), (Value::Text("kind".into()), Value::Text("x".into()))]));
     }
-    let l = parse(&join(1, &h, &raw.body));
+    let l = parse(&join(raw.version, &h, &raw.body));
     assert!(matches!(l.unlock_with_key(&v.export_vault_key(), v.device_id()), Err(VaultError::Tampered(TamperKind::Manifest))));
 }
 
@@ -150,7 +150,7 @@ fn k06_header_merge_password_change_survives() {
     a.change_password(&pw("first password"), &pw("second password"), KdfParams::for_tests(), 5_000).unwrap();
     // B edits an item later but did not change slots
     let id = b.items().next().unwrap().id;
-    b.set_field(id, "password", pw("b-edit"), 6_000).unwrap();
+    b.set_field_named(id, "password", pw("b-edit"), 6_000).unwrap();
     let a_disk = parse(&a.serialize()).unlock_with_key(&b.export_vault_key(), dev_b).unwrap();
     b.merge_from(&a_disk).unwrap();
     let out = b.serialize();

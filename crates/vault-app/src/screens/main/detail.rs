@@ -18,7 +18,7 @@ use gpui_component::progress::ProgressCircle;
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
-use vault_core::{ExposeSecret, Field, FieldKind, HistoryEntry, Item};
+use vault_core::{ExposeSecret, Field, FieldKind, HistoryEntry, Item, Uuid};
 
 use super::MainScreen;
 use super::attachments;
@@ -41,7 +41,7 @@ const TOTP_URGENT_SECS: u32 = 5;
 pub(crate) enum DetailAction {
     Copy(CopyTarget),
     CopyHistory(u64),
-    Reveal(String),
+    Reveal(Uuid),
     OpenUrl(usize),
     ToggleHistory,
 }
@@ -64,7 +64,7 @@ impl DetailActions {
                         s.copy(CopyTarget::History(ix), cx);
                     }
                 }
-                DetailAction::Reveal(name) => s.toggle_reveal(&name, cx),
+                DetailAction::Reveal(field) => s.toggle_reveal(field, cx),
                 DetailAction::OpenUrl(ix) => s.open_url(Some(ix), cx),
                 DetailAction::ToggleHistory => s.toggle_history(cx),
             })
@@ -75,7 +75,7 @@ impl DetailActions {
 /// One read-mode renderer for the main detail column and pinned item windows.
 pub(crate) struct ReadDetail<'a> {
     pub state: &'a Entity<AppState>,
-    pub revealed: &'a HashSet<String>,
+    pub revealed: &'a HashSet<Uuid>,
     pub history_open: bool,
     pub actions: DetailActions,
     pub standalone: bool,
@@ -102,7 +102,7 @@ fn copy_button(
 
 fn reveal_button(
     ix: usize,
-    name: &str,
+    field: Uuid,
     revealed: bool,
     what: &str,
     actions: &DetailActions,
@@ -113,9 +113,8 @@ fn reveal_button(
         (IconName::Eye, "Reveal")
     };
     let actions = actions.clone();
-    let name = name.to_owned();
     ui::icon_button(("reveal", ix), icon, &format!("{verb} {what}"))
-        .on_click(move |_, _, cx| (actions.0)(DetailAction::Reveal(name.clone()), cx))
+        .on_click(move |_, _, cx| (actions.0)(DetailAction::Reveal(field), cx))
 }
 
 /// A field's value area in read mode: clicking it does exactly what the row's Copy
@@ -123,6 +122,7 @@ fn reveal_button(
 /// Focusable, so Enter or Space on it copies too (gpui clicks a focused div on key up).
 fn copy_on_click(
     ix: usize,
+    field: Uuid,
     what: &str,
     shown: AnyElement,
     actions: &DetailActions,
@@ -132,7 +132,7 @@ fn copy_on_click(
     ui::copy_value_area(("field-value", ix), what, cx)
         // Tests click the value by this key (no-op outside test builds).
         .debug_selector(move || format!("field-value {ix}"))
-        .on_click(move |_, _, cx| (actions.0)(DetailAction::Copy(CopyTarget::Field(ix)), cx))
+        .on_click(move |_, _, cx| (actions.0)(DetailAction::Copy(CopyTarget::Field(field)), cx))
         .child(shown)
 }
 
@@ -658,7 +658,7 @@ impl ReadDetail<'_> {
             return section_row(ix, &field.name, cx).into_any_element();
         }
         let theme = cx.theme();
-        let revealed = self.revealed.contains(&field.name);
+        let revealed = self.revealed.contains(&field.id);
         let value = field.value.expose_secret();
         let card_number = crate::listing::is_card_number(item, field);
         // Extra buttons before the copy button, which every field gets.
@@ -670,13 +670,15 @@ impl ReadDetail<'_> {
             FieldKind::Totp => "Copy one-time code  ⌘⇧T".to_owned(),
             FieldKind::Url => "Copy website".to_owned(),
             FieldKind::Notes => "Copy notes".to_owned(),
+            // An empty name would read "Copy " (01 §4: names may be empty).
+            _ if field.name.trim().is_empty() => "Copy value".to_owned(),
             _ => format!("Copy {}", field.name),
         };
 
         let shown: AnyElement = match field.kind {
             _ if card_number => {
                 buttons.push(
-                    reveal_button(ix, &field.name, revealed, "card number", &self.actions)
+                    reveal_button(ix, field.id, revealed, "card number", &self.actions)
                         .into_any_element(),
                 );
                 if revealed {
@@ -694,8 +696,7 @@ impl ReadDetail<'_> {
                     "value"
                 };
                 buttons.push(
-                    reveal_button(ix, &field.name, revealed, what, &self.actions)
-                        .into_any_element(),
+                    reveal_button(ix, field.id, revealed, what, &self.actions).into_any_element(),
                 );
                 if revealed {
                     mono(value.to_string(), cx).into_any_element()
@@ -736,7 +737,7 @@ impl ReadDetail<'_> {
             copy_button(
                 ("copy", ix),
                 &copy_label,
-                CopyTarget::Field(ix),
+                CopyTarget::Field(field.id),
                 &self.actions,
             )
             .into_any_element(),
@@ -745,7 +746,7 @@ impl ReadDetail<'_> {
         field_row(
             ix,
             field.name.clone().into(),
-            copy_on_click(ix, &field.name, shown, &self.actions, cx),
+            copy_on_click(ix, field.id, &field.name, shown, &self.actions, cx),
             buttons,
             cx,
         )
@@ -818,7 +819,10 @@ impl ReadDetail<'_> {
     fn render_history(&self, item: &Item, now: u64, cx: &App) -> AnyElement {
         let entries: Vec<&HistoryEntry> = item.history.iter().collect();
         history_view(
-            &entries,
+            History {
+                entries: &entries,
+                fields: &item.fields,
+            },
             None,
             self.state,
             self.history_open,
@@ -834,7 +838,7 @@ impl ReadDetail<'_> {
 /// edit mode, which adds a trash button per entry and a "Clear history" button; removing
 /// never reveals a value.
 pub(super) fn history_disclosure(
-    history: &[&HistoryEntry],
+    history: History<'_>,
     removed: Option<usize>,
     s: &AppState,
     state: &Entity<AppState>,
@@ -852,8 +856,17 @@ pub(super) fn history_disclosure(
     )
 }
 
+/// Password history entries and the item's fields (to name the field each belonged to).
+pub(super) struct History<'a> {
+    pub entries: &'a [&'a HistoryEntry],
+    pub fields: &'a [Field],
+}
+
 fn history_view(
-    history: &[&HistoryEntry],
+    History {
+        entries: history,
+        fields,
+    }: History<'_>,
     removed: Option<usize>,
     state: &Entity<AppState>,
     open: bool,
@@ -899,6 +912,14 @@ fn history_view(
         .enumerate()
         .map(|(j, h)| {
             let stamp = h.replaced_at;
+            // Version 2 entries know their field: say which one (its name now, or that it
+            // was removed). Entries without a field id read as before.
+            let field = h.field_id.map(|id| {
+                fields.iter().find(|f| f.id == id).map_or_else(
+                    || "removed field".to_owned(),
+                    |f| text::capitalize_first(&f.name),
+                )
+            });
             let copy = {
                 let actions = actions.clone();
                 // By stamp in the stored item: in edit mode the shown list skips removals.
@@ -930,16 +951,29 @@ fn history_view(
                         .text_color(theme.muted_foreground)
                         .flex_1(),
                 )
-                .child(ui::muted(
-                    format!(
+                .child({
+                    let replaced = format!(
                         "replaced {} ({})",
                         text::date(stamp),
                         text::relative(now, stamp)
-                    ),
-                    cx,
-                ))
-                .child(copy)
-                .children(remove)
+                    );
+                    let line = match field.as_deref() {
+                        Some(name) if !name.is_empty() => format!("{name} \u{b7} {replaced}"),
+                        _ => replaced,
+                    };
+                    // Tests read which field the entry names ("-" when it names none).
+                    let selector = format!(
+                        "history-entry {j} {}",
+                        field.as_deref().filter(|n| !n.is_empty()).unwrap_or("-")
+                    );
+                    // The line gives way (truncated) before the buttons do.
+                    ui::muted(line, cx)
+                        .min_w_0()
+                        .truncate()
+                        .debug_selector(move || selector.clone())
+                })
+                .child(div().flex_none().child(copy))
+                .children(remove.map(|r| div().flex_none().child(r)))
         });
 
     let clear = (editing && count > 0).then(|| {
