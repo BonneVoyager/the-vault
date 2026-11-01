@@ -48,6 +48,8 @@ keepass = { version = "^0.17.0", optional = true, default-features = false }
 [dev-dependencies]
 keepass = { version = "^0.17.0", default-features = false, features = ["save_kdbx4"] }
 zip = { version = "^2.2.0", default-features = false, features = ["deflate"] }
+# Property tests of the merge laws (tests/merge_props.rs).
+proptest = "^1.12.0"
 
 [[test]]
 name = "sync_feature"

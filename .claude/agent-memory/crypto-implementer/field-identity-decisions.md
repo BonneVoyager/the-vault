@@ -98,7 +98,8 @@ only path that changes `format_version`.
 - L1: `normalize_field_tombstones` no longer truncates; `cap_field_tombstones` runs only in
   `merge_live` and drops (oldest first) only markers whose field is absent on BOTH input
   sides, leaving the list over the cap otherwise. Residual limit: a third device that never
-  saw a capped-away marker can resurrect that field. `removed_attachments` keeps its plain cap.
+  saw a capped-away marker can resurrect that field. `removed_attachments` got the same merge-only cap on 2026-11-01
+  (see [[attachment-decisions]]).
 
 **PA-1 per-attribute stamps (2026-10-31, owner-approved):** `Item.{title,favorite,tags,icon}_modified_at:
 Option<Millis>`, optional item keys written only when Some (canonical order after

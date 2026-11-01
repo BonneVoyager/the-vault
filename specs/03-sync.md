@@ -47,7 +47,7 @@ Steps 1–7 run under an exclusive advisory lock on `<name>.vault/.lock` (flock)
 
 ## 3. Watching and reacting to external changes
 
-Watcher: one `notify` recursive watch on the package's PARENT directory with no initial tree scan, debounced 500 ms (a second watch would restart the FSEvents stream). Classification: the package dir or `<name>.vault/vault.bin` → primary changed; `<name>.vault/attachments/**`, `backups/**` and tmp files → ignored; sibling `X.vault/` packages, `X.vault/vault.bin`, `X.vault/attachments/*` (a late blob re-triggers a deferred package move), and `<name>.vault/vault*.bin` files other than `vault.bin` → conflict candidates (§6); deeper paths ignored.
+Watcher: one `notify` recursive watch on the package's PARENT directory with no initial tree scan, debounced 500 ms (a second watch would restart the FSEvents stream). Classification: the package dir or `<name>.vault/vault.bin` → primary changed; `<name>.vault/attachments/**`, `backups/**` and tmp files → ignored; sibling `X.vault/` packages, `X.vault/vault.bin`, `X.vault/attachments/*` (a late blob re-triggers a deferred package move), and `<name>.vault/vault*.bin` files other than `vault.bin` → conflict candidates (§6); deeper paths ignored. Names are compared normalisation-insensitively (each component folded to NFC on both sides, including the stored package and parent paths; 2026-11-01) because providers may deliver NFD spellings; nothing is renamed on disk, and filesystem operations always use the spelling the event or caller supplied. Accepted edge: on a volume that keeps NFC and NFD names as distinct files, a sibling that differs only by form is treated as our own package.
 
 On a debounced event for `<name>.vault/vault.bin`:
 
@@ -112,7 +112,7 @@ Field-level merge, keyed by `field.id` (2026-10-31; never by name):
 
 `history` is merged by union on `(value, replaced_at)`, sorted, capped to 10 newest; `removed_history` stamps are unioned (cap 10 newest) and any history entry whose `replaced_at` is in the set is dropped, so a user's deletion of a history entry survives merge. A later `set_field` producing an entry with a stamp already in the set gets `max(now, stamp+1)`, which the monotone stamp rule guarantees anyway. Markers are keyed by stamp alone: if two devices change the same password in the same millisecond from the same base and one side deletes that history stamp before merging, the conflict-loser value is dropped with it. Accepted.
 
-`attachments` are merged by union on `id` (sorted by `added_at`, then `id`); `removed_attachments` tombstones are unioned with the greatest `removed_at` per id, and a ref is dropped when a tombstone for its id has `removed_at ≥ added_at`. Unlike fields, an attachment removal therefore survives a merge with a device that still holds the ref.
+`attachments` are merged by union on `id` (sorted by `added_at`, then `id`); `removed_attachments` tombstones are unioned with the greatest `removed_at` per id, and a ref is dropped when a tombstone for its id has `removed_at ≥ added_at`. Unlike fields, an attachment removal therefore survives a merge with a device that still holds the ref. Like `removed_fields`, `removed_attachments` markers are never dropped by a local removal; a merge caps them at 64 by dropping, oldest `removed_at` first, only markers whose reference neither side still holds, so a marker outlives the cap until the peer has dropped the reference and its blob is prunable (accepted limit, as for fields: a third device offline since before such a dropped marker can bring the reference back; 2026-11-01).
 
 Result item `modified_at = max(ours, theirs)`. Merged item takes `device_id` of whichever side supplied the winning metadata.
 
@@ -126,7 +126,7 @@ Clock skew: timestamps come from each device's wall clock. If skew exceeds a few
 
 ## 6. Conflicted copies
 
-Cloud providers resolve simultaneous writes by creating a sibling file instead of merging. Patterns to detect (case-insensitive, in `<dir>` only):
+Cloud providers resolve simultaneous writes by creating a sibling file instead of merging. Patterns to detect (case- and normalisation-insensitive, in `<dir>` only):
 
 - Whole-package (iCloud): `<name> 2.vault/`, `<name> 3.vault/`, … and `<name> (<host>'s conflicted copy <date>).vault/`
 - Per-file (Dropbox, Google Drive, Syncthing sync the files inside the package individually): `<name>.vault/vault (<host>'s conflicted copy <date>).bin`, `<name>.vault/vault 2.bin`, …
@@ -138,7 +138,7 @@ On watcher event for a file matching the Dropbox pattern or any new `*.vault` in
 1. parse; if vault_id != ours → ignore (it's some other vault the user put there)
 2. unlock with cached key (if locked, defer to next unlock; keep a list of pending conflict paths)
 3. ours.merge_from(theirs); save()
-4. whole-package: copy any attachment blobs we lack (never replacing), then move the whole package to <name>.vault/backups/conflict-<timestamp>-<original name>/ — deferred to the next event while blobs referenced by the merged items are still missing from both sides; per-file: move the file to <name>.vault/backups/conflict-<timestamp>-<original name>.vault.bin
+4. whole-package: copy any attachment blobs we lack (never replacing), then move the whole package to <name>.vault/backups/conflict-<timestamp>-<original name>/ — deferred to the next event while blobs referenced by the merged items are still missing from both sides, emitting `SyncEvent::WaitingForBlobs(conflict path)` once per waiting package (never while locked; it may fire again only after the package is absorbed or gone, or after `lock`/`stop_watching`/`start_watching` reset the bookkeeping; a package still waiting at `lock` is re-checked at the next unlock even if watching was stopped meanwhile; `ConflictAbsorbed` follows when the blobs arrive; 2026-11-01); per-file: move the file to <name>.vault/backups/conflict-<timestamp>-<original name>.vault.bin
 5. emit SyncEvent::ConflictAbsorbed(path)
 ```
 
@@ -182,7 +182,7 @@ impl SyncedVault {
     pub fn backups(&self) -> Result<Vec<BackupInfo>, SyncError>;
     pub fn backup_now(&mut self) -> Result<PathBuf, SyncError>;
     pub fn restore_from(&mut self, backup: &Path, password: &SecretString) -> Result<(), SyncError>;
-    pub fn delete_backup(&mut self, backup: &Path) -> Result<(), SyncError>;   // user-initiated; path must be inside backups/ (file or conflict package); refuses the primary; any kind incl. Unsaved/Conflict
+    pub fn delete_backup(&mut self, backup: &Path) -> Result<(), SyncError>;   // user-initiated; path must be inside backups/ (file or conflict package); refuses the primary; any kind incl. Unsaved/Conflict; name match is NFC-insensitive
 
     // attachments (v1.1) — streaming; the ref is added to / removed from the item by the caller via `edit`
     pub fn add_attachment(&mut self, item: Uuid, name: &str, data: impl Read, size: u64, now: Millis) -> Result<Uuid, SyncError>; // seals + writes blob, appends ref, marks dirty
@@ -195,11 +195,14 @@ pub enum SyncEvent {
     Merged(MergeReport),
     ChangedWhileLocked,
     ConflictAbsorbed(PathBuf),
+    WaitingForBlobs(PathBuf),    // whole-package conflict merged, move into backups/ deferred for missing blobs (§6 step 4)
     CorruptOnDisk,
     ForeignVault,
     CloudUnavailable,
     BackupTaken(PathBuf),
     BackupDeleted(PathBuf),      // user-initiated delete_backup
+    AttachmentsPruned(usize),    // orphan blobs deleted by cleanup (§1.1)
+    PrimaryMissing,              // vault.bin vanished while unlocked; kept dirty, next save recreates it
     KeyMismatch,                 // on-disk file no longer opens with our cached key (password changed elsewhere); edits are kept, next unlock re-verifies
     KeyRotatedOnDisk,            // vault_key rotated elsewhere; must re-unlock with the password
     SaveBlocked(SaveBlocked),     // NewerVersion | ForeignVault; in-memory state kept; emitted once at first detection and once per refused save

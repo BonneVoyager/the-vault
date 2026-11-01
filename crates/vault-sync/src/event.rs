@@ -53,4 +53,14 @@ pub enum SyncEvent {
     /// writes an Unsaved backup if that has not happened. Emitted once until the primary is
     /// seen or written again.
     PrimaryMissing,
+    /// A whole-package conflicted copy (03 §6) at this path was merged and saved, but moving
+    /// it into `backups/` is deferred: blobs that its items reference (and the merged vault
+    /// still references) are missing both from our `attachments/` and from the copy's, so the
+    /// provider is presumably still delivering them. The package stays where it is; when the
+    /// blobs arrive they are copied and the package is moved
+    /// ([`SyncEvent::ConflictAbsorbed`] follows). Emitted once per package while it waits,
+    /// not on every re-check; it comes again after the package was absorbed or disappeared,
+    /// and once more for a package still waiting after `lock` + unlock or after watching is
+    /// stopped and restarted. The path is as received from the filesystem (not sanitised).
+    WaitingForBlobs(PathBuf),
 }

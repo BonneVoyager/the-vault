@@ -1,4 +1,4 @@
-//! iCloud eviction hooks (spec 04 §4) and cloud-provider detection.
+//! iCloud eviction hooks (spec 04 §4) and iCloud Drive path detection.
 //!
 //! `ICloudHooks` mirrors `vault_sync::CloudHooks` with inherent methods.
 //! vault-macos does not depend on vault-sync, so `vault-app` supplies the
@@ -27,31 +27,11 @@ pub enum CloudError {
     Other(String),
 }
 
-/// Which sync provider owns a path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CloudProvider {
-    ICloud,
-    Dropbox,
-    Local,
-}
-
 /// True if `path` is inside iCloud Drive: the `NSURLIsUbiquitousItemKey`
 /// resource value is true, or the path lies under `~/Library/Mobile Documents`
 /// (covers files that do not exist yet).
 pub fn is_in_icloud(path: &Path) -> bool {
     under_mobile_documents(path) || imp::is_ubiquitous(path)
-}
-
-/// Classifies `path` by provider. Dropbox: a `Dropbox` path component, or a
-/// `Library/CloudStorage/Dropbox*` component.
-pub fn cloud_provider(path: &Path) -> CloudProvider {
-    if is_in_icloud(path) {
-        CloudProvider::ICloud
-    } else if is_dropbox(path) {
-        CloudProvider::Dropbox
-    } else {
-        CloudProvider::Local
-    }
 }
 
 fn names(path: &Path) -> Vec<&str> {
@@ -67,13 +47,6 @@ fn under_mobile_documents(path: &Path) -> bool {
     names(path)
         .windows(2)
         .any(|w| w[0] == "Library" && w[1] == "Mobile Documents")
-}
-
-fn is_dropbox(path: &Path) -> bool {
-    let n = names(path);
-    n.contains(&"Dropbox")
-        || n.windows(3)
-            .any(|w| w[0] == "Library" && w[1] == "CloudStorage" && w[2].starts_with("Dropbox"))
 }
 
 struct Pin {

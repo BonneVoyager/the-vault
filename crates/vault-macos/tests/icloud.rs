@@ -1,10 +1,10 @@
-//! iCloud hooks and provider detection (spec 04 §4, §8).
+//! iCloud hooks and iCloud Drive path detection (spec 04 §4, §8).
 
 use std::fs::{File, FileTimes};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use vault_macos::{CloudProvider, ICloudHooks, cloud_provider, is_in_icloud};
+use vault_macos::{ICloudHooks, is_in_icloud};
 
 #[test]
 fn non_ubiquitous_temp_path_is_not_evicted() {
@@ -38,28 +38,16 @@ fn ensure_downloaded_on_local_path_is_immediate() {
 }
 
 #[test]
-fn provider_classification() {
-    assert_eq!(
-        cloud_provider(Path::new(
-            "/Users/x/Library/Mobile Documents/com~apple~CloudDocs/a.vault"
-        )),
-        CloudProvider::ICloud
-    );
-    assert_eq!(
-        cloud_provider(Path::new("/Users/x/Dropbox/a.vault")),
-        CloudProvider::Dropbox
-    );
-    assert_eq!(
-        cloud_provider(Path::new(
-            "/Users/x/Library/CloudStorage/Dropbox-Personal/a.vault"
-        )),
-        CloudProvider::Dropbox
-    );
+fn mobile_documents_path_is_icloud() {
+    assert!(is_in_icloud(Path::new(
+        "/Users/x/Library/Mobile Documents/com~apple~CloudDocs/a.vault"
+    )));
+}
+
+#[test]
+fn missing_temp_path_is_not_icloud() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(
-        cloud_provider(&dir.path().join("a.vault")),
-        CloudProvider::Local
-    );
+    assert!(!is_in_icloud(&dir.path().join("a.vault")));
 }
 
 #[test]

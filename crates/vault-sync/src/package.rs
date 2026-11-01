@@ -10,9 +10,13 @@
 //!   .lock                           advisory save lock (03 §2), empty
 //! ```
 
+use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+
+use unicode_normalization::{UnicodeNormalization, is_nfc};
 
 use crate::error::SyncError;
 
@@ -61,6 +65,57 @@ pub(crate) fn vault_name(package: &Path) -> String {
     match f.strip_suffix(PACKAGE_EXT) {
         Some(n) if !n.is_empty() => n.to_owned(),
         _ => f,
+    }
+}
+
+/// `s` in Unicode NFC. Cloud providers may deliver a name in another normalisation form (NFD)
+/// than the one we wrote, so every comparison of names goes through this; nothing on disk is
+/// ever renamed.
+pub(crate) fn nfc(s: &str) -> Cow<'_, str> {
+    if is_nfc(s) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(s.nfc().collect())
+    }
+}
+
+/// Comparison key for a name that matches case-insensitively (like the default APFS volume)
+/// and normalisation-insensitively: NFC, Unicode lowercase, NFC again (lowercasing can
+/// decompose).
+pub(crate) fn fold_name(s: &str) -> String {
+    nfc(&nfc(s).to_lowercase()).into_owned()
+}
+
+/// Whether two path components are equal after NFC (case-sensitive). Non-UTF-8 components
+/// compare byte-wise.
+pub(crate) fn same_component(a: &OsStr, b: &OsStr) -> bool {
+    a == b
+        || match (a.to_str(), b.to_str()) {
+            (Some(a), Some(b)) => nfc(a) == nfc(b),
+            _ => false,
+        }
+}
+
+/// [`Path::strip_prefix`] with components compared by [`same_component`]. The remainder
+/// keeps `path`'s own spelling.
+pub(crate) fn strip_prefix_nfc<'a>(path: &'a Path, prefix: &Path) -> Option<&'a Path> {
+    let mut rest = path.components();
+    for want in prefix.components() {
+        let got = rest.next()?;
+        if !same_component(got.as_os_str(), want.as_os_str()) {
+            return None;
+        }
+    }
+    Some(rest.as_path())
+}
+
+/// Identity of a path for bookkeeping (dedupe sets, per-path reports): the path in NFC, so
+/// the spellings a watcher event and a directory listing deliver count as one. Only for
+/// keys; file operations use the path as received.
+pub(crate) fn path_key(path: &Path) -> PathBuf {
+    match path.to_str() {
+        Some(s) => PathBuf::from(nfc(s).into_owned()),
+        None => path.to_owned(),
     }
 }
 
@@ -131,6 +186,33 @@ mod tests {
         assert_eq!(vault_name(p), "My");
         assert_eq!(vault_name(Path::new("/x/plain")), "plain");
         assert_eq!(vault_name(Path::new("/x/.vault")), ".vault");
+    }
+
+    #[test]
+    fn names_compare_after_nfc() {
+        let composed = "\u{c4}rzte.vault"; // Ä as one code point
+        let decomposed = "A\u{308}rzte.vault"; // A + combining diaeresis
+        assert_ne!(composed, decomposed);
+        assert_eq!(nfc(decomposed), composed);
+        assert!(matches!(nfc(composed), Cow::Borrowed(_)));
+        assert_eq!(fold_name(decomposed), fold_name("\u{e4}RZTE.VAULT"));
+        assert_ne!(fold_name(decomposed), fold_name("Arzte.vault"));
+        assert!(same_component(OsStr::new(composed), OsStr::new(decomposed)));
+        assert!(!same_component(
+            OsStr::new(composed),
+            OsStr::new("\u{e4}rzte.vault")
+        ));
+
+        let path = PathBuf::from(format!("/d/{decomposed}/vault.bin"));
+        let pkg = PathBuf::from(format!("/d/{composed}"));
+        assert_eq!(strip_prefix_nfc(&path, &pkg), Some(Path::new("vault.bin")));
+        assert_eq!(strip_prefix_nfc(&pkg, &pkg), Some(Path::new("")));
+        assert_eq!(strip_prefix_nfc(&path, Path::new("/d/Arzte.vault")), None);
+        assert_eq!(strip_prefix_nfc(Path::new("/d"), &pkg), None);
+        assert_eq!(
+            path_key(&path),
+            PathBuf::from(format!("/d/{composed}/vault.bin"))
+        );
     }
 
     #[test]

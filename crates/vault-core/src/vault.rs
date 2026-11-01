@@ -50,7 +50,10 @@ pub use merge::MergeReport;
 
 /// Maximum number of `history` entries kept per item (01 §4, 02 "set_field").
 pub const HISTORY_CAP: usize = 10;
-/// Maximum number of attachment removal markers kept per item (newest first).
+/// Target number of attachment removal markers (`removed_attachments`, 01 §4) per item,
+/// newest first. Same discipline as [`FIELD_TOMBSTONE_CAP`]: applied only inside the merge,
+/// and only over markers whose reference is absent on both input sides; local removals
+/// never truncate the list.
 pub const ATTACHMENT_TOMBSTONE_CAP: usize = 64;
 /// Target number of field removal markers (`removed_fields`, 01 §4) per item, newest first.
 /// Applied only inside the merge, and only over markers whose field is absent on both input
@@ -954,8 +957,10 @@ impl UnlockedVault {
     ///
     /// The marker is what keeps the removal across a merge: a peer that still carries the
     /// reference drops it because `removed_at >= added_at` (see `merge`). Markers are kept
-    /// newest first, capped at [`ATTACHMENT_TOMBSTONE_CAP`], and purged by
-    /// [`UnlockedVault::purge_tombstones_older_than`].
+    /// newest first and purged by [`UnlockedVault::purge_tombstones_older_than`]. A local
+    /// removal never drops a marker; the cap [`ATTACHMENT_TOMBSTONE_CAP`] is applied only by
+    /// a merge, oldest first, to markers whose reference neither side still holds (03 §5,
+    /// same discipline as `removed_fields`).
     ///
     /// # Errors
     ///

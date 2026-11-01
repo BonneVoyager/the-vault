@@ -313,7 +313,9 @@ fn ours_wins_metadata(ours: &Item, theirs: &Item) -> bool {
 /// [`HISTORY_CAP`].
 ///
 /// Attachment removal markers are the union by `id` with the greater `removed_at`, newest
-/// first, capped at [`ATTACHMENT_TOMBSTONE_CAP`]. Attachment references are the union by `id`
+/// first, capped at [`ATTACHMENT_TOMBSTONE_CAP`] with the same discipline as field markers
+/// ([`cap_attachment_tombstones`]): only here, oldest first, and only markers whose reference
+/// neither input side still holds. Attachment references are the union by `id`
 /// (ours' copy kept when both carry an id; the blob and reference are immutable so the copies
 /// can only differ if something is wrong) minus every reference whose id has a marker with
 /// `removed_at >= added_at`, sorted by `(added_at, id)` so both sides produce the same order.
@@ -434,6 +436,13 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
         }
     }
     attachments.sort_by(|a, b| a.added_at.cmp(&b.added_at).then_with(|| a.id.cmp(&b.id)));
+    // Same discipline as `removed_fields`: a marker may fall off the cap only once neither
+    // input side still carries its reference (so the peer just merged cannot bring it back
+    // and its blob can be pruned), oldest first; otherwise the list stays over the cap until
+    // a later merge, when both sides lack the reference, finishes the job.
+    cap_attachment_tombstones(&mut removed_attachments, |id| {
+        ours.attachment(id).is_none() && theirs.attachment(id).is_none()
+    });
 
     // Per-attribute merge (03 §5, 01 §4 per-attribute stamps): each of title, favorite,
     // tags (as one set) and icon follows its own effective stamp; see `pick_attr`.
@@ -562,7 +571,23 @@ pub(crate) fn normalize_field_tombstones(tombstones: &mut Vec<FieldTombstone>) {
 /// absent on both input sides). If fewer than needed are droppable the list stays over the
 /// cap; a later merge finishes the job.
 fn cap_field_tombstones(tombstones: &mut Vec<FieldTombstone>, droppable: impl Fn(Uuid) -> bool) {
-    let mut excess = tombstones.len().saturating_sub(FIELD_TOMBSTONE_CAP);
+    cap_tombstones(tombstones, FIELD_TOMBSTONE_CAP, |t| droppable(t.id));
+}
+
+/// [`cap_field_tombstones`] for attachment removal markers: down to
+/// [`ATTACHMENT_TOMBSTONE_CAP`], oldest first, only markers for which `droppable(id)` holds
+/// (in the merge: the reference is absent on both input sides).
+fn cap_attachment_tombstones(
+    tombstones: &mut Vec<AttachmentTombstone>,
+    droppable: impl Fn(Uuid) -> bool,
+) {
+    cap_tombstones(tombstones, ATTACHMENT_TOMBSTONE_CAP, |t| droppable(t.id));
+}
+
+/// Drop, oldest (end of the newest-first list) first, droppable markers until the list is
+/// at `cap` or no droppable marker is left.
+fn cap_tombstones<T>(tombstones: &mut Vec<T>, cap: usize, droppable: impl Fn(&T) -> bool) {
+    let mut excess = tombstones.len().saturating_sub(cap);
     if excess == 0 {
         return;
     }
@@ -570,16 +595,19 @@ fn cap_field_tombstones(tombstones: &mut Vec<FieldTombstone>, droppable: impl Fn
     let mut i = tombstones.len();
     while excess > 0 && i > 0 {
         i -= 1;
-        if droppable(tombstones[i].id) {
+        if droppable(&tombstones[i]) {
             tombstones.remove(i);
             excess -= 1;
         }
     }
 }
 
-/// Sort attachment removal markers newest first (ties by id), keep one marker per id (the
-/// greatest `removed_at`), and cap at [`ATTACHMENT_TOMBSTONE_CAP`]. Shared with
-/// `remove_attachment_ref`, `insert` and `update`.
+/// Sort attachment removal markers newest first (ties by id) and keep one marker per id (the
+/// greatest `removed_at`). Shared with `remove_attachment_ref`, `insert` and `update`.
+/// Deliberately does **not** truncate (same reasoning as [`normalize_field_tombstones`]): a
+/// marker dropped by count while a peer still holds the reference would let that reference,
+/// and a blob vault-sync may already have pruned, come back; the cap is applied by
+/// [`cap_attachment_tombstones`] inside the merge, where both sides are known.
 pub(crate) fn normalize_attachment_tombstones(tombstones: &mut Vec<AttachmentTombstone>) {
     tombstones.sort_by(|a, b| {
         b.removed_at
@@ -589,7 +617,6 @@ pub(crate) fn normalize_attachment_tombstones(tombstones: &mut Vec<AttachmentTom
     // After the sort the first occurrence of an id is its greatest removed_at.
     let mut seen = std::collections::BTreeSet::new();
     tombstones.retain(|t| seen.insert(t.id));
-    tombstones.truncate(ATTACHMENT_TOMBSTONE_CAP);
 }
 
 /// Sort removed-history stamps newest first, drop duplicates, and cap at [`HISTORY_CAP`].

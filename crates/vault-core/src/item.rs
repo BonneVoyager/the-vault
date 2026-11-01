@@ -298,8 +298,9 @@ impl fmt::Debug for AttachmentRef {
 /// Removal marker for an attachment reference (01 §4, v1.1 `removed_attachments`). Written
 /// by [`crate::UnlockedVault::remove_attachment_ref`] so that a merge with a peer that still
 /// carries the reference drops it instead of resurrecting it (the blob may already be
-/// pruned). Holds no secret. Capped per item at [`crate::vault::ATTACHMENT_TOMBSTONE_CAP`]
-/// and purged with the item tombstones.
+/// pruned). Holds no secret. Purged with the item tombstones; the per-item cap
+/// [`crate::vault::ATTACHMENT_TOMBSTONE_CAP`] is applied only by a merge, to markers whose
+/// reference neither side still holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AttachmentTombstone {
     /// The removed reference's id.
@@ -389,8 +390,9 @@ pub struct Item {
     /// [`crate::UnlockedVault::add_attachment_ref`] / `remove_attachment_ref` so the item is
     /// restamped; the blobs themselves are managed by `vault-sync`.
     pub attachments: Vec<AttachmentRef>,
-    /// Removal markers for attachment references (v1.1), newest first, capped at
-    /// [`crate::vault::ATTACHMENT_TOMBSTONE_CAP`]. Written only when non-empty.
+    /// Removal markers for attachment references (v1.1), newest first. Written only when
+    /// non-empty. Capped at [`crate::vault::ATTACHMENT_TOMBSTONE_CAP`] only by a merge (a
+    /// local removal never drops a marker), so the list may be longer in between.
     pub removed_attachments: Vec<AttachmentTombstone>,
     /// `replaced_at` stamps of history entries the user deleted (01 §4 `removed_history`),
     /// newest first, deduplicated, capped at [`crate::vault::HISTORY_CAP`]. Never holds the

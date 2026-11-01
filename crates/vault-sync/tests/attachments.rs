@@ -790,10 +790,14 @@ fn conflict_package_with_extra_blob_is_absorbed_whole() {
             .join(blob_file_name(id))
             .is_file()
     );
+    let seen: Vec<SyncEvent> = events.try_iter().collect();
+    assert!(seen.contains(&SyncEvent::ConflictAbsorbed(absorbed.path.clone())));
+    // Its blob was there all along: nothing to wait for.
     assert!(
-        events
-            .try_iter()
-            .any(|e| e == SyncEvent::ConflictAbsorbed(absorbed.path.clone()))
+        !seen
+            .iter()
+            .any(|e| matches!(e, SyncEvent::WaitingForBlobs(_))),
+        "{seen:?}"
     );
     // On disk too: a fresh open sees the reference.
     let mut c = SyncedVault::open(&path, Uuid::from_u128(0xC), Arc::new(NoopHooks)).unwrap();
@@ -833,11 +837,20 @@ fn conflict_package_does_not_replace_existing_blobs() {
 }
 
 /// A conflicted package whose items reference a blob that has not arrived inside it yet: it
-/// is merged, but only moved once the blob arrives (and is copied).
+/// is merged, but only moved once the blob arrives (and is copied). `WaitingForBlobs` is
+/// reported once for the deferral, not again on later re-checks, and `ConflictAbsorbed`
+/// follows the blob's arrival.
 #[test]
 fn conflict_package_waits_for_a_late_blob() {
     let (dir, path, mut a, item) = setup();
     a.start_watching().unwrap();
+    let events = a.subscribe();
+    let mut seen: Vec<SyncEvent> = Vec::new();
+    let waiting = |seen: &[SyncEvent]| {
+        seen.iter()
+            .filter(|e| matches!(e, SyncEvent::WaitingForBlobs(_)))
+            .count()
+    };
     let staging = dir.path().join("staging");
     fs::create_dir(&staging).unwrap();
     let file = vault_sync::VAULT_FILE_NAME;
@@ -867,6 +880,32 @@ fn conflict_package_waits_for_a_late_blob() {
     }
     assert!(conflict.exists(), "moved before its blob arrived");
     assert_eq!(a.attachment_state(id), AttachmentState::Missing);
+    seen.extend(events.try_iter());
+    assert_eq!(
+        seen.iter()
+            .filter(|e| **e == SyncEvent::WaitingForBlobs(conflict.clone()))
+            .count(),
+        1,
+        "{seen:?}"
+    );
+
+    // Another file arrives in the package (not the blob): the package is re-checked, the
+    // state is unchanged, and nothing is reported again.
+    fs::write(conflict.join("attachments").join("unrelated.bin"), b"x").unwrap();
+    let rechecked = wait_until(|| a.poll() > 0);
+    assert!(rechecked, "no event for the package");
+    for _ in 0..20 {
+        a.poll();
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(conflict.exists());
+    seen.extend(events.try_iter());
+    assert_eq!(waiting(&seen), 1, "{seen:?}");
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_)))
+    );
 
     fs::rename(
         &in_transit,
@@ -878,6 +917,17 @@ fn conflict_package_waits_for_a_late_blob() {
         !conflict.exists()
     }));
     assert_eq!(read_all(&a, item, id).unwrap(), b"late");
+    seen.extend(events.try_iter());
+    let absorbed_at = seen
+        .iter()
+        .position(|e| matches!(e, SyncEvent::ConflictAbsorbed(_)))
+        .expect("ConflictAbsorbed after the blob arrived");
+    let waited_at = seen
+        .iter()
+        .position(|e| matches!(e, SyncEvent::WaitingForBlobs(_)))
+        .unwrap();
+    assert!(waited_at < absorbed_at);
+    assert_eq!(waiting(&seen), 1, "{seen:?}");
 }
 
 /// A conflicted package without `vault.bin` that only holds blobs (they arrived after the
@@ -907,4 +957,143 @@ fn blob_only_conflict_package_contributes_its_blobs() {
     }));
     assert_eq!(read_all(&a, item, id).unwrap(), b"precious");
     assert!(remnant.exists());
+}
+
+/// Plant a conflicted package `test 2.vault` whose item references a new attachment whose blob
+/// is still in transit (held outside the package). Returns the package path, the blob's
+/// in-transit path and the attachment id.
+fn plant_waiting_conflict(
+    dir: &Path,
+    path: &Path,
+    item: Uuid,
+    tag: &str,
+) -> (PathBuf, PathBuf, Uuid) {
+    let staging = dir.join(format!("staging-{tag}"));
+    fs::create_dir(&staging).unwrap();
+    let file = vault_sync::VAULT_FILE_NAME;
+    fs::copy(path.join(file), staging.join(file)).unwrap();
+    let mut b = SyncedVault::open(&staging, DEV_B, Arc::new(NoopHooks)).unwrap();
+    b.unlock(&pw()).unwrap();
+    let id = add(&mut b, item, tag.as_bytes());
+    b.save().unwrap();
+    drop(b);
+    let in_transit = dir.join(format!("in-transit-{tag}.bin"));
+    fs::rename(
+        staging.join("attachments").join(blob_file_name(id)),
+        &in_transit,
+    )
+    .unwrap();
+    let conflict = dir.join("test 2.vault");
+    fs::rename(&staging, &conflict).unwrap();
+    (conflict, in_transit, id)
+}
+
+fn waiting_events(
+    events: &crossbeam_channel::Receiver<SyncEvent>,
+    seen: &mut Vec<SyncEvent>,
+    path: &Path,
+) -> usize {
+    seen.extend(events.try_iter());
+    seen.iter()
+        .filter(|e| **e == SyncEvent::WaitingForBlobs(path.to_owned()))
+        .count()
+}
+
+/// A waiting package disappears while nothing watches; a new copy with the same name (iCloud
+/// reuses " 2") that also waits is reported again once watching restarts.
+#[test]
+fn same_named_copy_waits_again_after_disappearing_while_unwatched() {
+    let (dir, path, mut a, item) = setup();
+    a.start_watching().unwrap();
+    let events = a.subscribe();
+    let mut seen = Vec::new();
+    let (conflict, _, first) = plant_waiting_conflict(dir.path(), &path, item, "one");
+    assert!(wait_until(|| {
+        a.poll();
+        waiting_events(&events, &mut seen, &conflict) == 1
+    }));
+    assert!(has_ref(&a, item, first));
+
+    a.stop_watching();
+    fs::remove_dir_all(&conflict).unwrap();
+    let (again, transit, second) = plant_waiting_conflict(dir.path(), &path, item, "two");
+    assert_eq!(again, conflict);
+    a.start_watching().unwrap();
+    assert!(
+        wait_until(|| {
+            a.poll();
+            waiting_events(&events, &mut seen, &conflict) == 2
+        }),
+        "{seen:?}"
+    );
+    assert!(has_ref(&a, item, second));
+    assert!(conflict.exists());
+
+    // The new copy was built from our merged vault, so it references both attachments; once
+    // both blobs arrive it is absorbed.
+    let blobs = conflict.join("attachments");
+    fs::rename(
+        dir.path().join("in-transit-one.bin"),
+        blobs.join(blob_file_name(first)),
+    )
+    .unwrap();
+    fs::rename(&transit, blobs.join(blob_file_name(second))).unwrap();
+    assert!(wait_until(|| {
+        a.poll();
+        !conflict.exists()
+    }));
+    seen.extend(events.try_iter());
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_)))
+    );
+    assert_eq!(waiting_events(&events, &mut seen, &conflict), 2);
+}
+
+/// A package still waiting for its blob across `lock` + `unlock` is re-checked at unlock and
+/// reported once more (no watcher event needed), then absorbed when the blob arrives.
+#[test]
+fn still_waiting_package_is_reported_again_after_lock_and_unlock() {
+    let (dir, path, mut a, item) = setup();
+    a.start_watching().unwrap();
+    let events = a.subscribe();
+    let mut seen = Vec::new();
+    let (conflict, transit, id) = plant_waiting_conflict(dir.path(), &path, item, "late");
+    assert!(wait_until(|| {
+        a.poll();
+        waiting_events(&events, &mut seen, &conflict) == 1
+    }));
+    drain_polls(&mut a);
+
+    let _ = a.lock();
+    a.unlock(&pw()).unwrap();
+    assert_eq!(waiting_events(&events, &mut seen, &conflict), 2, "{seen:?}");
+    assert!(conflict.exists());
+    // Once more only: further re-checks of the unchanged state stay quiet.
+    drain_polls(&mut a);
+    assert_eq!(waiting_events(&events, &mut seen, &conflict), 2, "{seen:?}");
+
+    fs::rename(
+        &transit,
+        conflict.join("attachments").join(blob_file_name(id)),
+    )
+    .unwrap();
+    assert!(wait_until(|| {
+        a.poll();
+        !conflict.exists()
+    }));
+    assert_eq!(read_all(&a, item, id).unwrap(), b"late");
+    seen.extend(events.try_iter());
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_)))
+    );
+}
+
+/// Poll for a second, so queued watcher events are drained.
+fn drain_polls(v: &mut SyncedVault) {
+    for _ in 0..20 {
+        v.poll();
+        thread::sleep(Duration::from_millis(50));
+    }
 }

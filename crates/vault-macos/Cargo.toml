@@ -53,7 +53,9 @@ objc2-security = { version = "=0.3.2", default-features = false, features = ["st
 # CFDictionary/CFData/CFString/CFNumber/CFError for the Security calls above.
 objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFBase", "CFData", "CFDictionary", "CFString", "CFNumber", "CFError", "CFCGTypes"] }
 # LAContext: canEvaluatePolicy (Biometric::available) and the Touch ID prompt reason.
-objc2-local-authentication = { version = "=0.3.2", default-features = false, features = ["std", "LAContext", "LAError"] }
+# LADomainState: LAContext.domainState.biometry.stateHash, the enrolled finger-set hash
+# (replaces the macOS 15 deprecated evaluatedPolicyDomainState).
+objc2-local-authentication = { version = "=0.3.2", default-features = false, features = ["std", "LAContext", "LAError", "LADomainState"] }
 # Launch at login (spec 05 §2.5): SMAppService.mainAppService register/unregister/status.
 objc2-service-management = { version = "=0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 

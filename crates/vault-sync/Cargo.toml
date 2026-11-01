@@ -29,6 +29,9 @@ notify-debouncer-full = "^0.7.0"
 # and errno constants for the directory-fsync classifier (step 5). Safe API, already in the
 # workspace lockfile through gpui's async-io.
 rustix = { version = "^1.1.6", features = ["fs"] }
+# NFC comparison of file and directory names (watcher classification, conflict and backup name
+# matching): cloud providers may deliver names in NFD. Already in the workspace via vault-core.
+unicode-normalization = "^0.1.26"
 
 [features]
 # Test-only hooks (`set_prune_clock_offset_for_tests`). Never enable outside tests.

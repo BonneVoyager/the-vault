@@ -14,10 +14,7 @@ mod window;
 
 pub use device::{BUNDLE_ID, DEVICE_ID_ENV, device_id, device_id_in, try_device_id};
 pub use error::MacError;
-pub use icloud::{
-    CloudError, CloudProvider, ICloudHooks, PIN_INTERVAL, POLL_INTERVAL, cloud_provider,
-    is_in_icloud,
-};
+pub use icloud::{CloudError, ICloudHooks, PIN_INTERVAL, POLL_INTERVAL, is_in_icloud};
 pub use idle::{
     Subscription, boot_time, on_distributed_notification, on_screen_locked, on_user_switched,
     on_will_sleep, reduce_motion_enabled, seconds_since_user_input,

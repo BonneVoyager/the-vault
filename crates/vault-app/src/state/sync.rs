@@ -228,6 +228,27 @@ impl AppState {
                     self.show_toast(super::touch_id::SLOT_GONE, cx);
                 }
             }
+            // 03 §6 step 4: merged, but the copy stays put until its blobs download;
+            // `ConflictAbsorbed` follows once they do.
+            // The copy's items are already merged into the open vault: refresh exactly as
+            // `ConflictAbsorbed` does.
+            SyncEvent::WaitingForBlobs(path) => {
+                self.vault_changed();
+                self.refresh_backups();
+                if !self.locked && self.vault.as_ref().is_some_and(SyncedVault::is_dirty) {
+                    self.schedule_autosave(cx);
+                }
+                let name = text::file_name(&path);
+                self.show_toast(
+                    format!(
+                        "Merged a conflicted copy ({name}); waiting for its attachments to download"
+                    ),
+                    cx,
+                );
+                if self.recheck_touch_slot() {
+                    self.show_toast(super::touch_id::SLOT_GONE, cx);
+                }
+            }
             SyncEvent::CorruptOnDisk => {
                 self.sync.corrupt = true;
                 if !self.locked {
@@ -1050,6 +1071,34 @@ mod tests {
     }
 
     #[gpui::test]
+    fn waiting_for_blobs_refreshes_and_toasts_the_file_name_only(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, id) = two_devices(dir.path(), cx);
+        let path = dir.path().join("t (conflict).vault");
+        state.update(cx, |s, cx| {
+            // What the merge did to the open vault: dirty, with a change the list must show.
+            let favorites = s.counts.favorites;
+            s.vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| v.update(id, 50, |it| it.favorite = true))
+                .unwrap()
+                .unwrap();
+            s.autosave_pending = false;
+            s.handle_sync_event(SyncEvent::WaitingForBlobs(path.clone()), cx);
+            assert_eq!(s.counts.favorites, favorites + 1, "listing refreshed");
+            assert!(s.autosave_pending);
+            let message = s.toast.as_ref().unwrap().message.to_string();
+            assert_eq!(
+                message,
+                "Merged a conflicted copy (t (conflict).vault); \
+                 waiting for its attachments to download"
+            );
+            assert!(!message.contains(&dir.path().display().to_string()));
+        });
+    }
+
+    #[gpui::test]
     fn restore_rechecks_an_edit_started_after_the_confirm(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (state, _other, _) = two_devices(dir.path(), cx);
@@ -1087,6 +1136,7 @@ mod tests {
                 SyncEvent::BackupDeleted(p.join("b.vault")),
                 SyncEvent::AttachmentsPruned(1),
                 SyncEvent::PrimaryMissing,
+                SyncEvent::WaitingForBlobs(p.join("conflict-y.vault")),
             ]
         };
         // Choose screen: no vault at all.

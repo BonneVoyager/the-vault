@@ -109,6 +109,8 @@ specs/                the specs
 
 - [specs/](specs/): start with `00-overview.md`, then the spec for the crate you touch (format, core API, sync, macOS, UI)
 - [docs/research/](docs/research/): research notes behind scoping decisions
+- [docs/two-device-sync-checklist.md](docs/two-device-sync-checklist.md): manual two-Mac sync test plan (iCloud Drive and Dropbox) for what `scripts/sync-lab.sh` cannot exercise
+- [docs/qa/](docs/qa/): bug-hunt reports
 - [CLAUDE.md](CLAUDE.md): working rules for contributors and agents
 
 ## Credits

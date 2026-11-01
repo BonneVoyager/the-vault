@@ -9,6 +9,8 @@
 //! cache: the recommended macOS cache walks every recursively watched tree up front (possibly
 //! all of iCloud Drive), and path classification needs no file ids.
 //!
+//! Every name and path comparison here is normalisation-insensitive (NFC per component, see
+//! [`package::nfc`]): a provider may deliver `A\u{308}` where we wrote `\u{c4}`.
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,7 +22,7 @@ use notify_debouncer_full::{DebounceEventResult, Debouncer, NoCache, new_debounc
 
 use crate::atomic::parent_dir;
 use crate::error::SyncError;
-use crate::package::{self, VAULT_FILE_NAME};
+use crate::package::{self, VAULT_FILE_NAME, fold_name, strip_prefix_nfc};
 
 /// Debounce window (03 §3).
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
@@ -49,10 +51,10 @@ pub(crate) enum ConflictKind {
     Generic,
 }
 
-/// Case-insensitive name equality (Unicode lowercase, like the default APFS volume). Not
-/// normalization-insensitive: NFC and NFD spellings of the same name differ here.
+/// Case-insensitive name equality (Unicode lowercase, like the default APFS volume), also
+/// insensitive to the normalisation form (NFC and NFD spellings of a name are equal).
 pub(crate) fn same_name(a: &str, b: &str) -> bool {
-    a == b || a.to_lowercase() == b.to_lowercase()
+    a == b || fold_name(a) == fold_name(b)
 }
 
 /// Classify an entry name in the package's parent directory against the package's name. `None`
@@ -61,9 +63,9 @@ pub(crate) fn classify(file: &str, primary: &str) -> Option<ConflictKind> {
     if file.starts_with('.') || same_name(file, primary) {
         return None;
     }
-    let lower = file.to_lowercase();
+    let lower = fold_name(file);
     let stem = lower.strip_suffix(".vault")?;
-    let name = primary.to_lowercase();
+    let name = fold_name(primary);
     let name = name.strip_suffix(".vault").unwrap_or(&name).to_owned();
     Some(pattern_kind(stem, &name))
 }
@@ -75,14 +77,14 @@ pub(crate) fn classify_inner(file: &str) -> Option<ConflictKind> {
     if file.starts_with('.') || same_name(file, VAULT_FILE_NAME) {
         return None;
     }
-    let lower = file.to_lowercase();
+    let lower = fold_name(file);
     let stem = lower.strip_suffix(".bin")?;
     stem.starts_with("vault")
         .then(|| pattern_kind(stem, "vault"))
 }
 
-/// Which 03 §6 pattern `stem` (lowercase, extension removed) matches for the lowercase base
-/// name `name`.
+/// Which 03 §6 pattern `stem` (folded by [`fold_name`], extension removed) matches for the
+/// folded base name `name`.
 fn pattern_kind(stem: &str, name: &str) -> ConflictKind {
     if let Some(rest) = stem.strip_prefix(&format!("{name} ")) {
         // Dropbox: "(<host>'s conflicted copy <date>)"; the apostrophe may be typographic.
@@ -195,7 +197,7 @@ struct Classifier {
 impl Classifier {
     fn place<'a>(&self, path: &'a Path) -> Place<'a> {
         for pkg in &self.package {
-            if let Ok(rel) = path.strip_prefix(pkg) {
+            if let Some(rel) = strip_prefix_nfc(path, pkg) {
                 let mut parts = rel.components().map(|c| c.as_os_str().to_str());
                 return match (parts.next(), parts.next()) {
                     (None, _) => Place::Primary,
@@ -205,7 +207,7 @@ impl Classifier {
                 };
             }
         }
-        let Some(rel) = self.parent.iter().find_map(|d| path.strip_prefix(d).ok()) else {
+        let Some(rel) = self.parent.iter().find_map(|d| strip_prefix_nfc(path, d)) else {
             return Place::Ignored;
         };
         let mut parts = rel.components().map(|c| c.as_os_str().to_str());
@@ -433,5 +435,127 @@ mod tests {
         );
         assert!(same_name("Ärzte Tresor.vault", "ärzte tresor.vault"));
         assert!(!same_name("Ärzte.vault", "Arzte.vault"));
+    }
+
+    /// `Ärzte` with Ä precomposed (NFC) and decomposed (NFD), under a parent `Café` likewise.
+    const NFC_NAME: &str = "\u{c4}rzte.vault";
+    const NFD_NAME: &str = "A\u{308}rzte.vault";
+    const NFC_DIR: &str = "/d/Caf\u{e9}";
+    const NFD_DIR: &str = "/d/Cafe\u{301}";
+
+    /// A package created with NFC names (directory and package).
+    fn nfc_classifier() -> (Classifier, Receiver<WatchSignal>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let pkg = PathBuf::from(NFC_DIR).join(NFC_NAME);
+        let c = Classifier {
+            package: [pkg.clone(), pkg],
+            parent: [PathBuf::from(NFC_DIR), PathBuf::from(NFC_DIR)],
+            package_name: NFC_NAME.to_owned(),
+            tx,
+        };
+        (c, rx)
+    }
+
+    #[test]
+    fn nfd_event_paths_classify_like_nfc() {
+        let (c, _rx) = nfc_classifier();
+        for dir in [NFC_DIR, NFD_DIR] {
+            for primary in [
+                format!("{dir}/{NFD_NAME}/vault.bin"),
+                format!("{dir}/{NFD_NAME}"),
+                format!("{dir}/{NFC_NAME}/vault.bin"),
+                format!("{dir}/a\u{308}RZTE.vault/vault.bin"),
+            ] {
+                assert_eq!(c.place(Path::new(&primary)), Place::Primary, "{primary}");
+            }
+            let inner = format!("{dir}/{NFD_NAME}/vault 2.bin");
+            assert_eq!(c.place(Path::new(&inner)), Place::Inner("vault 2.bin"));
+            for ignored in [
+                format!("{dir}/{NFD_NAME}/attachments/00000000000000000000000000000001.bin"),
+                format!("{dir}/{NFD_NAME}/backups/x.vault.bin"),
+            ] {
+                assert_eq!(c.place(Path::new(&ignored)), Place::Ignored, "{ignored}");
+            }
+            let sibling = "A\u{308}rzte 2.vault";
+            for path in [
+                format!("{dir}/{sibling}"),
+                format!("{dir}/{sibling}/vault.bin"),
+            ] {
+                assert_eq!(c.place(Path::new(&path)), Place::Sibling(sibling), "{path}");
+            }
+        }
+        // Differs by more than normalisation: another directory, another package.
+        assert_eq!(
+            c.place(Path::new("/d/Cafe/\u{c4}rzte.vault/vault.bin")),
+            Place::Ignored
+        );
+        assert_eq!(
+            c.place(Path::new("/d/Caf\u{e9}/Arzte.vault/vault.bin")),
+            Place::Sibling("Arzte.vault")
+        );
+    }
+
+    #[test]
+    fn nfd_siblings_match_the_nfc_package_name() {
+        assert_eq!(classify(NFD_NAME, NFC_NAME), None);
+        assert_eq!(classify(NFC_NAME, NFD_NAME), None);
+        assert_eq!(
+            classify("A\u{308}rzte 2.vault", NFC_NAME),
+            Some(ConflictKind::ICloud)
+        );
+        assert_eq!(
+            classify("\u{c4}rzte 3.vault", NFD_NAME),
+            Some(ConflictKind::ICloud)
+        );
+        assert_eq!(
+            classify(
+                "A\u{308}rzte (Mac's conflicted copy 2026-10-30).vault",
+                NFC_NAME
+            ),
+            Some(ConflictKind::Dropbox)
+        );
+        // Not the same name: only the generic "any *.vault" rule applies (the header decides).
+        assert_eq!(
+            classify("Arzte 2.vault", NFC_NAME),
+            Some(ConflictKind::Generic)
+        );
+        assert_eq!(
+            classify("A\u{300}rzte 2.vault", NFC_NAME),
+            Some(ConflictKind::Generic)
+        );
+        assert_eq!(classify("A\u{308}rzte.txt", NFC_NAME), None);
+        // `vault.bin` spelled with a decomposed letter cannot occur (ASCII), but `vault 2.bin`
+        // with a provider-added suffix still matches whatever form the rest is in.
+        assert_eq!(classify_inner("vault 2.bin"), Some(ConflictKind::ICloud));
+        assert!(same_name(NFC_NAME, NFD_NAME));
+        assert!(same_name("\u{e4}RZTE.vault", NFD_NAME));
+        assert!(!same_name("Arzte.vault", NFD_NAME));
+    }
+
+    #[test]
+    fn handler_sends_signals_for_nfd_events() {
+        use notify::event::{CreateKind, ModifyKind};
+        use notify_debouncer_full::DebouncedEvent;
+        use std::time::Instant;
+
+        let (c, rx) = nfc_classifier();
+        let ev = |kind: EventKind, p: String| {
+            DebouncedEvent::new(notify::Event::new(kind).add_path(p.into()), Instant::now())
+        };
+        let modify = EventKind::Modify(ModifyKind::Any);
+        let create = EventKind::Create(CreateKind::Folder);
+        c.handle(Ok(vec![
+            ev(modify, format!("{NFD_DIR}/{NFD_NAME}/vault.bin")),
+            ev(create, format!("{NFD_DIR}/A\u{308}rzte 2.vault")),
+            ev(create, format!("{NFD_DIR}/Arzte.txt")),
+        ]));
+        let got: Vec<WatchSignal> = rx.try_iter().collect();
+        assert_eq!(
+            got,
+            [
+                WatchSignal::CandidateConflict(PathBuf::from(NFC_DIR).join("A\u{308}rzte 2.vault")),
+                WatchSignal::PrimaryChanged,
+            ]
+        );
     }
 }

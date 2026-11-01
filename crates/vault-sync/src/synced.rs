@@ -147,7 +147,14 @@ pub struct SyncedVault {
     locked_fallback: Option<LockedVault>,
     /// Last `ForeignVault` / `Error` reported per sibling, with the bytes' hash, so a file
     /// that keeps firing watcher events is reported once until it changes or disappears.
+    /// Keyed by [`package::path_key`].
     sibling_reports: HashMap<PathBuf, ([u8; 32], reconcile::SiblingReport)>,
+    /// Conflicted packages whose move is deferred until their blobs arrive and for which
+    /// [`SyncEvent::WaitingForBlobs`] was emitted: [`package::path_key`] -> path as received.
+    /// An entry goes when the package is absorbed or disappears; the whole map is cleared by
+    /// `start_watching`, `stop_watching` and `lock` (whose entries are re-checked at the next
+    /// unlock), so a package still waiting after any of those is reported once more.
+    waiting_for_blobs: HashMap<PathBuf, PathBuf>,
     /// The primary was found missing while unlocked ([`SyncEvent::PrimaryMissing`] emitted,
     /// vault marked dirty). Cleared when the primary is read or written again, and on lock.
     primary_missing: bool,
@@ -215,6 +222,7 @@ impl SyncedVault {
             save_blocked: None,
             locked_fallback: None,
             sibling_reports: HashMap::new(),
+            waiting_for_blobs: HashMap::new(),
             primary_missing: false,
             prune_clock_offset: Duration::ZERO,
         };
@@ -317,6 +325,7 @@ impl SyncedVault {
             save_blocked: None,
             locked_fallback: None,
             sibling_reports: HashMap::new(),
+            waiting_for_blobs: HashMap::new(),
             primary_missing: false,
             prune_clock_offset: Duration::ZERO,
         })
@@ -506,6 +515,17 @@ impl SyncedVault {
         // which locking discards; carry it over so the next unlock still rewrites the file.
         if std::mem::take(&mut self.dirty_from_corrupt) {
             self.rewrite_on_unlock = true;
+        }
+        // Packages still waiting for blobs: re-check (and report again) after the next
+        // unlock, even if no watcher event arrives for them meanwhile.
+        for (key, path) in std::mem::take(&mut self.waiting_for_blobs) {
+            if !self
+                .pending_conflicts
+                .iter()
+                .any(|p| package::path_key(p) == key)
+            {
+                self.pending_conflicts.push(path);
+            }
         }
         self.unlocked = None;
         self.dirty = false;
@@ -786,7 +806,11 @@ impl SyncedVault {
         }
         let info = backup::list_backups(&self.path)?
             .into_iter()
-            .find(|b| b.path.file_name() == Some(name))
+            .find(|b| {
+                b.path
+                    .file_name()
+                    .is_some_and(|n| package::same_component(n, name))
+            })
             .ok_or_else(refuse)?;
         between();
         let removed = if meta.is_dir() {

@@ -502,6 +502,10 @@ fn absorb_sibling(name: &str) {
     // The merged result is on disk.
     let disk = on_disk(&path).unlock(&pw()).unwrap();
     assert_eq!(disk.items().count(), 2);
+    // No attachments, so nothing to wait for.
+    drain_for(&mut a, 2);
+    ea.pump();
+    assert!(!ea.any(|e| matches!(e, SyncEvent::WaitingForBlobs(_))));
 }
 
 #[test]
@@ -1136,4 +1140,117 @@ fn flipped_slot_nonce_is_detected_as_tamper() {
     let _ = a.lock();
     a.unlock(&pw()).unwrap();
     assert_eq!(titles(&a), ["from a", "mail"]);
+}
+
+/// `Ärzte` with Ä precomposed (NFC, as the app writes it) and decomposed (NFD, as some
+/// providers deliver names).
+const NFC_NAME: &str = "\u{c4}rzte.vault";
+const NFD_STEM: &str = "A\u{308}rzte";
+
+/// A creates `Ärzte.vault` (NFC) with one item; B opens the same package through the NFD
+/// spelling of its path (a provider-delivered path), so every event B's watcher sees names
+/// the package in a different form than B was given.
+///
+/// On APFS these end-to-end tests also pass without NFC matching (`canonicalize` and FSEvents
+/// both return the stored form); the discriminating checks are the classifier unit tests in
+/// `src/watch.rs`, which feed NFD event paths directly. These guard the whole pipeline.
+fn nfc_package_opened_as_nfd() -> (TempDir, PathBuf, SyncedVault, SyncedVault) {
+    let dir = tempfile::tempdir().unwrap();
+    let package = dir.path().join(NFC_NAME);
+    let mut a = SyncedVault::create(
+        &package,
+        &pw(),
+        KdfParams::for_tests(),
+        DEV_A,
+        Arc::new(NoopHooks),
+    )
+    .unwrap();
+    a.edit(|v| v.insert(Item::new("mail", Uuid::nil(), T0), T0))
+        .unwrap();
+    a.save().unwrap();
+    let nfd = dir.path().join(format!("{NFD_STEM}.vault"));
+    let mut b = SyncedVault::open(&nfd, DEV_B, Arc::new(NoopHooks)).unwrap();
+    b.unlock(&pw()).unwrap();
+    (dir, package, a, b)
+}
+
+/// Writes to the NFC-named package reach B (opened via NFD) as primary changes: merged, and
+/// B's own package is never mistaken for a conflicted sibling (which would move it away).
+#[test]
+fn package_named_in_another_normalisation_form_is_still_primary() {
+    let (dir, package, mut a, mut b) = nfc_package_opened_as_nfd();
+    b.start_watching().unwrap();
+    let mut eb = Events::new(&b);
+    a.edit(|v| v.insert(Item::new("from a", Uuid::nil(), T0), T0))
+        .unwrap();
+    a.save().unwrap();
+    assert!(wait_until(|| {
+        b.poll();
+        titles(&b) == ["from a", "mail"]
+    }));
+    drain_for(&mut b, 2);
+    eb.pump();
+    assert!(eb.any(merged));
+    assert!(
+        !eb.any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_))),
+        "{:?}",
+        eb.seen
+    );
+    assert!(package.join(VAULT_FILE_NAME).is_file());
+    // Nothing was renamed on disk: the package keeps its NFC name.
+    let names: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, [NFC_NAME]);
+}
+
+/// A numbered sibling whose name arrives in NFD next to the NFC package is absorbed; an
+/// unrelated vault whose name differs by more than normalisation is left alone.
+#[test]
+fn sibling_in_another_normalisation_form_is_absorbed() {
+    let (dir, package, mut a, mut b) = nfc_package_opened_as_nfd();
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+
+    // Another vault, named `Arzte 2.vault`: a candidate only by the generic rule, rejected
+    // by its vault id.
+    let other_pkg = dir.path().join(".other.vault");
+    let other = SyncedVault::create(
+        &other_pkg,
+        &pw(),
+        KdfParams::for_tests(),
+        DEV_A,
+        Arc::new(NoopHooks),
+    )
+    .unwrap();
+    drop(other);
+    let unrelated = dir.path().join("Arzte 2.vault");
+    fs::rename(&other_pkg, &unrelated).unwrap();
+
+    b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
+        .unwrap();
+    let copy = dir.path().join(format!("{NFD_STEM} 2.vault"));
+    plant_package(&copy, &b.vault().unwrap().serialize());
+    assert!(wait_until(|| {
+        a.poll();
+        ea.pump();
+        ea.any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_)))
+    }));
+    assert_eq!(titles(&a), ["from b", "mail"]);
+    assert!(!copy.exists());
+    let moved = a
+        .backups()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.is_conflict())
+        .unwrap();
+    assert!(moved.path.starts_with(package.join("backups")));
+    drain_for(&mut a, 2);
+    ea.pump();
+    assert!(
+        unrelated.join(VAULT_FILE_NAME).is_file(),
+        "unrelated vault moved"
+    );
+    assert_eq!(ea.count(|e| matches!(e, SyncEvent::ConflictAbsorbed(_))), 1);
 }

@@ -978,6 +978,18 @@ mod tests {
 
     #[gpui::test]
     fn conflict_absorbed_rechecks_the_slot(cx: &mut TestAppContext) {
+        merged_conflict_rechecks_the_slot(vault_sync::SyncEvent::ConflictAbsorbed, cx);
+    }
+
+    #[gpui::test]
+    fn waiting_for_blobs_rechecks_the_slot(cx: &mut TestAppContext) {
+        merged_conflict_rechecks_the_slot(vault_sync::SyncEvent::WaitingForBlobs, cx);
+    }
+
+    fn merged_conflict_rechecks_the_slot(
+        event: fn(PathBuf) -> vault_sync::SyncEvent,
+        cx: &mut TestAppContext,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let (state, _bio, _path) = setup(dir.path(), cx);
         enable(&state, cx);
@@ -993,7 +1005,7 @@ mod tests {
         });
         let copy = dir.path().join("t (conflict).vault");
         state.update(cx, |s, cx| {
-            s.handle_sync_event(vault_sync::SyncEvent::ConflictAbsorbed(copy), cx);
+            s.handle_sync_event(event(copy), cx);
         });
         state.read_with(cx, |s, _| assert!(s.policy().unwrap().stale));
         assert_eq!(toast(&state, cx).as_deref(), Some(SLOT_GONE));

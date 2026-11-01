@@ -193,7 +193,10 @@ fn snapshot_file_name(name: &str, stamp: &str, kind: BackupKind, seq: u32) -> St
 }
 
 /// `(taken_at, same-second sequence, kind)` for a file we manage, `None` for anything else.
+/// `file` and `name` are compared in NFC: a provider may deliver either in NFD.
 fn parse_file_name(file: &str, name: &str) -> Option<(SystemTime, u32, BackupKind)> {
+    let (file, name) = (package::nfc(file), package::nfc(name));
+    let (file, name) = (file.as_ref(), name.as_ref());
     if let Some(rest) = file.strip_prefix(CONFLICT_PREFIX) {
         let stamp = rest.get(..STAMP_LEN)?;
         let orig = rest.get(STAMP_LEN..)?.strip_prefix('-')?;
@@ -541,6 +544,30 @@ mod tests {
             let (y, m, d) = civil_from_days(z);
             assert_eq!(days_from_civil(y, m, d), z);
         }
+    }
+
+    #[test]
+    fn file_names_parse_in_either_normalisation_form() {
+        let t = at(1_793_196_191);
+        let (nfc, nfd) = ("\u{c4}rzte", "A\u{308}rzte");
+        for (file_name, vault) in [(nfc, nfd), (nfd, nfc), (nfd, nfd)] {
+            let f = format!("{file_name}-2026-10-28T14-03-11Z-unsaved-2.vault.bin");
+            assert_eq!(
+                parse_file_name(&f, vault),
+                Some((t, 2, BackupKind::Unsaved)),
+                "{f}"
+            );
+        }
+        let conflict = format!("conflict-2026-10-28T14-03-11Z-{nfd} 2.vault");
+        assert_eq!(
+            parse_file_name(&conflict, nfc),
+            Some((t, 0, BackupKind::Conflict))
+        );
+        // More than a normalisation difference: not ours.
+        assert_eq!(
+            parse_file_name("Arzte-2026-10-28T14-03-11Z.vault.bin", nfc),
+            None
+        );
     }
 
     #[test]

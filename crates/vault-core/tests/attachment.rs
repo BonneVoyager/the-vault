@@ -736,9 +736,10 @@ fn attachment_tombstones_survive_serialize_parse_and_are_omitted_when_empty() {
 }
 
 #[test]
-fn attachment_tombstones_are_capped_and_purged() {
+fn attachment_tombstones_are_never_capped_locally_and_are_purged() {
+    // (i) 70 local removals keep all 70 markers: the cap is a merge-only rule (03 §5).
     let (mut v, id) = vault_with_item();
-    let n = ATTACHMENT_TOMBSTONE_CAP + 10;
+    let n = ATTACHMENT_TOMBSTONE_CAP + 6;
     let mut ids = Vec::new();
     for i in 0..n as u64 {
         let r = new_ref("r", 1, i).unwrap();
@@ -751,14 +752,14 @@ fn attachment_tombstones_are_capped_and_purged() {
     }
     let item = v.get(id).unwrap();
     assert!(item.attachments.is_empty());
-    assert_eq!(item.removed_attachments.len(), ATTACHMENT_TOMBSTONE_CAP);
-    // Newest first; the 10 oldest removals fell off.
-    assert_eq!(item.removed_attachments[0].id, ids[n - 1]);
-    assert!(
-        item.removed_attachments
-            .iter()
-            .all(|t| t.removed_at >= 10_010)
+    assert_eq!(
+        item.removed_attachments.len(),
+        n,
+        "over the cap, on purpose"
     );
+    // Newest first, nothing dropped.
+    assert_eq!(item.removed_attachments[0].id, ids[n - 1]);
+    assert_eq!(item.removed_attachments[n - 1].id, ids[0]);
     let stamps: Vec<_> = item
         .removed_attachments
         .iter()
@@ -767,6 +768,12 @@ fn attachment_tombstones_are_capped_and_purged() {
     let mut sorted = stamps.clone();
     sorted.sort_unstable_by(|a, b| b.cmp(a));
     assert_eq!(stamps, sorted);
+    // The parser does not reject a list over the cap.
+    let reopened = LockedVault::parse(&v.serialize())
+        .unwrap()
+        .unlock(&pw())
+        .unwrap();
+    assert_eq!(reopened.get(id).unwrap().removed_attachments.len(), n);
 
     // Purge: markers older than the cutoff go; items are untouched; count is items only.
     let modified = item.modified_at;
@@ -782,7 +789,7 @@ fn attachment_tombstones_are_capped_and_purged() {
     assert_eq!(v.purge_tombstones_older_than(u64::MAX), 0);
     assert!(v.get(id).unwrap().removed_attachments.is_empty());
 
-    // The cap is also enforced on insert/update and in a merge.
+    // insert/update normalise (newest first, one per id) but never truncate either.
     let mut item = Item::new("n", Uuid::nil(), 1);
     for i in 0..n as u64 {
         item.removed_attachments.push(AttachmentTombstone {
@@ -791,10 +798,7 @@ fn attachment_tombstones_are_capped_and_purged() {
         });
     }
     let iid = v.insert(item, 1);
-    assert_eq!(
-        v.get(iid).unwrap().removed_attachments.len(),
-        ATTACHMENT_TOMBSTONE_CAP
-    );
+    assert_eq!(v.get(iid).unwrap().removed_attachments.len(), n);
     v.update(iid, 2, |item| {
         item.removed_attachments.push(AttachmentTombstone {
             id: Uuid::nil(),
@@ -803,6 +807,107 @@ fn attachment_tombstones_are_capped_and_purged() {
     })
     .unwrap();
     let t = &v.get(iid).unwrap().removed_attachments;
-    assert_eq!(t.len(), ATTACHMENT_TOMBSTONE_CAP);
+    assert_eq!(t.len(), n + 1);
     assert_eq!(t[0].id, Uuid::nil());
+}
+
+#[test]
+fn attachment_marker_cap_fires_only_in_merge_and_only_for_refs_neither_side_holds() {
+    // A adds 50 refs, B takes a copy, A adds 20 more and then removes all 70 (70 markers,
+    // removal i stamped 10_000 + i). B still holds refs 0..50 and never saw 50..70.
+    let (mut a, id) = vault_with_item();
+    a.set_device_id(Uuid::from_u128(0xA));
+    let n = ATTACHMENT_TOMBSTONE_CAP + 6;
+    let mut ids = Vec::new();
+    for i in 0..50u64 {
+        let r = new_ref("r", 1, 200 + i).unwrap();
+        ids.push(r.id);
+        a.add_attachment_ref(id, r, 200 + i).unwrap();
+    }
+    let mut b = LockedVault::parse(&a.serialize())
+        .unwrap()
+        .unlock(&pw())
+        .unwrap();
+    b.set_device_id(Uuid::from_u128(0xB));
+    for i in 50..n as u64 {
+        let r = new_ref("r", 1, 200 + i).unwrap();
+        ids.push(r.id);
+        a.add_attachment_ref(id, r, 200 + i).unwrap();
+    }
+    for (i, rid) in ids.iter().enumerate() {
+        a.remove_attachment_ref(id, *rid, 10_000 + i as u64)
+            .unwrap();
+    }
+    assert_eq!(a.get(id).unwrap().removed_attachments.len(), n);
+    let marker_ids = |v: &vault_core::UnlockedVault| -> Vec<Uuid> {
+        v.get(id)
+            .unwrap()
+            .removed_attachments
+            .iter()
+            .map(|t| t.id)
+            .collect()
+    };
+
+    // (ii) B merges A: every ref goes (removed_at >= added_at), markers for the 50 refs B
+    // still held at merge time are kept past the cap; of the 20 markers whose ref neither
+    // side holds, the 6 oldest (50..56) are dropped.
+    let a_snap = LockedVault::parse(&a.serialize())
+        .unwrap()
+        .unlock(&pw())
+        .unwrap();
+    assert!(b.merge_from(&a_snap).unwrap().changed());
+    assert!(b.get(id).unwrap().attachments.is_empty(), "no resurrection");
+    let kept = marker_ids(&b);
+    assert_eq!(kept.len(), ATTACHMENT_TOMBSTONE_CAP);
+    for (i, rid) in ids.iter().enumerate() {
+        let expect = !(50..56).contains(&i);
+        assert_eq!(kept.contains(rid), expect, "marker {i}");
+    }
+    assert!(
+        b.attachment_ids().next().is_none(),
+        "every blob is prunable"
+    );
+
+    // (iii) A merges B: both sides now lack every ref, so the union (70 again, A still has
+    // 50..56) caps to 64 by dropping the oldest six removals overall (0..6).
+    let b_snap = LockedVault::parse(&b.serialize())
+        .unwrap()
+        .unlock(&pw())
+        .unwrap();
+    assert!(a.merge_from(&b_snap).unwrap().changed());
+    let kept = marker_ids(&a);
+    assert_eq!(kept.len(), ATTACHMENT_TOMBSTONE_CAP);
+    for (i, rid) in ids.iter().enumerate() {
+        assert_eq!(kept.contains(rid), i >= 6, "marker {i}");
+    }
+    assert_eq!(
+        a.get(id)
+            .unwrap()
+            .removed_attachments
+            .last()
+            .unwrap()
+            .removed_at,
+        10_006
+    );
+    // B catches up and converges (the cap round's +1 bump needs one more exchange).
+    let a_snap = LockedVault::parse(&a.serialize())
+        .unwrap()
+        .unlock(&pw())
+        .unwrap();
+    b.merge_from(&a_snap).unwrap();
+    assert_eq!(marker_ids(&b), marker_ids(&a));
+    let b_snap = LockedVault::parse(&b.serialize())
+        .unwrap()
+        .unlock(&pw())
+        .unwrap();
+    a.merge_from(&b_snap).unwrap();
+    assert!(vault_core::merge::item_eq(
+        a.get(id).unwrap(),
+        b.get(id).unwrap()
+    ));
+    assert!(!a.merge_from(&b_snap).unwrap().changed());
+    assert!(!b.merge_from(&a_snap).unwrap().changed());
+    // Re-adding a capped-away id is a plain add again (its marker is gone); accepted limit,
+    // same as for fields (03 §5).
+    assert!(a.get(id).unwrap().attachments.is_empty());
 }

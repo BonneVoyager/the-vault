@@ -426,10 +426,12 @@ fn m11_equal_stamp_content_change_visible() {
     assert_eq!(snap_vault(&n.devs[2]), s);
 }
 
-/// 03 §5 removed_attachments cap 64 newest; removed_history cap 10 newest (bounded growth).
+/// 03 §5 (attachments paragraph, merge-only cap): a local removal never drops a
+/// `removed_attachments` marker; a merge caps them at 64, dropping oldest `removed_at` first,
+/// and only markers whose reference neither side still holds.
 #[test]
 fn m12_tombstone_caps() {
-    let mut n = Net::new(1);
+    let mut n = Net::new(2);
     let id = seeded(&mut n, 100);
     for i in 0..80u64 {
         let r = attachment::new_ref("x", 1, 200 + i).unwrap();
@@ -438,7 +440,18 @@ fn m12_tombstone_caps() {
         n.devs[0].remove_attachment_ref(id, rid, 300 + i).unwrap();
     }
     let it = n.devs[0].get(id).unwrap();
-    assert!(it.removed_attachments.len() <= 64, "removed_attachments cap 64: {}", it.removed_attachments.len());
+    assert_eq!(it.removed_attachments.len(), 80, "local removal must not cap markers");
+    let mut all: Vec<_> = it.removed_attachments.iter().map(|t| (t.removed_at, t.id)).collect();
+    all.sort();
+    let newest: Vec<_> = all[16..].to_vec();
+
+    // Device 1 never saw any of these refs: neither side holds them, so the merge caps.
+    n.pull(1, 0);
+    let it = n.devs[1].get(id).unwrap();
+    assert_eq!(it.removed_attachments.len(), 64, "merge caps at 64");
+    let mut got: Vec<_> = it.removed_attachments.iter().map(|t| (t.removed_at, t.id)).collect();
+    got.sort();
+    assert_eq!(got, newest, "the 64 newest by removed_at survive");
 }
 
 /// 02 purge_tombstones_older_than removes only old tombstones.

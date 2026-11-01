@@ -1,6 +1,6 @@
 ---
 name: attachment-decisions
-description: Settled vault-core v1.1 attachment decisions (2026-10-29) — AttachmentRef shape, chunk AAD layout, seal-by-value, validate_ref on every write path, removal tombstones + merge rule, fixture v1-attach layout
+description: Settled vault-core v1.1 attachment decisions (2026-10-29, cap rule revised 2026-11-01) — AttachmentRef shape, chunk AAD layout, seal-by-value, validate_ref on every write path, removal tombstones + merge rule + merge-only cap, fixture v1-attach layout
 metadata:
   type: project
 ---
@@ -71,8 +71,14 @@ new stamp, LIFTED to at least the removed ref's `added_at` (`stamp(now, modified
 added_at)`; the item restamps to that floor) so an ahead-clock add cannot outrun its marker;
 `add_attachment_ref` clamps `r.added_at` to <= the item's new stamp. `check_attachment_refs`
 (insert/try_insert/update) also rejects a ref whose id has a marker on the same item. `merge::normalize_attachment_tombstones`: newest first, ties by id, one per id (max
-removed_at), cap `vault::ATTACHMENT_TOMBSTONE_CAP = 64`; applied in remove, try_insert,
-update and merge. **Merge (live+live):** union both marker lists, then union refs by id MINUS
+removed_at), NO truncation (2026-11-01); applied in remove, try_insert, update and merge. The
+cap `vault::ATTACHMENT_TOMBSTONE_CAP = 64` is merge-only since 2026-11-01, same discipline as
+`removed_fields`: `cap_attachment_tombstones` (shared generic `cap_tombstones` with the field
+one) runs only in `merge_live`, drops oldest `removed_at` first, only markers whose ref is
+absent on BOTH input sides; otherwise the list stays over the cap until a later merge. A
+local removal never drops a marker; the parser never rejects a long list; no format bump.
+Tests: `attachment_tombstones_are_never_capped_locally_and_are_purged`,
+`attachment_marker_cap_fires_only_in_merge_and_only_for_refs_neither_side_holds`. **Merge (live+live):** union both marker lists, then union refs by id MINUS
 any ref with a marker `removed_at >= added_at`, sorted `(added_at, id)`; item-tombstone cases
 still clone wholesale. `add_attachment_ref` refuses an id that has a marker (Malformed
 "duplicate attachment"). `purge_tombstones_older_than(cutoff)` also drops markers with

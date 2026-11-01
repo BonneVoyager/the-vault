@@ -1,13 +1,16 @@
 //! Cloud-provider hooks (03 §7). `vault-macos` supplies the iCloud implementation.
 //! Also the pure path classifier behind the "which provider syncs this vault" label
 //! ([`classify_location`]). It reads path components only (no I/O, no canonicalisation) and
-//! compares them ASCII case-insensitively, as the default APFS volume does. A
+//! compares them ASCII case-insensitively, as the default APFS volume does, and in NFC (the
+//! home directory's user name may arrive decomposed). A
 //! `Library/Mobile Documents` pair anywhere in the path, including on another volume
 //! (`/Volumes/x/Library/Mobile Documents/…`), reads as iCloud Drive: that folder exists only
 //! for iCloud, so the simple rule is kept.
 
 use std::path::{Component, Path};
 use std::time::Duration;
+
+use crate::package;
 
 /// Failure reported by [`CloudHooks::ensure_downloaded`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -151,7 +154,11 @@ fn first_under_home<'a>(names: &[&'a str], home: Option<&Path>) -> Option<&'a st
     }
     names
         .windows(tail.len())
-        .position(|w| w.iter().zip(tail).all(|(a, b)| eq(a, b)))
+        .position(|w| {
+            w.iter()
+                .zip(tail)
+                .all(|(a, b)| eq(&package::nfc(a), &package::nfc(b)))
+        })
         .and_then(|i| names.get(i + tail.len()).copied())
 }
 
@@ -358,6 +365,95 @@ mod tests {
             classify("/Users/a/Library/CloudStorage", false),
             "Local folder"
         );
+    }
+
+    #[test]
+    fn home_prefix_matches_whole_components_only() {
+        let alice = Path::new("/Users/alice");
+        let alicia = Path::new("/Users/alicia");
+        let under = |path: &str, home: &Path| {
+            classify_location(Path::new(path), Some(home), || false)
+                .label()
+                .to_owned()
+        };
+        assert_eq!(under("/Users/alice/Dropbox/x.vault", alice), "Dropbox");
+        assert_eq!(under("/Users/alicia/Dropbox/x.vault", alicia), "Dropbox");
+        // A home is not a string prefix of another user's home, in either direction.
+        assert_eq!(
+            under("/Users/alicia/Dropbox/x.vault", alice),
+            "Local folder"
+        );
+        assert_eq!(
+            under("/Users/alice/Dropbox/x.vault", alicia),
+            "Local folder"
+        );
+        assert_eq!(
+            under("/Users/alice/Dropbox/x.vault", Path::new("/Users/ali")),
+            "Local folder"
+        );
+        // Case variants of the home still match whole components only.
+        assert_eq!(under("/USERS/ALICE/dropbox/x.vault", alice), "Dropbox");
+        assert_eq!(
+            under("/users/ALICIA/Dropbox/x.vault", alice),
+            "Local folder"
+        );
+        assert_eq!(
+            under("/Users/ALICE/Dropbox/x.vault", alicia),
+            "Local folder"
+        );
+    }
+
+    #[test]
+    fn home_matches_across_normalisation_forms() {
+        let got = classify_location(
+            Path::new("/Users/Jose\u{301}/Dropbox/x.vault"),
+            Some(Path::new("/Users/Jos\u{e9}")),
+            || false,
+        );
+        assert_eq!(got.label(), "Dropbox");
+        let got = classify_location(
+            Path::new("/Users/Jose/Dropbox/x.vault"),
+            Some(Path::new("/Users/Jos\u{e9}")),
+            || false,
+        );
+        assert_eq!(got.label(), "Local folder");
+    }
+
+    #[test]
+    fn cloud_storage_prefix_is_whole_component() {
+        for (library, storage) in [
+            ("Library", "CloudStorage"),
+            ("library", "cloudstorage"),
+            ("LIBRARY", "CLOUDSTORAGE"),
+        ] {
+            let ok = format!("/Users/a/{library}/{storage}/Dropbox/x.vault");
+            assert_eq!(classify(&ok, false), "Dropbox", "{ok}");
+            // Longer or shorter components that merely start or end with the names.
+            for bad in [
+                format!("/Users/a/{library}/{storage}X/Dropbox/x.vault"),
+                format!("/Users/a/{library}/X{storage}/Dropbox/x.vault"),
+                format!("/Users/a/{library}X/{storage}/Dropbox/x.vault"),
+                format!("/Users/a/{library}/Cloud/Dropbox/x.vault"),
+                format!("/Users/a/{library}{storage}/Dropbox/x.vault"),
+                format!("/Users/a/{library} {storage}/Dropbox/x.vault"),
+            ] {
+                assert_eq!(classify(&bad, false), "Local folder", "{bad}");
+            }
+        }
+        // The provider folder's prefix is its whole segment before the first `-`.
+        for (folder, label) in [
+            ("DropboxPlus", "DropboxPlus"),
+            ("dropboxplus-x", "dropboxplus"),
+            ("Boxed-x", "Boxed"),
+            ("BOX-x", "Box"),
+            ("box", "Box"),
+            ("onedrive-Personal", "OneDrive"),
+            ("ONEDRIVE", "OneDrive"),
+            ("OneDriveX-Personal", "OneDriveX"),
+        ] {
+            let path = format!("/Users/a/Library/CloudStorage/{folder}/x.vault");
+            assert_eq!(classify(&path, false), label, "{folder}");
+        }
     }
 
     #[test]

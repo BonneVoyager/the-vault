@@ -45,7 +45,7 @@ Design (per vault, keyed by `vault_id`):
 Policy, enforced by `vault-app`, not here:
 - Master password required after reboot (detect via boot time), after 7 days, and after 5 failed Touch ID attempts. The failure counter resets only on a password unlock; creating a vault counts as a password unlock. If boot time cannot be read, require the password (fail closed).
 - Touch ID can be enabled only after a successful master-password unlock in this session.
-- `rotate_vault_key` drops the enclave slot; Touch ID must be re-enrolled afterwards. Biometry change is detected by comparing the stored `evaluatedPolicyDomainState`; on mismatch the enrolment is stale and the user re-enrols.
+- `rotate_vault_key` drops the enclave slot; Touch ID must be re-enrolled afterwards. Biometry change is detected by comparing the stored `LAContext.domainState.biometry.stateHash` (macOS 15 API; byte-identical to the deprecated `evaluatedPolicyDomainState` it replaced on 2026-11-01, so earlier enrolments stay valid; a nil hash counts as changed); on mismatch the enrolment is stale and the user re-enrols. The stored value is only ever compared for equality, so a future API change costs one re-enrol, never a lockout.
 
 ### 2b. Passkey unlock (post-phase-5, macOS 15)
 

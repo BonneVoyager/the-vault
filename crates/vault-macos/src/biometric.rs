@@ -83,7 +83,8 @@ mod payload {
     pub(crate) struct Payload {
         pub slot_id: Uuid,
         pub ciphertext: Vec<u8>,
-        /// `LAContext.evaluatedPolicyDomainState` at enroll time.
+        /// `LAContext.domainState.biometry.stateHash` at enroll time (byte-identical to
+        /// the deprecated `evaluatedPolicyDomainState` stored by earlier builds).
         pub domain_state: Option<Vec<u8>>,
     }
 
@@ -240,18 +241,24 @@ mod imp {
         }
     }
 
-    /// `evaluatedPolicyDomainState`: opaque hash of the enrolled finger set, set after a
-    /// successful biometric `canEvaluatePolicy`/evaluation. Deprecated in macOS 15 in favour
-    /// of `LADomainState` (`LAContext.domainState`), which is available on our macOS 15 floor
-    /// (objc2-local-authentication `LADomainState` feature); migrating is a possible follow-up.
-    /// Apple warns the value may change across major OS updates; that only forces a password
-    /// unlock and re-enroll.
+    /// `LAContext.domainState.biometry.stateHash`: opaque hash of the enrolled finger set,
+    /// set after a successful biometric `canEvaluatePolicy`/evaluation. `None` when no
+    /// biometry is enrolled (nil `stateHash`). Replaces the macOS 15 deprecated
+    /// `evaluatedPolicyDomainState`, which returns the same bytes (checked by
+    /// `tests::domain_state_matches_legacy_api`), so enrolments made before the switch stay
+    /// valid. Apple warns the value may change across major OS updates; that only forces a
+    /// password unlock and re-enroll.
     fn domain_state(ctx: &LAContext) -> Option<Vec<u8>> {
-        // SAFETY: property getter on a context we own. (NSData::to_vec is enabled through
-        // objc2-local-authentication's LAContext feature.)
-        #[allow(deprecated)]
-        let data = unsafe { ctx.evaluatedPolicyDomainState() }?;
+        // SAFETY: property getters on a context we own and on the objects it returns.
+        // (NSData::to_vec is enabled through objc2-local-authentication's LAContext feature.)
+        let data = unsafe { ctx.domainState().biometry().stateHash() }?;
         Some(data.to_vec())
+    }
+
+    /// True when the enrolment is stale: the current finger-set hash differs from the one
+    /// stored at enroll time, or no biometry is enrolled (`current` is `None`).
+    fn biometry_changed(enrolled: &[u8], current: Option<&[u8]>) -> bool {
+        current != Some(enrolled)
     }
 
     pub(super) fn available() -> bool {
@@ -477,7 +484,7 @@ mod imp {
         // Detect a changed finger set before prompting: BiometryCurrentSet keys then fail
         // with a generic errSecAuthFailed only after the user has touched the sensor.
         let ctx = preflight().map_err(map_la)?;
-        if domain_state(&ctx).as_deref() != Some(enrolled_state.as_slice()) {
+        if biometry_changed(&enrolled_state, domain_state(&ctx).as_deref()) {
             return Err(MacError::BiometryChanged);
         }
         // SAFETY: setter on a context we own; the string is copied.
@@ -514,7 +521,7 @@ mod imp {
             )
         }
         .ok_or_else(|| {
-            let changed = domain_state(&ctx).as_deref() != Some(enrolled_state.as_slice());
+            let changed = biometry_changed(&enrolled_state, domain_state(&ctx).as_deref());
             decrypt_error(take_error(err), changed)
         })?;
         drop(ctx);
@@ -610,6 +617,36 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn biometry_changed_rules() {
+            assert!(!biometry_changed(b"set", Some(b"set")));
+            assert!(biometry_changed(b"set", Some(b"other")));
+            // Nil stateHash means no biometry enrolled: stale.
+            assert!(biometry_changed(b"set", None));
+        }
+
+        /// Enrolments stored before the LADomainState switch hold the deprecated
+        /// `evaluatedPolicyDomainState`; they stay valid only while both APIs return the same
+        /// bytes. Preflight only, never prompts; passes vacuously without Touch ID. If this
+        /// fails after an OS update, those enrolments read as stale and need one re-enroll.
+        #[test]
+        fn domain_state_matches_legacy_api() {
+            let Ok(ctx) = preflight() else { return };
+            // The deprecated getter is read here only to pin the compatibility above.
+            // SAFETY: property getter on a context we own.
+            #[allow(deprecated)]
+            let legacy = unsafe { ctx.evaluatedPolicyDomainState() }.map(|d| d.to_vec());
+            let current = domain_state(&ctx);
+            assert!(
+                current.is_some(),
+                "preflight succeeded but stateHash is nil"
+            );
+            assert!(
+                current == legacy,
+                "domainState and evaluatedPolicyDomainState differ"
+            );
+        }
 
         #[test]
         fn status_mapping() {

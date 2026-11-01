@@ -9,6 +9,7 @@
 //! there is no key at all.
 
 use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -42,9 +43,13 @@ impl SyncedVault {
     /// conflicted packages created while the app was not running are picked up by the first
     /// [`poll`]. A no-op if already watching. Nothing is processed until [`poll`] is called.
     ///
+    /// Packages already waiting for blobs are reported again ([`SyncEvent::WaitingForBlobs`])
+    /// when the start-up scan re-checks them: whatever happened while unwatched is unknown.
+    ///
     /// [`poll`]: SyncedVault::poll
     pub fn start_watching(&mut self) -> Result<(), SyncError> {
         if self.watcher.is_none() {
+            self.waiting_for_blobs.clear();
             self.watcher = Some(Watcher::start(&self.path)?);
         }
         Ok(())
@@ -53,8 +58,11 @@ impl SyncedVault {
     /// Stop watching and discard queued signals. Dropping the debouncer only sets its stop
     /// flag; it does not join, so its threads wind down shortly after this returns (any signal
     /// they still send goes nowhere).
+    /// Also forgets which packages were reported as waiting for blobs: nothing tells us if
+    /// they disappear while unwatched.
     pub fn stop_watching(&mut self) {
         self.watcher = None;
+        self.waiting_for_blobs.clear();
     }
 
     pub fn is_watching(&self) -> bool {
@@ -72,11 +80,13 @@ impl SyncedVault {
         let signals: Vec<WatchSignal> = watcher.signals.try_iter().collect();
         let mut primary = false;
         let mut conflicts: Vec<PathBuf> = Vec::new();
+        let mut keys: HashSet<PathBuf> = HashSet::new();
         for signal in &signals {
             match signal {
                 WatchSignal::PrimaryChanged => primary = true,
                 WatchSignal::CandidateConflict(p) => {
-                    if !conflicts.contains(p) {
+                    // An event and a rescan may spell the same name in NFC and NFD.
+                    if keys.insert(package::path_key(p)) {
                         conflicts.push(p.clone());
                     }
                 }
@@ -313,7 +323,10 @@ impl SyncedVault {
     /// 03 §6 for a candidate: a sibling `*.vault` package, or a per-file copy of `vault.bin`
     /// inside our package.
     fn on_candidate_conflict(&mut self, path: &Path) {
-        if path.parent() == Some(self.path.as_path()) {
+        if path
+            .parent()
+            .is_some_and(|p| package::path_key(p) == package::path_key(&self.path))
+        {
             self.on_file_conflict(path);
         } else {
             self.on_package_conflict(path);
@@ -332,7 +345,7 @@ impl SyncedVault {
         match fs::symlink_metadata(path) {
             Ok(m) if m.is_file() => {}
             _ => {
-                self.sibling_reports.remove(path);
+                self.forget_sibling(path);
                 return;
             }
         }
@@ -344,7 +357,7 @@ impl SyncedVault {
         }
         match backup::absorb_conflict_file(&self.path, path, SystemTime::now()) {
             Ok(dst) => {
-                self.sibling_reports.remove(path);
+                self.forget_sibling(path);
                 self.emit(SyncEvent::ConflictAbsorbed(dst));
             }
             Err(e) => self.emit_error(e),
@@ -365,7 +378,7 @@ impl SyncedVault {
             // Gone (we or another device already moved it), or not a package (a plain file is
             // the unsupported single-file layout).
             _ => {
-                self.sibling_reports.remove(path);
+                self.forget_sibling(path);
                 return;
             }
         }
@@ -421,12 +434,18 @@ impl SyncedVault {
         // is an event for this package).
         if let Some(id) = self.blob_missing_both_sides(&opened) {
             tracing::info!(path = %path.display(), attachment = %id, "conflicted package merged; waiting for its blobs before moving it");
+            // Once per deferred package, not on every re-check while nothing arrived.
+            let key = package::path_key(path);
+            if let Entry::Vacant(slot) = self.waiting_for_blobs.entry(key) {
+                slot.insert(path.to_owned());
+                self.emit(SyncEvent::WaitingForBlobs(path.to_owned()));
+            }
             return;
         }
         // Steps 4-5.
         match backup::absorb_conflict_package(&self.path, path, SystemTime::now()) {
             Ok(dst) => {
-                self.sibling_reports.remove(path);
+                self.forget_sibling(path);
                 self.emit(SyncEvent::ConflictAbsorbed(dst));
             }
             Err(e) => self.emit_error(e),
@@ -471,7 +490,12 @@ impl SyncedVault {
         }
         // Step 2: no key while locked; defer.
         if self.unlocked.is_none() {
-            if !self.pending_conflicts.iter().any(|p| p == path) {
+            let key = package::path_key(path);
+            if !self
+                .pending_conflicts
+                .iter()
+                .any(|p| package::path_key(p) == key)
+            {
                 self.pending_conflicts.push(path.to_owned());
             }
             tracing::info!(path = %path.display(), ?kind, "conflicted copy queued until unlock");
@@ -532,12 +556,21 @@ impl SyncedVault {
         kind: SiblingReport,
         event: SyncEvent,
     ) {
-        if self.sibling_reports.get(path) == Some(&(hash, kind)) {
+        let key = package::path_key(path);
+        if self.sibling_reports.get(&key) == Some(&(hash, kind)) {
             tracing::debug!(path = %path.display(), ?kind, "already reported; not repeating");
             return;
         }
-        self.sibling_reports.insert(path.to_owned(), (hash, kind));
+        self.sibling_reports.insert(key, (hash, kind));
         self.emit(event);
+    }
+
+    /// Drop per-sibling bookkeeping (reports, blob wait) for a copy that was absorbed or is
+    /// gone, so a new copy under the same name is reported afresh.
+    fn forget_sibling(&mut self, path: &Path) {
+        let key = package::path_key(path);
+        self.sibling_reports.remove(&key);
+        self.waiting_for_blobs.remove(&key);
     }
 
     /// Work deferred while locked: rewrite a corrupt primary and absorb queued copies.
