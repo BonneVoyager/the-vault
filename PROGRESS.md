@@ -546,4 +546,61 @@ Bug hunt: not run for this wave; last full run after the field-id wave (2026-10-
 Workspace: fmt PASS, clippy PASS, test PASS — 971 passed, 13 ignored (app 374, cli 51, core 287, macos 60 + harnesses, sync 202; workspace run was on the pre-closer tree at 967, vault-app rerun after the closers 374); QA spec-checks 144/144 and now rustfmt-clean, CLI 60/60. Uncommitted: this wave plus the follow-ups wave above (owner commits; proposed title for both: "Merge property tests, NFC sync paths, Touch ID state, reference links, traceability").
 Not verified by eye: reference-style links in a real note (clickable for http(s), plain for mailto, images never load).
 Owner's call: the ~930-line notes.rs diff (mostly tests) exceeds the 400-line guide; accept or ask for a test-file split.
-Bug hunt: not yet run for this wave or the previous one.
+Bug hunt: run for this wave and the previous one on 2026-11-01 (see below).
+
+## Bug hunt (2026-11-01)
+
+Report: `docs/qa/bug-hunt-2026-11-01.md`. Covers commits a7d7a22 and 215a0f9. High 0, medium 0, low 2.
+
+- **L1 (open, vault-core merge):** merging a vault with a copy of itself is not idempotent when an
+  item's attachment refs are not in merge order. `add_attachment_ref` appends; the merge sorts by
+  `(added_at, id)` and compares refs positionally, so two refs added in the same millisecond make
+  the self-merge report `updated: 1` and bump `modified_at`. One extra write per device, then it
+  settles; no write loop between two devices. Reproduced by the orchestrator: `qa/spec-checks`
+  `ml01`, `ml07`, `ml08` fail. Suggested fix: compare attachment refs as a set (or sort both sides
+  before comparing). Routing: crypto-implementer (vault-core merge), then security-reviewer.
+- **L2 (fixed):** spec 01 §4 still described `removed_attachments` as "cap 64 newest"; reworded to
+  match 03 §5 (merge-only, only markers neither side references).
+- All findings from the 2026-10-30 and 2026-10-31 hunts are confirmed fixed.
+- Ledger now 169 checks (166 pass, the 3 failures are L1) + CLI script 81/81. New files:
+  `qa/spec-checks/tests/{merge_laws,hostile_stamps,sync_nfc}.rs`; additions to `cli_bridge.rs`,
+  `cli/run_all.sh`, ledger README. Project suite: fmt and clippy clean, 974 passed, 13 ignored.
+
+## Hardening wave (2026-11-01)
+
+- **HW-0 (done): merge self-idempotence with attachments** (bug-hunt L1). `Item.attachments` is now
+  kept in canonical `(added_at, id)` order on every write path (`add_attachment_ref`, `try_insert`,
+  `update`), on read in the parser, and in `merge_live` via `normalize_attachments`. No format
+  change, no version bump; any order is accepted on read and normalised without a restamp. Spec 01
+  §4 states the invariant. Tests: `attachment.rs` self-merge fixed point (incl. merge output
+  re-merged) and parser reorder-on-read. Security review: SHIP. Ledger `ml01/ml07/ml08` pass.
+  Side effect: tests in vault-sync and vault-app that indexed attachments positionally after
+  same-millisecond adds were nondeterministic; rewritten to look up by name or compare as sets.
+  Production code never picks an attachment by position.
+- **HW-1 (done): closed-lid Touch ID false alarm.** LAError `BiometryNotAvailable` maps to
+  `MacError::NotAvailable` in `map_la`, `cf_error`, `decrypt_error` (a nested -6 wins over a nil
+  re-read domain hash). Non-LocalAuthentication preflight failures are `Other`, no longer faked as
+  -6. App: new `NotAvailable` arm, toast "Touch ID isn't available right now; enter your master
+  password", enrolment kept, failure counter and `last_password_unlock_at` unchanged. Spec 04
+  updated (NotAvailable sentence; full list of `BiometryChanged` causes). Security review: SHIP.
+- **HW-2 (done): tests for five uncovered traceability rules** in vault-sync: 03§1.1-11, 03§2-11
+  (`#[cfg(test)]` warn counter, serialised with the sibling test), 03§7-3 (both conflict shapes,
+  fake cloud provider in `tests/cloud.rs`), 03§7-6, 03§7-7 (asserts no retry during a quiet poll).
+  Code review: FIX FIRST → fixed → green over three runs. Traceability table updated: 4 uncovered.
+  Found but not fixed (scope): permission-denied lock fallback warns on every save, not once
+  (`open_lock_file`, one line).
+- **HW-3 (done): `VAULT_PROPTEST_CASES`** env override for the merge property tests (default 24);
+  README line added.
+
+## CHECKPOINT — Hardening wave complete (2026-11-01)
+
+fmt and clippy clean. `cargo test --workspace`: 0 failed (vault-app 375, vault-sync 208,
+vault-core all binaries, vault-macos, vault-cli). QA ledger 169/169, fmt-clean. CLI script 81/81.
+Uncommitted: 26 files, +695/−42, plus the 2026-11-01 bug-hunt report and three new ledger files.
+
+Owner eye checks: Touch ID with the lid closed on an external display shows the new toast and does
+not ask to re-enrol; a real finger-set change still does. Follow-up options: one-line warn-once
+fix for the permission-denied lock path; attachment display order for files dropped in the same
+millisecond is by id (production never relied on insertion order, but the UI could sort by name).
+
+Bug hunt: run for the previous two waves (2026-11-01 report); not yet run for this wave.

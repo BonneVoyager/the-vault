@@ -1,6 +1,6 @@
 ---
 name: attachment-decisions
-description: Settled vault-core v1.1 attachment decisions (2026-10-29, cap rule revised 2026-11-01) — AttachmentRef shape, chunk AAD layout, seal-by-value, validate_ref on every write path, removal tombstones + merge rule + merge-only cap, fixture v1-attach layout
+description: Settled vault-core v1.1 attachment decisions (2026-10-29, cap rule revised 2026-11-01, canonical ref order 2026-11-01) — AttachmentRef shape, chunk AAD layout, seal-by-value, validate_ref on every write path, removal tombstones + merge rule + merge-only cap, refs kept in (added_at, id) order on every write path and on read, fixture v1-attach layout
 metadata:
   type: project
 ---
@@ -84,7 +84,22 @@ still clone wholesale. `add_attachment_ref` refuses an id that has a marker (Mal
 "duplicate attachment"). `purge_tombstones_older_than(cutoff)` also drops markers with
 `removed_at < cutoff` on every item (no restamp; return value counts items only).
 `attachment_ids()` lists LIVE refs only (tombstoned ids are prunable). `item_eq` compares
-attachments (incl. key bytes) and markers.
+attachments (incl. key bytes) and markers, POSITIONALLY.
+
+**Canonical ref order everywhere (bug hunt 2026-11-01 L1, fixed 2026-11-01):**
+`Item.attachments` is kept in `(added_at, id)` ascending — the merge's order — on EVERY
+write path, not only as merge output: `merge::normalize_attachments(&mut [AttachmentRef])`
+(stable sort) is called by `add_attachment_ref` (after push), `try_insert`, `update`,
+`merge_live`, and the parser (`format.rs` item read). Reason: `item_eq` is positional, so a
+merge that only reordered refs reported `updated: 1` and bumped `modified_at`, breaking
+`x.merge_from(copy of x)` idempotence (two refs in one millisecond, or a later add with an
+earlier `added_at`, trigger it). Chosen over an order-blind `item_eq` so both devices
+serialize the same bytes. No format change: any order is accepted on read; a pre-fix file
+with another order is reordered in memory without a restamp and rewritten canonically on its
+next save. Removal preserves relative order, so `remove_attachment_ref` needs no call. If a
+new write path for `attachments` is added, call the normaliser there too. Test:
+`attachment.rs::self_merge_is_a_no_op_for_refs_added_out_of_canonical_order`; independent
+checks `qa/spec-checks merge_laws ml01/ml07/ml08`.
 
 **Fixture:** `tests/fixtures/v1-attach.vault` (item id 0x06.., refs 0x0A.. empty.txt 0 B and
 0x0B.. three-chunks.bin 2 MiB+7, content `i % 251`), blobs under

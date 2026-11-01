@@ -386,9 +386,11 @@ pub struct Item {
     pub icon_modified_at: Option<Millis>,
     pub fields: Vec<Field>,
     pub history: Vec<HistoryEntry>,
-    /// Attachment references (01 §4, v1.1). Empty for every v1 file. Add and remove through
-    /// [`crate::UnlockedVault::add_attachment_ref`] / `remove_attachment_ref` so the item is
-    /// restamped; the blobs themselves are managed by `vault-sync`.
+    /// Attachment references (01 §4, v1.1), kept in `(added_at, id)` ascending order, the
+    /// merge's canonical order (03 §5), on every write path and on read. Empty for every v1
+    /// file. Add and remove through [`crate::UnlockedVault::add_attachment_ref`] /
+    /// `remove_attachment_ref` so the item is restamped; the blobs themselves are managed by
+    /// `vault-sync`.
     pub attachments: Vec<AttachmentRef>,
     /// Removal markers for attachment references (v1.1), newest first. Written only when
     /// non-empty. Capped at [`crate::vault::ATTACHMENT_TOMBSTONE_CAP`] only by a merge (a

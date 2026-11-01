@@ -50,8 +50,10 @@ fn file(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
     path
 }
 
+/// The item's references, sorted by name: core orders them by `(added_at, id)`, so files
+/// added in one call (one millisecond) come back in random-id order.
 fn refs(state: &Entity<AppState>, item: Uuid, cx: &mut TestAppContext) -> Vec<(Uuid, String)> {
-    state.read_with(cx, |s, _| {
+    let mut refs: Vec<(Uuid, String)> = state.read_with(cx, |s, _| {
         s.unlocked_vault()
             .and_then(|v| v.get(item))
             .map(|i| {
@@ -61,7 +63,18 @@ fn refs(state: &Entity<AppState>, item: Uuid, cx: &mut TestAppContext) -> Vec<(U
                     .collect()
             })
             .unwrap_or_default()
-    })
+    });
+    refs.sort_by(|a, b| a.1.cmp(&b.1));
+    refs
+}
+
+/// The id of the reference called `name`.
+fn ref_named(state: &Entity<AppState>, item: Uuid, name: &str, cx: &mut TestAppContext) -> Uuid {
+    refs(state, item, cx)
+        .into_iter()
+        .find(|(_, n)| n == name)
+        .unwrap_or_else(|| panic!("no {name}"))
+        .0
 }
 
 fn add(state: &Entity<AppState>, paths: Vec<PathBuf>, cx: &mut TestAppContext) {
@@ -369,8 +382,8 @@ fn dirty_with_evicted(
         vec![file(dir, "gone.txt", b"1"), file(dir, "cloud.txt", b"2")],
         cx,
     );
-    let ids = refs(state, item, cx);
-    let (gone, cloud) = (ids[0].0, ids[1].0);
+    let gone = ref_named(state, item, "gone.txt", cx);
+    let cloud = ref_named(state, item, "cloud.txt", cx);
     store.set_state(cloud, AttachmentState::NotDownloaded);
     state.update(cx, |s, cx| {
         s.begin_edit(cx);

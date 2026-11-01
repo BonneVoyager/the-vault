@@ -109,7 +109,7 @@ AAD = `vault_id || item.id || modified_at_be64 || format_version_be16`.
   "created_at":  u64   (v1.3, optional, no version bump; unix millis the item was created; writers omit the key when unknown, readers treat missing or null as unknown and any other non-integer as Malformed; immutable metadata: a merge keeps the minimum of the two known values, or whichever side has one, and a differing created_at alone is not a change and never bumps modified_at)
   "fields":      [Field]
   "attachments": [AttachmentRef]   (v1.1, empty in v1)
-  "removed_attachments": [{ "id": bytes(16), "removed_at": u64 }]   (v1.1, optional; tombstones so a removal survives merge, cap 64 newest, purged with item tombstones)
+  "removed_attachments": [{ "id": bytes(16), "removed_at": u64 }]   (v1.1, optional; tombstones so a removal survives merge, capped at 64 only during a merge and only for markers neither side still references, see 03 §5; purged with item tombstones)
   "history":     [HistoryEntry]    last 10 password values, optional
   "removed_history": [u64]         optional; `replaced_at` stamps of history entries the user deleted (never the value), cap 10 newest, purged with item tombstones
   "removed_fields": [{ "id": bytes(16), "removed_at": u64 }]   (version 2, optional; field removal tombstones, newest first, cap 64, written only when non-empty, purged with item tombstones; 03 §5)
@@ -127,6 +127,8 @@ Field = {
 HistoryEntry = { "value": tstr, "replaced_at": u64, "field_id": bytes(16) (version 2, optional; the field the value belonged to) }
 AttachmentRef = { "id": bytes(16), "name": tstr, "size": u64, "key": bytes(32), "chunk_nonces": [bytes(24)], "added_at": u64 }
 ```
+
+`attachments` is kept sorted by `(added_at, id)` in memory and on disk (since 2026-11-01). Any order is accepted on read and normalised without a restamp, so a merge of a vault with its own copy is a no-op and two devices serialise the same bytes.
 
 ### Attachments (v1.1, no version bump)
 

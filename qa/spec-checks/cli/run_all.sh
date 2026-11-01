@@ -217,6 +217,105 @@ grep -qE '[0-9a-f]{8}-[0-9a-f]{4}-[45][0-9a-f]{3}-' "$T/o" && ok "get --ids on a
 v get NoSuchItem >"$T/o" 2>&1
 grep -q "$MPW" "$T/o" && bad "error output contains the master password" || ok "no master password in error output"
 
+# =====================================================================================
+# 2026-11-01 additions: `edit`, `sync`, VAULT_DEVICE_ID (00 phase 1 "later dev-tool additions"),
+# conflict copies of both shapes via `sync` (03 §6), NFD names (03 §3/§6), concurrent editors.
+# =====================================================================================
+export VAULT_FILE="$T/ed.vault"
+v init --kdf-test-params >/dev/null 2>&1
+v add --title Site --username alice >/dev/null 2>&1
+v edit Site --title "Site 2" --favorite --tag red --tag blue >"$T/o" 2>&1 && ok "edit title/favorite/tags" || bad "edit title/favorite/tags" "$(cat "$T/o")"
+v list --tag red >"$T/o" 2>&1
+grep -q "Site 2" "$T/o" && ok "edit --tag visible in list --tag" || bad "edit --tag" "$(cat "$T/o")"
+v edit "Site 2" --untag red >/dev/null 2>&1
+v list --tag red >"$T/o" 2>&1
+! grep -q "Site 2" "$T/o" && ok "edit --untag" || bad "edit --untag" "$(cat "$T/o")"
+export EDSECRET="edit-Secret-Value-913"
+v edit "Site 2" --set-env "password=EDSECRET" >"$T/o" 2>&1; rc=$?
+if [ $rc -eq 0 ] && ! grep -q "$EDSECRET" "$T/o"; then ok "edit --set-env (value not echoed)"; else bad "edit --set-env" "rc=$rc $(cat "$T/o")"; fi
+v get "Site 2" --reveal >"$T/o" 2>&1
+grep -q "$EDSECRET" "$T/o" && ok "edit --set-env value stored" || bad "edit --set-env stored" "$(cat "$T/o")"
+v edit "Site 2" --set-env "password=NO_SUCH_ENV_VAR_QA" >"$T/o" 2>&1; rc=$?
+[ $rc -ne 0 ] && [ $rc -ne 101 ] && ok "edit --set-env missing var: clean error" || bad "edit --set-env missing var" "rc=$rc $(cat "$T/o")"
+v edit "Site 2" --add "text:dup=one" --add "text:dup=two" >"$T/o" 2>&1 && ok "edit --add two same-named fields" || bad "edit --add dup" "$(cat "$T/o")"
+cp "$VAULT_FILE/vault.bin" "$T/ed-before.bin"
+v edit "Site 2" --set "dup=three" >"$T/o" 2>&1; rc=$?
+if [ $rc -ne 0 ] && [ $rc -ne 101 ] && cmp -s "$T/ed-before.bin" "$VAULT_FILE/vault.bin"; then ok "edit --set on a shared name is refused, file untouched"; else bad "edit --set ambiguous name" "rc=$rc $(cat "$T/o")"; fi
+fid=$(v get "Site 2" --ids 2>/dev/null | grep -i "dup" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+v edit "Site 2" --rm-field "$fid" >"$T/o" 2>&1; rc=$?
+n=$(v get "Site 2" --reveal 2>/dev/null | grep -ci "dup")
+[ $rc -eq 0 ] && [ "$n" = "1" ] && ok "edit --rm-field by id removes exactly one field" || bad "edit --rm-field" "rc=$rc dup-count=$n $(cat "$T/o")"
+v edit "Site 2" --add "section:Login details" >"$T/o" 2>&1 && ok "edit --add section" || bad "edit --add section" "$(cat "$T/o")"
+v edit "Site 2" --add "bogus:x=y" >"$T/o" 2>&1; rc=$?
+[ $rc -ne 0 ] && [ $rc -ne 101 ] && ok "edit --add unknown kind: clean error" || bad "edit --add unknown kind" "rc=$rc $(cat "$T/o")"
+v edit "Site 2" --icon "symbol:NoSuchIcon:#zzzzzz" >"$T/o" 2>&1; rc=$?
+[ $rc -ne 101 ] && ok "edit --icon malformed: no panic (rc=$rc)" || bad "edit --icon panics" "$(cat "$T/o")"
+v edit "Site 2" --rm-field "00000000-0000-0000-0000-000000000000" >"$T/o" 2>&1; rc=$?
+[ $rc -ne 0 ] && [ $rc -ne 101 ] && ok "edit --rm-field unknown id: clean error" || bad "edit --rm-field unknown id" "rc=$rc $(cat "$T/o")"
+
+# VAULT_DEVICE_ID: a malformed value must not be silently replaced by a random id or panic
+cp "$VAULT_FILE/vault.bin" "$T/ed-before.bin"
+VAULT_DEVICE_ID="not-a-uuid" "$V" --password-env MPW add --title DevBad >"$T/o" 2>&1; rc=$?
+if [ $rc -ne 0 ] && [ $rc -ne 101 ] && cmp -s "$T/ed-before.bin" "$VAULT_FILE/vault.bin"; then ok "VAULT_DEVICE_ID malformed: clean error, nothing written"; else bad "VAULT_DEVICE_ID malformed" "rc=$rc $(cat "$T/o")"; fi
+
+# concurrent editors of one item (03 §2 lock): every --set lands
+pids=()
+for i in $(seq 1 10); do v edit "Site 2" --add "text:c$i=v$i" >"$T/ce$i.log" 2>&1 & pids+=($!); done
+fails=0; for p in "${pids[@]}"; do wait "$p" || fails=$((fails+1)); done
+n=$(v get "Site 2" --reveal 2>/dev/null | grep -cE "c([0-9]|10)\b")
+[ "$n" = "10" ] && [ "$fails" = "0" ] && ok "10 concurrent edit --add on one item: none lost" || bad "concurrent edits" "fields=$n failed=$fails $(cat "$T"/ce*.log | sort | uniq -c | head -3)"
+
+# mixed concurrent writers: add + edit + sync
+pids=()
+for i in $(seq 1 5); do v add --title "mx$i" >"$T/mx$i.log" 2>&1 & pids+=($!); v edit "Site 2" --set "c$i=w$i" >"$T/me$i.log" 2>&1 & pids+=($!); v sync >"$T/ms$i.log" 2>&1 & pids+=($!); done
+fails=0; for p in "${pids[@]}"; do wait "$p" || fails=$((fails+1)); done
+n=$(v list 2>/dev/null | grep -c "mx[0-9]")
+w=$(v get "Site 2" --reveal 2>/dev/null | grep -cE "\bw[1-5]\b")
+[ "$n" = "5" ] && [ "$w" = "5" ] && [ "$fails" = "0" ] && ok "mixed concurrent add/edit/sync: none lost" || bad "mixed concurrent writers" "adds=$n sets=$w failed=$fails $(cat "$T"/m[xes]*.log | sort | uniq -c | head -3)"
+
+# ---- sync absorbs both conflict shapes (03 §6) --------------------------------------------
+export VAULT_FILE="$T/sy.vault"
+v init --kdf-test-params >/dev/null 2>&1
+v add --title Base >/dev/null 2>&1
+cp -R "$VAULT_FILE" "$T/stage1.vault"
+"$V" --vault "$T/stage1.vault" --password-env MPW add --title FromPerFile >/dev/null 2>&1
+cp "$T/stage1.vault/vault.bin" "$VAULT_FILE/vault 2.bin"
+cp -R "$VAULT_FILE" "$T/stage2.vault"; rm -f "$T/stage2.vault/vault 2.bin"
+"$V" --vault "$T/stage2.vault" --password-env MPW add --title FromSibling >/dev/null 2>&1
+mv "$T/stage2.vault" "$T/sy 2.vault"
+v sync >"$T/o" 2>&1; rc=$?
+v list >"$T/o2" 2>&1
+if [ $rc -eq 0 ] && grep -q FromPerFile "$T/o2" && grep -q FromSibling "$T/o2"; then ok "sync absorbs per-file and sibling-package copies"; else bad "sync absorb" "rc=$rc $(cat "$T/o") $(cat "$T/o2")"; fi
+if [ ! -e "$VAULT_FILE/vault 2.bin" ] && [ ! -e "$T/sy 2.vault" ] && ls "$VAULT_FILE/backups" | grep -q "^conflict-"; then ok "sync moves both copies into backups/"; else bad "sync move" "$(ls "$VAULT_FILE" "$VAULT_FILE/backups" "$T" | tr '\n' ' ')"; fi
+
+# NFD-named sibling of an NFC-named package (03 §3/§6 normalisation-insensitive)
+NFCP="$T/$(printf 'Caf\xc3\xa9').vault"
+NFDS="$T/$(printf 'Cafe\xcc\x81') 2.vault"
+"$V" --vault "$NFCP" --password-env MPW init --kdf-test-params >/dev/null 2>&1
+cp -R "$NFCP" "$T/stage3.vault"
+"$V" --vault "$T/stage3.vault" --password-env MPW add --title FromNfd >/dev/null 2>&1
+mv "$T/stage3.vault" "$NFDS"
+"$V" --vault "$NFCP" --password-env MPW sync >"$T/o" 2>&1; rc=$?
+"$V" --vault "$NFCP" --password-env MPW list >"$T/o2" 2>&1
+if [ $rc -eq 0 ] && grep -q FromNfd "$T/o2" && [ ! -e "$NFDS" ]; then ok "sync absorbs an NFD-spelt sibling package"; else bad "sync NFD sibling" "rc=$rc $(cat "$T/o") $(cat "$T/o2")"; fi
+
+# a foreign vault named like a conflict copy is left alone (03 §6 step 1)
+"$V" --vault "$T/foreign.vault" --password-env MPW init --kdf-test-params >/dev/null 2>&1
+mv "$T/foreign.vault" "$T/sy 3.vault"
+v sync >"$T/o" 2>&1; rc=$?
+[ -e "$T/sy 3.vault/vault.bin" ] && ok "sync leaves a foreign 'sy 3.vault' untouched" || bad "sync foreign copy" "rc=$rc $(cat "$T/o")"
+
+# a whole-package copy missing a referenced blob is merged but not moved (03 §6 step 4)
+cp -R "$VAULT_FILE" "$T/stage4.vault"; rm -rf "$T/stage4.vault/backups"
+echo "late" >"$T/late.txt"
+"$V" --vault "$T/stage4.vault" --password-env MPW attach add Base "$T/late.txt" >/dev/null 2>&1
+"$V" --vault "$T/stage4.vault" --password-env MPW add --title FromWaiting >/dev/null 2>&1
+rm -f "$T/stage4.vault/attachments/"*.bin
+mv "$T/stage4.vault" "$T/sy 4.vault"
+v sync >"$T/o" 2>&1; rc=$?
+v list >"$T/o2" 2>&1
+if [ $rc -ne 101 ] && grep -q FromWaiting "$T/o2" && [ -e "$T/sy 4.vault" ]; then ok "sync merges a blob-waiting package but does not move it"; else bad "sync waiting package" "rc=$rc exists=$([ -e "$T/sy 4.vault" ] && echo y || echo n) $(cat "$T/o")"; fi
+
 echo
 echo "CLI checks: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]

@@ -93,7 +93,7 @@ Coverage: `direct` asserts exactly this rule. `indirect` is exercised by a broad
 | 03§1.1-8 | Cleanup never runs while locked | sync::attachments::prune_skips_clean_saves_and_locked_vaults; sync::robustness::stale_vault_tmp_is_removed_only_while_unlocked | direct |
 | 03§1.1-9 | Tombstone keeps refs so the blob outlives deletion | sync::attachments::deleted_item_keeps_its_blob_while_tombstoned | direct |
 | 03§1.1-10 | Peer reference judged after pre-save merge | sync::attachments::peer_prunes_unreferenced_blob_only_after_grace; sync::attachments::removal_survives_merge_on_both_devices_and_blob_is_pruned | indirect |
-| 03§1.1-11 | Attachments are not in backups | none | none |
+| 03§1.1-11 | Attachments are not in backups | sync::attachments::backups_contain_no_attachment_blobs | direct |
 | 03§1.1-12 | 100 MB per-file cap | sync::attachments::size_cap_is_refused_before_reading; core::attachment::size_cap | direct |
 | 03§1.1-13 | Provider label classifier (iCloud, CloudStorage prefix, Dropbox, local) | sync::src/cloud::cloud_storage_providers_by_folder_prefix; sync::src/cloud::icloud_drive_by_path_or_ubiquity; sync::src/cloud::legacy_dropbox_in_home; sync::src/cloud::ubiquity_is_not_queried_when_the_path_decides | direct |
 
@@ -111,7 +111,7 @@ Coverage: `direct` asserts exactly this rule. `indirect` is exercised by a broad
 | 03§2-8 | Exclusive flock on .lock around read-merge-write, no lost items | sync::robustness::concurrent_saves_from_two_threads_lose_nothing; sync::robustness::concurrent_saves_from_two_processes_lose_nothing; qa::sync::s12_concurrent_writers_no_lost_items | direct |
 | 03§2-9 | Lock helper: exclusive excludes and times out, file is private | sync::src/lock::exclusive_excludes_and_times_out; sync::src/lock::shared_locks_coexist_and_file_is_private | direct |
 | 03§2-10 | No locking on ENOTSUP/ENOLCK or permission failure: proceed unlocked | sync::src/lock::volume_without_locking_gets_a_no_op_guard; sync::src/lock::read_only_dir_without_lock_file_proceeds_unlocked | direct |
-| 03§2-11 | Fallback warning logged once | none | none |
+| 03§2-11 | Fallback warning logged once | sync::src/lock::lock_fallback_warning_is_logged_once (counts the warn-once branch; only the ENOTSUP/ENOLCK path) | indirect |
 | 03§2-12 | Native no-replace rename for backups and blobs, hard-link fallback | sync::src/atomic::no_replace_refuses_existing_target; sync::src/atomic::no_replace_falls_back_to_hard_link_without_exclusive_rename; sync::src/atomic::rename_no_replace_moves_files_and_directories_and_never_clobbers | direct |
 | 03§2-13 | Reads of vault.bin capped at 64 MiB with a typed error | sync::untrusted_disk::oversized_primary_is_refused_by_open; sync::untrusted_disk::oversized_backup_is_refused_by_restore | direct |
 | 03§2-14 | Never write in place or truncate | sync::synced_vault::failed_save_leaves_original_intact | indirect |
@@ -257,11 +257,11 @@ Coverage: `direct` asserts exactly this rule. `indirect` is exercised by a broad
 |---|---|---|---|
 | 03§7-1 | Default hooks: is_evicted false, ensure_downloaded Ok, pin no-op | sync::backups::two_saves_in_a_second_take_one_snapshot | indirect |
 | 03§7-2 | ensure_downloaded before every read of the primary | qa::sync_cloud::v02_cloud_hooks; sync::robustness::save_downloads_the_primary_before_taking_the_lock; sync::backups::backup_and_restore_wait_for_cloud_download | direct |
-| 03§7-3 | ensure_downloaded before reading a conflict copy | none | none |
+| 03§7-3 | ensure_downloaded before reading a conflict copy | sync::cloud::evicted_conflict_copy_is_downloaded_before_reading; sync::cloud::conflict_copy_download_failure_is_cloud_unavailable | direct |
 | 03§7-4 | pin after the first successful open | qa::sync_cloud::v02_cloud_hooks | direct |
 | 03§7-5 | Timeout emits CloudUnavailable and nothing is overwritten | sync::hardening::save_does_not_overwrite_a_primary_it_cannot_download; sync::synced_vault::download_timeout_fails_open | direct |
-| 03§7-6 | Default timeout is 30 s | none | none |
-| 03§7-7 | Retry on the next watcher event | none | none |
+| 03§7-6 | Default timeout is 30 s | sync::cloud::default_download_timeout_is_30_seconds | direct |
+| 03§7-7 | Retry on the next watcher event | sync::cloud::cloud_unavailable_conflict_is_retried_on_the_next_watcher_event | direct |
 
 ### §8 Public API and SyncEvent
 
@@ -313,14 +313,11 @@ Direct versus indirect is judged from test names and doc comments, not from read
 
 ## Uncovered rules
 
+Five rules were covered on 2026-11-01 (03§1.1-11, 03§2-11, 03§7-3, 03§7-6, 03§7-7). Known deviation: the permission-denied lock fallback (EACCES/EPERM/EROFS in `open_lock_file`) warns on every save, not once; only the unsupported-volume path is pinned.
+
 | Rule id | Rule | Why it matters |
 |---|---|---|
 | 02§zero-2 | Secrets are zeroized on drop, never plain String | Name-only check is impossible. Needs a review gate or a type-level lint. |
 | 02§api-18 | serialize never fails | Only enforced by the signature. Low risk. |
-| 03§1.1-11 | Attachments are not in backups | Owner decision with no test pinning it. A change would go unnoticed. |
 | 03§2-2 | fsync(tmp) before rename | Durability claim with no fault-injection test. |
-| 03§2-11 | Lock fallback warning logged once | Behaviour is tested, the logging is not. |
-| 03§7-3 | ensure_downloaded before reading a conflict copy | Only primary and blob reads are tested. An evicted conflict copy could be misread as corrupt. |
-| 03§7-6 | Default download timeout is 30 s | Constant not asserted. |
-| 03§7-7 | CloudUnavailable retries on the next watcher event | No test drives a second event after a timeout. |
 | 03§8-auto | Autosave 2 s after last edit | App-side by design. Belongs in a `vault-app` test. |

@@ -227,8 +227,8 @@ mod imp {
     }
 
     /// A fresh `LAContext` after a successful biometric `canEvaluatePolicy`
-    /// preflight (never prompts). On failure returns the LAError code.
-    fn preflight() -> Result<Retained<LAContext>, isize> {
+    /// preflight (never prompts). On failure returns the mapped error (`preflight_error`).
+    fn preflight() -> Result<Retained<LAContext>, MacError> {
         // SAFETY: plain `[[LAContext alloc] init]`; any thread.
         let ctx = unsafe { LAContext::new() };
         // SAFETY: preflight only, never prompts; the policy is a valid constant.
@@ -236,8 +236,19 @@ mod imp {
             ctx.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthenticationWithBiometrics)
         } {
             Ok(()) => Ok(ctx),
-            Err(e) if e.domain().to_string() == LA_ERROR_DOMAIN => Err(e.code()),
-            Err(_) => Err(LAError::BiometryNotAvailable.0),
+            Err(e) => Err(preflight_error(&e.domain().to_string(), e.code())),
+        }
+    }
+
+    /// LAError codes go through `map_la`; any other domain is a genuine fault, reported
+    /// as such rather than faked as BiometryNotAvailable (which would read as "try later").
+    fn preflight_error(domain: &str, code: isize) -> MacError {
+        if domain == LA_ERROR_DOMAIN {
+            map_la(code)
+        } else {
+            MacError::Other(format!(
+                "LocalAuthentication preflight failed: {domain} {code}"
+            ))
         }
     }
 
@@ -483,7 +494,7 @@ mod imp {
 
         // Detect a changed finger set before prompting: BiometryCurrentSet keys then fail
         // with a generic errSecAuthFailed only after the user has touched the sensor.
-        let ctx = preflight().map_err(map_la)?;
+        let ctx = preflight()?;
         if biometry_changed(&enrolled_state, domain_state(&ctx).as_deref()) {
             return Err(MacError::BiometryChanged);
         }
@@ -549,9 +560,11 @@ mod imp {
             | LAError::SystemCancel
             | LAError::AppCancel
             | LAError::UserFallback => MacError::UserCancelled,
-            LAError::BiometryNotAvailable | LAError::BiometryNotEnrolled => {
-                MacError::BiometryChanged
-            }
+            // Sensor temporarily unreachable (lid closed, external display, ...): the
+            // enrolment is still good, so this must never read as BiometryChanged.
+            LAError::BiometryNotAvailable => MacError::NotAvailable,
+            // No fingers enrolled: the BiometryCurrentSet key is unusable.
+            LAError::BiometryNotEnrolled => MacError::BiometryChanged,
             LAError::BiometryLockout => MacError::Other("Touch ID is locked out".into()),
             _ => MacError::Other(format!("LocalAuthentication error {code}")),
         }
@@ -559,8 +572,9 @@ mod imp {
 
     /// Maps a `SecKeyCreateDecryptedData` failure. `errSecAuthFailed` is what an
     /// invalidated BiometryCurrentSet key returns, but also what a failed match can return:
-    /// it means BiometryChanged only when the domain state differs from the enrolled one;
-    /// otherwise the LAError nested in the userInfo (if any) decides.
+    /// it means BiometryChanged only when the domain state differs from the enrolled one
+    /// and the nested LAError (if any) is not BiometryNotAvailable; otherwise the nested
+    /// LAError decides.
     fn decrypt_error(err: Option<CFRetained<CFError>>, domain_changed: bool) -> MacError {
         let Some(err) = err else {
             return cf_error(None);
@@ -571,10 +585,16 @@ mod imp {
         if is_la || err.code() != errSecAuthFailed as isize {
             return cf_error(Some(err));
         }
+        let la_code = underlying_la_code(&err);
+        // The sensor went away mid-prompt: the domain state read afterwards may be nil
+        // too, which must not invalidate the enrolment.
+        if la_code == Some(LAError::BiometryNotAvailable.0) {
+            return MacError::NotAvailable;
+        }
         if domain_changed {
             return MacError::BiometryChanged;
         }
-        match underlying_la_code(&err) {
+        match la_code {
             Some(code) => map_la(code),
             None => MacError::Keychain(errSecAuthFailed),
         }
@@ -649,13 +669,34 @@ mod imp {
         }
 
         #[test]
+        fn preflight_error_mapping() {
+            assert!(matches!(
+                preflight_error(LA_ERROR_DOMAIN, -6),
+                MacError::NotAvailable
+            ));
+            assert!(matches!(
+                preflight_error(LA_ERROR_DOMAIN, -7),
+                MacError::BiometryChanged
+            ));
+            match preflight_error("NSOSStatusErrorDomain", -6) {
+                MacError::Other(m) => {
+                    assert_eq!(
+                        m,
+                        "LocalAuthentication preflight failed: NSOSStatusErrorDomain -6"
+                    )
+                }
+                e => panic!("non-LA domain must not be NotAvailable: {e:?}"),
+            }
+        }
+
+        #[test]
         fn status_mapping() {
             assert!(matches!(map_status(-128), MacError::UserCancelled));
             assert!(matches!(map_status(-67712), MacError::BiometryChanged));
             assert!(matches!(map_status(-25293), MacError::Keychain(-25293)));
             assert!(matches!(map_la(-2), MacError::UserCancelled));
             assert!(matches!(map_la(-4), MacError::UserCancelled));
-            assert!(matches!(map_la(-6), MacError::BiometryChanged));
+            assert!(matches!(map_la(-6), MacError::NotAvailable));
             assert!(matches!(map_la(-7), MacError::BiometryChanged));
             assert!(matches!(map_la(-8), MacError::Other(_)));
         }
@@ -715,6 +756,32 @@ mod imp {
             assert!(matches!(
                 decrypt_error(Some(error(LA_ERROR_DOMAIN, -2, None)), true),
                 MacError::UserCancelled
+            ));
+            // A sensor that went away (lid closed) is NotAvailable, never BiometryChanged:
+            // as a top-level LAError, as a nested one, or through cf_error.
+            assert!(matches!(
+                decrypt_error(Some(error(LA_ERROR_DOMAIN, -6, None)), false),
+                MacError::NotAvailable
+            ));
+            let gone = error(LA_ERROR_DOMAIN, -6, None);
+            for changed in [false, true] {
+                let wrapped = error(OS, -25293, Some(&gone));
+                assert!(matches!(
+                    decrypt_error(Some(wrapped), changed),
+                    MacError::NotAvailable
+                ));
+            }
+            assert!(matches!(
+                cf_error(Some(error(LA_ERROR_DOMAIN, -6, None))),
+                MacError::NotAvailable
+            ));
+            // Only -6 skips the domain check: a nested failed match (-1) with a changed
+            // finger set is still BiometryChanged.
+            let failed = error(LA_ERROR_DOMAIN, -1, None);
+            let wrapped = error(OS, -25293, Some(&failed));
+            assert!(matches!(
+                decrypt_error(Some(wrapped), true),
+                MacError::BiometryChanged
             ));
         }
     }

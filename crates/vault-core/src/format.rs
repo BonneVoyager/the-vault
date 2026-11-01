@@ -1357,13 +1357,18 @@ pub fn decode_item_plain(
             .collect::<Result<Vec<_>, _>>()?,
     };
     // Optional on read: a v1 writer always emits `[]`, but tolerate a missing or null key.
-    let attachments = match m.take("attachments") {
+    let mut attachments = match m.take("attachments") {
         None | Some(Value::Null) => Vec::new(),
         Some(v) => as_array(v, "item.attachments")?
             .into_iter()
             .map(attachment_from_value)
             .collect::<Result<Vec<_>, _>>()?,
     };
+    // Any order is accepted on read (no format change); in memory the references are kept in
+    // the merge's canonical `(added_at, id)` order so a merge never reorders them. A file
+    // written before 2026-11-01 may hold another order and is rewritten canonically, without
+    // a restamp, by its next save.
+    crate::vault::merge::normalize_attachments(&mut attachments);
     let removed_attachments = match m.take("removed_attachments") {
         None | Some(Value::Null) => Vec::new(),
         Some(v) => as_array(v, "item.removed_attachments")?

@@ -34,6 +34,10 @@ pub const MAX_TOUCH_FAILURES: u32 = 5;
 pub const SLOT_GONE: &str = "Another device changed this vault's keys, so Touch ID must be set up \
                              again in Settings \u{25b8} Security.";
 
+/// Toast when Touch ID is temporarily unavailable (lid closed, ...); the enrollment stays.
+pub const TOUCH_UNAVAILABLE: &str =
+    "Touch ID isn't available right now; enter your master password";
+
 /// Persisted per vault in `settings.json` under `touch_id.<vault_id>`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -355,6 +359,11 @@ impl AppState {
                     // Tampered, unreadable, ...: say so; the enrollment is fine.
                     Ok(Err(e)) => this.error = Some(super::error_message(&e).into()),
                     Err(MacError::UserCancelled) => {}
+                    // Sensor temporarily unreachable (lid closed, ...): the enrollment is
+                    // fine and this is not a failed attempt.
+                    Err(MacError::NotAvailable) => {
+                        this.set_toast(Toast::window(TOUCH_UNAVAILABLE));
+                    }
                     Err(MacError::BiometryChanged) => {
                         this.mark_stale();
                         this.set_toast(Toast::window(
@@ -817,6 +826,32 @@ mod tests {
             assert!(!s.touch_enabled());
             assert!(s.touch_enable_blocker().is_none(), "can be turned on again");
         });
+    }
+
+    #[gpui::test]
+    fn unavailable_sensor_keeps_the_enrollment(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, bio, path) = setup(dir.path(), cx);
+        enable(&state, cx);
+        lock(&state, cx);
+        let before = policy(&state, cx).unwrap().last_password_unlock_at;
+        bio.with(|i| i.next_unlock_error = Some(MacError::NotAvailable));
+        state.update(cx, |s, cx| s.touch_unlock(cx));
+        cx.run_until_parked();
+        assert_eq!(toast(&state, cx).as_deref(), Some(TOUCH_UNAVAILABLE));
+        state.read_with(cx, |s, _| {
+            assert!(s.locked);
+            let p = s.policy().unwrap();
+            assert!(!p.stale);
+            assert_eq!(p.failed_touch_attempts, 0);
+            assert_eq!(p.last_password_unlock_at, before);
+            assert_eq!(s.touch_policy(), Ok(()));
+        });
+        assert_eq!(enclave_slots_on_disk(&path).len(), 1);
+        // The sensor is back: Touch ID unlocks with the same enrollment.
+        state.update(cx, |s, cx| s.touch_unlock(cx));
+        cx.run_until_parked();
+        state.read_with(cx, |s, _| assert!(!s.locked));
     }
 
     #[gpui::test]

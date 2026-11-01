@@ -213,7 +213,10 @@ fn main_read(cx: &mut TestAppContext) {
     let (state, mut vcx) = main_window(dir.path(), TALL, cx);
     state.update(&mut vcx, |s, cx| {
         s.toggle_history(cx);
-        let png = s.selected_item().unwrap().attachments[0].id;
+        // By name: both files share an `added_at`, so their order is the random ids'.
+        let item = s.selected_item().unwrap();
+        let png = item.attachments.iter().find(|a| a.name == "photo.png");
+        let png = png.unwrap().id;
         s.toggle_attachment_preview(png, cx);
     });
     let targets = [

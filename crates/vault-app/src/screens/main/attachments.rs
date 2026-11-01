@@ -574,6 +574,20 @@ mod tests {
         })
     }
 
+    /// The ids of the references called `names`, in that order (core sorts by
+    /// `(added_at, id)`, so files added in one call have no fixed position).
+    fn named<const N: usize>(
+        state: &Entity<AppState>,
+        item: Uuid,
+        names: [&str; N],
+        vcx: &VisualTestContext,
+    ) -> [Uuid; N] {
+        state.read_with(vcx, |s, _| {
+            let i = s.selected_item().filter(|i| i.id == item).unwrap();
+            names.map(|n| i.attachments.iter().find(|a| a.name == n).unwrap().id)
+        })
+    }
+
     fn shown(key: &'static str, vcx: &mut VisualTestContext) -> bool {
         vcx.debug_bounds(key).is_some()
     }
@@ -596,9 +610,7 @@ mod tests {
             ],
             &mut vcx,
         );
-        let [_, pdf, heic] = ids(&state, item, &vcx)[..] else {
-            panic!("three refs")
-        };
+        let [pdf, heic] = named(&state, item, ["scan.pdf", "photo.heic"], &vcx);
         store.set_state(pdf, AttachmentState::NotDownloaded);
         store.blobs.lock().unwrap().remove(&heic);
         vcx.update(|_, cx| state.update(cx, |_, cx| cx.notify()));
@@ -671,9 +683,7 @@ mod tests {
             ],
             &mut vcx,
         );
-        let [png, md] = ids(&state, item, &vcx)[..] else {
-            panic!("two refs")
-        };
+        let [png, md] = named(&state, item, ["dot.png", "a.md"], &vcx);
         vcx.update(|_, cx| state.update(cx, |s, cx| s.toggle_attachment_preview(png, cx)));
         vcx.run_until_parked();
         assert!(shown("attachment-preview-shown dot.png image", &mut vcx));
@@ -709,7 +719,7 @@ mod tests {
             "edit mode offers Remove"
         );
         // Remove through the UI: trash, then the inline confirm.
-        let x = ids(&state, item, &vcx)[1];
+        let [x] = named(&state, item, ["x.txt"], &vcx);
         let trash = vcx.debug_bounds("attachment-remove x.txt").unwrap();
         vcx.simulate_click(trash.center(), gpui::Modifiers::none());
         vcx.run_until_parked();

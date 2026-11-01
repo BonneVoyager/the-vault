@@ -141,7 +141,14 @@ fn add_save_reopen_and_stream_identical_bytes() {
     let three = add(&mut v, item, &big);
 
     assert!(v.is_dirty());
-    assert_eq!(ref_ids(&v, item), vec![empty, three]);
+    // Both refs share `added_at`; core orders them by (added_at, id), so compare as sets.
+    let mut both = vec![empty, three];
+    both.sort();
+    let sorted = |mut ids: Vec<Uuid>| {
+        ids.sort();
+        ids
+    };
+    assert_eq!(sorted(ref_ids(&v, item)), both);
     assert_eq!(mode(&v.attachments_dir()), 0o700);
     for id in [empty, three] {
         assert_eq!(mode(&blob(&v, id)), 0o600);
@@ -161,7 +168,7 @@ fn add_save_reopen_and_stream_identical_bytes() {
 
     let mut other = SyncedVault::open(&path, DEV_B, Arc::new(NoopHooks)).unwrap();
     other.unlock(&pw()).unwrap();
-    assert_eq!(ref_ids(&other, item), vec![empty, three]);
+    assert_eq!(sorted(ref_ids(&other, item)), both);
     assert_eq!(read_all(&other, item, empty).unwrap(), Vec::<u8>::new());
     assert_eq!(read_all(&other, item, three).unwrap(), big);
     let reader = other.open_attachment(item, three).unwrap();
@@ -1096,4 +1103,49 @@ fn drain_polls(v: &mut SyncedVault) {
         v.poll();
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Every file under `dir`, recursively (directories themselves not listed).
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let p = entry.unwrap().path();
+        if fs::symlink_metadata(&p).unwrap().is_dir() {
+            out.extend(files_under(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// 03 §1.1 (owner decision 2026-10-29): snapshots copy only the vault file, never blobs.
+#[test]
+fn backups_contain_no_attachment_blobs() {
+    let (_dir, path, mut v, item) = setup();
+    let id = add(&mut v, item, &three_chunks());
+    v.save().unwrap();
+    let snap = v.backup_now().unwrap();
+    let blob_bytes = fs::read(blob(&v, id)).unwrap();
+    // Skip the blob header; the ciphertext body is what a copied blob would contain.
+    let probe = &blob_bytes[blob_bytes.len() / 2..blob_bytes.len() / 2 + 64];
+
+    let backups = path.join("backups");
+    let files = files_under(&backups);
+    assert!(files.contains(&snap), "{files:?}");
+    assert!(files.len() >= 2, "first-save snapshot missing: {files:?}");
+    for f in &files {
+        let name = f.file_name().unwrap().to_string_lossy();
+        assert_eq!(f.parent().unwrap(), backups, "nested backup entry {f:?}");
+        assert!(name.ends_with(".vault.bin"), "{name}");
+        assert!(!name.contains(&blob_file_name(id)), "{name}");
+        let bytes = fs::read(f).unwrap();
+        assert!(bytes.len() < blob_bytes.len(), "{name} is blob-sized");
+        assert!(
+            !bytes.windows(probe.len()).any(|w| w == probe),
+            "{name} holds blob bytes"
+        );
+    }
+    // The snapshot is the vault file at that moment, nothing more.
+    assert_eq!(fs::read(&snap).unwrap(), fs::read(v.vault_file()).unwrap());
 }

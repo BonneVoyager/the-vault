@@ -119,6 +119,12 @@ fn is_unsupported(e: &io::Error) -> bool {
 
 static WARNED_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
+/// Test-only count of "locking unavailable" warnings actually logged (03 §2: once per
+/// process). The crate has no log-capture support, so tests observe this instead.
+#[cfg(test)]
+static UNSUPPORTED_WARNINGS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn open_rw(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -148,6 +154,8 @@ fn acquire(
             Err(TryLockError::Error(e)) if e.kind() == ErrorKind::Interrupted => continue,
             Err(TryLockError::Error(e)) if is_unsupported(&e) => {
                 if !WARNED_UNSUPPORTED.swap(true, Ordering::Relaxed) {
+                    #[cfg(test)]
+                    UNSUPPORTED_WARNINGS.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(path = %path.display(), error = %e, "file locking unavailable on this volume; concurrent writers are not protected");
                 }
                 return Ok(PackageLock { _file: None });
@@ -176,6 +184,13 @@ mod tests {
         let path = package::lock_file(dir);
         let file = open_rw(&path).unwrap();
         acquire(file, &path, exclusive, Duration::from_millis(30), real)
+    }
+
+    /// Serialises the tests that drive the "locking unsupported" fallback (shared
+    /// `WARNED_UNSUPPORTED` / `UNSUPPORTED_WARNINGS`). A poisoned lock is still a lock.
+    fn unsupported_lock_serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
@@ -259,6 +274,7 @@ mod tests {
 
     #[test]
     fn volume_without_locking_gets_a_no_op_guard() {
+        let _serial = unsupported_lock_serial();
         let dir = tempfile::tempdir().unwrap();
         let path = package::lock_file(dir.path());
         let unsupported = [
@@ -290,5 +306,28 @@ mod tests {
         })
         .unwrap_err();
         assert!(matches!(err, SyncError::Io { .. }), "{err:?}");
+    }
+
+    /// 03 §2-11: the fallback warning is logged once per process, however many saves and
+    /// opens hit an unlockable volume. The flag and counter are process-global and
+    /// `volume_without_locking_gets_a_no_op_guard` may log first; both tests hold
+    /// [`unsupported_lock_serial`], so the other test's warning is never half-done (flag set,
+    /// counter not yet bumped) when this one reads it. Only "exactly one" is asserted, never
+    /// which test logged it.
+    #[test]
+    fn lock_fallback_warning_is_logged_once() {
+        let _serial = unsupported_lock_serial();
+        let dir = tempfile::tempdir().unwrap();
+        let path = package::lock_file(dir.path());
+        for exclusive in [true, false, true, true] {
+            let file = open_rw(&path).unwrap();
+            let guard = acquire(file, &path, exclusive, LOCK_TIMEOUT, |_, _| {
+                Err(TryLockError::Error(io::Error::from_raw_os_error(ENOTSUP)))
+            })
+            .unwrap();
+            assert!(guard._file.is_none());
+        }
+        assert!(WARNED_UNSUPPORTED.load(Ordering::Relaxed));
+        assert_eq!(UNSUPPORTED_WARNINGS.load(Ordering::Relaxed), 1);
     }
 }

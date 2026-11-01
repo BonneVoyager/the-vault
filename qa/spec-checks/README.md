@@ -15,9 +15,15 @@ cargo fmt --all -- --check                     # formatting is part of the manua
 
 - `src/lib.rs`: an independent decoder and independent crypto (Argon2id, HKDF, XChaCha20-Poly1305 with the spec AADs), sync helpers, and a child-process runner with time and RSS limits.
 - `src/bin/`: `open_file`, `open_kdbx` and `open_1pux` harnesses, so aborts or OOM in hostile-input cases are observable.
-- `tests/`: `format`, `corruption`, `keys`, `merge`, `sync`, `sync_edge`, `sync_cloud`, `attachments`, `retention`, `totp_gen`, `import`, `modes`, `cli_bridge`, and since 2026-10-31 `field_ids`, `merge_ids`, `upgrade`.
+- `tests/`: `format`, `corruption`, `keys`, `merge`, `sync`, `sync_edge`, `sync_cloud`, `attachments`, `retention`, `totp_gen`, `import`, `modes`, `cli_bridge`, since 2026-10-31 `field_ids`, `merge_ids`, `upgrade`, and since 2026-11-01 `merge_laws`, `hostile_stamps`, `sync_nfc`.
 - `src/lib.rs` also has an independent file writer (`build_file`) and UUIDv5 (`uuid5`, `derived_field_id`) for hand-made version 1 and version 2 files.
 - 2026-10-31 port to format version 2: by-name `set_field` calls became `set_field_named`; rebuilt files keep the source file's version; "newer version" simulations use version 3; `snap_item` includes field ids, `removed_fields`, `created_at` and icons.
+- 2026-11-01 additions: `merge_laws` (00 roadmap item 2 merge laws with this ledger's own seeded
+  generator, decrypting every ItemPlain independently; `removed_attachments` merge-only cap),
+  `hostile_stamps` (sweeps over a file with attribute stamps and attachment markers, hostile types,
+  stamps at `u64::MAX`), `sync_nfc` (03 §3 NFC path comparisons, §6 case/normalisation-insensitive
+  conflict names, §8 `delete_backup` paths, `WaitingForBlobs` semantics), `cli_bridge` b10-b11
+  (`VAULT_DEVICE_ID`, `edit`), and `cli/run_all.sh` sections for `edit`, `sync` and concurrent editors.
 - Temp files go under `tmp/` (git-ignored) and are removed by each test.
 
 A passing check shows the behaviour on those inputs only. It is not a proof.

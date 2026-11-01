@@ -538,6 +538,7 @@ impl UnlockedVault {
     pub fn try_insert(&mut self, mut item: Item, now: Millis) -> Result<Uuid, VaultError> {
         check_attachment_refs(&item)?;
         check_field_ids(&item)?;
+        merge::normalize_attachments(&mut item.attachments);
         merge::normalize_attachment_tombstones(&mut item.removed_attachments);
         merge::normalize_removed_history(&mut item.removed_history);
         reconcile_field_tombstones(&mut item, now);
@@ -628,6 +629,7 @@ impl UnlockedVault {
             *item = before;
             return Err(e);
         }
+        merge::normalize_attachments(&mut item.attachments);
         merge::normalize_attachment_tombstones(&mut item.removed_attachments);
         merge::normalize_removed_history(&mut item.removed_history);
         for field in &mut item.fields {
@@ -942,6 +944,9 @@ impl UnlockedVault {
         let mut r = r;
         r.added_at = r.added_at.min(floor);
         item.attachments.push(r);
+        // Keep the merge's canonical `(added_at, id)` order locally too, so merging with a
+        // copy of this vault is a no-op (see `merge::normalize_attachments`).
+        merge::normalize_attachments(&mut item.attachments);
         restamp(item, floor, device_id);
         Ok(())
     }

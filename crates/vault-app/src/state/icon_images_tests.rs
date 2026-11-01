@@ -151,7 +151,12 @@ fn replacing_an_image_removes_the_previous_reference(cx: &mut TestAppContext) {
         image_file(dir.path(), "c.png", [0, 0, 200, 255]),
         cx,
     );
-    assert_eq!(ref_ids(&stored(&state, id, cx)), vec![a, b, c]);
+    // As a set: core orders by `(added_at, id)` and the three may share a millisecond.
+    let mut refs = ref_ids(&stored(&state, id, cx));
+    let mut want = vec![a, b, c];
+    refs.sort();
+    want.sort();
+    assert_eq!(refs, want);
     state.read_with(cx, |s, _| {
         assert_eq!(
             s.edit_buffer().unwrap().icon_refs_dropped_on_save(),

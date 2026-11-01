@@ -554,6 +554,132 @@ fn merge_unions_refs_sorted_by_added_at_then_id() {
     assert_eq!(att_ids(c.get(id).unwrap()), att_ids(d.get(id).unwrap()));
 }
 
+/// `x.merge_from(copy of x's own file)` must change nothing: no report entry, no
+/// `modified_at` bump, no reorder.
+fn assert_self_merge_is_noop(v: &vault_core::UnlockedVault, id: Uuid) {
+    let (mut x, y) = two_copies(v);
+    let before = x.get(id).unwrap().modified_at;
+    let before_ids = att_ids(x.get(id).unwrap());
+    let rep = x.merge_from(&y).unwrap();
+    assert_eq!(rep.updated, 0, "{rep:?}");
+    assert!(!rep.changed(), "{rep:?}");
+    assert_eq!(x.get(id).unwrap().modified_at, before);
+    assert_eq!(att_ids(x.get(id).unwrap()), before_ids);
+    assert!(vault_core::merge::item_eq(
+        v.get(id).unwrap(),
+        x.get(id).unwrap()
+    ));
+}
+
+/// 03 §3 "Merge is idempotent" (bug hunt 2026-11-01, L1). Refs added locally out of the
+/// merge's `(added_at, id)` order (two in the same millisecond with descending ids, then one
+/// carrying an earlier `added_at`) used to sit in insertion order, so a merge with a copy of
+/// the vault's own file reordered them, reported `updated: 1` and bumped `modified_at`.
+/// Every write path now keeps the canonical order, and a merge's output is a fixed point.
+#[test]
+fn self_merge_is_a_no_op_for_refs_added_out_of_canonical_order() {
+    let (mut v, id) = vault_with_item();
+    let mut a = new_ref("a", 1, 2_000).unwrap();
+    let mut b = new_ref("b", 1, 2_000).unwrap();
+    a.id = Uuid::from_u128(2);
+    b.id = Uuid::from_u128(1);
+    v.add_attachment_ref(id, a, 2_000).unwrap();
+    v.add_attachment_ref(id, b, 2_000).unwrap();
+    let refs = &v.get(id).unwrap().attachments;
+    assert_eq!(refs[0].added_at, refs[1].added_at, "same millisecond");
+    let mut early = new_ref("early", 1, 1_500).unwrap();
+    early.id = Uuid::from_u128(3);
+    v.add_attachment_ref(id, early, 2_001).unwrap();
+    let canonical = [Uuid::from_u128(3), Uuid::from_u128(1), Uuid::from_u128(2)];
+    assert_eq!(att_ids(v.get(id).unwrap()), canonical);
+    assert_self_merge_is_noop(&v, id);
+
+    // `insert` and `update` carrying refs in the wrong order are normalised too.
+    let mut item = sample_item(2, 100);
+    let mut p = new_ref("p", 1, 300).unwrap();
+    let mut q = new_ref("q", 1, 300).unwrap();
+    p.id = Uuid::from_u128(20);
+    q.id = Uuid::from_u128(10);
+    item.attachments = vec![p, q];
+    let id2 = v.insert(item, 300);
+    assert_eq!(
+        att_ids(v.get(id2).unwrap()),
+        [Uuid::from_u128(10), Uuid::from_u128(20)]
+    );
+    v.update(id2, 400, |i| i.attachments.reverse()).unwrap();
+    assert_eq!(
+        att_ids(v.get(id2).unwrap()),
+        [Uuid::from_u128(10), Uuid::from_u128(20)]
+    );
+    assert_self_merge_is_noop(&v, id2);
+
+    // Merge output is a fixed point: after a real two-device merge, each side's result is
+    // unchanged by a merge with a copy of itself.
+    let (mut c, mut d) = two_copies(&v);
+    c.set_device_id(Uuid::from_u128(0xC));
+    d.set_device_id(Uuid::from_u128(0xD));
+    let mut x = new_ref("x", 1, 2_000).unwrap();
+    let mut y = new_ref("y", 1, 2_000).unwrap();
+    x.id = Uuid::from_u128(0);
+    y.id = Uuid::from_u128(4);
+    c.add_attachment_ref(id, x, 3_000).unwrap();
+    d.add_attachment_ref(id, y, 3_000).unwrap();
+    assert_eq!(c.merge_from(&d).unwrap().updated, 1);
+    assert_self_merge_is_noop(&c, id);
+    assert_eq!(d.merge_from(&c).unwrap().updated, 1);
+    assert_self_merge_is_noop(&d, id);
+    assert_eq!(
+        att_ids(d.get(id).unwrap()),
+        [
+            Uuid::from_u128(3),
+            Uuid::from_u128(0),
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            Uuid::from_u128(4)
+        ]
+    );
+}
+
+/// Migration of a file written before the canonical-order rule (2026-11-01): the parser
+/// accepts any order and normalises it without touching `modified_at`; the next encode then
+/// writes the canonical order. `encode_item_plain` writes the in-memory order verbatim, so a
+/// hand-built item with refs in descending `(added_at, id)` order stands in for such a file.
+#[test]
+fn parser_normalises_a_non_canonical_ref_order_without_a_restamp() {
+    use vault_core::format::{FORMAT_VERSION, decode_item_plain, encode_item_plain};
+
+    let mut item = sample_item(1, 100);
+    item.modified_at = 500;
+    let mut late = new_ref("late", 1, 400).unwrap();
+    let mut p = new_ref("p", 1, 300).unwrap();
+    let mut q = new_ref("q", 1, 300).unwrap();
+    late.id = Uuid::from_u128(0);
+    p.id = Uuid::from_u128(2);
+    q.id = Uuid::from_u128(1);
+    let mut canonical = item.clone();
+    canonical.attachments = vec![q.clone(), p.clone(), late.clone()];
+    item.attachments = vec![late, p, q];
+
+    let plain = encode_item_plain(&item);
+    assert_ne!(
+        plain.as_slice(),
+        encode_item_plain(&canonical).as_slice(),
+        "the encoder keeps the given order, so the parser is what is under test"
+    );
+    let back = decode_item_plain(&plain, item.id, item.modified_at, FORMAT_VERSION).unwrap();
+    assert_eq!(
+        att_ids(&back),
+        [Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(0)]
+    );
+    assert_eq!(back.modified_at, 500);
+    assert!(vault_core::merge::item_eq(&canonical, &back));
+    assert_eq!(
+        encode_item_plain(&back).as_slice(),
+        encode_item_plain(&canonical).as_slice(),
+        "the next save writes the canonical order"
+    );
+}
+
 #[test]
 fn removed_ref_stays_removed_after_merge_both_ways() {
     let (mut v, id) = vault_with_item();

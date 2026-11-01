@@ -52,6 +52,8 @@ cargo run -p vault-app
 cargo run -p vault-cli -- --help
 ```
 
+The merge property tests run 24 cases per law by default; set `VAULT_PROPTEST_CASES=500` for a deeper pass (`cargo test -p vault-core --test merge_props`).
+
 The app excludes its windows from screen capture. For screenshots in debug builds only, set `VAULT_ALLOW_SCREEN_CAPTURE=1`. Release builds ignore it.
 
 ## CLI quick example

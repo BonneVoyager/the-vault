@@ -422,3 +422,121 @@ fn b09_concurrent_upgrade_and_adds() {
     );
     assert!(errs.is_empty(), "{errs:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// 2026-11-01 additions: VAULT_DEVICE_ID and `edit` (00 phase 1 "later dev-tool additions").
+// ---------------------------------------------------------------------------------------------
+
+fn cli_env(pkg: &std::path::Path, env: &[(&str, &str)], args: &[&str]) -> (i32, String) {
+    let mut c = Command::new(vault_bin());
+    c.arg("--vault")
+        .arg(pkg)
+        .args(["--password-env", "QA_MPW"])
+        .args(args)
+        .env("QA_MPW", "tidy-Walrus-orbit-Velvet-42")
+        .env_remove("VAULT_FILE")
+        .env_remove("VAULT_DEVICE_ID");
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    let out = c.output().unwrap();
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    s.push_str(&String::from_utf8_lossy(&out.stderr));
+    (out.status.code().unwrap_or(-1), s)
+}
+
+/// 00 phase 1: "`VAULT_DEVICE_ID` overrides the stored device id for one process": items written
+/// under the override carry it (01 §4 device_id); the next process without it uses the stored id
+/// again, and the stored id is the same across two plain runs.
+#[test]
+fn b10_vault_device_id_override_is_per_process() {
+    let d = tempdir();
+    let p = d.path().join("dv.vault");
+    let (rc, out) = cli_env(&p, &[], &["init", "--kdf-test-params"]);
+    assert_eq!(rc, 0, "{out}");
+    let forced = uuid::Uuid::new_v4();
+    let fs = forced.to_string();
+    let (rc, out) = cli_env(
+        &p,
+        &[("VAULT_DEVICE_ID", &fs)],
+        &["add", "--title", "Forced"],
+    );
+    assert_eq!(rc, 0, "{out}");
+    for t in ["Plain1", "Plain2"] {
+        let (rc, out) = cli_env(&p, &[], &["add", "--title", t]);
+        assert_eq!(rc, 0, "{out}");
+    }
+    let o = indep::open_file(
+        &std::fs::read(p.join("vault.bin")).unwrap(),
+        "tidy-Walrus-orbit-Velvet-42",
+    );
+    let dev_of = |title: &str| -> Vec<u8> {
+        let it = o
+            .items
+            .iter()
+            .find(|x| get(&x.2, "title").and_then(|v| v.as_text()) == Some(title))
+            .unwrap();
+        bytes_of(get(&it.2, "device_id").unwrap())
+    };
+    assert_eq!(
+        dev_of("Forced"),
+        forced.as_bytes().to_vec(),
+        "override used"
+    );
+    assert_ne!(
+        dev_of("Plain1"),
+        forced.as_bytes().to_vec(),
+        "override persisted"
+    );
+    assert_eq!(dev_of("Plain1"), dev_of("Plain2"), "stored id is stable");
+}
+
+/// 02 update semantics through `vault edit`: a rename (`--set` keeps the id) and `--rm-field`
+/// write what the spec says: same field id after a value change, and a removed_fields marker for
+/// a removed id (01 §4 "removed_fields ... written only when non-empty").
+#[test]
+fn b11_cli_edit_keeps_ids_and_writes_markers() {
+    let d = tempdir();
+    let p = d.path().join("ed.vault");
+    assert_eq!(cli_env(&p, &[], &["init", "--kdf-test-params"]).0, 0);
+    let (rc, out) = cli_env(&p, &[], &["add", "--title", "E", "--username", "alice"]);
+    assert_eq!(rc, 0, "{out}");
+    let ids = |p: &std::path::Path| -> Vec<(String, Vec<u8>)> {
+        let o = indep::open_file(
+            &std::fs::read(p.join("vault.bin")).unwrap(),
+            "tidy-Walrus-orbit-Velvet-42",
+        );
+        get(&o.items[0].2, "fields")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    get(f, "name").unwrap().as_text().unwrap().to_string(),
+                    bytes_of(get(f, "id").unwrap()),
+                )
+            })
+            .collect()
+    };
+    let before = ids(&p);
+    let (rc, out) = cli_env(&p, &[], &["edit", "E", "--set", "username=bob"]);
+    assert_eq!(rc, 0, "{out}");
+    let after = ids(&p);
+    assert_eq!(before, after, "a value change keeps every field id");
+    let victim = uuid::Uuid::from_slice(&after[0].1).unwrap().to_string();
+    let (rc, out) = cli_env(&p, &[], &["edit", "E", "--rm-field", &victim]);
+    assert_eq!(rc, 0, "{out}");
+    let o = indep::open_file(
+        &std::fs::read(p.join("vault.bin")).unwrap(),
+        "tidy-Walrus-orbit-Velvet-42",
+    );
+    let rf = get(&o.items[0].2, "removed_fields").expect("removed_fields written");
+    assert!(
+        rf.as_array()
+            .unwrap()
+            .iter()
+            .any(|m| bytes_of(get(m, "id").unwrap()) == after[0].1),
+        "marker for the removed id"
+    );
+}

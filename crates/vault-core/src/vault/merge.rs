@@ -435,7 +435,7 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
             attachments.push(a.clone());
         }
     }
-    attachments.sort_by(|a, b| a.added_at.cmp(&b.added_at).then_with(|| a.id.cmp(&b.id)));
+    normalize_attachments(&mut attachments);
     // Same discipline as `removed_fields`: a marker may fall off the cap only once neither
     // input side still carries its reference (so the peer just merged cannot bring it back
     // and its blob can be pruned), oldest first; otherwise the list stays over the cap until
@@ -617,6 +617,20 @@ pub(crate) fn normalize_attachment_tombstones(tombstones: &mut Vec<AttachmentTom
     // After the sort the first occurrence of an id is its greatest removed_at.
     let mut seen = std::collections::BTreeSet::new();
     tombstones.retain(|t| seen.insert(t.id));
+}
+
+/// Put attachment references in the merge's canonical order, `(added_at, id)` ascending
+/// (03 §5 "sorted by `added_at`, then `id`"). Shared with `add_attachment_ref`, `insert`,
+/// `update` and the parser so an item is in this order *everywhere*, not only as merge
+/// output: [`item_eq`] compares references positionally, so a merge that merely reordered
+/// them would count as a change, bump `modified_at`, and break idempotence
+/// (`x.merge_from(copy of x)` must be a no-op; bug hunt 2026-11-01, L1). Two references
+/// added in the same millisecond, or one added under a clock that went back, are the
+/// ordinary triggers. Removal keeps the relative order, so it needs no call. Stable, so
+/// nothing else about the item changes, and deterministic even if two references were to
+/// share an id (nothing rejects that): equal keys keep their relative order.
+pub(crate) fn normalize_attachments(attachments: &mut [AttachmentRef]) {
+    attachments.sort_by(|a, b| a.added_at.cmp(&b.added_at).then_with(|| a.id.cmp(&b.id)));
 }
 
 /// Sort removed-history stamps newest first, drop duplicates, and cap at [`HISTORY_CAP`].

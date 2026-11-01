@@ -3,6 +3,10 @@
 //! on two or three "devices" with skewed, sometimes backwards-running clocks.
 //!
 //! Ids are deterministic (derived from small slots) so a shrunk case is reproducible.
+//!
+//! Set `VAULT_PROPTEST_CASES` (a u32) to override the cases per law for a deeper pass, e.g.
+//! `VAULT_PROPTEST_CASES=500 cargo test -p vault-core --test merge_props`. Unset or
+//! unparsable values fall back to the default of 24.
 
 mod common;
 
@@ -545,8 +549,16 @@ fn all_same(devs: &[UnlockedVault]) -> Result<(), TestCaseError> {
 /// Cases per law: each case runs Argon2 (test KDF params) once per device, which dominates.
 const CASES: u32 = 24;
 
+/// Case count: `VAULT_PROPTEST_CASES` if set and parsable, else `CASES`.
+fn cases() -> u32 {
+    std::env::var("VAULT_PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(CASES)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(CASES))]
+    #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     /// Law 1: after one exchange the vaults are equal up to `modified_at` (|delta| <= 1),
     /// after a second exchange fully equal.
