@@ -114,5 +114,5 @@ Unit tests plus diff-based code and security review missed two cross-device defe
 3. **Fuzzing the parsers** (`cargo-fuzz`): file format, KDBX outer header walk, CSV and 1PUX importers, TOTP URI; fixed time budget per wave, corpus checked in.
 4. **Multi-device simulation** in vault-sync: randomised interleavings of edits, saves, locks and conflict copies of both shapes, compared against a reference model.
 5. **Mutation testing** (`cargo-mutants`) on vault-core and vault-sync per wave, listing tests that do not bite.
-6. **Spec traceability**: a table mapping every guarantee in 02 and 03 to a named test.
+6. **Spec traceability** — DONE 2026-11-01 (`docs/spec-traceability.md`, 220 rules, 9 uncovered; refresh it when a spec section or test file changes): a table mapping every guarantee in 02 and 03 to a named test.
 7. **Golden screenshots**: compare headless renders of each screen against stored images to catch visual regressions.

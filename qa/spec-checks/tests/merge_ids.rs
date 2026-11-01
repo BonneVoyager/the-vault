@@ -13,11 +13,18 @@ impl Net {
         let base = UnlockedVault::create(&pw("pw"), KdfParams::for_tests(), Uuid::new_v4());
         let l = LockedVault::parse(&base.serialize()).unwrap();
         let k = base.export_vault_key();
-        Net { devs: (0..n).map(|_| l.unlock_with_key(&k, Uuid::new_v4()).unwrap()).collect() }
+        Net {
+            devs: (0..n)
+                .map(|_| l.unlock_with_key(&k, Uuid::new_v4()).unwrap())
+                .collect(),
+        }
     }
     fn disk(&self, from: usize, to: usize) -> UnlockedVault {
         let b = self.devs[from].serialize();
-        LockedVault::parse(&b).unwrap().unlock_with_key(&self.devs[to].export_vault_key(), self.devs[to].device_id()).unwrap()
+        LockedVault::parse(&b)
+            .unwrap()
+            .unlock_with_key(&self.devs[to].export_vault_key(), self.devs[to].device_id())
+            .unwrap()
     }
     fn pull(&mut self, to: usize, from: usize) -> MergeReport {
         let d = self.disk(from, to);
@@ -46,8 +53,10 @@ impl Net {
 fn seeded(n: &mut Net, now: u64) -> (Uuid, Uuid, Uuid) {
     let d0 = n.devs[0].device_id();
     let mut it = Item::new("Login", d0, now);
-    it.fields.push(Field::new("username", FieldKind::Text, pw("u0"), now));
-    it.fields.push(Field::new("password", FieldKind::Password, pw("p0"), now));
+    it.fields
+        .push(Field::new("username", FieldKind::Text, pw("u0"), now));
+    it.fields
+        .push(Field::new("password", FieldKind::Password, pw("p0"), now));
     let (u, p) = (it.fields[0].id, it.fields[1].id);
     let id = n.devs[0].insert(it, now);
     for i in 1..n.devs.len() {
@@ -56,7 +65,14 @@ fn seeded(n: &mut Net, now: u64) -> (Uuid, Uuid, Uuid) {
     (id, u, p)
 }
 fn fields(v: &UnlockedVault, id: Uuid) -> Vec<(Uuid, String, String)> {
-    v.get(id).map(|i| i.fields.iter().map(|f| (f.id, f.name.clone(), f.value.expose_secret().clone())).collect()).unwrap_or_default()
+    v.get(id)
+        .map(|i| {
+            i.fields
+                .iter()
+                .map(|f| (f.id, f.name.clone(), f.value.expose_secret().clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 03 §5 "Field-level merge, keyed by field.id (2026-10-31; never by name)". Replaces the
@@ -65,14 +81,32 @@ fn fields(v: &UnlockedVault, id: Uuid) -> Vec<(Uuid, String, String)> {
 fn mi01_same_name_added_on_two_devices_both_kept() {
     let mut n = Net::new(2);
     let (id, _, _) = seeded(&mut n, 100);
-    n.devs[0].update(id, 200, |it| it.fields.push(Field::new("pin", FieldKind::Text, pw("1111"), 200))).unwrap();
-    n.devs[1].update(id, 210, |it| it.fields.push(Field::new("pin", FieldKind::Text, pw("2222"), 210))).unwrap();
+    n.devs[0]
+        .update(id, 200, |it| {
+            it.fields
+                .push(Field::new("pin", FieldKind::Text, pw("1111"), 200))
+        })
+        .unwrap();
+    n.devs[1]
+        .update(id, 210, |it| {
+            it.fields
+                .push(Field::new("pin", FieldKind::Text, pw("2222"), 210))
+        })
+        .unwrap();
     n.all_pairs(2);
     for d in &n.devs {
-        let pins: Vec<String> = fields(d, id).into_iter().filter(|f| f.1 == "pin").map(|f| f.2).collect();
+        let pins: Vec<String> = fields(d, id)
+            .into_iter()
+            .filter(|f| f.1 == "pin")
+            .map(|f| f.2)
+            .collect();
         let mut s = pins.clone();
         s.sort();
-        assert_eq!(s, vec!["1111", "2222"], "both same-named fields survive: {pins:?}");
+        assert_eq!(
+            s,
+            vec!["1111", "2222"],
+            "both same-named fields survive: {pins:?}"
+        );
     }
     n.assert_converged();
 }
@@ -85,14 +119,22 @@ fn mi02_rename_vs_edit() {
     for (b_at, want_name, want_val) in [(250u64, "login", "u0"), (350u64, "username", "b-val")] {
         let mut n = Net::new(2);
         let (id, u, _) = seeded(&mut n, 100);
-        n.devs[0].update(id, 300, |it| it.fields.iter_mut().find(|f| f.id == u).unwrap().name = "login".into()).unwrap();
+        n.devs[0]
+            .update(id, 300, |it| {
+                it.fields.iter_mut().find(|f| f.id == u).unwrap().name = "login".into()
+            })
+            .unwrap();
         n.devs[1].set_field(id, u, pw("b-val"), b_at).unwrap();
         n.all_pairs(2);
         for d in &n.devs {
             let fs = fields(d, id);
             assert_eq!(fs.len(), 2, "rename is not delete+add: {fs:?}");
             let f = fs.iter().find(|f| f.0 == u).unwrap();
-            assert_eq!((f.1.as_str(), f.2.as_str()), (want_name, want_val), "B at {b_at}");
+            assert_eq!(
+                (f.1.as_str(), f.2.as_str()),
+                (want_name, want_val),
+                "B at {b_at}"
+            );
         }
         n.assert_converged();
     }
@@ -114,11 +156,18 @@ fn mi03_removed_fields_two_devices() {
         n.pull(0, 1);
         for (di, d) in n.devs.iter().enumerate() {
             let it = d.get(id).unwrap();
-            assert_eq!(it.field_by_id(u).is_some(), survives, "edit at {edit_at} vs marker 200, device {di}");
+            assert_eq!(
+                it.field_by_id(u).is_some(),
+                survives,
+                "edit at {edit_at} vs marker 200, device {di}"
+            );
             assert!(it.field_by_id(p).is_some(), "untouched field stays");
             let has_marker = it.removed_fields.iter().any(|t| t.id == u);
             if survives {
-                assert!(!has_marker, "marker dropped on both sides when the edit is strictly later (device {di})");
+                assert!(
+                    !has_marker,
+                    "marker dropped on both sides when the edit is strictly later (device {di})"
+                );
                 assert_eq!(it.field_by_id(u).unwrap().value.expose_secret(), "edited");
             } else {
                 assert!(has_marker, "marker kept (device {di})");
@@ -139,15 +188,25 @@ fn mi04_removed_fields_three_devices_relay() {
     n.devs[1].set_field(id, p, pw("b-pass"), 310).unwrap(); // B edits a different field later
     n.pull(2, 0); // C learns the removal
     n.pull(2, 1); // C merges B (still has u at 100)
-    assert!(n.devs[2].get(id).unwrap().field_by_id(u).is_none(), "stale copy did not resurrect on the relay");
+    assert!(
+        n.devs[2].get(id).unwrap().field_by_id(u).is_none(),
+        "stale copy did not resurrect on the relay"
+    );
     n.pull(1, 2); // B learns from C only
-    assert!(n.devs[1].get(id).unwrap().field_by_id(u).is_none(), "removal reached B through C");
+    assert!(
+        n.devs[1].get(id).unwrap().field_by_id(u).is_none(),
+        "removal reached B through C"
+    );
     n.all_pairs(2);
     for d in &n.devs {
         let it = d.get(id).unwrap();
         assert!(it.field_by_id(u).is_none());
         assert_eq!(it.field_by_id(p).unwrap().value.expose_secret(), "b-pass");
-        assert_eq!(it.removed_fields.iter().filter(|t| t.id == u).count(), 1, "one marker per id");
+        assert_eq!(
+            it.removed_fields.iter().filter(|t| t.id == u).count(),
+            1,
+            "one marker per id"
+        );
     }
     n.assert_converged();
     // two devices remove the same field at different times -> greatest removed_at kept
@@ -157,7 +216,14 @@ fn mi04_removed_fields_three_devices_relay() {
     n.devs[1].remove_field(id, u, 500).unwrap();
     n.all_pairs(2);
     for d in &n.devs {
-        let m: Vec<u64> = d.get(id).unwrap().removed_fields.iter().filter(|t| t.id == u).map(|t| t.removed_at).collect();
+        let m: Vec<u64> = d
+            .get(id)
+            .unwrap()
+            .removed_fields
+            .iter()
+            .filter(|t| t.id == u)
+            .map(|t| t.removed_at)
+            .collect();
         assert_eq!(m, vec![500], "greatest removed_at per id");
     }
     n.assert_converged();
@@ -175,19 +241,28 @@ fn mi05_removed_fields_union_cap() {
     let d0 = n.devs[0].device_id();
     let mut it = Item::new("many", d0, 100);
     for k in 0..80 {
-        it.fields.push(Field::new(format!("f{k}"), FieldKind::Text, pw("x"), 100));
+        it.fields
+            .push(Field::new(format!("f{k}"), FieldKind::Text, pw("x"), 100));
     }
     let ids: Vec<Uuid> = it.fields.iter().map(|f| f.id).collect();
     let id = n.devs[0].insert(it, 100);
     n.pull(1, 0);
     for k in 0..40 {
-        n.devs[0].remove_field(id, ids[k], 1_000 + 2 * k as u64).unwrap();
-        n.devs[1].remove_field(id, ids[40 + k], 1_001 + 2 * k as u64).unwrap();
+        n.devs[0]
+            .remove_field(id, ids[k], 1_000 + 2 * k as u64)
+            .unwrap();
+        n.devs[1]
+            .remove_field(id, ids[40 + k], 1_001 + 2 * k as u64)
+            .unwrap();
     }
     n.all_pairs(3);
     for d in &n.devs {
         let it = d.get(id).unwrap();
-        assert!(it.fields.is_empty(), "all 80 removals applied: {} left", it.fields.len());
+        assert!(
+            it.fields.is_empty(),
+            "all 80 removals applied: {} left",
+            it.fields.len()
+        );
         assert_eq!(it.removed_fields.len(), 64);
         let stamps: Vec<u64> = it.removed_fields.iter().map(|t| t.removed_at).collect();
         let mut sorted = stamps.clone();
@@ -198,17 +273,33 @@ fn mi05_removed_fields_union_cap() {
     n.assert_converged();
     // byte-equal: the decrypted, canonical ItemPlain CBOR of every item is identical on both sides
     let plain = |v: &UnlockedVault| -> Vec<(Vec<u8>, u64, Vec<u8>)> {
-        let mut x: Vec<(Vec<u8>, u64, Vec<u8>)> = indep::open_file(&v.serialize(), "pw").items.into_iter().map(|(i, m, pt)| (i, m, enc(&pt))).collect();
+        let mut x: Vec<(Vec<u8>, u64, Vec<u8>)> = indep::open_file(&v.serialize(), "pw")
+            .items
+            .into_iter()
+            .map(|(i, m, pt)| (i, m, enc(&pt)))
+            .collect();
         x.sort();
         x
     };
-    assert_eq!(plain(&n.devs[0]), plain(&n.devs[1]), "item payloads byte-equal after three rounds");
+    assert_eq!(
+        plain(&n.devs[0]),
+        plain(&n.devs[1]),
+        "item payloads byte-equal after three rounds"
+    );
     let before = plain(&n.devs[0]);
     for (to, from) in [(0, 1), (1, 0), (0, 1)] {
         let r = n.pull(to, from);
-        assert_eq!((r.added, r.updated, r.deleted, r.header_updated), (0, 0, 0, false), "further pull {to}<-{from} changed something: {r:?}");
+        assert_eq!(
+            (r.added, r.updated, r.deleted, r.header_updated),
+            (0, 0, 0, false),
+            "further pull {to}<-{from} changed something: {r:?}"
+        );
     }
-    assert_eq!(plain(&n.devs[0]), before, "further pulls leave the payloads unchanged");
+    assert_eq!(
+        plain(&n.devs[0]),
+        before,
+        "further pulls leave the payloads unchanged"
+    );
     assert_eq!(plain(&n.devs[1]), before);
 }
 
@@ -240,17 +331,31 @@ fn mi06_created_at_minimum_not_a_change() {
             })
             .collect();
         let f = build_file(raw.version, &raw.header, &o.vault_key, &items);
-        LockedVault::parse(&f).unwrap().unlock_with_key(&n.devs[from].export_vault_key(), Uuid::new_v4()).unwrap()
+        LockedVault::parse(&f)
+            .unwrap()
+            .unlock_with_key(&n.devs[from].export_vault_key(), Uuid::new_v4())
+            .unwrap()
     };
     let older = mk(&n, 1, Some(50));
     let r = n.devs[0].merge_from(&older).unwrap();
     let it = n.devs[0].get(id).unwrap();
     assert_eq!(it.created_at, Some(50), "minimum kept");
-    assert_eq!(it.modified_at, ma, "created_at alone never bumps modified_at");
-    assert_eq!((r.added, r.updated, r.deleted), (0, 0, 0), "not a change: {r:?}");
+    assert_eq!(
+        it.modified_at, ma,
+        "created_at alone never bumps modified_at"
+    );
+    assert_eq!(
+        (r.added, r.updated, r.deleted),
+        (0, 0, 0),
+        "not a change: {r:?}"
+    );
     let newer = mk(&n, 1, Some(10_000));
     n.devs[0].merge_from(&newer).unwrap();
-    assert_eq!(n.devs[0].get(id).unwrap().created_at, Some(50), "a larger value never replaces the minimum");
+    assert_eq!(
+        n.devs[0].get(id).unwrap().created_at,
+        Some(50),
+        "a larger value never replaces the minimum"
+    );
     // one side unknown -> the known one
     let mut m = Net::new(2);
     let (id2, _, _) = seeded(&mut m, 100);
@@ -259,19 +364,32 @@ fn mi06_created_at_minimum_not_a_change() {
     mine.merge_from(&unknown).unwrap();
     assert_eq!(mine.get(id2).unwrap().created_at, None);
     m.devs[0].merge_from(&unknown).unwrap();
-    assert_eq!(m.devs[0].get(id2).unwrap().created_at, Some(100), "whichever side has one");
+    assert_eq!(
+        m.devs[0].get(id2).unwrap().created_at,
+        Some(100),
+        "whichever side has one"
+    );
     let mut u2 = mk(&m, 1, None);
     u2.merge_from(&m.disk(0, 1)).unwrap();
-    assert_eq!(u2.get(id2).unwrap().created_at, Some(100), "unknown side adopts the known value");
+    assert_eq!(
+        u2.get(id2).unwrap().created_at,
+        Some(100),
+        "unknown side adopts the known value"
+    );
     // created_at also follows when the other side wins metadata: B later title edit, A older created_at
     let mut k = Net::new(2);
     let (id3, _, _) = seeded(&mut k, 100);
     let mut a = mk(&k, 0, Some(7));
     let mut b = k.disk(1, 1);
-    b.update(id3, 900, |it| it.title = "B title".into()).unwrap();
+    b.update(id3, 900, |it| it.title = "B title".into())
+        .unwrap();
     a.merge_from(&b).unwrap();
     let it = a.get(id3).unwrap();
-    assert_eq!((it.title.as_str(), it.created_at), ("B title", Some(7)), "minimum survives losing metadata");
+    assert_eq!(
+        (it.title.as_str(), it.created_at),
+        ("B title", Some(7)),
+        "minimum survives losing metadata"
+    );
 }
 
 /// 03 §5 "both live" (amended 2026-10-31): "title, favorite, tags (as one set) and icon are each
@@ -282,27 +400,47 @@ fn mi06_created_at_minimum_not_a_change() {
 fn mi07_icon_travels_with_metadata() {
     let mut n = Net::new(2);
     let (id, _, _) = seeded(&mut n, 100);
-    n.devs[0].update(id, 300, |it| it.icon = Some(ItemIcon::new("symbol", "star"))).unwrap();
+    n.devs[0]
+        .update(id, 300, |it| {
+            it.icon = Some(ItemIcon::new("symbol", "star"))
+        })
+        .unwrap();
     n.devs[1].update(id, 400, |it| it.favorite = true).unwrap();
     n.all_pairs(2);
     for d in &n.devs {
         let it = d.get(id).unwrap();
         assert!(it.favorite, "B's favorite survives");
-        assert_eq!(it.icon.as_ref().map(|c| c.value.as_str()), Some("star"), "A's icon survives B's later, unrelated edit");
+        assert_eq!(
+            it.icon.as_ref().map(|c| c.value.as_str()),
+            Some("star"),
+            "A's icon survives B's later, unrelated edit"
+        );
     }
     n.assert_converged();
     // concurrent icon edits: greater icon stamp wins; B's later title edit does not drag its older icon along
     let mut n = Net::new(2);
     let (id, _, _) = seeded(&mut n, 100);
-    n.devs[1].update(id, 300, |it| it.icon = Some(ItemIcon::new("symbol", "old"))).unwrap();
+    n.devs[1]
+        .update(id, 300, |it| it.icon = Some(ItemIcon::new("symbol", "old")))
+        .unwrap();
     let mut ic = ItemIcon::new("letter", "");
     ic.color = Some("#00ff00".into());
-    n.devs[0].update(id, 400, |it| it.icon = Some(ic.clone())).unwrap();
-    n.devs[1].update(id, 500, |it| it.title = "B title".into()).unwrap();
+    n.devs[0]
+        .update(id, 400, |it| it.icon = Some(ic.clone()))
+        .unwrap();
+    n.devs[1]
+        .update(id, 500, |it| it.title = "B title".into())
+        .unwrap();
     n.all_pairs(2);
     for d in &n.devs {
         let it = d.get(id).unwrap();
-        assert_eq!(it.icon.as_ref().map(|c| (c.kind.as_str(), c.color.as_deref())), Some(("letter", Some("#00ff00"))), "later icon wins");
+        assert_eq!(
+            it.icon
+                .as_ref()
+                .map(|c| (c.kind.as_str(), c.color.as_deref())),
+            Some(("letter", Some("#00ff00"))),
+            "later icon wins"
+        );
         assert_eq!(it.title, "B title");
     }
     n.assert_converged();
@@ -313,13 +451,30 @@ fn mi07_icon_travels_with_metadata() {
 fn mi08_section_and_history_field_id_merge() {
     let mut n = Net::new(2);
     let (id, _, p) = seeded(&mut n, 100);
-    n.devs[0].update(id, 200, |it| it.fields.insert(0, Field::new("Login details", FieldKind::Section, pw(""), 200))).unwrap();
+    n.devs[0]
+        .update(id, 200, |it| {
+            it.fields.insert(
+                0,
+                Field::new("Login details", FieldKind::Section, pw(""), 200),
+            )
+        })
+        .unwrap();
     n.devs[1].set_field(id, p, pw("p1"), 210).unwrap();
     n.all_pairs(2);
     for d in &n.devs {
         let it = d.get(id).unwrap();
-        assert!(it.fields.iter().any(|f| f.kind == FieldKind::Section && f.name == "Login details"));
-        assert_eq!(it.history.iter().map(|h| (h.value.expose_secret().clone(), h.field_id)).collect::<Vec<_>>(), vec![("p0".into(), Some(p))]);
+        assert!(
+            it.fields
+                .iter()
+                .any(|f| f.kind == FieldKind::Section && f.name == "Login details")
+        );
+        assert_eq!(
+            it.history
+                .iter()
+                .map(|h| (h.value.expose_secret().clone(), h.field_id))
+                .collect::<Vec<_>>(),
+            vec![("p0".into(), Some(p))]
+        );
     }
     n.assert_converged();
 }
@@ -349,14 +504,30 @@ fn mi09_random_scripts_with_field_ids_converge() {
             };
             let now = clock[d];
             let id = ids[rng.gen_range(0..ids.len())];
-            let fids: Vec<Uuid> = n.devs[d].get(id).map(|i| i.fields.iter().map(|f| f.id).collect()).unwrap_or_default();
-            let pick = |rng: &mut rand::rngs::StdRng| if fids.is_empty() { None } else { Some(fids[rng.gen_range(0..fids.len())]) };
+            let fids: Vec<Uuid> = n.devs[d]
+                .get(id)
+                .map(|i| i.fields.iter().map(|f| f.id).collect())
+                .unwrap_or_default();
+            let pick = |rng: &mut rand::rngs::StdRng| {
+                if fids.is_empty() {
+                    None
+                } else {
+                    Some(fids[rng.gen_range(0..fids.len())])
+                }
+            };
             match rng.gen_range(0..11) {
                 0 => {
                     let _ = n.devs[d].delete(id, now);
                 }
                 1 => {
-                    let _ = n.devs[d].update(id, now, |it| it.fields.push(Field::new("dup", FieldKind::Text, pw(&format!("{d}-{now}")), now)));
+                    let _ = n.devs[d].update(id, now, |it| {
+                        it.fields.push(Field::new(
+                            "dup",
+                            FieldKind::Text,
+                            pw(&format!("{d}-{now}")),
+                            now,
+                        ))
+                    });
                 }
                 2 => {
                     if let Some(f) = pick(&mut rng) {
@@ -378,7 +549,13 @@ fn mi09_random_scripts_with_field_ids_converge() {
                     }
                 }
                 6 => {
-                    let _ = n.devs[d].update(id, now, |it| it.icon = if it.icon.is_some() { None } else { Some(ItemIcon::new("symbol", format!("s{now}"))) });
+                    let _ = n.devs[d].update(id, now, |it| {
+                        it.icon = if it.icon.is_some() {
+                            None
+                        } else {
+                            Some(ItemIcon::new("symbol", format!("s{now}")))
+                        }
+                    });
                 }
                 7 => {
                     let _ = n.devs[d].update(id, now, |it| it.title = format!("t{now}"));
@@ -386,7 +563,8 @@ fn mi09_random_scripts_with_field_ids_converge() {
                 8 => {
                     let dev = n.devs[d].device_id();
                     let mut it = Item::new("new", dev, now);
-                    it.fields.push(Field::new("password", FieldKind::Password, pw("x"), now));
+                    it.fields
+                        .push(Field::new("password", FieldKind::Password, pw("x"), now));
                     ids.push(n.devs[d].insert(it, now));
                 }
                 _ => {
@@ -408,11 +586,24 @@ fn mi09_random_scripts_with_field_ids_converge() {
             let mut s: Vec<String> = v
                 .items_including_deleted()
                 .map(|i| {
-                    let mut f: Vec<String> = i.fields.iter().map(|f| format!("{}:{}={}", f.id, f.name, f.value.expose_secret())).collect();
+                    let mut f: Vec<String> = i
+                        .fields
+                        .iter()
+                        .map(|f| format!("{}:{}={}", f.id, f.name, f.value.expose_secret()))
+                        .collect();
                     f.sort();
                     let mut rf: Vec<Uuid> = i.removed_fields.iter().map(|t| t.id).collect();
                     rf.sort();
-                    format!("{}|{}|del={}|{:?}|rf={:?}|icon={:?}|ca={:?}", i.id, i.title, i.deleted_at.is_some(), f, rf, i.icon.as_ref().map(|c| c.value.clone()), i.created_at)
+                    format!(
+                        "{}|{}|del={}|{:?}|rf={:?}|icon={:?}|ca={:?}",
+                        i.id,
+                        i.title,
+                        i.deleted_at.is_some(),
+                        f,
+                        rf,
+                        i.icon.as_ref().map(|c| c.value.clone()),
+                        i.created_at
+                    )
                 })
                 .collect();
             s.sort();
@@ -422,9 +613,13 @@ fn mi09_random_scripts_with_field_ids_converge() {
             let (cx, cy) = (content(&xy), content(&yx));
             let dx: Vec<&String> = cx.iter().filter(|l| !cy.contains(l)).collect();
             let dy: Vec<&String> = cy.iter().filter(|l| !cx.contains(l)).collect();
-            failures.push(format!("seed {seed}: not commutative\n  x<-y only: {dx:?}\n  y<-x only: {dy:?}"));
+            failures.push(format!(
+                "seed {seed}: not commutative\n  x<-y only: {dx:?}\n  y<-x only: {dy:?}"
+            ));
             for it in x.items_including_deleted() {
-                let Some(o) = y.items_including_deleted().find(|o| o.id == it.id) else { continue };
+                let Some(o) = y.items_including_deleted().find(|o| o.id == it.id) else {
+                    continue;
+                };
                 for f in &it.fields {
                     if let Some(g) = o.field_by_id(f.id) {
                         if f.name != g.name || f.value.expose_secret() != g.value.expose_secret() {
@@ -450,7 +645,10 @@ fn mi09_random_scripts_with_field_ids_converge() {
             for t in &it.removed_fields {
                 if let Some(f) = it.field_by_id(t.id) {
                     if t.removed_at >= f.modified_at {
-                        failures.push(format!("seed {seed}: field {} present with marker {} >= {}", t.id, t.removed_at, f.modified_at));
+                        failures.push(format!(
+                            "seed {seed}: field {} present with marker {} >= {}",
+                            t.id, t.removed_at, f.modified_at
+                        ));
                     }
                 }
             }
@@ -481,7 +679,12 @@ fn pair(a: u8, b: u8) -> Net {
     let base = UnlockedVault::create(&pw("pw"), KdfParams::for_tests(), Uuid::from_bytes([a; 16]));
     let l = LockedVault::parse(&base.serialize()).unwrap();
     let k = base.export_vault_key();
-    Net { devs: vec![l.unlock_with_key(&k, Uuid::from_bytes([a; 16])).unwrap(), l.unlock_with_key(&k, Uuid::from_bytes([b; 16])).unwrap()] }
+    Net {
+        devs: vec![
+            l.unlock_with_key(&k, Uuid::from_bytes([a; 16])).unwrap(),
+            l.unlock_with_key(&k, Uuid::from_bytes([b; 16])).unwrap(),
+        ],
+    }
 }
 
 /// 03 §5 field row "tie -> greater device_id of the owning item; tie -> ours" together with "Merge
@@ -496,13 +699,26 @@ fn mi10_field_tie_with_shared_item_device_id_converges() {
     let (id, u, _) = seeded(&mut n, 100);
     n.devs[0].set_field(id, u, pw("from-A"), 500).unwrap();
     n.devs[1].set_field(id, u, pw("from-B"), 500).unwrap();
-    n.devs[1].update(id, 600, |it| it.title = "B title".into()).unwrap();
+    n.devs[1]
+        .update(id, 600, |it| it.title = "B title".into())
+        .unwrap();
     n.all_pairs(4);
-    let va = fields(&n.devs[0], id).into_iter().find(|f| f.0 == u).unwrap().2;
-    let vb = fields(&n.devs[1], id).into_iter().find(|f| f.0 == u).unwrap().2;
+    let va = fields(&n.devs[0], id)
+        .into_iter()
+        .find(|f| f.0 == u)
+        .unwrap()
+        .2;
+    let vb = fields(&n.devs[1], id)
+        .into_iter()
+        .find(|f| f.0 == u)
+        .unwrap()
+        .2;
     let da = n.devs[0].get(id).unwrap().device_id;
     let db = n.devs[1].get(id).unwrap().device_id;
-    assert_eq!(va, vb, "after four all-pairs rounds A has {va:?}, B has {vb:?} (item device_id A={da}, B={db})");
+    assert_eq!(
+        va, vb,
+        "after four all-pairs rounds A has {va:?}, B has {vb:?} (item device_id A={da}, B={db})"
+    );
 }
 
 /// 03 §5 "removed_fields markers are unioned (... cap 64 newest)" and "The former 'field deletion
@@ -514,7 +730,8 @@ fn mi11_removals_beyond_cap_resurrect() {
     let d0 = n.devs[0].device_id();
     let mut it = Item::new("many", d0, 100);
     for k in 0..70 {
-        it.fields.push(Field::new(format!("f{k}"), FieldKind::Text, pw("x"), 100));
+        it.fields
+            .push(Field::new(format!("f{k}"), FieldKind::Text, pw("x"), 100));
     }
     let ids: Vec<Uuid> = it.fields.iter().map(|f| f.id).collect();
     let id = n.devs[0].insert(it, 100);
@@ -523,6 +740,16 @@ fn mi11_removals_beyond_cap_resurrect() {
         n.devs[0].remove_field(id, *fid, 1_000 + k as u64).unwrap();
     }
     n.pull(0, 1);
-    let back: Vec<String> = n.devs[0].get(id).unwrap().fields.iter().map(|f| f.name.clone()).collect();
-    assert!(back.is_empty(), "{} removed fields came back after merging the offline copy: {back:?}", back.len());
+    let back: Vec<String> = n.devs[0]
+        .get(id)
+        .unwrap()
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    assert!(
+        back.is_empty(),
+        "{} removed fields came back after merging the offline copy: {back:?}",
+        back.len()
+    );
 }

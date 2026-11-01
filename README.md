@@ -111,6 +111,7 @@ specs/                the specs
 - [docs/research/](docs/research/): research notes behind scoping decisions
 - [docs/two-device-sync-checklist.md](docs/two-device-sync-checklist.md): manual two-Mac sync test plan (iCloud Drive and Dropbox) for what `scripts/sync-lab.sh` cannot exercise
 - [docs/qa/](docs/qa/): bug-hunt reports
+- [docs/spec-traceability.md](docs/spec-traceability.md): every guarantee in specs 02 and 03 mapped to its tests, with the uncovered rules listed
 - [CLAUDE.md](CLAUDE.md): working rules for contributors and agents
 
 ## Credits

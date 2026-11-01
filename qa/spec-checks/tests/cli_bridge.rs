@@ -13,16 +13,36 @@ fn b01_cli_init_header_created_at() {
     let d = tempdir();
     let p = d.path().join("c.vault");
     let st = Command::new(vault_bin())
-        .args(["--vault", p.to_str().unwrap(), "--password-env", "QA_MPW", "init", "--kdf-test-params"])
+        .args([
+            "--vault",
+            p.to_str().unwrap(),
+            "--password-env",
+            "QA_MPW",
+            "init",
+            "--kdf-test-params",
+        ])
         .env("QA_MPW", "tidy-Walrus-orbit-Velvet-42")
         .output()
         .unwrap();
-    assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+    assert!(
+        st.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st.stderr)
+    );
     let b = std::fs::read(p.join("vault.bin")).unwrap();
     let raw = split(&b);
     let ca = u64_of(get(&raw.header, "created_at").unwrap());
-    let slot_ca: Vec<u64> = get(&raw.header, "slots").unwrap().as_array().unwrap().iter().map(|s| u64_of(get(s, "created_at").unwrap())).collect();
-    assert!(ca > 1_600_000_000 && slot_ca.iter().all(|c| *c > 1_600_000_000), "header created_at={ca}, slot created_at={slot_ca:?}");
+    let slot_ca: Vec<u64> = get(&raw.header, "slots")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| u64_of(get(s, "created_at").unwrap()))
+        .collect();
+    assert!(
+        ca > 1_600_000_000 && slot_ca.iter().all(|c| *c > 1_600_000_000),
+        "header created_at={ca}, slot created_at={slot_ca:?}"
+    );
     // the independent decoder opens a CLI-made vault (spec AADs, HKDF labels, NFC)
     indep::open_file(&b, "tidy-Walrus-orbit-Velvet-42");
 }
@@ -62,17 +82,35 @@ fn b02_cli_upgrade() {
     let d = tempdir();
     let p = pkg_from_bytes(d.path(), "u.vault", &fixture("v1-basic.vault"));
     let before = std::fs::read(p.join("vault.bin")).unwrap();
-    let (rc, out) = cli(&p, "wrong horse battery staple", &["upgrade", "--allow-weak"]);
+    let (rc, out) = cli(
+        &p,
+        "wrong horse battery staple",
+        &["upgrade", "--allow-weak"],
+    );
     assert!(rc != 0 && rc != 101, "wrong password: rc={rc} {out}");
     assert!(!out.contains("wrong horse"), "password echoed");
-    assert_eq!(std::fs::read(p.join("vault.bin")).unwrap(), before, "wrong password leaves the file untouched");
+    assert_eq!(
+        std::fs::read(p.join("vault.bin")).unwrap(),
+        before,
+        "wrong password leaves the file untouched"
+    );
     let (rc, out) = cli(&p, FIXTURE_PW, &["upgrade", "--allow-weak"]);
     assert_eq!(rc, 0, "{out}");
     let after = std::fs::read(p.join("vault.bin")).unwrap();
     assert_eq!(version_of(&after), 2, "upgrade writes version 2: {out}");
-    let u = LockedVault::parse(&after).unwrap().unlock(&pw(FIXTURE_PW)).unwrap();
-    let u0 = LockedVault::parse(&before).unwrap().unlock(&pw(FIXTURE_PW)).unwrap();
-    assert_eq!(snap_vault(&u), snap_vault(&u0), "contents and ids unchanged");
+    let u = LockedVault::parse(&after)
+        .unwrap()
+        .unlock(&pw(FIXTURE_PW))
+        .unwrap();
+    let u0 = LockedVault::parse(&before)
+        .unwrap()
+        .unlock(&pw(FIXTURE_PW))
+        .unwrap();
+    assert_eq!(
+        snap_vault(&u),
+        snap_vault(&u0),
+        "contents and ids unchanged"
+    );
     let (rc, out2) = cli(&p, FIXTURE_PW, &["upgrade", "--allow-weak"]);
     assert_eq!(rc, 0, "second upgrade is a no-op, not an error: {out2}");
     assert_eq!(version_of(&std::fs::read(p.join("vault.bin")).unwrap()), 2);
@@ -85,7 +123,10 @@ fn b02_cli_upgrade() {
 #[test]
 fn b03_cli_upgrade_drops_enclave_slot() {
     let d = tempdir();
-    let mut v = LockedVault::parse(&fixture("v1-basic.vault")).unwrap().unlock(&pw(FIXTURE_PW)).unwrap();
+    let mut v = LockedVault::parse(&fixture("v1-basic.vault"))
+        .unwrap()
+        .unlock(&pw(FIXTURE_PW))
+        .unwrap();
     v.add_enclave_slot(&secrecy::SecretVec::new(vec![1; 32]), 1_800_000_000_000);
     let b = v.serialize();
     assert_eq!(version_of(&b), 1);
@@ -93,9 +134,18 @@ fn b03_cli_upgrade_drops_enclave_slot() {
     let (rc, out) = cli(&p, FIXTURE_PW, &["upgrade", "--allow-weak"]);
     assert_eq!(rc, 0, "{out}");
     let after = std::fs::read(p.join("vault.bin")).unwrap();
-    let kinds: Vec<String> = get(&split(&after).header, "slots").unwrap().as_array().unwrap().iter().map(|s| get(s, "kind").unwrap().as_text().unwrap().to_string()).collect();
+    let kinds: Vec<String> = get(&split(&after).header, "slots")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| get(s, "kind").unwrap().as_text().unwrap().to_string())
+        .collect();
     assert_eq!(kinds, vec!["password"], "enclave slot dropped");
-    assert!(out.to_lowercase().contains("touch id") || out.to_lowercase().contains("slot"), "INFO: CLI does not mention the dropped slot: {out:?}");
+    assert!(
+        out.to_lowercase().contains("touch id") || out.to_lowercase().contains("slot"),
+        "INFO: CLI does not mention the dropped slot: {out:?}"
+    );
 }
 
 /// 01 §9 + 03 §3: the CLI upgrades the file while another handle (the app) holds the v1 vault
@@ -110,11 +160,18 @@ fn b04_cli_upgrade_while_app_holds_v1() {
     let (rc, out) = cli(&p, FIXTURE_PW, &["upgrade", "--allow-weak"]);
     assert_eq!(rc, 0, "{out}");
     let id = app.vault().unwrap().items().next().unwrap().id;
-    app.edit(|v| v.update(id, now_ms(), |it| it.favorite = true)).unwrap().unwrap();
+    app.edit(|v| v.update(id, now_ms(), |it| it.favorite = true))
+        .unwrap()
+        .unwrap();
     app.save().unwrap();
     let disk = std::fs::read(p.join("vault.bin")).unwrap();
     let r = LockedVault::parse(&disk).and_then(|l| l.unlock(&pw(FIXTURE_PW)));
-    assert!(r.is_ok(), "after `vault upgrade` and an app save the file is version {} and the password fails: {:?}", version_of(&disk), r.err());
+    assert!(
+        r.is_ok(),
+        "after `vault upgrade` and an app save the file is version {} and the password fails: {:?}",
+        version_of(&disk),
+        r.err()
+    );
     let (rc, out) = cli(&p, FIXTURE_PW, &["list"]);
     assert_eq!(rc, 0, "CLI can no longer open the vault: {out}");
 }
@@ -123,13 +180,23 @@ fn section_pkg(d: &std::path::Path) -> (std::path::PathBuf, uuid::Uuid) {
     let p = d.join("sec.vault");
     let mut a = Dev::create(&p);
     let dev = a.dev;
-    let id = a
-        .s
-        .edit(move |v| {
+    let id =
+        a.s.edit(move |v| {
             let mut it = Item::new("Sectioned", dev, 100);
-            it.fields.push(Field::new("Zebrahead", FieldKind::Section, pw("SECTIONSECRETQQ"), 100));
-            it.fields.push(Field::new("username", FieldKind::Text, pw("bob"), 100));
-            it.fields.push(Field::new("password", FieldKind::Password, pw("pw-visible-on-reveal"), 100));
+            it.fields.push(Field::new(
+                "Zebrahead",
+                FieldKind::Section,
+                pw("SECTIONSECRETQQ"),
+                100,
+            ));
+            it.fields
+                .push(Field::new("username", FieldKind::Text, pw("bob"), 100));
+            it.fields.push(Field::new(
+                "password",
+                FieldKind::Password,
+                pw("pw-visible-on-reveal"),
+                100,
+            ));
             v.insert(it, 100)
         })
         .unwrap();
@@ -164,10 +231,14 @@ fn b05_section_value_never_in_cli_output() {
             leaks.push(format!("{args:?} printed the section value: {out}"));
         }
         if args[0] == "list" && args.len() == 2 && out.contains("Sectioned") {
-            leaks.push(format!("{args:?} matched the item through its section: {out}"));
+            leaks.push(format!(
+                "{args:?} matched the item through its section: {out}"
+            ));
         }
         if args.len() >= 3 && args[2] == "--reveal" && !out.contains("pw-visible-on-reveal") {
-            leaks.push(format!("{args:?}: --reveal did not reveal the password (control): {out}"));
+            leaks.push(format!(
+                "{args:?}: --reveal did not reveal the password (control): {out}"
+            ));
         }
     }
     let csv = d.path().join("e.csv");
@@ -189,14 +260,29 @@ fn b06_icon_blob_hidden_from_attach_list() {
     let p = d.path().join("ic.vault");
     let mut a = Dev::create(&p);
     let item = a.add_login("Iconic", now_ms());
-    let icon_id = a.s.add_attachment(item, "icon-blob.png", &b"\x89PNG fake"[..], 9, now_ms()).unwrap();
-    a.s.add_attachment(item, "real-doc.txt", &b"hello"[..], 5, now_ms()).unwrap();
-    a.s.edit(|v| v.update(item, now_ms(), |it| it.icon = Some(ItemIcon::new("image", icon_id.to_string())))).unwrap().unwrap();
+    let icon_id =
+        a.s.add_attachment(item, "icon-blob.png", &b"\x89PNG fake"[..], 9, now_ms())
+            .unwrap();
+    a.s.add_attachment(item, "real-doc.txt", &b"hello"[..], 5, now_ms())
+        .unwrap();
+    a.s.edit(|v| {
+        v.update(item, now_ms(), |it| {
+            it.icon = Some(ItemIcon::new("image", icon_id.to_string()))
+        })
+    })
+    .unwrap()
+    .unwrap();
     a.s.save().unwrap();
     let (rc, out) = cli(&p, PW, &["attach", "list", "Iconic"]);
     assert_eq!(rc, 0, "{out}");
-    assert!(out.contains("real-doc.txt"), "control: ordinary attachment listed: {out}");
-    assert!(!out.contains("icon-blob.png") && !out.contains(&icon_id.to_string()), "icon blob listed: {out}");
+    assert!(
+        out.contains("real-doc.txt"),
+        "control: ordinary attachment listed: {out}"
+    );
+    assert!(
+        !out.contains("icon-blob.png") && !out.contains(&icon_id.to_string()),
+        "icon blob listed: {out}"
+    );
     let (_, g) = cli(&p, PW, &["get", "Iconic"]);
     assert!(!g.contains("icon-blob.png"), "icon blob shown by get: {g}");
     if g.contains("2 attachment") {
@@ -217,7 +303,12 @@ fn b07_get_ids_match_file() {
     let v = read_vault(&p);
     for f in &v.get(id).unwrap().fields {
         if f.kind != FieldKind::Section {
-            assert!(out.contains(&f.id.to_string()), "field {} id {} missing from `get --ids`: {out}", f.name, f.id);
+            assert!(
+                out.contains(&f.id.to_string()),
+                "field {} id {} missing from `get --ids`: {out}",
+                f.name,
+                f.id
+            );
         }
     }
     let _ = v.get(id).unwrap().fields[0].value.expose_secret();
@@ -228,18 +319,39 @@ fn b07_get_ids_match_file() {
 fn b08_cli_add_sets_created_at() {
     let d = tempdir();
     let p = d.path().join("ca.vault");
-    let (rc, out) = cli(&p, "tidy-Walrus-orbit-Velvet-42", &["init", "--kdf-test-params"]);
+    let (rc, out) = cli(
+        &p,
+        "tidy-Walrus-orbit-Velvet-42",
+        &["init", "--kdf-test-params"],
+    );
     assert_eq!(rc, 0, "{out}");
     let t0 = now_ms();
-    let (rc, out) = cli(&p, "tidy-Walrus-orbit-Velvet-42", &["add", "--title", "New", "--username", "u"]);
+    let (rc, out) = cli(
+        &p,
+        "tidy-Walrus-orbit-Velvet-42",
+        &["add", "--title", "New", "--username", "u"],
+    );
     assert_eq!(rc, 0, "{out}");
-    let o = indep::open_file(&std::fs::read(p.join("vault.bin")).unwrap(), "tidy-Walrus-orbit-Velvet-42");
+    let o = indep::open_file(
+        &std::fs::read(p.join("vault.bin")).unwrap(),
+        "tidy-Walrus-orbit-Velvet-42",
+    );
     let ca = get(&o.items[0].2, "created_at").map(u64_of);
-    assert!(matches!(ca, Some(c) if c + 5_000 >= t0 && c <= now_ms() + 5_000), "created_at {ca:?} vs now {t0}");
+    assert!(
+        matches!(ca, Some(c) if c + 5_000 >= t0 && c <= now_ms() + 5_000),
+        "created_at {ca:?} vs now {t0}"
+    );
     for f in get(&o.items[0].2, "fields").unwrap().as_array().unwrap() {
-        assert_eq!(bytes_of(get(f, "id").expect("CLI-written field has an id")).len(), 16);
+        assert_eq!(
+            bytes_of(get(f, "id").expect("CLI-written field has an id")).len(),
+            16
+        );
     }
-    assert_eq!(version_of(&std::fs::read(p.join("vault.bin")).unwrap()), 2, "init writes version 2");
+    assert_eq!(
+        version_of(&std::fs::read(p.join("vault.bin")).unwrap()),
+        2,
+        "init writes version 2"
+    );
 }
 
 /// 03 §2 lock + 01 §9: `vault upgrade` racing six `vault add` processes on a v1 vault: no lost
@@ -255,7 +367,15 @@ fn b09_concurrent_upgrade_and_adds() {
             Command::new(vault_bin())
                 .arg("--vault")
                 .arg(&p)
-                .args(["--password-env", "QA_MPW", "add", "--title", &title, "--username", "u"])
+                .args([
+                    "--password-env",
+                    "QA_MPW",
+                    "add",
+                    "--title",
+                    &title,
+                    "--username",
+                    "u",
+                ])
                 .env("QA_MPW", FIXTURE_PW)
                 .env_remove("VAULT_FILE")
                 .stdout(std::process::Stdio::null())
@@ -287,9 +407,18 @@ fn b09_concurrent_upgrade_and_adds() {
     }
     let disk = std::fs::read(p.join("vault.bin")).unwrap();
     let u = LockedVault::parse(&disk).and_then(|l| l.unlock(&pw(FIXTURE_PW)));
-    assert!(u.is_ok(), "version {} does not open: {:?}; process errors {errs:?}", version_of(&disk), u.as_ref().err());
+    assert!(
+        u.is_ok(),
+        "version {} does not open: {:?}; process errors {errs:?}",
+        version_of(&disk),
+        u.as_ref().err()
+    );
     let u = u.unwrap();
     let n = u.items().filter(|i| i.title.starts_with("race")).count();
-    assert_eq!((n, version_of(&disk)), (6, 2), "items kept and version 2; process errors {errs:?}");
+    assert_eq!(
+        (n, version_of(&disk)),
+        (6, 2),
+        "items kept and version 2; process errors {errs:?}"
+    );
     assert!(errs.is_empty(), "{errs:?}");
 }

@@ -721,6 +721,56 @@ fn note_links_open_through_the_app_and_unsafe_schemes_do_nothing(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn note_reference_links_to_the_web_open_and_others_stay_plain(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering;
+    let before = crate::screens::main::notes::IMAGE_RESOLVES.load(Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let (_state, _, mut vcx) = note_item(
+        dir.path(),
+        "Full [site][Full], collapsed [coll][], shortcut [SHORT].\n\
+         Mail [me][m], logo ![pic][img], plain [nothing].\n\n\
+         [full]: https://example.org/full\n\
+         [Coll]: https://example.org/coll\n\
+         [short]: https://example.org/short\n\
+         [m]: mailto:a@b.c\n\
+         [img]: https://example.invalid/p.png",
+        cx,
+    );
+    vcx.run_until_parked();
+    for form in ["full", "coll", "short"] {
+        let selector = leak(format!("note-link https://example.org/{form}"));
+        assert!(vcx.debug_bounds(selector).is_some(), "{form} is a web link");
+    }
+    assert!(
+        vcx.debug_bounds("note-text nothing").is_none(),
+        "no stray plugin node"
+    );
+    // The mailto: reference and the image reference are plain text; nothing loads.
+    assert!(
+        vcx.debug_bounds("note-text me").is_some(),
+        "mailto stays plain"
+    );
+    assert!(
+        vcx.debug_bounds("note-text pic").is_some(),
+        "image shows alt text"
+    );
+    assert_eq!(
+        crate::screens::main::notes::IMAGE_RESOLVES.load(Ordering::SeqCst),
+        before
+    );
+    let link = vcx
+        .debug_bounds("note-link https://example.org/full")
+        .unwrap()
+        .center();
+    vcx.simulate_click(link, gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.cx.opened_url().as_deref(),
+        Some("https://example.org/full")
+    );
+}
+
+#[gpui::test]
 fn raw_html_in_a_note_is_shown_literally(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let raw = "<b>x</b><script>alert(1)</script>";

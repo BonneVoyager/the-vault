@@ -8,7 +8,10 @@ pub fn tmp_root() -> PathBuf {
 }
 
 pub fn tempdir() -> tempfile::TempDir {
-    tempfile::Builder::new().prefix("chk-").tempdir_in(tmp_root()).unwrap()
+    tempfile::Builder::new()
+        .prefix("chk-")
+        .tempdir_in(tmp_root())
+        .unwrap()
 }
 
 pub fn pw(s: &str) -> secrecy::SecretString {
@@ -16,7 +19,10 @@ pub fn pw(s: &str) -> secrecy::SecretString {
 }
 
 /// Runs `f` on a thread; returns None if it does not finish within `secs`.
-pub fn with_timeout<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+pub fn with_timeout<T: Send + 'static>(
+    secs: u64,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(f());
@@ -52,7 +58,14 @@ pub fn split(bytes: &[u8]) -> RawFile {
         Value::Array(a) => a,
         _ => panic!("body is not an array"),
     };
-    RawFile { version, header_len, header_bytes, header, body_bytes, body }
+    RawFile {
+        version,
+        header_len,
+        header_bytes,
+        header,
+        body_bytes,
+        body,
+    }
 }
 
 pub fn join(version: u16, header: &Value, body: &[Value]) -> Vec<u8> {
@@ -74,13 +87,19 @@ pub fn enc(v: &Value) -> Vec<u8> {
 
 pub fn get<'a>(m: &'a Value, k: &str) -> Option<&'a Value> {
     match m {
-        Value::Map(e) => e.iter().find(|(kk, _)| kk.as_text() == Some(k)).map(|(_, v)| v),
+        Value::Map(e) => e
+            .iter()
+            .find(|(kk, _)| kk.as_text() == Some(k))
+            .map(|(_, v)| v),
         _ => None,
     }
 }
 pub fn get_mut<'a>(m: &'a mut Value, k: &str) -> Option<&'a mut Value> {
     match m {
-        Value::Map(e) => e.iter_mut().find(|(kk, _)| kk.as_text() == Some(k)).map(|(_, v)| v),
+        Value::Map(e) => e
+            .iter_mut()
+            .find(|(kk, _)| kk.as_text() == Some(k))
+            .map(|(_, v)| v),
         _ => None,
     }
 }
@@ -105,7 +124,8 @@ pub fn is_canonical(v: &Value) -> bool {
     match v {
         Value::Map(e) => {
             let keys: Vec<Vec<u8>> = e.iter().map(|(k, _)| enc(k)).collect();
-            keys.windows(2).all(|w| w[0] < w[1]) && e.iter().all(|(k, v)| is_canonical(k) && is_canonical(v))
+            keys.windows(2).all(|w| w[0] < w[1])
+                && e.iter().all(|(k, v)| is_canonical(k) && is_canonical(v))
         }
         Value::Array(a) => a.iter().all(is_canonical),
         Value::Tag(_, b) => is_canonical(b),
@@ -123,7 +143,8 @@ pub mod indep {
         let params = argon2::Params::new(m, t, p, Some(32)).unwrap();
         let a = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
         let mut out = [0u8; 32];
-        a.hash_password_into(password_nfc.as_bytes(), salt, &mut out).unwrap();
+        a.hash_password_into(password_nfc.as_bytes(), salt, &mut out)
+            .unwrap();
         out
     }
     pub fn hkdf(vault_key: &[u8], vault_id: &[u8], info: &str) -> [u8; 32] {
@@ -134,11 +155,13 @@ pub mod indep {
     }
     pub fn open(key: &[u8], nonce: &[u8], ct: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
         let c = XChaCha20Poly1305::new_from_slice(key).unwrap();
-        c.decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad }).ok()
+        c.decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad })
+            .ok()
     }
     pub fn seal(key: &[u8], nonce: &[u8], pt: &[u8], aad: &[u8]) -> Vec<u8> {
         let c = XChaCha20Poly1305::new_from_slice(key).unwrap();
-        c.encrypt(XNonce::from_slice(nonce), Payload { msg: pt, aad }).unwrap()
+        c.encrypt(XNonce::from_slice(nonce), Payload { msg: pt, aad })
+            .unwrap()
     }
     pub fn slot_aad(version: u16, vault_id: &[u8], slot_id: &[u8], kind: &str) -> Vec<u8> {
         let mut a = b"RVLT".to_vec();
@@ -155,7 +178,12 @@ pub mod indep {
         a.extend_from_slice(&version.to_be_bytes());
         a
     }
-    pub fn manifest_aad(vault_id: &[u8], count: u32, version: u16, digest: Option<&[u8]>) -> Vec<u8> {
+    pub fn manifest_aad(
+        vault_id: &[u8],
+        count: u32,
+        version: u16,
+        digest: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut a = vault_id.to_vec();
         a.extend_from_slice(&count.to_be_bytes());
         a.extend_from_slice(&version.to_be_bytes());
@@ -169,8 +197,14 @@ pub mod indep {
         use sha2::Digest;
         let sma = get(header, "slots_modified_at")?.clone();
         let mut entries = vec![
-            (Value::Text("kdf".into()), get(header, "kdf").unwrap().clone()),
-            (Value::Text("slots".into()), get(header, "slots").unwrap().clone()),
+            (
+                Value::Text("kdf".into()),
+                get(header, "kdf").unwrap().clone(),
+            ),
+            (
+                Value::Text("slots".into()),
+                get(header, "slots").unwrap().clone(),
+            ),
             (Value::Text("slots_modified_at".into()), sma),
         ];
         if let Some(d) = get(header, "slots_device_id") {
@@ -209,8 +243,18 @@ pub mod indep {
             if get(s, "kind").unwrap().as_text() != Some("password") {
                 continue;
             }
-            let aad = slot_aad(raw.version, &vault_id, &bytes_of(get(s, "id").unwrap()), "password");
-            if let Some(k) = open(&kek, &bytes_of(get(s, "nonce").unwrap()), &bytes_of(get(s, "wrapped_key").unwrap()), &aad) {
+            let aad = slot_aad(
+                raw.version,
+                &vault_id,
+                &bytes_of(get(s, "id").unwrap()),
+                "password",
+            );
+            if let Some(k) = open(
+                &kek,
+                &bytes_of(get(s, "nonce").unwrap()),
+                &bytes_of(get(s, "wrapped_key").unwrap()),
+                &aad,
+            ) {
                 vault_key = Some(k);
                 break;
             }
@@ -225,18 +269,39 @@ pub mod indep {
             let id = bytes_of(get(r, "id").unwrap());
             let ma = u64_of(get(r, "modified_at").unwrap());
             let aad = item_aad(&vault_id, &id, ma, raw.version);
-            let pt = open(&item_key, &bytes_of(get(r, "nonce").unwrap()), &bytes_of(get(r, "ct").unwrap()), &aad)
-                .expect("01 §4: item did not open with the spec AAD and HKDF item key");
+            let pt = open(
+                &item_key,
+                &bytes_of(get(r, "nonce").unwrap()),
+                &bytes_of(get(r, "ct").unwrap()),
+                &aad,
+            )
+            .expect("01 §4: item did not open with the spec AAD and HKDF item key");
             items.push((id, ma, ciborium::from_reader(&pt[..]).unwrap()));
         }
         let m = &raw.body[n - 1];
-        assert_eq!(get(m, "t").unwrap().as_text(), Some("manifest"), "01 §4 manifest last");
+        assert_eq!(
+            get(m, "t").unwrap().as_text(),
+            Some("manifest"),
+            "01 §4 manifest last"
+        );
         let digest = header_digest(h);
         let aad = manifest_aad(&vault_id, (n - 1) as u32, raw.version, digest.as_deref());
-        let pt = open(&manifest_key, &bytes_of(get(m, "nonce").unwrap()), &bytes_of(get(m, "ct").unwrap()), &aad)
-            .expect("01 §4: manifest did not open with the spec AAD");
+        let pt = open(
+            &manifest_key,
+            &bytes_of(get(m, "nonce").unwrap()),
+            &bytes_of(get(m, "ct").unwrap()),
+            &aad,
+        )
+        .expect("01 §4: manifest did not open with the spec AAD");
         let manifest = ciborium::from_reader(&pt[..]).unwrap();
-        Opened { vault_key, item_key, manifest_key, vault_id, items, manifest }
+        Opened {
+            vault_key,
+            item_key,
+            manifest_key,
+            vault_id,
+            items,
+            manifest,
+        }
     }
 }
 
@@ -250,19 +315,59 @@ pub fn snap_item(i: &vault_core::Item) -> String {
     let mut fields: Vec<String> = i
         .fields
         .iter()
-        .map(|f| format!("{}|{}|{:?}|{:?}|{}|{}|{:?}", f.id, f.name, f.kind, f.kind_raw, f.value.expose_secret(), f.modified_at, f.section))
+        .map(|f| {
+            format!(
+                "{}|{}|{:?}|{:?}|{}|{}|{:?}",
+                f.id,
+                f.name,
+                f.kind,
+                f.kind_raw,
+                f.value.expose_secret(),
+                f.modified_at,
+                f.section
+            )
+        })
         .collect();
     fields.sort();
     let order: Vec<String> = i.fields.iter().map(|f| f.id.to_string()).collect();
-    let hist: Vec<String> = i.history.iter().map(|h| format!("{}@{}#{:?}", h.value.expose_secret(), h.replaced_at, h.field_id)).collect();
-    let mut rf: Vec<String> = i.removed_fields.iter().map(|t| format!("{}@{}", t.id, t.removed_at)).collect();
+    let hist: Vec<String> = i
+        .history
+        .iter()
+        .map(|h| {
+            format!(
+                "{}@{}#{:?}",
+                h.value.expose_secret(),
+                h.replaced_at,
+                h.field_id
+            )
+        })
+        .collect();
+    let mut rf: Vec<String> = i
+        .removed_fields
+        .iter()
+        .map(|t| format!("{}@{}", t.id, t.removed_at))
+        .collect();
     rf.sort();
     let mut tags = i.tags.clone();
     tags.sort();
-    let icon = i.icon.as_ref().map(|c| format!("{}:{}:{:?}", c.kind, c.value, c.color));
+    let icon = i
+        .icon
+        .as_ref()
+        .map(|c| format!("{}:{}:{:?}", c.kind, c.value, c.color));
     format!(
         "{}|{}|{:?}|{}|{:?}|{:?}|{:?}|rf={:?}|ca={:?}|icon={:?}|ma={}|order={}",
-        i.id, i.title, i.deleted_at, i.favorite, tags, fields, hist, rf, i.created_at, icon, i.modified_at, order.len()
+        i.id,
+        i.title,
+        i.deleted_at,
+        i.favorite,
+        tags,
+        fields,
+        hist,
+        rf,
+        i.created_at,
+        icon,
+        i.modified_at,
+        order.len()
     )
 }
 pub fn snap_vault(v: &vault_core::UnlockedVault) -> Vec<String> {
@@ -275,9 +380,19 @@ pub fn snap_content(v: &vault_core::UnlockedVault) -> Vec<String> {
     let mut s: Vec<String> = v
         .items_including_deleted()
         .map(|i| {
-            let mut f: Vec<String> = i.fields.iter().map(|f| format!("{}={}", f.name, f.value.expose_secret())).collect();
+            let mut f: Vec<String> = i
+                .fields
+                .iter()
+                .map(|f| format!("{}={}", f.name, f.value.expose_secret()))
+                .collect();
             f.sort();
-            format!("{}|{}|del={}|{:?}", i.id, i.title, i.deleted_at.is_some(), f)
+            format!(
+                "{}|{}|del={}|{:?}",
+                i.id,
+                i.title,
+                i.deleted_at.is_some(),
+                f
+            )
         })
         .collect();
     s.sort();
@@ -288,8 +403,15 @@ pub fn snap_content(v: &vault_core::UnlockedVault) -> Vec<String> {
 /// enforced on macOS, so we watch RSS by polling `ps`). Returns (stdout, status description).
 pub fn run_child(bin: &str, args: &[&str], secs: u64, max_rss_mb: u64) -> (String, String) {
     use std::process::{Command, Stdio};
-    let exe = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug").join(bin);
-    let mut c = Command::new(&exe).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let exe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/debug")
+        .join(bin);
+    let mut c = Command::new(&exe)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let start = std::time::Instant::now();
     let mut peak = 0u64;
     loop {
@@ -299,16 +421,32 @@ pub fn run_child(bin: &str, args: &[&str], secs: u64, max_rss_mb: u64) -> (Strin
             c.stdout.take().unwrap().read_to_string(&mut out).unwrap();
             let mut err = String::new();
             c.stderr.take().unwrap().read_to_string(&mut err).unwrap();
-            let status = if st.success() { format!("exit0 peak={peak}MB") } else { format!("FAIL {st} peak={peak}MB stderr={}", err.lines().take(3).collect::<Vec<_>>().join(" / ")) };
+            let status = if st.success() {
+                format!("exit0 peak={peak}MB")
+            } else {
+                format!(
+                    "FAIL {st} peak={peak}MB stderr={}",
+                    err.lines().take(3).collect::<Vec<_>>().join(" / ")
+                )
+            };
             return (out.trim().to_string(), status);
         }
-        let ps = Command::new("ps").args(["-o", "rss=", "-p", &c.id().to_string()]).output().unwrap();
-        let rss: u64 = String::from_utf8_lossy(&ps.stdout).trim().parse().unwrap_or(0);
+        let ps = Command::new("ps")
+            .args(["-o", "rss=", "-p", &c.id().to_string()])
+            .output()
+            .unwrap();
+        let rss: u64 = String::from_utf8_lossy(&ps.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
         peak = peak.max(rss / 1024);
         if peak > max_rss_mb {
             let _ = c.kill();
             let _ = c.wait();
-            return (String::new(), format!("KILLED rss {peak}MB > {max_rss_mb}MB"));
+            return (
+                String::new(),
+                format!("KILLED rss {peak}MB > {max_rss_mb}MB"),
+            );
         }
         if start.elapsed().as_secs() > secs {
             let _ = c.kill();
@@ -343,16 +481,33 @@ pub mod dev {
     impl Dev {
         pub fn create(path: &Path) -> Dev {
             let dev = uuid::Uuid::new_v4();
-            let s = SyncedVault::create(path, &pw(PW), vault_core::KdfParams::for_tests(), dev, hooks()).unwrap();
+            let s = SyncedVault::create(
+                path,
+                &pw(PW),
+                vault_core::KdfParams::for_tests(),
+                dev,
+                hooks(),
+            )
+            .unwrap();
             let rx = s.subscribe();
-            Dev { s, rx, seen: vec![], dev }
+            Dev {
+                s,
+                rx,
+                seen: vec![],
+                dev,
+            }
         }
         pub fn open(path: &Path) -> Dev {
             let dev = uuid::Uuid::new_v4();
             let mut s = SyncedVault::open(path, dev, hooks()).unwrap();
             let rx = s.subscribe();
             s.unlock(&pw(PW)).unwrap();
-            Dev { s, rx, seen: vec![], dev }
+            Dev {
+                s,
+                rx,
+                seen: vec![],
+                dev,
+            }
         }
         pub fn v(&self) -> &vault_core::UnlockedVault {
             self.s.vault().unwrap()
@@ -381,27 +536,51 @@ pub mod dev {
             self.s
                 .edit(move |v| {
                     let mut it = vault_core::Item::new(t, dev, now);
-                    it.fields.push(vault_core::Field::new("username", vault_core::FieldKind::Text, pw("u"), now));
-                    it.fields.push(vault_core::Field::new("password", vault_core::FieldKind::Password, pw("p"), now));
+                    it.fields.push(vault_core::Field::new(
+                        "username",
+                        vault_core::FieldKind::Text,
+                        pw("u"),
+                        now,
+                    ));
+                    it.fields.push(vault_core::Field::new(
+                        "password",
+                        vault_core::FieldKind::Password,
+                        pw("p"),
+                        now,
+                    ));
                     v.insert(it, now)
                 })
                 .unwrap()
         }
     }
     pub fn now_ms() -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
     pub fn mode(p: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
     pub fn ls(p: &Path) -> Vec<String> {
-        let mut v: Vec<String> = std::fs::read_dir(p).map(|r| r.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+        let mut v: Vec<String> = std::fs::read_dir(p)
+            .map(|r| {
+                r.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
         v.sort();
         v
     }
     pub fn copy_dir(from: &Path, to: &Path) {
-        let st = std::process::Command::new("cp").arg("-R").arg(from).arg(to).status().unwrap();
+        let st = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(from)
+            .arg(to)
+            .status()
+            .unwrap();
         assert!(st.success());
     }
     pub fn primary(pkg: &Path) -> PathBuf {
@@ -409,7 +588,10 @@ pub mod dev {
     }
     pub fn read_vault(pkg: &Path) -> vault_core::UnlockedVault {
         let b = std::fs::read(primary(pkg)).unwrap();
-        vault_core::LockedVault::parse(&b).unwrap().unlock(&pw(PW)).unwrap()
+        vault_core::LockedVault::parse(&b)
+            .unwrap()
+            .unlock(&pw(PW))
+            .unwrap()
     }
 }
 
@@ -429,7 +611,8 @@ pub const FIXTURE_PW: &str = "correct horse battery staple";
 pub fn canon(v: Value) -> Value {
     match v {
         Value::Map(e) => {
-            let mut e: Vec<(Value, Value)> = e.into_iter().map(|(k, v)| (canon(k), canon(v))).collect();
+            let mut e: Vec<(Value, Value)> =
+                e.into_iter().map(|(k, v)| (canon(k), canon(v))).collect();
             e.sort_by_key(|(k, _)| enc(k));
             Value::Map(e)
         }
@@ -471,7 +654,13 @@ pub fn derived_field_id(item_id: &[u8; 16], name: &str, ordinal: usize) -> uuid:
 
 /// A field map as 01 §4 describes it. `id: None` omits the key (version 1 shape).
 pub fn field_v(id: Option<[u8; 16]>, name: &str, kind: &str, value: &str, ma: u64) -> Value {
-    let mut e = vec![("name", t(name)), ("kind", t(kind)), ("value", t(value)), ("modified_at", i(ma)), ("section", Value::Null)];
+    let mut e = vec![
+        ("name", t(name)),
+        ("kind", t(kind)),
+        ("value", t(value)),
+        ("modified_at", i(ma)),
+        ("section", Value::Null),
+    ];
     if let Some(id) = id {
         e.push(("id", Value::Bytes(id.to_vec())));
     }
@@ -493,7 +682,12 @@ pub fn item_plain(title: &str, device: [u8; 16], fields: Vec<Value>) -> Value {
 
 /// Independent writer: seals items and the manifest with the spec AADs under `vault_key`, for the
 /// given header (kept byte-for-byte; the digest is recomputed from it when it is stamped).
-pub fn build_file(version: u16, header: &Value, vault_key: &[u8], items: &[([u8; 16], u64, Value)]) -> Vec<u8> {
+pub fn build_file(
+    version: u16,
+    header: &Value,
+    vault_key: &[u8],
+    items: &[([u8; 16], u64, Value)],
+) -> Vec<u8> {
     use rand::RngCore;
     let vault_id = bytes_of(get(header, "vault_id").unwrap());
     let item_key = indep::hkdf(vault_key, &vault_id, "vault/item/v1");
@@ -503,7 +697,12 @@ pub fn build_file(version: u16, header: &Value, vault_key: &[u8], items: &[([u8;
     for (id, ma, pt) in items {
         let mut nonce = [0u8; 24];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
-        let ct = indep::seal(&item_key, &nonce, &enc(&canon(pt.clone())), &indep::item_aad(&vault_id, id, *ma, version));
+        let ct = indep::seal(
+            &item_key,
+            &nonce,
+            &enc(&canon(pt.clone())),
+            &indep::item_aad(&vault_id, id, *ma, version),
+        );
         body.push(canon(map(vec![
             ("t", t("item")),
             ("id", Value::Bytes(id.to_vec())),
@@ -514,12 +713,26 @@ pub fn build_file(version: u16, header: &Value, vault_key: &[u8], items: &[([u8;
         pairs.push((*id, *ma));
     }
     pairs.sort();
-    let man = Value::Array(pairs.iter().map(|(id, ma)| Value::Array(vec![Value::Bytes(id.to_vec()), i(*ma)])).collect());
+    let man = Value::Array(
+        pairs
+            .iter()
+            .map(|(id, ma)| Value::Array(vec![Value::Bytes(id.to_vec()), i(*ma)]))
+            .collect(),
+    );
     let digest = indep::header_digest(header);
     let mut nonce = [0u8; 24];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let ct = indep::seal(&manifest_key, &nonce, &enc(&man), &indep::manifest_aad(&vault_id, items.len() as u32, version, digest.as_deref()));
-    body.push(canon(map(vec![("t", t("manifest")), ("nonce", Value::Bytes(nonce.to_vec())), ("ct", Value::Bytes(ct))])));
+    let ct = indep::seal(
+        &manifest_key,
+        &nonce,
+        &enc(&man),
+        &indep::manifest_aad(&vault_id, items.len() as u32, version, digest.as_deref()),
+    );
+    body.push(canon(map(vec![
+        ("t", t("manifest")),
+        ("nonce", Value::Bytes(nonce.to_vec())),
+        ("ct", Value::Bytes(ct)),
+    ])));
     join(version, header, &body)
 }
 
@@ -529,7 +742,12 @@ pub fn empty_base(version: u16) -> (u16, Value, Vec<u8>) {
     let b = if version == 1 {
         fixture("v1-empty.vault")
     } else {
-        vault_core::UnlockedVault::create(&pw(FIXTURE_PW), vault_core::KdfParams::for_tests(), uuid::Uuid::new_v4()).serialize()
+        vault_core::UnlockedVault::create(
+            &pw(FIXTURE_PW),
+            vault_core::KdfParams::for_tests(),
+            uuid::Uuid::new_v4(),
+        )
+        .serialize()
     };
     let raw = split(&b);
     assert_eq!(raw.version, version);

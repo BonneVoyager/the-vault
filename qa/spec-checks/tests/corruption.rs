@@ -10,7 +10,12 @@ fn sample() -> Vec<u8> {
     let mut v = UnlockedVault::create(&pw(PW), KdfParams::for_tests(), dev);
     for i in 0..3 {
         let mut it = Item::new(format!("i{i}"), dev, 10);
-        it.fields.push(Field::new("password", FieldKind::Password, pw("s3cret"), 10));
+        it.fields.push(Field::new(
+            "password",
+            FieldKind::Password,
+            pw("s3cret"),
+            10,
+        ));
         v.insert(it, 10);
     }
     v.add_enclave_slot(&secrecy::SecretVec::new(vec![3; 32]), 20);
@@ -18,10 +23,12 @@ fn sample() -> Vec<u8> {
 }
 
 fn try_open(b: Vec<u8>) -> Result<Result<Vec<String>, String>, String> {
-    std::panic::catch_unwind(move || match LockedVault::parse(&b).and_then(|l| l.unlock(&pw(PW))) {
-        Ok(u) => Ok(snap_vault(&u)),
-        Err(e) => Err(format!("{e:?}")),
-    })
+    std::panic::catch_unwind(
+        move || match LockedVault::parse(&b).and_then(|l| l.unlock(&pw(PW))) {
+            Ok(u) => Ok(snap_vault(&u)),
+            Err(e) => Err(format!("{e:?}")),
+        },
+    )
     .map_err(|_| "PANIC".to_string())
 }
 
@@ -198,7 +205,15 @@ fn c10_sweeps_on_new_fixtures() {
     let mut bad = vec![];
     for name in ["v2-basic.vault", "v1-meta.vault", "v1-icon.vault"] {
         let b = fixture(name);
-        let open = |m: Vec<u8>| std::panic::catch_unwind(move || LockedVault::parse(&m).and_then(|l| l.unlock(&pw(FIXTURE_PW))).map(|u| snap_vault(&u)).map_err(|_| ())).map_err(|_| ());
+        let open = |m: Vec<u8>| {
+            std::panic::catch_unwind(move || {
+                LockedVault::parse(&m)
+                    .and_then(|l| l.unlock(&pw(FIXTURE_PW)))
+                    .map(|u| snap_vault(&u))
+                    .map_err(|_| ())
+            })
+            .map_err(|_| ())
+        };
         let orig = open(b.clone()).unwrap().unwrap();
         for cut in 0..b.len() {
             match open(b[..cut].to_vec()) {
@@ -214,7 +229,9 @@ fn c10_sweeps_on_new_fixtures() {
             m[pos] ^= 1 << rng.gen_range(0..8);
             match open(m) {
                 Err(()) => bad.push(format!("{name} flip at {pos}: PANIC")),
-                Ok(Ok(s)) if s != orig => bad.push(format!("{name} flip at {pos}: accepted with different contents")),
+                Ok(Ok(s)) if s != orig => bad.push(format!(
+                    "{name} flip at {pos}: accepted with different contents"
+                )),
                 _ => {}
             }
         }
@@ -230,16 +247,68 @@ fn c11_hostile_v2_item_payloads() {
     let (ver, h, key) = empty_base(2);
     let fid = *Uuid::new_v4().as_bytes();
     let base = || item_plain("x", [1; 16], vec![field_v(Some(fid), "a", "text", "v", 10)]);
-    let many: Vec<Value> = (0..200_000u64).map(|k| map(vec![("id", Value::Bytes(Uuid::new_v4().as_bytes().to_vec())), ("removed_at", i(k))])).collect();
+    let many: Vec<Value> = (0..200_000u64)
+        .map(|k| {
+            map(vec![
+                ("id", Value::Bytes(Uuid::new_v4().as_bytes().to_vec())),
+                ("removed_at", i(k)),
+            ])
+        })
+        .collect();
     let cases: Vec<(&str, &str, Value)> = vec![
         ("removed_fields text", "removed_fields", t("x")),
-        ("removed_fields entry without id", "removed_fields", Value::Array(vec![map(vec![("removed_at", i(1))])])),
-        ("removed_fields id 3 bytes", "removed_fields", Value::Array(vec![map(vec![("id", Value::Bytes(vec![1, 2, 3])), ("removed_at", i(1))])])),
-        ("removed_fields removed_at text", "removed_fields", Value::Array(vec![map(vec![("id", Value::Bytes(vec![1; 16])), ("removed_at", t("1"))])])),
-        ("removed_fields 200k entries", "removed_fields", Value::Array(many)),
-        ("history field_id text", "history", Value::Array(vec![map(vec![("value", t("old")), ("replaced_at", i(5)), ("field_id", t("nope"))])])),
-        ("history field_id 15 bytes", "history", Value::Array(vec![map(vec![("value", t("old")), ("replaced_at", i(5)), ("field_id", Value::Bytes(vec![0; 15]))])])),
-        ("marker for a present field, later stamp", "removed_fields", Value::Array(vec![map(vec![("id", Value::Bytes(fid.to_vec())), ("removed_at", i(99))])])),
+        (
+            "removed_fields entry without id",
+            "removed_fields",
+            Value::Array(vec![map(vec![("removed_at", i(1))])]),
+        ),
+        (
+            "removed_fields id 3 bytes",
+            "removed_fields",
+            Value::Array(vec![map(vec![
+                ("id", Value::Bytes(vec![1, 2, 3])),
+                ("removed_at", i(1)),
+            ])]),
+        ),
+        (
+            "removed_fields removed_at text",
+            "removed_fields",
+            Value::Array(vec![map(vec![
+                ("id", Value::Bytes(vec![1; 16])),
+                ("removed_at", t("1")),
+            ])]),
+        ),
+        (
+            "removed_fields 200k entries",
+            "removed_fields",
+            Value::Array(many),
+        ),
+        (
+            "history field_id text",
+            "history",
+            Value::Array(vec![map(vec![
+                ("value", t("old")),
+                ("replaced_at", i(5)),
+                ("field_id", t("nope")),
+            ])]),
+        ),
+        (
+            "history field_id 15 bytes",
+            "history",
+            Value::Array(vec![map(vec![
+                ("value", t("old")),
+                ("replaced_at", i(5)),
+                ("field_id", Value::Bytes(vec![0; 15])),
+            ])]),
+        ),
+        (
+            "marker for a present field, later stamp",
+            "removed_fields",
+            Value::Array(vec![map(vec![
+                ("id", Value::Bytes(fid.to_vec())),
+                ("removed_at", i(99)),
+            ])]),
+        ),
     ];
     let mut report = vec![];
     for (name, k, val) in cases {
@@ -250,10 +319,16 @@ fn c11_hostile_v2_item_payloads() {
         let t0 = std::time::Instant::now();
         let r = with_timeout(30, move || {
             std::panic::catch_unwind(|| {
-                LockedVault::parse(&f).and_then(|l| l.unlock(&pw(FIXTURE_PW))).map(|u| {
-                    let it = u.get(Uuid::from_bytes(id)).unwrap();
-                    (it.removed_fields.len(), it.fields.len(), u.serialize().len())
-                })
+                LockedVault::parse(&f)
+                    .and_then(|l| l.unlock(&pw(FIXTURE_PW)))
+                    .map(|u| {
+                        let it = u.get(Uuid::from_bytes(id)).unwrap();
+                        (
+                            it.removed_fields.len(),
+                            it.fields.len(),
+                            u.serialize().len(),
+                        )
+                    })
             })
             .map_err(|_| ())
         });
@@ -261,7 +336,10 @@ fn c11_hostile_v2_item_payloads() {
         match r {
             None => report.push(format!("HANG {name}")),
             Some(Err(())) => report.push(format!("PANIC {name}")),
-            Some(Ok(res)) => eprintln!("INFO {name}: {:?} in {el:?}", res.map_err(|e| format!("{e:?}").chars().take(80).collect::<String>())),
+            Some(Ok(res)) => eprintln!(
+                "INFO {name}: {:?} in {el:?}",
+                res.map_err(|e| format!("{e:?}").chars().take(80).collect::<String>())
+            ),
         }
         if el.as_secs() > 10 {
             report.push(format!("SLOW {name}: {el:?}"));

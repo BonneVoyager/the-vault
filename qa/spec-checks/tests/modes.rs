@@ -9,7 +9,8 @@ fn m01_modes_report() {
     let pkg = d.path().join("md.vault");
     let mut a = Dev::create(&pkg);
     let item = a.add_login("x", now_ms());
-    a.s.add_attachment(item, "f", &b"abc"[..], 3, now_ms()).unwrap();
+    a.s.add_attachment(item, "f", &b"abc"[..], 3, now_ms())
+        .unwrap();
     a.s.save().unwrap();
     a.s.backup_now().unwrap();
     a.add_login("y", now_ms());
@@ -23,7 +24,11 @@ fn m01_modes_report() {
         for e in std::fs::read_dir(&p).unwrap() {
             let e = e.unwrap().path();
             let m = mode(&e);
-            lines.push(format!("{:o} {}", m, e.strip_prefix(d.path()).unwrap().display()));
+            lines.push(format!(
+                "{:o} {}",
+                m,
+                e.strip_prefix(d.path()).unwrap().display()
+            ));
             if e.is_dir() {
                 walk.push(e);
             }
@@ -31,6 +36,12 @@ fn m01_modes_report() {
     }
     lines.sort();
     eprintln!("{}", lines.join("\n"));
-    let loose: Vec<&String> = lines.iter().filter(|l| l.contains("backups/") && !l.starts_with("600") && !l.starts_with("700")).collect();
-    assert!(loose.is_empty(), "backup files readable by group/other: {loose:?}");
+    let loose: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("backups/") && !l.starts_with("600") && !l.starts_with("700"))
+        .collect();
+    assert!(
+        loose.is_empty(),
+        "backup files readable by group/other: {loose:?}"
+    );
 }

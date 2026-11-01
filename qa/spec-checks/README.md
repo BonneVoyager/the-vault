@@ -10,6 +10,7 @@ cd qa/spec-checks
 cargo build --bins                             # child-process harnesses for hostile inputs
 cargo test --no-fail-fast
 ./cli/run_all.sh                               # black-box CLI against target/debug/vault
+cargo fmt --all -- --check                     # formatting is part of the manual check set
 ```
 
 - `src/lib.rs`: an independent decoder and independent crypto (Argon2id, HKDF, XChaCha20-Poly1305 with the spec AADs), sync helpers, and a child-process runner with time and RSS limits.

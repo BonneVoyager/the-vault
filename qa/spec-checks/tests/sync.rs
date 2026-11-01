@@ -7,7 +7,11 @@ use std::path::Path;
 use vault_core::*;
 
 fn val(v: &UnlockedVault, id: uuid::Uuid, name: &str) -> Option<String> {
-    v.get(id)?.fields.iter().find(|f| f.name == name).map(|f| f.value.expose_secret().clone())
+    v.get(id)?
+        .fields
+        .iter()
+        .find(|f| f.name == name)
+        .map(|f| f.value.expose_secret().clone())
 }
 fn backups_dir(pkg: &Path) -> std::path::PathBuf {
     pkg.join("backups")
@@ -24,16 +28,26 @@ fn s01_save_layout() {
     assert!(pkg.is_dir(), "03 §1: <name>.vault is a package directory");
     let names = ls(&pkg);
     assert!(names.contains(&"vault.bin".to_string()), "{names:?}");
-    assert!(!names.iter().any(|n| n.contains(".tmp")), "tmp left behind: {names:?}");
+    assert!(
+        !names.iter().any(|n| n.contains(".tmp")),
+        "tmp left behind: {names:?}"
+    );
     assert_eq!(mode(&primary(&pkg)), 0o600, "vault.bin mode 0600");
     assert_eq!(read_vault(&pkg).items().count(), 1);
     assert!(!a.s.is_dirty());
     // nothing written as siblings of the package except the package itself
-    assert_eq!(ls(d.path()), vec!["Personal.vault".to_string()], "no sibling files (03 §1 package replaces siblings)");
+    assert_eq!(
+        ls(d.path()),
+        vec!["Personal.vault".to_string()],
+        "no sibling files (03 §1 package replaces siblings)"
+    );
     // created_at is a real time (01 §2 "created_at: u64 unix seconds")
     let raw = split(&std::fs::read(primary(&pkg)).unwrap());
     let ca = u64_of(get(&raw.header, "created_at").unwrap());
-    assert!(ca > 1_600_000_000, "header created_at = {ca}; expected unix seconds of creation");
+    assert!(
+        ca > 1_600_000_000,
+        "header created_at = {ca}; expected unix seconds of creation"
+    );
 }
 
 /// 03 §4 policy: first save after unlock snapshots; two saves within 1 s -> one backup;
@@ -47,11 +61,21 @@ fn s02_backup_policy() {
     a.s.save().unwrap();
     a.add_login("two", now_ms());
     a.s.save().unwrap();
-    let snaps: Vec<String> = ls(&backups_dir(&pkg)).into_iter().filter(|n| n.starts_with("p-")).collect();
-    assert_eq!(snaps.len(), 1, "two saves within an hour -> one snapshot: {snaps:?}");
+    let snaps: Vec<String> = ls(&backups_dir(&pkg))
+        .into_iter()
+        .filter(|n| n.starts_with("p-"))
+        .collect();
+    assert_eq!(
+        snaps.len(),
+        1,
+        "two saves within an hour -> one snapshot: {snaps:?}"
+    );
     let name = &snaps[0];
     // p-YYYY-MM-DDTHH-MM-SSZ.vault[.bin]
-    let ok = name.len() >= "p-2026-10-28T14-03-11Z.vault".len() && name.as_bytes()[12] == b'T' && name.contains('Z') && !name.contains(':');
+    let ok = name.len() >= "p-2026-10-28T14-03-11Z.vault".len()
+        && name.as_bytes()[12] == b'T'
+        && name.contains('Z')
+        && !name.contains(':');
     assert!(ok, "snapshot name {name}");
     // exact bytes: the newest snapshot equals the bytes written at that save -> must open
     let sb = std::fs::read(backups_dir(&pkg).join(name)).unwrap();
@@ -59,20 +83,44 @@ fn s02_backup_policy() {
     // item count decreased -> extra snapshot
     a.s.edit(|v| v.delete(id, now_ms())).unwrap().unwrap();
     a.s.save().unwrap();
-    let snaps2: Vec<String> = ls(&backups_dir(&pkg)).into_iter().filter(|n| n.starts_with("p-")).collect();
-    assert!(snaps2.len() >= 2, "item count decreased -> extra backup: {snaps2:?}");
+    let snaps2: Vec<String> = ls(&backups_dir(&pkg))
+        .into_iter()
+        .filter(|n| n.starts_with("p-"))
+        .collect();
+    assert!(
+        snaps2.len() >= 2,
+        "item count decreased -> extra backup: {snaps2:?}"
+    );
     // same-second names get a -N suffix; pick the newest by mtime
-    let newest = snaps2.iter().max_by_key(|n| std::fs::metadata(backups_dir(&pkg).join(n)).unwrap().modified().unwrap()).unwrap();
+    let newest = snaps2
+        .iter()
+        .max_by_key(|n| {
+            std::fs::metadata(backups_dir(&pkg).join(n))
+                .unwrap()
+                .modified()
+                .unwrap()
+        })
+        .unwrap();
     let latest = std::fs::read(backups_dir(&pkg).join(newest)).unwrap();
-    assert_eq!(latest, std::fs::read(primary(&pkg)).unwrap(), "snapshot = exact bytes just written");
+    assert_eq!(
+        latest,
+        std::fs::read(primary(&pkg)).unwrap(),
+        "snapshot = exact bytes just written"
+    );
     // first save after unlock -> snapshot
     let _ = a.s.lock();
     a.s.unlock(&pw(PW)).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
     a.add_login("three", now_ms());
     a.s.save().unwrap();
-    let snaps3: Vec<String> = ls(&backups_dir(&pkg)).into_iter().filter(|n| n.starts_with("p-")).collect();
-    assert!(snaps3.len() > snaps2.len(), "first save after unlock -> snapshot: {snaps3:?}");
+    let snaps3: Vec<String> = ls(&backups_dir(&pkg))
+        .into_iter()
+        .filter(|n| n.starts_with("p-"))
+        .collect();
+    assert!(
+        snaps3.len() > snaps2.len(),
+        "first save after unlock -> snapshot: {snaps3:?}"
+    );
     let infos = a.s.backups().unwrap();
     assert!(infos.len() >= snaps3.len());
     // backup_now
@@ -92,18 +140,32 @@ fn s03_two_handles_converge_via_watcher() {
     a.s.start_watching().unwrap();
     b.s.start_watching().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(700));
-    a.s.edit(|v| v.set_field_named(id, "username", pw("from-a"), now_ms())).unwrap().unwrap();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("from-a"), now_ms()))
+        .unwrap()
+        .unwrap();
     a.s.save().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(30));
-    b.s.edit(|v| v.set_field_named(id, "password", pw("from-b"), now_ms())).unwrap().unwrap();
+    b.s.edit(|v| v.set_field_named(id, "password", pw("from-b"), now_ms()))
+        .unwrap()
+        .unwrap();
     b.s.save().unwrap();
     let ok = a.wait_for(10, |_| false) || true;
     let _ = ok;
     a.drain();
     b.drain();
     for (n, x) in [("a", &a), ("b", &b)] {
-        assert_eq!(val(x.v(), id, "username").as_deref(), Some("from-a"), "{n} username; events {:?}", x.seen);
-        assert_eq!(val(x.v(), id, "password").as_deref(), Some("from-b"), "{n} password; events {:?}", x.seen);
+        assert_eq!(
+            val(x.v(), id, "username").as_deref(),
+            Some("from-a"),
+            "{n} username; events {:?}",
+            x.seen
+        );
+        assert_eq!(
+            val(x.v(), id, "password").as_deref(),
+            Some("from-b"),
+            "{n} password; events {:?}",
+            x.seen
+        );
     }
     let disk = read_vault(&pkg);
     assert_eq!(val(&disk, id, "username").as_deref(), Some("from-a"));
@@ -124,9 +186,15 @@ fn s04_delete_vs_edit_across_handles() {
         let mut b = Dev::open(&pkg);
         a.s.start_watching().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(700));
-        let (td, te) = if later_edit { (t0 + 1_000, t0 + 2_000) } else { (t0 + 2_000, t0 + 1_000) };
+        let (td, te) = if later_edit {
+            (t0 + 1_000, t0 + 2_000)
+        } else {
+            (t0 + 2_000, t0 + 1_000)
+        };
         a.s.edit(|v| v.delete(id, td)).unwrap().unwrap();
-        b.s.edit(|v| v.set_field_named(id, "username", pw("edited"), te)).unwrap().unwrap();
+        b.s.edit(|v| v.set_field_named(id, "username", pw("edited"), te))
+            .unwrap()
+            .unwrap();
         a.s.save().unwrap();
         b.s.save().unwrap(); // pre-write merge
         a.wait_for(4, |_| false); // A learns B's write through its watcher (03 §3)
@@ -138,7 +206,11 @@ fn s04_delete_vs_edit_across_handles() {
     }
 }
 
-fn conflict_copy_with_extra_item(pkg: &Path, dir: &Path, name: &str) -> (std::path::PathBuf, uuid::Uuid) {
+fn conflict_copy_with_extra_item(
+    pkg: &Path,
+    dir: &Path,
+    name: &str,
+) -> (std::path::PathBuf, uuid::Uuid) {
     // Make a whole-package copy (iCloud shape) that has one more item than the primary.
     let copy = dir.join(name);
     copy_dir(pkg, &copy);
@@ -152,7 +224,11 @@ fn conflict_copy_with_extra_item(pkg: &Path, dir: &Path, name: &str) -> (std::pa
 /// 03 §6 whole-package conflict copy (iCloud): absorbed, merged, moved to backups/conflict-*.
 #[test]
 fn s05_sibling_package_conflict_absorbed() {
-    for name in ["s 2.vault", "s (Mac's conflicted copy 2026-10-30).vault", "S 3.VAULT"] {
+    for name in [
+        "s 2.vault",
+        "s (Mac's conflicted copy 2026-10-30).vault",
+        "S 3.VAULT",
+    ] {
         let d = tempdir();
         let pkg = d.path().join("s.vault");
         let mut a = Dev::create(&pkg);
@@ -167,19 +243,36 @@ fn s05_sibling_package_conflict_absorbed() {
         let got = a.wait_for(10, |e| e.iter().any(|x| x.starts_with("ConflictAbsorbed")));
         assert!(got, "{name}: no ConflictAbsorbed; events {:?}", a.seen);
         assert!(a.v().get(cid).is_some(), "{name}: conflict item merged");
-        assert!(read_vault(&pkg).get(cid).is_some(), "{name}: merged result saved");
+        assert!(
+            read_vault(&pkg).get(cid).is_some(),
+            "{name}: merged result saved"
+        );
         assert!(!target.exists(), "{name}: conflict package moved away");
-        let moved: Vec<String> = ls(&backups_dir(&pkg)).into_iter().filter(|n| n.starts_with("conflict-")).collect();
+        let moved: Vec<String> = ls(&backups_dir(&pkg))
+            .into_iter()
+            .filter(|n| n.starts_with("conflict-"))
+            .collect();
         assert_eq!(moved.len(), 1, "{name}: {moved:?}");
-        assert!(moved[0].ends_with(name), "{name}: moved name keeps original: {moved:?}");
-        assert!(backups_dir(&pkg).join(&moved[0]).join("vault.bin").exists(), "never delete a conflict copy");
+        assert!(
+            moved[0].ends_with(name),
+            "{name}: moved name keeps original: {moved:?}"
+        );
+        assert!(
+            backups_dir(&pkg).join(&moved[0]).join("vault.bin").exists(),
+            "never delete a conflict copy"
+        );
     }
 }
 
 /// 03 §6 per-file conflict copy (Dropbox/Google Drive/Syncthing): `vault*.bin` inside the package.
 #[test]
 fn s06_in_package_conflict_absorbed() {
-    for name in ["vault (Mac's conflicted copy 2026-10-30).bin", "vault 2.bin", "VAULT 3.BIN", "vault (1).bin"] {
+    for name in [
+        "vault (Mac's conflicted copy 2026-10-30).bin",
+        "vault 2.bin",
+        "VAULT 3.BIN",
+        "vault (1).bin",
+    ] {
         let d = tempdir();
         let pkg = d.path().join("q.vault");
         let mut a = Dev::create(&pkg);
@@ -194,15 +287,27 @@ fn s06_in_package_conflict_absorbed() {
         let got = a.wait_for(10, |e| e.iter().any(|x| x.starts_with("ConflictAbsorbed")));
         if name == "vault (1).bin" {
             // not one of the spec'd patterns; whatever happens, the file must not be deleted
-            assert!(target.exists() || ls(&backups_dir(&pkg)).iter().any(|n| n.contains("vault (1)")), "{name} vanished");
+            assert!(
+                target.exists()
+                    || ls(&backups_dir(&pkg))
+                        .iter()
+                        .any(|n| n.contains("vault (1)")),
+                "{name} vanished"
+            );
             continue;
         }
         assert!(got, "{name}: no ConflictAbsorbed; events {:?}", a.seen);
         assert!(a.v().get(cid).is_some(), "{name}: merged");
         assert!(!target.exists(), "{name}: moved");
-        let moved: Vec<String> = ls(&backups_dir(&pkg)).into_iter().filter(|n| n.starts_with("conflict-")).collect();
+        let moved: Vec<String> = ls(&backups_dir(&pkg))
+            .into_iter()
+            .filter(|n| n.starts_with("conflict-"))
+            .collect();
         assert_eq!(moved.len(), 1, "{name}: {moved:?}");
-        assert!(moved[0].ends_with(".vault.bin"), "per-file -> conflict-<ts>-<orig>.vault.bin: {moved:?}");
+        assert!(
+            moved[0].ends_with(".vault.bin"),
+            "per-file -> conflict-<ts>-<orig>.vault.bin: {moved:?}"
+        );
     }
 }
 
@@ -229,7 +334,11 @@ fn s07_foreign_conflict_copy_untouched() {
     assert!(sib.join("vault.bin").exists(), "foreign sibling untouched");
     assert!(inpkg.exists(), "foreign in-package copy untouched");
     assert_eq!(a.v().items().count(), 1);
-    assert!(!a.seen.iter().any(|e| e.starts_with("ConflictAbsorbed")), "{:?}", a.seen);
+    assert!(
+        !a.seen.iter().any(|e| e.starts_with("ConflictAbsorbed")),
+        "{:?}",
+        a.seen
+    );
 }
 
 /// 03 §3 step 3 + §9: corrupt primary -> CorruptOnDisk, memory intact, next save rewrites valid file.
@@ -247,10 +356,15 @@ fn s08_corrupt_primary() {
     let got = a.wait_for(8, |e| e.iter().any(|x| x.contains("CorruptOnDisk")));
     assert!(got, "CorruptOnDisk; events {:?}", a.seen);
     assert!(a.v().get(id).is_some(), "in-memory intact");
-    a.s.edit(|v| v.set_field_named(id, "username", pw("after"), now_ms())).unwrap().unwrap();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("after"), now_ms()))
+        .unwrap()
+        .unwrap();
     let r = a.s.save();
     assert!(r.is_ok(), "next save rewrites a valid file: {r:?}");
-    assert_eq!(val(&read_vault(&pkg), id, "username").as_deref(), Some("after"));
+    assert_eq!(
+        val(&read_vault(&pkg), id, "username").as_deref(),
+        Some("after")
+    );
 }
 
 /// 03 §3: newer FORMAT_VERSION or foreign vault_id on disk -> save refused, in-memory kept, file untouched.
@@ -264,11 +378,17 @@ fn s09_save_blocked() {
     let mut b = std::fs::read(primary(&pkg)).unwrap();
     b[4..6].copy_from_slice(&3u16.to_be_bytes());
     std::fs::write(primary(&pkg), &b).unwrap();
-    a.s.edit(|v| v.set_field_named(id, "username", pw("blocked"), now_ms())).unwrap().unwrap();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("blocked"), now_ms()))
+        .unwrap()
+        .unwrap();
     let r = a.s.save();
     assert!(r.is_err(), "newer version on disk -> save refused");
     assert_eq!(std::fs::read(primary(&pkg)).unwrap(), b, "file untouched");
-    assert_eq!(val(a.v(), id, "username").as_deref(), Some("blocked"), "in-memory kept");
+    assert_eq!(
+        val(a.v(), id, "username").as_deref(),
+        Some("blocked"),
+        "in-memory kept"
+    );
     // foreign vault at the primary path
     let other = tempdir();
     let opkg = other.path().join("o.vault");
@@ -297,7 +417,9 @@ fn s09b_save_blocked_is_an_event() {
     b[4..6].copy_from_slice(&3u16.to_be_bytes());
     std::fs::write(primary(&pkg), &b).unwrap();
     a.wait_for(4, |_| false);
-    a.s.edit(|v| v.set_field_named(id, "username", pw("x2"), now_ms())).unwrap().unwrap();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("x2"), now_ms()))
+        .unwrap()
+        .unwrap();
     let r = a.s.save();
     a.drain();
     assert!(
@@ -331,7 +453,11 @@ fn s10_lock_with_unsaved_edits() {
             }
         }
     }
-    assert!(found, "unsaved edit preserved in a backup on lock; backups {:?}", ls(&backups_dir(&pkg)));
+    assert!(
+        found,
+        "unsaved edit preserved in a backup on lock; backups {:?}",
+        ls(&backups_dir(&pkg))
+    );
 }
 
 /// 03 §8 restore_from: snapshots current first; works when the primary no longer parses.
@@ -347,12 +473,23 @@ fn s11_restore_from() {
     a.s.save().unwrap();
     std::fs::write(primary(&pkg), b"not a vault").unwrap();
     let before: Vec<String> = ls(&backups_dir(&pkg));
-    a.s.restore_from(&snap, &pw(PW)).expect("restore works when primary does not parse");
+    a.s.restore_from(&snap, &pw(PW))
+        .expect("restore works when primary does not parse");
     let after: Vec<String> = ls(&backups_dir(&pkg));
-    assert!(after.len() > before.len(), "current snapshotted first: {before:?} -> {after:?}");
-    assert!(read_vault(&pkg).items().any(|i| i.id == id), "restored content on disk");
+    assert!(
+        after.len() > before.len(),
+        "current snapshotted first: {before:?} -> {after:?}"
+    );
+    assert!(
+        read_vault(&pkg).items().any(|i| i.id == id),
+        "restored content on disk"
+    );
     // the snapshot of the unparsable current file must preserve its bytes
-    let preserved = after.iter().filter(|n| !before.contains(n)).any(|n| std::fs::read(backups_dir(&pkg).join(n)).map(|b| b == b"not a vault").unwrap_or(false));
+    let preserved = after.iter().filter(|n| !before.contains(n)).any(|n| {
+        std::fs::read(backups_dir(&pkg).join(n))
+            .map(|b| b == b"not a vault")
+            .unwrap_or(false)
+    });
     assert!(preserved, "unparsable current preserved before restore");
     // wrong password refused
     assert!(a.s.restore_from(&snap, &pw("wrong")).is_err());
@@ -415,13 +552,29 @@ fn s14_password_change_on_other_handle_survives() {
     let mut b = Dev::open(&pkg);
     a.s.start_watching().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(700));
-    a.s.edit(|v| v.set_field_named(id, "username", pw("a-unsaved"), now_ms())).unwrap().unwrap();
-    b.s.edit(|v| v.change_password(&pw(PW), &pw("brand new pass"), KdfParams::for_tests(), now_ms())).unwrap().unwrap();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("a-unsaved"), now_ms()))
+        .unwrap()
+        .unwrap();
+    b.s.edit(|v| {
+        v.change_password(
+            &pw(PW),
+            &pw("brand new pass"),
+            KdfParams::for_tests(),
+            now_ms(),
+        )
+    })
+    .unwrap()
+    .unwrap();
     b.s.save().unwrap();
-    a.wait_for(5, |e| e.iter().any(|x| x.starts_with("Merged") || x.contains("Key")));
+    a.wait_for(5, |e| {
+        e.iter()
+            .any(|x| x.starts_with("Merged") || x.contains("Key"))
+    });
     a.s.save().unwrap();
     let l = LockedVault::parse(&std::fs::read(primary(&pkg)).unwrap()).unwrap();
-    let u = l.unlock(&pw("brand new pass")).expect("new password opens after A's save");
+    let u = l
+        .unlock(&pw("brand new pass"))
+        .expect("new password opens after A's save");
     assert_eq!(val(&u, id, "username").as_deref(), Some("a-unsaved"));
     assert!(l.unlock(&pw(PW)).is_err(), "old password no longer opens");
 }
@@ -438,11 +591,15 @@ fn s15_key_rotated_elsewhere() {
     let mut b = Dev::open(&pkg);
     a.s.start_watching().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(700));
-    b.s.edit(|v| v.rotate_vault_key(&pw(PW), now_ms())).unwrap().unwrap();
+    b.s.edit(|v| v.rotate_vault_key(&pw(PW), now_ms()))
+        .unwrap()
+        .unwrap();
     b.s.save().unwrap();
     let rotated = std::fs::read(primary(&pkg)).unwrap();
     a.wait_for(5, |e| e.iter().any(|x| x.contains("Key")));
-    a.s.edit(|v| v.set_field_named(id, "username", pw("mine"), now_ms())).unwrap().ok();
+    a.s.edit(|v| v.set_field_named(id, "username", pw("mine"), now_ms()))
+        .unwrap()
+        .ok();
     let _ = a.s.save();
     let now = std::fs::read(primary(&pkg)).unwrap();
     let u = LockedVault::parse(&now).unwrap().unlock(&pw(PW)).unwrap();
@@ -467,7 +624,9 @@ fn s15b_key_rotation_event_kind() {
     let mut b = Dev::open(&pkg);
     a.s.start_watching().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(700));
-    b.s.edit(|v| v.rotate_vault_key(&pw(PW), now_ms())).unwrap().unwrap();
+    b.s.edit(|v| v.rotate_vault_key(&pw(PW), now_ms()))
+        .unwrap()
+        .unwrap();
     b.s.save().unwrap();
     let got = a.wait_for(8, |e| e.iter().any(|x| x.contains("KeyRotatedOnDisk")));
     assert!(got, "expected KeyRotatedOnDisk; got {:?}", a.seen);
@@ -485,17 +644,35 @@ fn s15c_key_rotation_documented_two_step_flow() {
     let mut b = Dev::open(&pkg);
     a.s.start_watching().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(700));
-    b.s.edit(|v| v.rotate_vault_key(&pw(PW), now_ms())).unwrap().unwrap();
+    b.s.edit(|v| v.rotate_vault_key(&pw(PW), now_ms()))
+        .unwrap()
+        .unwrap();
     let bid = b.add_login("from-b", now_ms());
     b.s.save().unwrap();
     // 03 §8: rotation elsewhere -> KeyRotatedOnDisk at detection (was KeyMismatch before the L3 fix)
-    assert!(a.wait_for(8, |e| e.iter().any(|x| x.contains("KeyRotatedOnDisk") || x.contains("KeyMismatch"))), "{:?}", a.seen);
-    a.s.edit(|v| v.set_field_named(id, "username", pw("a-edit"), now_ms())).unwrap().unwrap();
+    assert!(
+        a.wait_for(8, |e| e.iter().any(
+            |x| x.contains("KeyRotatedOnDisk") || x.contains("KeyMismatch")
+        )),
+        "{:?}",
+        a.seen
+    );
+    a.s.edit(|v| v.set_field_named(id, "username", pw("a-edit"), now_ms()))
+        .unwrap()
+        .unwrap();
     assert!(a.s.save().is_err(), "save refused while key mismatched");
     a.s.unlock(&pw(PW)).unwrap();
     a.drain();
-    assert!(a.seen.iter().any(|x| x.contains("KeyRotatedOnDisk")), "{:?}", a.seen);
-    assert!(a.seen.iter().any(|x| x.starts_with("Merged")), "re-unlock merges on-disk items: {:?}", a.seen);
+    assert!(
+        a.seen.iter().any(|x| x.contains("KeyRotatedOnDisk")),
+        "{:?}",
+        a.seen
+    );
+    assert!(
+        a.seen.iter().any(|x| x.starts_with("Merged")),
+        "re-unlock merges on-disk items: {:?}",
+        a.seen
+    );
     assert!(a.v().get(bid).is_some());
     assert_eq!(val(a.v(), id, "username").as_deref(), Some("a-edit"));
     a.s.save().unwrap();
@@ -518,6 +695,12 @@ fn s16_echo_suppressed() {
         a.s.save().unwrap();
     }
     a.wait_for(3, |_| false);
-    assert!(!a.seen.iter().any(|e| e.starts_with("Merged") || e.contains("Corrupt") || e.contains("Error")), "{:?}", a.seen);
+    assert!(
+        !a.seen
+            .iter()
+            .any(|e| e.starts_with("Merged") || e.contains("Corrupt") || e.contains("Error")),
+        "{:?}",
+        a.seen
+    );
     assert!(!a.s.is_dirty());
 }
