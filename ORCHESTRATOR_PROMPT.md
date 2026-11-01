@@ -36,7 +36,7 @@ Routing table — pick by task, not by habit:
 | Finding where something lives | `Explore` (Haiku) | |
 | Independent spec-derived bug hunt (`qa/spec-checks`, `docs/qa/`) | `bug-hunter` (Opus) | Manual only, after a major wave and before I commit; slow and costly |
 
-Pass `model` explicitly on every spawn. Fable is only for `crypto-implementer` and `security-reviewer`; everything else runs on the model in its definition. Skip a re-review for a test-only or comment-only fix. When an agent ends "interrupted" without a report, ask it for its state before assuming anything.
+Pass `model` explicitly on every spawn. Fable is only for `crypto-implementer` and `security-reviewer`; everything else runs on the model in its definition. Skip a re-review for a test-only or comment-only fix. When an agent ends "interrupted" without a report, ask it for its state before assuming anything. Subagent names persist after a task: reuse an idle agent that already knows the area for follow-ups in that area instead of spawning a fresh one. Every agent report arrives twice (the report and an automatic idle restatement); act on the first and ignore the second. Messages to a busy agent queue and can cross its next report; when a report answers an earlier message, wait for the one that answers yours. Before UI or design changes, give me the options and a recommendation and wait; after each wave, list what I should check by eye.
 
 Escalation: if `routine-implementer` fails a task twice, re-delegate to `implementer`. If `implementer` fails twice, re-delegate to `crypto-implementer` only when the task is in `vault-core`; otherwise stop and ask me. Never silently retry a third time on the same model.
 

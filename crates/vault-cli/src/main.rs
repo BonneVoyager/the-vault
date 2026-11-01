@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+
 use vault_core::{
     CsvMapping, ExposeSecret, FORMAT_VERSION, Field, FieldKind, Item, ItemIcon, KdfParams,
     PassphraseSpec, PasswordSpec, Query, SecretString, Totp, UnlockedVault, Uuid, VaultError,
@@ -18,8 +19,39 @@ use vault_core::{
 };
 use vault_sync::{AttachmentState, NoopHooks, SyncError, SyncedVault};
 
+mod edit;
+
+/// Write to stdout/stderr like `println!`/`eprintln!`, but a closed pipe (`| grep -q`, `| head`)
+/// ends the program quietly with status 0 instead of panicking. Any other write error still
+/// panics, as the std macros do.
+fn write_or_exit(res: std::io::Result<()>, what: &str) {
+    match res {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(e) => panic!("failed printing to {what}: {e}"),
+    }
+}
+
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        write_or_exit(writeln!(std::io::stdout(), $($arg)*), "stdout")
+    }};
+}
+
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        write_or_exit(writeln!(std::io::stderr(), $($arg)*), "stderr")
+    }};
+}
+
 #[derive(Parser)]
-#[command(name = "vault", about = "Dev/debug CLI for the vault password manager")]
+#[command(
+    name = "vault",
+    about = "Dev/debug CLI for the vault password manager",
+    after_help = "Environment:\n  VAULT_FILE        vault package path (same as --vault)\n  VAULT_DEVICE_ID   use this UUID as the device id instead of the stored one"
+)]
 struct Cli {
     /// Path to the vault package directory (`<name>.vault`).
     #[arg(long, global = true, env = "VAULT_FILE")]
@@ -53,6 +85,11 @@ enum Cmd {
         #[arg(long)]
         ids: bool,
     },
+    /// Edit an item. Values given on the command line are visible in process listings (ps,
+    /// shell history); use --set-env for secrets.
+    Edit(EditArgs),
+    /// Absorb queued conflict copies, merge pending changes from disk and save if needed.
+    Sync,
     /// Upgrade the vault file to the current format version (drops non-password slots).
     Upgrade {
         /// Do not warn when the master password is under 50 bits of strength.
@@ -137,6 +174,40 @@ struct AddArgs {
     totp_field: bool,
     #[arg(long = "tag")]
     tags: Vec<String>,
+}
+
+#[derive(Args)]
+struct EditArgs {
+    /// Item id or title.
+    id_or_title: String,
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long, conflicts_with = "unfavorite")]
+    favorite: bool,
+    #[arg(long)]
+    unfavorite: bool,
+    /// Add a tag (repeatable).
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+    /// Remove a tag (repeatable).
+    #[arg(long = "untag")]
+    untags: Vec<String>,
+    /// auto, symbol:<IconName>[:#RRGGBB] or letter:#RRGGBB.
+    #[arg(long)]
+    icon: Option<String>,
+    /// Set a field value: <field-id-or-name>=<value> (repeatable). A new name creates a text
+    /// field; a name shared by several fields is refused, use the id (`vault get --ids`).
+    #[arg(long = "set", value_name = "FIELD=VALUE")]
+    sets: Vec<String>,
+    /// Like --set, but the value is read from the environment variable: <field>=<ENVVAR>.
+    #[arg(long = "set-env", value_name = "FIELD=ENVVAR")]
+    set_envs: Vec<String>,
+    /// Add a field: <kind>:<name>[=<value>]; kinds text, password, url, notes, email, section.
+    #[arg(long = "add", value_name = "KIND:NAME[=VALUE]")]
+    adds: Vec<String>,
+    /// Remove the field with this id (repeatable).
+    #[arg(long = "rm-field", value_name = "FIELD_ID")]
+    rm_fields: Vec<Uuid>,
 }
 
 #[derive(Args)]
@@ -314,6 +385,63 @@ fn field_line(item: &Item, f: &Field, reveal: bool, show_id: bool) -> String {
     line
 }
 
+/// What `vault sync` prints for the events it drained. Every line is terminal-safe: conflict
+/// copy names come from other devices and providers.
+struct SyncReport {
+    lines: Vec<String>,
+    problems: Vec<String>,
+    absorbed: usize,
+}
+
+fn sync_report(events: impl Iterator<Item = vault_sync::SyncEvent>) -> SyncReport {
+    use vault_sync::SyncEvent;
+    let mut r = SyncReport {
+        lines: Vec::new(),
+        problems: Vec::new(),
+        absorbed: 0,
+    };
+    for ev in events {
+        match ev {
+            SyncEvent::ConflictAbsorbed(p) => {
+                r.absorbed += 1;
+                r.lines.push(format!(
+                    "absorbed conflict copy -> {}",
+                    sanitize_for_terminal(&p.display().to_string())
+                ));
+            }
+            SyncEvent::Merged(m) => r.lines.push(format!(
+                "merged: {} added, {} updated, {} deleted, {} unchanged{}",
+                m.added,
+                m.updated,
+                m.deleted,
+                m.unchanged,
+                if m.header_updated {
+                    ", header updated"
+                } else {
+                    ""
+                }
+            )),
+            SyncEvent::ForeignVault => r
+                .lines
+                .push("note: a different vault sits next to this one; left alone".to_owned()),
+            SyncEvent::Error(m) => r
+                .problems
+                .push(sanitize_for_terminal(&format!("error: {m}"))),
+            SyncEvent::KeyMismatch | SyncEvent::KeyRotatedOnDisk => r
+                .problems
+                .push("the vault on disk no longer opens with this key".to_owned()),
+            SyncEvent::SaveBlocked(b) => r
+                .problems
+                .push(sanitize_for_terminal(&format!("save blocked: {b:?}"))),
+            SyncEvent::CloudUnavailable => r
+                .problems
+                .push("cloud copy not downloaded in time".to_owned()),
+            _ => {}
+        }
+    }
+    r
+}
+
 /// Hint for `list`/`get` when the vault file is older than this build writes.
 fn format_hint(v: &UnlockedVault) -> Option<&'static str> {
     (v.header().format_version < FORMAT_VERSION).then_some("Vault is format 1; run `vault upgrade`")
@@ -381,28 +509,47 @@ fn find_item(vault: &UnlockedVault, key: &str) -> Result<Uuid> {
         return Ok(id);
     }
     let lower = key.to_lowercase();
-    let hits: Vec<&Item> = vault
+    let by_title: Vec<&Item> = vault
         .items()
         .filter(|i| i.title.to_lowercase() == lower)
         .collect();
-    match hits.as_slice() {
-        [one] => Ok(one.id),
-        [] => bail!("no item matches \"{}\"", sanitize_for_terminal(key)),
-        many => {
-            let list: Vec<String> = many
-                .iter()
-                .map(|i| format!("{} {}", i.id, sanitize_for_terminal(&i.title)))
-                .collect();
-            bail!(
-                "ambiguous title \"{}\"; candidates:\n{}",
-                sanitize_for_terminal(key),
-                list.join("\n")
-            )
-        }
+    // An id prefix: at least 8 hex characters (hyphens do not count), what `list` prints.
+    let hex_shaped = lower.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+        && lower.bytes().filter(u8::is_ascii_hexdigit).count() >= 8;
+    let by_prefix: Vec<&Item> = if hex_shaped {
+        vault
+            .items()
+            .filter(|i| {
+                if lower.contains('-') {
+                    i.id.to_string().starts_with(&lower)
+                } else {
+                    i.id.simple().to_string().starts_with(&lower)
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let ids = |items: &[&Item]| {
+        items
+            .iter()
+            .map(|i| i.id.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let shown = sanitize_for_terminal(key);
+    match (by_title.as_slice(), by_prefix.as_slice()) {
+        ([t], [p]) if t.id == p.id => Ok(t.id),
+        ([], []) => bail!("no item matches \"{shown}\""),
+        ([one], []) | ([], [one]) => Ok(one.id),
+        (t, []) => bail!("ambiguous title \"{shown}\"; candidates:\n{}", ids(t)),
+        ([], p) => bail!("ambiguous id prefix \"{shown}\"; candidates:\n{}", ids(p)),
+        _ => bail!(
+            "ambiguous: \"{shown}\" matches both a title and an id prefix; pass the full UUID"
+        ),
     }
 }
 
-/// Keep `VaultError` reachable for the exit-code mapping in `main`.
 fn sync_err(e: SyncError) -> anyhow::Error {
     match e {
         SyncError::Vault(v) => v.into(),
@@ -742,6 +889,9 @@ fn run(cli: Cli) -> Result<()> {
             println!("id:    {}", item.id);
             println!("title: {}", sanitize_for_terminal(&item.title));
             println!("tags:  {}", sanitize_for_terminal(&item.tags.join(", ")));
+            if *ids {
+                println!("Device: {}", item.device_id);
+            }
             if let Some(icon) = &item.icon {
                 println!("Icon: {}", sanitize_for_terminal(&icon_summary(item, icon)));
             }
@@ -777,6 +927,75 @@ fn run(cli: Cli) -> Result<()> {
                     None => println!("{short}  {title}  [{tags}]"),
                 }
             }
+        }
+        Cmd::Edit(a) => {
+            let mut plan = edit::EditPlan {
+                title: a.title.clone(),
+                favorite: if a.favorite {
+                    Some(true)
+                } else if a.unfavorite {
+                    Some(false)
+                } else {
+                    None
+                },
+                tags_add: a.tags.clone(),
+                tags_rm: a.untags.clone(),
+                icon: a.icon.as_deref().map(edit::parse_icon).transpose()?,
+                rm_fields: a.rm_fields.clone(),
+                ..Default::default()
+            };
+            for s in &a.sets {
+                let (t, v) = edit::parse_target(s)?;
+                plan.sets.push((t, SecretString::new(v)));
+            }
+            for s in &a.set_envs {
+                let (key, var) = s
+                    .split_once('=')
+                    .context("--set-env expects <field>=<ENVVAR>")?;
+                plan.sets
+                    .push((edit::parse_field_ref(key)?, env_secret(var)?));
+            }
+            for s in &a.adds {
+                plan.adds.push(edit::parse_add(s)?);
+            }
+            if plan.is_empty() {
+                bail!("nothing to edit: pass at least one edit flag");
+            }
+            let path = vault_path(&cli)?;
+            let pw = master_password(&cli, false)?;
+            let mut sv = open_synced(&path, &pw)?;
+            let item = synced_item(&sv, &a.id_or_title)?;
+            sv.edit(|v| edit::apply(v, item, &plan, now_millis()))
+                .map_err(sync_err)??;
+            sv.save().map_err(sync_err)?;
+            println!("updated {item}");
+        }
+        Cmd::Sync => {
+            let path = vault_path(&cli)?;
+            let pw = master_password(&cli, false)?;
+            let mut sv = open_synced(&path, &pw)?;
+            let rx = sv.subscribe();
+            let run = sv.start_watching().map_err(sync_err).and_then(|()| {
+                sv.poll();
+                if sv.is_dirty() {
+                    sv.save().map_err(sync_err)?;
+                }
+                Ok(())
+            });
+            // Always stop the watcher and report what was queued, even when a step failed.
+            sv.stop_watching();
+            let report = sync_report(rx.try_iter());
+            for line in &report.lines {
+                println!("{line}");
+            }
+            for p in &report.problems {
+                eprintln!("{p}");
+            }
+            run?;
+            if !report.problems.is_empty() {
+                bail!("not converged");
+            }
+            println!("synced: {} conflict copies absorbed", report.absorbed);
         }
         Cmd::Upgrade { allow_weak } => {
             let path = vault_path(&cli)?;
@@ -838,13 +1057,6 @@ fn run(cli: Cli) -> Result<()> {
             }
             let sv = open_cli(&cli)?;
             let vault = sv.vault().context("vault is locked")?;
-            eprintln!(
-                "WARNING: writing UNENCRYPTED passwords and secrets to {}",
-                out.display()
-            );
-            eprintln!(
-                "WARNING: anyone who can read that file can read every secret. Delete it after use."
-            );
             let export = export_csv(vault);
             if *force {
                 replace_private(out, &export.0)?;
@@ -854,6 +1066,15 @@ fn run(cli: Cli) -> Result<()> {
                 f.write_all(&export.0)
                     .with_context(|| format!("writing {}", out.display()))?;
             }
+            // Warn only after the file is written: a closed stderr must not end the program
+            // before the export exists.
+            eprintln!(
+                "WARNING: writing UNENCRYPTED passwords and secrets to {}",
+                out.display()
+            );
+            eprintln!(
+                "WARNING: anyone who can read that file can read every secret. Delete it after use."
+            );
             println!("exported to {}", out.display());
         }
         Cmd::Import { format, input } => {
@@ -1176,6 +1397,75 @@ mod tests {
         assert_eq!(
             field_line(&named, &named.fields[0], false, false),
             "user: v"
+        );
+    }
+
+    #[test]
+    fn sync_report_escapes_paths_and_collects_problems() {
+        use vault_sync::SyncEvent;
+        let r = sync_report(
+            vec![
+                SyncEvent::ConflictAbsorbed(PathBuf::from("/x/conflict-\u{1b}[31mred.bin")),
+                SyncEvent::Error("bad \u{1b}[2J".to_owned()),
+                SyncEvent::KeyRotatedOnDisk,
+            ]
+            .into_iter(),
+        );
+        assert_eq!(r.absorbed, 1);
+        let all = format!("{:?}{:?}", r.lines, r.problems);
+        assert!(!all.contains('\u{1b}'), "{all}");
+        assert!(r.lines[0].contains("\\u{1b}[31mred"));
+        assert_eq!(r.problems.len(), 2);
+    }
+
+    #[test]
+    fn find_item_accepts_unambiguous_id_prefixes() {
+        let mut v = test_vault();
+        let mut a = Item::new("Alpha", Uuid::nil(), 1);
+        a.id = Uuid::parse_str("aaaaaaaa-1111-4111-8111-111111111111").unwrap();
+        let mut b = Item::new("Beta", Uuid::nil(), 1);
+        b.id = Uuid::parse_str("aaaaaaaa-2222-4222-8222-222222222222").unwrap();
+        let mut c = Item::new("Gamma", Uuid::nil(), 1);
+        c.id = Uuid::parse_str("cccccccc-3333-4333-8333-333333333333").unwrap();
+        let (a, _b, c) = (v.insert(a, 1), v.insert(b, 1), v.insert(c, 1));
+        assert_eq!(find_item(&v, "cccccccc").unwrap(), c);
+        assert_eq!(find_item(&v, "CCCCCCCC33").unwrap(), c);
+        assert_eq!(find_item(&v, "aaaaaaaa-1").unwrap(), a);
+        let e = find_item(&v, "aaaaaaaa").unwrap_err().to_string();
+        assert!(e.contains("ambiguous id prefix"), "{e}");
+        assert!(
+            find_item(&v, "cccccc").is_err(),
+            "under 8 chars is not a prefix"
+        );
+        assert!(find_item(&v, "dddddddd").is_err());
+        assert_eq!(find_item(&v, "alpha").unwrap(), a);
+    }
+
+    #[test]
+    fn find_item_title_and_prefix_collision_and_hyphen_count() {
+        let mut v = test_vault();
+        let mut a = Item::new("Alpha", Uuid::nil(), 1);
+        a.id = Uuid::parse_str("abcdef12-1111-4111-8111-111111111111").unwrap();
+        let mut b = Item::new("abcdef12", Uuid::nil(), 1);
+        b.id = Uuid::parse_str("99999999-2222-4222-8222-222222222222").unwrap();
+        let (a, _b) = (v.insert(a, 1), v.insert(b, 1));
+        let e = find_item(&v, "abcdef12").unwrap_err().to_string();
+        assert!(
+            e.contains("title and an id prefix") && e.contains("full UUID"),
+            "{e}"
+        );
+        assert_eq!(find_item(&v, &a.to_string()).unwrap(), a);
+        // Seven hex characters plus a hyphen is still too short.
+        assert!(find_item(&v, "abcdef1-").is_err());
+        assert!(find_item(&v, "abcdef1").is_err());
+        // Ambiguity lists show ids only.
+        let mut c = Item::new("Secret title", Uuid::nil(), 1);
+        c.id = Uuid::parse_str("abcdef12-3333-4333-8333-333333333333").unwrap();
+        v.insert(c, 1);
+        let e = find_item(&v, "abcdef12-").unwrap_err().to_string();
+        assert!(
+            e.contains("ambiguous id prefix") && !e.contains("Secret title"),
+            "{e}"
         );
     }
 }

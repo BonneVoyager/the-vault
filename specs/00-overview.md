@@ -81,7 +81,7 @@ Rules of dependency: `vault-core` depends on nothing in the workspace. `vault-sy
 - Round-trip test: create → add 100 items → serialize → parse → unlock → equal
 - Tamper tests: flip a byte in header, in item ciphertext, in manifest, drop an item, swap an item into another vault — all must fail with the right error
 - KDF calibration function works
-- `vault-cli`: `init`, `add`, `get`, `list`, `rm`, `totp`, `gen`, `export`, `import --format csv`
+- `vault-cli`: `init`, `add`, `get`, `list`, `rm`, `totp`, `gen`, `export`, `import --format csv`; later dev-tool additions: `attach`, `upgrade` (01 §9), `edit` (title, favorite, tags, icon, set/add/remove fields; command-line values are visible in process listings, `--set-env` for secrets) and `sync` (start the watcher, poll once, absorb conflict copies, save), both added 2026-10-31 for the sync lab; `VAULT_DEVICE_ID` overrides the stored device id for one process
 - Format fixture `tests/fixtures/v1-basic.vault` committed with its password in the test
 
 ### Phase 2 — app skeleton

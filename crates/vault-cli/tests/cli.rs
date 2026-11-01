@@ -709,3 +709,383 @@ fn upgrade_v1_fixture_then_noop() {
     );
     assert!(again.contains("already at version 2"), "{again}");
 }
+
+fn core_item(pkg: &Path, title: &str) -> vault_core::Item {
+    let mut sv = vault_sync::SyncedVault::open(
+        pkg,
+        "11111111-1111-4111-8111-111111111111".parse().unwrap(),
+        std::sync::Arc::new(vault_sync::NoopHooks),
+    )
+    .unwrap();
+    sv.unlock(&vault_core::SecretString::new(PW.to_owned()))
+        .unwrap();
+    sv.vault()
+        .unwrap()
+        .items()
+        .find(|i| i.title == title)
+        .unwrap_or_else(|| panic!("no item {title}"))
+        .clone()
+}
+
+fn field_id(get_ids: &str, label: &str, nth: usize) -> String {
+    get_ids
+        .lines()
+        .filter(|l| l.starts_with(&format!("{label}: ")))
+        .nth(nth)
+        .and_then(|l| l.rsplit_once("(id "))
+        .map(|(_, id)| id.trim_end_matches(')').to_owned())
+        .unwrap_or_else(|| panic!("no field {label} #{nth} in {get_ids}"))
+}
+
+#[test]
+fn edit_flags_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("e.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    ok(&vault(
+        &f,
+        PW,
+        &[
+            "add",
+            "--title",
+            "Site",
+            "--username",
+            "octo",
+            "--tag",
+            "dev",
+        ],
+    ));
+    assert!(!vault(&f, PW, &["edit", "Site"]).status.success());
+
+    let out = ok(&vault(
+        &f,
+        PW,
+        &[
+            "edit",
+            "Site",
+            "--title",
+            "Site2",
+            "--favorite",
+            "--tag",
+            "work",
+            "--untag",
+            "dev",
+            "--icon",
+            "symbol:key:#112233",
+            "--set",
+            "username=bob",
+            "--set",
+            "newfield=hello",
+            "--add",
+            "section:Extras",
+            "--add",
+            "text:dup=1",
+            "--add",
+            "text:dup=2",
+        ],
+    ));
+    assert!(out.starts_with("updated "), "{out}");
+    let it = core_item(&f, "Site2");
+    assert!(it.favorite);
+    assert!(it.tags.iter().any(|t| t == "work") && !it.tags.iter().any(|t| t == "dev"));
+    assert_eq!(it.icon.as_ref().unwrap().value, "key");
+    let get = ok(&vault(&f, PW, &["get", "Site2", "--ids", "--reveal"]));
+    assert!(get.contains("Icon: symbol key #112233"), "{get}");
+    assert!(
+        get.contains("username: bob") && get.contains("newfield: hello"),
+        "{get}"
+    );
+    assert!(get.lines().any(|l| l.starts_with("EXTRAS")), "{get}");
+    let section = it
+        .fields
+        .iter()
+        .find(|f| f.kind == vault_core::FieldKind::Section)
+        .unwrap();
+    assert!(vault_core::ExposeSecret::expose_secret(&section.value).is_empty());
+
+    // Ambiguous name is refused and changes nothing.
+    let bad = vault(&f, PW, &["edit", "Site2", "--title", "X", "--set", "dup=z"]);
+    assert!(!bad.status.success());
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert!(err.contains("ambiguous: 2 fields named \"dup\""), "{err}");
+    core_item(&f, "Site2");
+    // Addressing by id works, and --set-env keeps the value off the command line.
+    let id = field_id(&get, "dup", 1);
+    ok(&vault(
+        &f,
+        PW,
+        &["edit", "Site2", "--set", &format!("{id}=two")],
+    ));
+    let o = Command::new(env!("CARGO_BIN_EXE_vault"))
+        .args([
+            "--vault",
+            f.to_str().unwrap(),
+            "--password-env",
+            "VAULT_TEST_PW",
+        ])
+        .args(["edit", "Site2", "--set-env", "username=EDIT_SECRET"])
+        .env("VAULT_TEST_PW", PW)
+        .env("EDIT_SECRET", "from-env")
+        .env("VAULT_DEVICE_ID", "11111111-1111-4111-8111-111111111111")
+        .output()
+        .unwrap();
+    ok(&o);
+    let get = ok(&vault(&f, PW, &["get", "Site2", "--ids", "--reveal"]));
+    assert!(get.contains("username: from-env"), "{get}");
+    assert!(get.contains("dup: two") && get.contains("dup: 1"), "{get}");
+
+    // rm-field leaves a tombstone.
+    ok(&vault(
+        &f,
+        PW,
+        &["edit", "Site2", "--rm-field", &id, "--icon", "auto"],
+    ));
+    let it = core_item(&f, "Site2");
+    assert!(it.removed_fields.iter().any(|t| t.id.to_string() == id));
+    assert!(!it.fields.iter().any(|f| f.id.to_string() == id));
+    assert!(it.icon.is_none());
+    assert!(
+        !vault(&f, PW, &["edit", "Site2", "--rm-field", &id])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn help_documents_device_id() {
+    let o = Command::new(env!("CARGO_BIN_EXE_vault"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&o.stdout).contains("VAULT_DEVICE_ID"));
+}
+
+fn vault_dev(file: &Path, device: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_vault"))
+        .args([
+            "--vault",
+            file.to_str().unwrap(),
+            "--password-env",
+            "VAULT_TEST_PW",
+        ])
+        .args(args)
+        .env("VAULT_TEST_PW", PW)
+        .env("VAULT_DEVICE_ID", device)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn device_id_env_is_recorded_per_item() {
+    const A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("d.vault");
+    ok(&vault_dev(&f, A, &["init", "--kdf-test-params"]));
+    ok(&vault_dev(
+        &f,
+        A,
+        &["add", "--template", "note", "--title", "ByA"],
+    ));
+    ok(&vault_dev(
+        &f,
+        B,
+        &["add", "--template", "note", "--title", "ByB"],
+    ));
+    let a = ok(&vault_dev(&f, A, &["get", "ByA", "--ids"]));
+    let b = ok(&vault_dev(&f, A, &["get", "ByB", "--ids"]));
+    assert!(a.contains(&format!("Device: {A}")), "{a}");
+    assert!(b.contains(&format!("Device: {B}")), "{b}");
+    assert!(!ok(&vault_dev(&f, A, &["get", "ByA"])).contains("Device:"));
+}
+
+/// A vault with one local item, plus a second package holding one remote item, built before
+/// the local `add` so the remote copy is placed only after the last write.
+fn sync_setup(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let f = dir.join("s.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    let remote = dir.join("remote.vault");
+    std::fs::create_dir(&remote).unwrap();
+    std::fs::copy(f.join("vault.bin"), remote.join("vault.bin")).unwrap();
+    ok(&vault(
+        &remote,
+        PW,
+        &["add", "--template", "note", "--title", "Remote"],
+    ));
+    ok(&vault(
+        &f,
+        PW,
+        &["add", "--template", "note", "--title", "Local"],
+    ));
+    (f, remote)
+}
+
+fn assert_synced(f: &Path) {
+    let out = ok(&vault(f, PW, &["sync"]));
+    assert!(out.contains("1 conflict copies absorbed"), "{out}");
+    let list = ok(&vault(f, PW, &["list"]));
+    assert!(list.contains("Local") && list.contains("Remote"), "{list}");
+    let backups: Vec<String> = std::fs::read_dir(f.join("backups"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        backups
+            .iter()
+            .filter(|n| n.starts_with("conflict-"))
+            .count(),
+        1,
+        "{backups:?}"
+    );
+    let again = ok(&vault(f, PW, &["sync"]));
+    assert!(again.contains("0 conflict copies absorbed"), "{again}");
+}
+
+#[test]
+fn sync_absorbs_sibling_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let (f, remote) = sync_setup(dir.path());
+    let sibling = dir.path().join("s 2.vault");
+    std::fs::rename(&remote, &sibling).unwrap();
+    assert_synced(&f);
+    assert!(
+        !sibling.exists(),
+        "sibling package must be moved to backups"
+    );
+}
+
+#[test]
+fn sync_absorbs_in_package_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let (f, remote) = sync_setup(dir.path());
+    let copy = f.join("vault (host's conflicted copy 2026-01-01).bin");
+    std::fs::copy(remote.join("vault.bin"), &copy).unwrap();
+    // The helper's package would itself be a sibling candidate; only the in-package copy stays.
+    std::fs::remove_dir_all(&remote).unwrap();
+    assert_synced(&f);
+    assert!(!copy.exists(), "copy must be moved to backups");
+}
+
+#[test]
+fn sync_output_escapes_conflict_file_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let (f, remote) = sync_setup(dir.path());
+    let copy = f.join("vault (h\u{1b}[31most's conflicted copy 2026-01-01).bin");
+    std::fs::copy(remote.join("vault.bin"), &copy).unwrap();
+    std::fs::remove_dir_all(&remote).unwrap();
+    let o = vault(&f, PW, &["sync"]);
+    let out = ok(&o);
+    assert!(out.contains("1 conflict copies absorbed"), "{out}");
+    assert!(
+        !out.contains('\u{1b}') && out.contains("\\u{1b}"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn sync_save_failure_still_reports_events() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (f, remote) = sync_setup(dir.path());
+    let sibling = dir.path().join("s 2.vault");
+    std::fs::rename(&remote, &sibling).unwrap();
+    // A package that cannot be written: the merge happens, the save fails.
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let o = vault(&f, PW, &["sync"]);
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("error:"),
+        "drained events must be printed: {stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&o.stdout).contains("synced:"));
+}
+
+#[test]
+fn id_prefix_from_list_works_everywhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("p.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    ok(&vault(
+        &f,
+        PW,
+        &["add", "--template", "note", "--title", "Pfx"],
+    ));
+    let list = ok(&vault(&f, PW, &["list"]));
+    let prefix = list.split_whitespace().next().unwrap().to_owned();
+    assert_eq!(prefix.len(), 8, "{list}");
+    assert!(ok(&vault(&f, PW, &["get", &prefix])).contains("title: Pfx"));
+    ok(&vault(&f, PW, &["edit", &prefix, "--title", "Pfx2"]));
+    assert!(ok(&vault(&f, PW, &["attach", "list", &prefix])).is_empty());
+    ok(&vault(&f, PW, &["rm", &prefix]));
+    assert!(!vault(&f, PW, &["get", &prefix]).status.success());
+}
+
+#[test]
+fn closed_stdout_exits_quietly() {
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("b.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    ok(&vault(
+        &f,
+        PW,
+        &["add", "--template", "note", "--title", "Pipe"],
+    ));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vault"))
+        .args([
+            "--vault",
+            f.to_str().unwrap(),
+            "--password-env",
+            "VAULT_TEST_PW",
+            "list",
+        ])
+        .env("VAULT_TEST_PW", PW)
+        .env("VAULT_DEVICE_ID", "11111111-1111-4111-8111-111111111111")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Close the read end before the program has unlocked and printed anything.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{:?}", out.status);
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("panicked"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn export_survives_closed_stderr() {
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("x.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    ok(&vault(
+        &f,
+        PW,
+        &["add", "--template", "note", "--title", "Exp"],
+    ));
+    let csv = dir.path().join("out.csv");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vault"))
+        .args([
+            "--vault",
+            f.to_str().unwrap(),
+            "--password-env",
+            "VAULT_TEST_PW",
+        ])
+        .args(["export", "--yes", "--out", csv.to_str().unwrap()])
+        .env("VAULT_TEST_PW", PW)
+        .env("VAULT_DEVICE_ID", "11111111-1111-4111-8111-111111111111")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stderr.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(std::fs::read_to_string(&csv).unwrap().contains("Exp"));
+}
