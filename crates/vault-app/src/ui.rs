@@ -114,6 +114,12 @@ pub const FOOTER_HEIGHT: f32 = 44.;
 /// column is inset by it.
 pub const FOCUS_RING_WIDTH: f32 = 1.;
 
+/// ⌥ held with no other modifier: the hold-to-reveal chord (05 §2.3). ⌥ as part of a
+/// shortcut (⌘⌥S, ⇧⌥…) does not reveal.
+pub fn option_alone(m: &gpui::Modifiers) -> bool {
+    m.alt && !m.platform && !m.control && !m.shift && !m.function
+}
+
 /// Top padding of the detail column's content: level with the search field in the
 /// title-bar band, or just below the sync banners when they occupy it.
 pub fn content_top(s: &crate::state::AppState) -> f32 {

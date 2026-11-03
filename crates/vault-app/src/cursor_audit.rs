@@ -379,8 +379,8 @@ fn rule(hit: &Hit) -> Expect {
             Expect::NotPointer
         }
         // Scroll containers and lists (the gaps between rows).
-        "sidebar-sections" | "item-list" | "detail-scroll" | "editor-scroll" | "backups"
-        | "backup-list" | "backup-detail" => Expect::NotPointer,
+        "sidebar-sections" | "item-list" | "detail-scroll" | "detail-tags" | "editor-scroll"
+        | "backups" | "backup-list" | "backup-detail" => Expect::NotPointer,
         // Editor row and section backgrounds (drop targets, not click targets) and the
         // TOTP hint line.
         "edit-row" | "edit-tags" | "edit-tag-chips" | "attachments-edit" | "totp-hint" => {

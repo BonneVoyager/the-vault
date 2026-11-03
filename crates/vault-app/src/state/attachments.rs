@@ -316,10 +316,11 @@ struct ReadTarget {
 }
 
 impl AppState {
-    /// The selected item for the detail column, including while an attachment task holds
+    /// The selected item (live, or trashed while Recently Deleted shows) for the detail
+    /// column, including while an attachment task holds
     /// the vault (then a snapshot taken when it started).
     pub fn shown_item(&self) -> Option<&Item> {
-        self.selected_item().or_else(|| {
+        self.viewed_item().or_else(|| {
             let (item, _) = self.attachments.held.as_ref()?;
             (Some(item.id) == self.selection && !self.locked).then_some(item)
         })

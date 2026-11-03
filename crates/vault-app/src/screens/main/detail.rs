@@ -26,9 +26,9 @@ use super::icon_view::item_tile;
 use super::list::alert_dot;
 use super::prompts;
 use super::sync_banners;
-use crate::actions::{DETAIL_CONTEXT, DeleteItem, EditItem, ToggleFavorite};
+use crate::actions::{DETAIL_CONTEXT, DeleteItem, EditItem, RecoverItem, ToggleFavorite};
 use crate::audit::Issue;
-use crate::state::{AppState, CopyTarget, Mode, ToastPlace, parse_totp};
+use crate::state::{AppState, CopyTarget, Mode, ToastPlace, expiry_text, parse_totp};
 use crate::ui::Clickable as _;
 use crate::{text, ui};
 
@@ -36,6 +36,9 @@ use crate::{text, ui};
 const HISTORY_SHOWN: usize = 10;
 /// The code turns amber and the ring pulses under this many seconds (§2.3 "under 5 s").
 const TOTP_URGENT_SECS: u32 = 5;
+/// Height cap of the pinned tags block (about two and a half rows of small tags, so a
+/// clipped third row shows there is more to scroll).
+const TAGS_MAX_H: f32 = 64.;
 
 #[derive(Clone)]
 pub(crate) enum DetailAction {
@@ -58,7 +61,7 @@ impl DetailActions {
                 DetailAction::Copy(target) => s.copy(target, cx),
                 DetailAction::CopyHistory(stamp) => {
                     if let Some(ix) = s
-                        .selected_item()
+                        .viewed_item()
                         .and_then(|item| item.history.iter().position(|h| h.replaced_at == stamp))
                     {
                         s.copy(CopyTarget::History(ix), cx);
@@ -79,12 +82,15 @@ pub(crate) struct ReadDetail<'a> {
     pub history_open: bool,
     pub actions: DetailActions,
     pub standalone: bool,
+    /// ⌥ is held (05 §2.3 "Hold ⌥ to reveal"): masked values render revealed without
+    /// touching `revealed`. The reveal buttons keep showing the per-field toggle.
+    pub peek: bool,
 }
 
 /// True when the selected item shows a TOTP code (the view then re-renders every second).
 pub fn shows_totp(s: &AppState) -> bool {
     s.main_active()
-        && s.selected_item()
+        && s.viewed_item()
             .is_some_and(|item| item.fields.iter().any(|f| f.kind == FieldKind::Totp))
 }
 
@@ -289,12 +295,61 @@ fn issue_banner(issue: &Issue, cx: &App) -> impl IntoElement {
         )
 }
 
+/// Under a trashed item's title (pinned header): when it goes, and Delete (permanently) / Recover.
+fn trash_card(deleted_at: u64, now: u64, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let message = expiry_text(deleted_at, now);
+    ui::v_flex()
+        .debug_selector(|| "trash-card".into())
+        .gap(px(10.))
+        .px(px(12.))
+        .py(px(10.))
+        .rounded(theme.radius)
+        .bg(theme.muted)
+        .child(
+            div()
+                .text_sm()
+                .debug_selector({
+                    let message = message.clone();
+                    move || format!("trash-expiry {message}")
+                })
+                .child(message),
+        )
+        .child(
+            ui::h_flex()
+                .justify_end()
+                .gap(px(8.))
+                .child(
+                    Button::new("trash-delete")
+                        .debug_selector(|| "trash-delete".into())
+                        .small()
+                        .label("Delete")
+                        .text_color(theme.danger)
+                        .tooltip("Delete permanently  \u{2318}\u{232b}")
+                        .clickable()
+                        .on_click(|_, window, cx| window.dispatch_action(Box::new(DeleteItem), cx)),
+                )
+                .child(
+                    Button::new("trash-recover")
+                        .debug_selector(|| "trash-recover".into())
+                        .primary()
+                        .small()
+                        .label("Recover")
+                        .tooltip("Recover  \u{2318}\u{21e7}Z")
+                        .clickable()
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(RecoverItem), cx)
+                        }),
+                ),
+        )
+}
+
 pub const ONBOARDING_TITLE: &str = "Your vault is ready";
 pub const SELECT_AN_ITEM: &str = "Select an item";
 
 /// The placeholder the detail column shows when no item is open, if any.
 pub fn detail_placeholder(s: &AppState) -> Option<&'static str> {
-    if s.is_editing() || s.selected_item().is_some() {
+    if s.is_editing() || s.viewed_item().is_some() {
         None
     } else if s.onboarding_visible() {
         Some(ONBOARDING_TITLE)
@@ -365,7 +420,7 @@ fn onboarding(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
 }
 
 impl MainScreen {
-    pub(super) fn render_detail(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_detail(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         // A selection change wipes the decrypted attachment preview before anything draws.
         self.state.update(cx, |s, cx| {
             s.follow_attachment_selection(cx);
@@ -392,6 +447,11 @@ impl MainScreen {
                 history_open: s.history_open,
                 actions: DetailActions::main(self.state.clone()),
                 standalone: false,
+                // Also checked against the window's live modifiers and the focus, so a
+                // key-up that went to another dispatch path cannot leave values revealed.
+                peek: s.option_reveal
+                    && ui::option_alone(&window.modifiers())
+                    && self.focus_in_screen(window, cx),
             }
             .render_item(item, s, cx)
             .into_any_element(),
@@ -493,12 +553,7 @@ impl MainScreen {
 }
 
 impl ReadDetail<'_> {
-    pub(crate) fn render_item(
-        &self,
-        item: &Item,
-        s: &AppState,
-        cx: &App,
-    ) -> gpui::Stateful<gpui::Div> {
+    pub(crate) fn render_item(&self, item: &Item, s: &AppState, cx: &App) -> gpui::Div {
         let theme = cx.theme();
         let now = text::now_millis();
         let device = if item.device_id == s.device_id() {
@@ -510,6 +565,8 @@ impl ReadDetail<'_> {
             .fields
             .iter()
             .position(|f| f.kind == FieldKind::Password);
+        // Recently Deleted: read-only, no header buttons; Recover / Delete in a card under the title.
+        let trashed = item.is_deleted();
 
         let favorite = ui::icon_button(
             "favorite",
@@ -545,7 +602,7 @@ impl ReadDetail<'_> {
                 ),
             )
             // The buttons reach into the title-bar band: clicks there must not move the window.
-            .when(!self.standalone, |header| {
+            .when(!self.standalone && !trashed, |header| {
                 header.child(
                     ui::no_window_drag(ui::h_flex())
                         .debug_selector(|| "detail-header-buttons".into())
@@ -578,21 +635,30 @@ impl ReadDetail<'_> {
             }
         }
 
-        ui::v_flex()
-            .id("detail-scroll")
-            .size_full()
-            .overflow_y_scroll()
+        let issues = s.listing.issues(item.id);
+        let has_issues = !issues.is_empty();
+        let pad_x = px(ui::COLUMN_PAD_X - ui::FOCUS_RING_WIDTH);
+
+        // Pinned (05 §2.3 "Detail header is pinned"): the header, the trash card (if
+        // trashed), the inline delete confirm, the tags and the rule under them stay put; everything else scrolls.
+        let pinned = ui::v_flex()
+            .debug_selector(|| "detail-pinned".into())
+            .flex_none()
             .pt(px(if self.standalone {
                 16.
             } else {
                 ui::content_top(s)
             }))
-            .px(px(ui::COLUMN_PAD_X - ui::FOCUS_RING_WIDTH))
-            .pb(px(64.))
+            .px(pad_x)
             .gap(px(12.))
             .child(header)
-            // Everything below the header holds controls and can scroll up into the
-            // title-bar band; mark it so clicks there never move the window.
+            // Recently Deleted: the expiry card sits under the title, and its inline
+            // confirm (from the card's Delete) directly below it, both above the tags.
+            .children(
+                item.deleted_at
+                    .filter(|_| !self.standalone)
+                    .map(|at| ui::no_window_drag(div()).child(trash_card(at, now, cx))),
+            )
             .when(!self.standalone, |col| {
                 col.children(
                     prompts::delete(s, self.state, cx).map(|p| ui::no_window_drag(div()).child(p)),
@@ -600,28 +666,49 @@ impl ReadDetail<'_> {
             })
             .when(!item.tags.is_empty(), |col| {
                 col.child(
-                    ui::h_flex().gap(px(6.)).flex_wrap().children(
-                        item.tags
-                            .iter()
-                            .map(|t| Tag::secondary().small().child(format!("#{t}"))),
-                    ),
+                    // Capped with its own scroll: many wrapping tags must not squeeze the
+                    // fields out of a small window.
+                    ui::h_flex()
+                        .id("detail-tags")
+                        .debug_selector(|| "detail-tags".into())
+                        .max_h(px(TAGS_MAX_H))
+                        .overflow_y_scroll()
+                        .gap(px(6.))
+                        .flex_wrap()
+                        .children(
+                            item.tags
+                                .iter()
+                                .map(|t| Tag::secondary().small().child(format!("#{t}"))),
+                        ),
                 )
             })
+            .child(ui::divider(cx).debug_selector(|| "detail-fields-rule".into()));
+
+        // The rows sit under the pinned rule exactly as each row sits under the one
+        // above: only their own `FIELD_ROW_PAD_Y` top padding, so the scroll area has no
+        // top padding. Warning cards come first when present; the rows then get a rule
+        // of their own above them, as before the header was pinned. Every field row
+        // (and the history disclosure) draws its own bottom border, so the last row's
+        // border already closes the group above the footer. Only the no-fields message
+        // needs a closing rule of its own.
+        let scroll = ui::v_flex()
+            .id("detail-scroll")
+            .debug_selector(|| "detail-scroll".into())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px(pad_x)
+            .pb(px(64.))
+            .gap(px(12.))
+            .when(has_issues, |col| col.pt(px(12.)))
             .children(
-                s.listing
-                    .issues(item.id)
+                issues
                     .iter()
                     .map(|issue| ui::no_window_drag(div()).child(issue_banner(issue, cx))),
             )
-            // The rule and the rows form one group without the column's gap, so the
-            // first row sits under the rule exactly as each row sits under the one above:
-            // only its own `FIELD_ROW_PAD_Y` top padding. Every field row (and the history
-            // disclosure) draws its own bottom border, so the last row's border already
-            // closes the group above the footer. Only the no-fields message needs a rule
-            // of its own.
             .child(
                 ui::v_flex()
-                    .child(ui::divider(cx).debug_selector(|| "detail-fields-rule".into()))
+                    .when(has_issues, |col| col.child(ui::divider(cx)))
                     .when(item.fields.is_empty(), |col| {
                         col.child(ui::muted("This item has no fields.", cx).py(px(FIELD_ROW_PAD_Y)))
                             .child(ui::divider(cx))
@@ -629,7 +716,7 @@ impl ReadDetail<'_> {
                     .child(ui::no_window_drag(ui::v_flex()).children(fields)),
             )
             .children(
-                (if self.standalone {
+                (if self.standalone || trashed {
                     attachments::reference_section(s, item, cx)
                 } else {
                     attachments::section(s, self.state, item, false, cx)
@@ -639,7 +726,11 @@ impl ReadDetail<'_> {
             .child(
                 ui::muted(footer_text(item, now, &device), cx)
                     .debug_selector(|| "detail-footer".into()),
-            )
+            );
+
+        // No id: the scroll area keeps the element path it had before the header was
+        // pinned (scroll state, cursor audit names).
+        ui::v_flex().size_full().child(pinned).child(scroll)
     }
 
     fn render_field(
@@ -655,6 +746,7 @@ impl ReadDetail<'_> {
         }
         let theme = cx.theme();
         let revealed = self.revealed.contains(&field.id);
+        let shown_plain = revealed || self.peek;
         let value = field.value.expose_secret();
         let card_number = crate::listing::is_card_number(item, field);
         // Extra buttons before the copy button, which every field gets.
@@ -677,7 +769,7 @@ impl ReadDetail<'_> {
                     reveal_button(ix, field.id, revealed, "card number", &self.actions)
                         .into_any_element(),
                 );
-                if revealed {
+                if shown_plain {
                     mono(value.to_string(), cx).into_any_element()
                 } else {
                     mono(text::mask_card(value), cx).into_any_element()
@@ -694,8 +786,10 @@ impl ReadDetail<'_> {
                 buttons.push(
                     reveal_button(ix, field.id, revealed, what, &self.actions).into_any_element(),
                 );
-                if revealed {
-                    mono(value.to_string(), cx).into_any_element()
+                if shown_plain {
+                    mono(value.to_string(), cx)
+                        .debug_selector(move || format!("field-plain {ix}"))
+                        .into_any_element()
                 } else {
                     mono(text::DOTS, cx)
                         .debug_selector(move || format!("field-masked {ix}"))

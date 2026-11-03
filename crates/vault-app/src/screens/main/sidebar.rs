@@ -154,6 +154,18 @@ impl MainScreen {
                         pick(Filter::Favorites),
                         cx,
                     ))
+                    // Hidden while the trash is empty (05 §2.3).
+                    .when(counts.deleted > 0, |col| {
+                        col.child(nav_row(
+                            "nav-deleted",
+                            IconName::Trash,
+                            "Recently Deleted",
+                            Some(counts.deleted),
+                            filter == Filter::RecentlyDeleted,
+                            pick(Filter::RecentlyDeleted),
+                            cx,
+                        ))
+                    })
                     .child(ui::divider(cx).my(px(6.)))
                     .child(nav_row(
                         "nav-tags",

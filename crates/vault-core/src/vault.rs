@@ -68,6 +68,13 @@ fn unknown_item(id: Uuid) -> VaultError {
     VaultError::Malformed(format!("unknown item {id}"))
 }
 
+/// The error for `recover` / `delete_permanently` on an item that is not a tombstone. Same
+/// reasoning as [`unknown_item`]: a caller-side precondition, reported as `Malformed` with a
+/// distinct message (02 "Recently Deleted" asks for an error, not a variant).
+fn not_deleted(id: Uuid) -> VaultError {
+    VaultError::Malformed(format!("item {id} is not deleted"))
+}
+
 /// The error for an item/manifest AEAD tag failure during unlock. `wrong_key` is true only on
 /// the `unlock_with_key` path (feature `sync`) while no record has authenticated yet, in which
 /// case the failure is reported as the wrong vault key rather than tampering.
@@ -891,8 +898,21 @@ impl UnlockedVault {
     /// (see [`stamp`]), `device_id = self.device_id`. The floor matters: a `deleted_at` behind
     /// the item's own `modified_at` would lose the merge tombstone rule
     /// (`deleted_at >= other.modified_at`) to any peer's untouched copy and silently undo the
-    /// delete under clock skew. Fields and history are left in place (01 §4 only says they
-    /// *may* be empty). Deleting a tombstone again moves `deleted_at` forward.
+    /// delete under clock skew.
+    ///
+    /// The whole item stays under the tombstone (02 "Recently Deleted", 2026-11-03): fields,
+    /// history, attachment references, extras and the removal markers are all kept, so the
+    /// item can be [`UnlockedVault::recover`]ed from the trash. Content leaves the file only
+    /// through [`UnlockedVault::delete_permanently`] / [`UnlockedVault::expire_deleted`]
+    /// (strip) or [`UnlockedVault::purge_tombstones_older_than`] (drop the record).
+    ///
+    /// Deleting a tombstone that still has content again moves `deleted_at` forward, as
+    /// before. Deleting a **stripped** tombstone ([`Item::has_content`] false) is a no-op
+    /// that returns `Ok(())` without restamping: moving its `deleted_at` forward would
+    /// re-arm the one-tombstone merge rule against a peer that has since recovered the item
+    /// (A recovers at t, B still holds the empty shell and deletes it at t' > t: the shell
+    /// would win and the recovered content would be lost on both sides). There is nothing
+    /// in the shell to delete, so nothing is lost by leaving it alone.
     ///
     /// # Errors
     ///
@@ -900,10 +920,104 @@ impl UnlockedVault {
     pub fn delete(&mut self, id: Uuid, now: Millis) -> Result<(), VaultError> {
         let device_id = self.device_id;
         let item = self.items.get_mut(&id).ok_or_else(|| unknown_item(id))?;
+        if item.is_deleted() && !item.has_content() {
+            return Ok(());
+        }
         let at = stamp(now, item.modified_at);
         item.deleted_at = Some(at);
         restamp(item, at, device_id);
         Ok(())
+    }
+
+    /// Take an item back out of the trash (02 "Recently Deleted"): clear `deleted_at` on a
+    /// tombstone that still has content ([`Item::has_content`]) and restamp it like every
+    /// other mutation (`modified_at = stamp(now, previous)`, `device_id = self.device_id`).
+    /// The restamp is what makes the recovery stick: the live item's `modified_at` is now
+    /// strictly past the tombstone's `deleted_at`, so a peer still holding the tombstone
+    /// loses the one-tombstone merge rule (03 §5: an edit after the delete resurrects).
+    /// Everything under the tombstone (fields, history, attachments, markers, extras) comes
+    /// back untouched.
+    ///
+    /// # Errors
+    ///
+    /// `Malformed("unknown item ..")` if `id` is not in the vault; `Malformed("item .. is not
+    /// deleted")` if it is live; `Malformed("item .. has no content")` if it is a stripped
+    /// tombstone (nothing left to recover, and resurrecting an empty shell would only race
+    /// the strip that is propagating). All three reuse `Malformed`, like every other
+    /// precondition failure on a mutation (`unknown_item`, duplicate attachment, last slot):
+    /// 01 §7 has no variant for a caller-side precondition and the messages are distinct.
+    pub fn recover(&mut self, id: Uuid, now: Millis) -> Result<(), VaultError> {
+        let device_id = self.device_id;
+        let item = self.items.get_mut(&id).ok_or_else(|| unknown_item(id))?;
+        if !item.is_deleted() {
+            return Err(not_deleted(id));
+        }
+        if !item.has_content() {
+            return Err(VaultError::Malformed(format!("item {id} has no content")));
+        }
+        item.deleted_at = None;
+        restamp(item, stamp(now, item.modified_at), device_id);
+        Ok(())
+    }
+
+    /// Strip a tombstone (02 "Recently Deleted"): empty `fields`, `history`, `attachments`,
+    /// `removed_fields`, `removed_attachments`, `removed_history` and `extras`, keep `id`,
+    /// `title`, `tags`, `favorite`, `icon`, `created_at`, `deleted_at` and the per-attribute
+    /// stamps, and restamp (`modified_at = stamp(now, previous)`, `device_id =
+    /// self.device_id`). The restamp is what propagates the strip: both sides are tombstones,
+    /// so the merge takes the whole item with the greater `(modified_at, device_id)` (03 §5),
+    /// and the stripped copy is strictly newer than the content copy it was made from. The
+    /// record's unknown plaintext extras (`record_extras`) are dropped too, as
+    /// [`UnlockedVault::purge_tombstones_older_than`] does: they belonged to the content
+    /// record, not the shell. Secrets are dropped in place through their zeroizing types,
+    /// never copied. Stripping an already stripped tombstone is allowed and only restamps.
+    ///
+    /// The result is what every tombstone was before 2026-11-03; the format is unchanged
+    /// (01 §4: fields may be empty on a tombstone).
+    ///
+    /// # Errors
+    ///
+    /// `Malformed("unknown item ..")` if `id` is not in the vault; `Malformed("item .. is not
+    /// deleted")` if it is live (delete first; stripping a live item would be a silent data
+    /// loss path). See [`UnlockedVault::recover`] for why `Malformed`.
+    pub fn delete_permanently(&mut self, id: Uuid, now: Millis) -> Result<(), VaultError> {
+        let device_id = self.device_id;
+        let item = self.items.get_mut(&id).ok_or_else(|| unknown_item(id))?;
+        if !item.is_deleted() {
+            return Err(not_deleted(id));
+        }
+        strip_tombstone(item, now, device_id);
+        self.record_extras.remove(&id);
+        Ok(())
+    }
+
+    /// Strip ([`UnlockedVault::delete_permanently`]) every tombstone that still has content
+    /// and whose `deleted_at < cutoff` (strictly older), restamping each with `now`, and
+    /// return how many were stripped. Idempotent: a second call with the same `cutoff` finds
+    /// no content and returns 0 (a stripped tombstone is never restamped again by this). The
+    /// retention window is the caller's: the app passes `now - 30 days`. Live items and
+    /// tombstones inside the window are untouched. Does not drop records; that stays
+    /// [`UnlockedVault::purge_tombstones_older_than`].
+    pub fn expire_deleted(&mut self, cutoff: Millis, now: Millis) -> usize {
+        let device_id = self.device_id;
+        let mut count = 0;
+        for (id, item) in &mut self.items {
+            if matches!(item.deleted_at, Some(d) if d < cutoff) && item.has_content() {
+                strip_tombstone(item, now, device_id);
+                self.record_extras.remove(id);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// The Recently Deleted list: tombstones that still have content
+    /// ([`Item::has_content`]), in id order. Stripped tombstones are not listed (there is
+    /// nothing to recover); live items never are.
+    pub fn deleted_items(&self) -> impl Iterator<Item = &Item> {
+        self.items
+            .values()
+            .filter(|i| i.is_deleted() && i.has_content())
     }
 
     /// Append an attachment reference to an item (01 §4, v1.1) and restamp the item like any
@@ -1400,6 +1514,23 @@ fn reconcile_field_tombstones(item: &mut Item, now: Millis) {
     }
     let live: BTreeSet<Uuid> = item.fields.iter().map(|f| f.id).collect();
     item.removed_fields.retain(|t| !live.contains(&t.id));
+}
+
+/// Empty the seven content lists of a tombstone and restamp it (02 "Recently Deleted";
+/// see [`UnlockedVault::delete_permanently`]). Each list is replaced by an empty `Vec` so the
+/// old one, with every `SecretString` inside, is dropped (and zeroized) here rather than
+/// cleared in place and kept allocated. Everything else on the item is untouched; `restamp`
+/// then keeps `deleted_at` and the attribute stamps under the new `modified_at` as usual.
+fn strip_tombstone(item: &mut Item, now: Millis, device_id: Uuid) {
+    debug_assert!(item.is_deleted());
+    item.fields = Vec::new();
+    item.history = Vec::new();
+    item.attachments = Vec::new();
+    item.removed_fields = Vec::new();
+    item.removed_attachments = Vec::new();
+    item.removed_history = Vec::new();
+    item.extras = Vec::new();
+    restamp(item, stamp(now, item.modified_at), device_id);
 }
 
 /// The timestamp a local mutation gets: `max(now, previous + 1)`. Every mutation therefore

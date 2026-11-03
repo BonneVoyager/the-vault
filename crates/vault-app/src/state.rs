@@ -36,6 +36,7 @@ mod session;
 mod sync;
 mod touch_id;
 mod transfer;
+mod trash;
 mod viewer;
 
 pub use attachments::{
@@ -53,6 +54,7 @@ pub use security::{SECURITY_TAB, SecurityForm, SecurityUi};
 pub use session::{CopyTarget, FocusTarget, parse_totp};
 pub use sync::{RestorePrompt, SYNC_TAB, SyncUi, TRANSFER_TAB};
 pub use touch_id::{TouchAuto, TouchDenied, TouchIdPolicy, TouchUi};
+pub use trash::{DELETE_RECOVERABLE, NO_DELETED_ITEMS, PURGE_CONFIRM, TRASH_INFO, expiry_text};
 
 /// Target duration of one KDF derivation on this Mac (01 §6).
 const KDF_TARGET: Duration = Duration::from_millis(500);
@@ -147,6 +149,8 @@ pub enum Filter {
     #[default]
     All,
     Favorites,
+    /// Trashed items that can still be recovered (05 §2.3 "Recently Deleted").
+    RecentlyDeleted,
     Tag(String),
 }
 
@@ -350,6 +354,10 @@ pub struct AppState {
     pub listing_version: u64,
     /// Field ids of the selected item whose values are revealed.
     pub revealed: HashSet<Uuid>,
+    /// ⌥ alone is held in the main window (05 §2.3 "Hold ⌥ to reveal"): the read-mode
+    /// detail shows every masked value. Transient; cleared on lock, selection change and
+    /// window deactivation so a missed key-up cannot leave secrets on screen.
+    pub option_reveal: bool,
     /// Password history disclosure of the selected item.
     pub history_open: bool,
     /// Bumped on every sidebar toggle; keys its slide. Visibility itself is
@@ -469,6 +477,7 @@ impl AppState {
             counts: Counts::default(),
             listing_version: 0,
             revealed: HashSet::new(),
+            option_reveal: false,
             history_open: false,
             sidebar_toggles: 0,
             tags_open: true,
@@ -741,21 +750,21 @@ impl AppState {
         }
         self.close_vault(cx);
         let (device_id, task_path) = (self.device_id, path.clone());
-        self.run_bg(
+        self.run_bg_cx(
             Busy::Calibrating,
             cx,
             move || {
                 let kdf = KdfParams::calibrate(KDF_TARGET);
                 SyncedVault::create(&task_path, &password, kdf, device_id, cloud::hooks())
             },
-            move |this, result, outcome| match result {
+            move |this, result, outcome, cx| match result {
                 Ok(mut vault) => {
                     // The file exists now whatever the user did meanwhile.
                     this.remember(&path);
                     match outcome {
                         Outcome::Fresh => {
                             this.install(vault, false);
-                            this.unlocked();
+                            this.unlocked_cx(cx);
                             this.password_unlocked(true);
                             this.show_onboarding = true;
                         }
@@ -788,7 +797,7 @@ impl AppState {
         let stale = self.stale_enrollment();
         let bio = self.biometrics.clone();
         let (device_id, hooks) = (self.device_id, cloud::hooks());
-        self.run_bg(
+        self.run_bg_cx(
             Busy::Unlocking,
             cx,
             move || {
@@ -806,12 +815,12 @@ impl AppState {
                 };
                 (vault, result, cleaned, upgraded)
             },
-            |this, (mut vault, result, cleaned, upgraded), outcome| match (outcome, result) {
+            |this, (mut vault, result, cleaned, upgraded), outcome, cx| match (outcome, result) {
                 // The user switched or closed the vault meanwhile; dropping zeroizes it.
                 (Outcome::Closed, _) => this.report_lock(None, &vault.lock()),
                 (Outcome::Fresh, Ok(())) => {
                     this.vault = Some(vault);
-                    this.unlocked();
+                    this.unlocked_cx(cx);
                     this.password_unlocked(true);
                     this.stale_cleaned(cleaned);
                     this.format_upgraded(upgraded);
@@ -919,16 +928,29 @@ impl AppState {
         .detach();
     }
 
-    fn unlocked(&mut self) {
+    /// [`Self::unlocked`] from a context that can schedule work: content the unlock sweep
+    /// stripped is written by the next autosave, not left on disk until the next edit.
+    fn unlocked_cx(&mut self, cx: &mut Context<Self>) {
+        if self.unlocked() > 0 {
+            self.schedule_autosave(cx);
+        }
+    }
+
+    /// Shows the unlocked vault. Returns how many trashed items the sweep stripped (the
+    /// vault is then dirty; [`Self::unlocked_cx`] schedules their save).
+    fn unlocked(&mut self) -> usize {
         self.apply_backup_settings();
         self.sync.save_failing = false;
         self.locked = false;
         self.error = None;
+        // Items past the 30 days go before anything shows them (05 §2.3).
+        let stripped = self.expire_trash();
         self.vault_changed();
         self.screen = Screen::Main;
         self.unlock_failures = 0;
         self.unlock_count = self.unlock_count.wrapping_add(1);
         self.touch_activity();
+        stripped
     }
 
     /// Save if dirty, lock, clear selection and edit buffer, show the unlock screen.
@@ -948,6 +970,9 @@ impl AppState {
         // Image icons added by an unsaved edit lose their references before the save.
         self.abandon_icon_adds(cx);
         self.clear_icon_images(cx);
+        if self.vault.as_ref().is_some_and(SyncedVault::is_dirty) {
+            self.expire_trash();
+        }
         let saved = match self.vault.as_mut() {
             Some(vault) if vault.is_dirty() => Some(vault.save()),
             _ => None,

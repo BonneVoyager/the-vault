@@ -6,7 +6,7 @@ A native macOS password manager in Rust: no webview, local-first, and one encryp
 
 ## Status
 
-**Vault is an AI-assisted research project. It has not undergone a rigorous security audit or received compliance certification. Do not use it to store high-value secrets.**
+**Vault is an AI-assisted experimental project. It has not undergone a rigorous security audit or received compliance certification. Do not use it to store high-value secrets.**
 
 Pre-release and not yet signed or notarized. It is built and reviewed by an agent pipeline and tested by the owner on macOS.
 

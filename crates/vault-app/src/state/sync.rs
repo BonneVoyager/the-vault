@@ -130,6 +130,12 @@ impl AppState {
         if !vault.is_dirty() {
             return;
         }
+        // The sweep runs before every write, so content past its 30 days (or brought back
+        // by a merge) never reaches disk.
+        self.expire_trash();
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
         let result = vault.save();
         self.autosave_finished(result, cx);
     }

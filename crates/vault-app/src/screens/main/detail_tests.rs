@@ -888,3 +888,209 @@ fn note_lines_lists_and_paragraphs_keep_their_shape(cx: &mut TestAppContext) {
     let fenced_crlf = height("```\r\nPIN 1234\r\nDoor 5678\r\n```", cx);
     assert_eq!(fenced_crlf, fenced, "a CRLF fence renders like an LF one");
 }
+
+fn hold(mods: gpui::Modifiers, vcx: &mut VisualTestContext) {
+    vcx.simulate_modifiers_change(mods);
+    vcx.run_until_parked();
+}
+
+fn option() -> gpui::Modifiers {
+    gpui::Modifiers {
+        alt: true,
+        ..Default::default()
+    }
+}
+
+/// 05 §2.3 "Hold ⌥ to reveal": ⌥ alone shows the masked password, release masks it
+/// again, and the per-field reveal set is never touched.
+#[gpui::test]
+fn holding_option_reveals_masked_values_until_release(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open(dir.path(), &[("GitHub", STRONG)], cx);
+    select(&state, ids[0], &mut vcx);
+    assert!(shown("field-masked 1", &mut vcx));
+    assert!(!shown("field-plain 1", &mut vcx));
+
+    hold(option(), &mut vcx);
+    assert!(shown("field-plain 1", &mut vcx), "plain value while held");
+    assert!(!shown("field-masked 1", &mut vcx));
+    assert!(state.read_with(&vcx, |s, _| s.revealed.is_empty()));
+
+    hold(gpui::Modifiers::none(), &mut vcx);
+    assert!(shown("field-masked 1", &mut vcx), "dots after release");
+    assert!(!shown("field-plain 1", &mut vcx));
+
+    // ⌥ as part of a chord (⌘⌥…) does not reveal.
+    hold(
+        gpui::Modifiers {
+            alt: true,
+            platform: true,
+            ..Default::default()
+        },
+        &mut vcx,
+    );
+    assert!(shown("field-masked 1", &mut vcx));
+}
+
+/// ⌥ released while focus sits in an overlay under Root (a dialog): the key-up never
+/// reaches the main screen, so leaving the screen already ended the reveal.
+#[gpui::test]
+fn option_released_in_an_overlay_leaves_values_masked(cx: &mut TestAppContext) {
+    use gpui_component::WindowExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open(dir.path(), &[("GitHub", STRONG)], cx);
+    // gpui reports focus moves only within an active window.
+    vcx.update(|window, _| window.activate_window());
+    select(&state, ids[0], &mut vcx);
+    hold(option(), &mut vcx);
+    assert!(shown("field-plain 1", &mut vcx));
+
+    let overlay = vcx.update(|window, cx| {
+        let focus = cx.focus_handle();
+        let inner = focus.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Overlay")
+                .child(gpui::div().track_focus(&inner).child("overlay"))
+        });
+        focus
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.focus(&overlay, cx));
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| overlay.is_focused(window) || overlay.contains_focused(window, cx))
+    );
+    hold(gpui::Modifiers::none(), &mut vcx);
+    assert!(!state.read_with(&vcx, |s, _| s.option_reveal));
+    assert!(
+        shown("field-masked 1", &mut vcx),
+        "dots after release in the overlay"
+    );
+    assert!(!shown("field-plain 1", &mut vcx));
+}
+
+/// A small window with the delete confirm open and many wrapping tags still lays out
+/// the fields: the tags block is capped and scrolls on its own.
+#[gpui::test]
+fn many_tags_and_delete_confirm_leave_room_for_fields(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open_items(
+        dir.path(),
+        |device| {
+            let mut item = login("Tagged", STRONG, device);
+            item.tags = (0..30)
+                .map(|i| format!("a-rather-long-tag-name-number-{i}"))
+                .collect();
+            vec![item]
+        },
+        cx,
+    );
+    vcx.simulate_resize(gpui::size(gpui::px(820.), gpui::px(520.)));
+    select(&state, ids[0], &mut vcx);
+    state.update(&mut vcx, |s, cx| s.request_delete(cx));
+    vcx.run_until_parked();
+    assert!(shown("delete-confirm", &mut vcx), "confirm open");
+    let bounds = |key: &'static str, vcx: &mut VisualTestContext| {
+        vcx.debug_bounds(key)
+            .unwrap_or_else(|| panic!("{key} not rendered"))
+    };
+    let tags = bounds("detail-tags", &mut vcx);
+    assert!(tags.size.height <= gpui::px(TAGS_MAX_H));
+    let scroll = bounds("detail-scroll", &mut vcx);
+    let row = bounds("field-row 0", &mut vcx);
+    assert!(
+        scroll.size.height >= row.size.height,
+        "scroll area {scroll:?}"
+    );
+    assert!(
+        row.bottom() <= scroll.bottom() && scroll.bottom() <= gpui::px(520.),
+        "first row inside the window: {row:?} in {scroll:?}"
+    );
+}
+
+/// A held ⌥ that never sees its key-up (selection moved, lock, the window lost key
+/// status) cannot leave secrets on screen.
+#[gpui::test]
+fn option_reveal_clears_on_selection_lock_and_blur(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open(dir.path(), &[("A", STRONG), ("B", STRONG)], cx);
+    select(&state, ids[0], &mut vcx);
+    let held = |vcx: &mut VisualTestContext| state.read_with(vcx, |s, _| s.option_reveal);
+
+    hold(option(), &mut vcx);
+    assert!(held(&mut vcx));
+    select(&state, ids[1], &mut vcx);
+    assert!(!held(&mut vcx), "selection change");
+    assert!(shown("field-masked 1", &mut vcx));
+
+    hold(gpui::Modifiers::none(), &mut vcx);
+    hold(option(), &mut vcx);
+    assert!(held(&mut vcx));
+    vcx.update(|window, _| window.activate_window());
+    vcx.run_until_parked();
+    assert!(held(&mut vcx), "activation alone keeps it");
+    vcx.deactivate_window();
+    assert!(!held(&mut vcx), "window blur");
+    assert!(shown("field-masked 1", &mut vcx));
+
+    hold(gpui::Modifiers::none(), &mut vcx);
+    hold(option(), &mut vcx);
+    assert!(held(&mut vcx));
+    state.update(&mut vcx, |s, cx| s.lock(cx));
+    vcx.run_until_parked();
+    assert!(!held(&mut vcx), "lock");
+}
+
+/// 05 §2.3 "Detail header is pinned": scrolling the fields leaves the header, tags and
+/// rule in place, and the first row still sits right under the rule.
+#[gpui::test]
+fn detail_header_stays_pinned_while_fields_scroll(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open_items(
+        dir.path(),
+        |device| {
+            let mut item = login("Long", STRONG, device);
+            item.tags = vec!["infra".into()];
+            for i in 0..40 {
+                item.fields.push(Field::new(
+                    format!("field {i}"),
+                    FieldKind::Text,
+                    SecretString::new(format!("value {i}")),
+                    1,
+                ));
+            }
+            vec![item]
+        },
+        cx,
+    );
+    select(&state, ids[0], &mut vcx);
+    let bounds = |key: &'static str, vcx: &mut VisualTestContext| {
+        vcx.debug_bounds(key)
+            .unwrap_or_else(|| panic!("{key} not rendered"))
+    };
+    let header = bounds("detail-header", &mut vcx);
+    let rule = bounds("detail-fields-rule", &mut vcx);
+    let row = bounds("field-row 0", &mut vcx);
+    assert_eq!(
+        row.top(),
+        rule.bottom(),
+        "first row directly under the rule"
+    );
+
+    let scroll = bounds("detail-footer", &mut vcx);
+    assert!(scroll.top() > header.bottom());
+    let at = row.center();
+    vcx.simulate_event(gpui::ScrollEvent {
+        position: at,
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-300.))),
+        ..Default::default()
+    });
+    vcx.run_until_parked();
+    assert!(
+        bounds("field-row 0", &mut vcx).top() < row.top(),
+        "fields scrolled"
+    );
+    assert_eq!(bounds("detail-header", &mut vcx), header, "header pinned");
+    assert_eq!(bounds("detail-fields-rule", &mut vcx), rule, "rule pinned");
+}

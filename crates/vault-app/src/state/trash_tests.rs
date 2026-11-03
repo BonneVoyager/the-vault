@@ -1,0 +1,194 @@
+//! Recently Deleted state: the 30-day sweep at unlock and before save, the expiry text.
+
+use std::sync::Arc;
+
+use gpui::{AppContext as _, Entity, TestAppContext};
+use vault_core::{Item, KdfParams, SecretString, Uuid};
+use vault_sync::{NoopHooks, SyncedVault};
+
+use super::*;
+use crate::state::Screen;
+
+const DAY: u64 = 24 * 60 * 60 * 1000;
+
+/// A saved vault file with a live item, an item deleted 31 days ago and one deleted 29
+/// days ago (in that id order).
+fn vault_file(dir: &std::path::Path) -> (std::path::PathBuf, [Uuid; 3]) {
+    let path = dir.join("t.vault");
+    let mut vault = SyncedVault::create(
+        &path,
+        &SecretString::new("pw".into()),
+        KdfParams::for_tests(),
+        Uuid::new_v4(),
+        Arc::new(NoopHooks),
+    )
+    .unwrap();
+    let now = text::now_millis();
+    let ids = vault
+        .edit(|v| {
+            let device = v.device_id();
+            let ids: Vec<Uuid> = ["Live", "Old", "Recent"]
+                .into_iter()
+                .map(|t| {
+                    let mut item = Item::new(t, device, 1);
+                    item.fields.push(vault_core::Field::new(
+                        "username",
+                        vault_core::FieldKind::Text,
+                        SecretString::new("chris".into()),
+                        1,
+                    ));
+                    v.insert(item, 1)
+                })
+                .collect();
+            v.delete(ids[1], now - 31 * DAY).unwrap();
+            v.delete(ids[2], now - 29 * DAY).unwrap();
+            [ids[0], ids[1], ids[2]]
+        })
+        .unwrap();
+    vault.save().unwrap();
+    (vault.path().to_owned(), ids)
+}
+
+fn has_content(state: &Entity<AppState>, id: Uuid, cx: &mut TestAppContext) -> bool {
+    state.read_with(cx, |s, _| {
+        s.unlocked_vault().unwrap().get(id).unwrap().has_content()
+    })
+}
+
+/// The 31-day-old item is stripped by the unlock itself (and saved), the 29-day-old one
+/// stays in the trash.
+#[gpui::test]
+fn sweep_at_unlock_strips_31_days_and_keeps_29(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, [live, old, recent]) = vault_file(dir.path());
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    state.update(cx, |s, cx| s.open_vault(path.clone(), cx));
+    cx.run_until_parked();
+    state.update(cx, |s, cx| s.unlock(SecretString::new("pw".into()), cx));
+    cx.run_until_parked();
+    assert_eq!(state.read_with(cx, |s, _| s.screen), Screen::Main);
+    assert!(!has_content(&state, old, cx));
+    assert!(has_content(&state, recent, cx));
+    assert!(has_content(&state, live, cx));
+    state.read_with(cx, |s, _| {
+        assert_eq!(s.counts.deleted, 1);
+        assert!(
+            s.vault.as_ref().unwrap().is_dirty(),
+            "the strip must be saved"
+        );
+        assert!(s.autosave_pending, "the unlock scheduled the save");
+    });
+
+    // The scheduled autosave writes the stripped tombstone; nothing saves by hand.
+    cx.executor().advance_clock(
+        super::super::session::AUTOSAVE_DEBOUNCE + std::time::Duration::from_millis(50),
+    );
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| {
+        assert!(!s.vault.as_ref().unwrap().is_dirty(), "autosaved");
+    });
+    let mut reopened = SyncedVault::open(&path, Uuid::new_v4(), Arc::new(NoopHooks)).unwrap();
+    reopened.unlock(&SecretString::new("pw".into())).unwrap();
+    let v = reopened.vault().unwrap();
+    assert!(!v.get(old).unwrap().has_content());
+    assert!(v.get(recent).unwrap().has_content());
+}
+
+/// Content past its 30 days that reaches memory after the unlock (a merge, here an edit
+/// standing in for one) is stripped by the save, before it is written.
+#[gpui::test]
+fn sweep_runs_before_save(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, [live, _, recent]) = vault_file(dir.path());
+    let mut vault = SyncedVault::open(&path, Uuid::new_v4(), Arc::new(NoopHooks)).unwrap();
+    vault.unlock(&SecretString::new("pw".into())).unwrap();
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    state.update(cx, |s, _| s.install_unlocked_for_tests(vault));
+    let now = text::now_millis();
+    state.update(cx, |s, _| {
+        s.vault
+            .as_mut()
+            .unwrap()
+            .edit(|v| v.delete(live, now - 40 * DAY))
+            .unwrap()
+            .unwrap();
+    });
+    assert!(has_content(&state, live, cx));
+    state.update(cx, |s, cx| s.save_now(cx));
+    assert!(!has_content(&state, live, cx));
+    assert!(has_content(&state, recent, cx));
+    state.read_with(cx, |s, _| {
+        assert!(!s.vault.as_ref().unwrap().is_dirty(), "saved");
+    });
+}
+
+/// Locked, the sweep does nothing (there is no vault to read, and it must not try).
+#[gpui::test]
+fn sweep_is_a_no_op_while_locked(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = vault_file(dir.path());
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    state.update(cx, |s, cx| s.open_vault(path, cx));
+    cx.run_until_parked();
+    state.update(cx, |s, _| {
+        assert!(s.locked);
+        assert_eq!(s.expire_trash(), 0);
+        assert!(!s.vault.as_ref().unwrap().is_dirty());
+    });
+}
+
+/// With nothing due the sweep changes nothing and does not mark a clean vault dirty.
+#[gpui::test]
+fn sweep_with_nothing_due_leaves_the_vault_clean(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = vault_file(dir.path());
+    let mut vault = SyncedVault::open(&path, Uuid::new_v4(), Arc::new(NoopHooks)).unwrap();
+    vault.unlock(&SecretString::new("pw".into())).unwrap();
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    // The install's unlock hook strips the 31-day item; save that.
+    state.update(cx, |s, cx| {
+        s.install_unlocked_for_tests(vault);
+        s.save_now(cx);
+    });
+    state.update(cx, |s, _| {
+        assert!(!s.vault.as_ref().unwrap().is_dirty());
+        assert_eq!(s.expire_trash(), 0);
+        assert!(!s.vault.as_ref().unwrap().is_dirty());
+    });
+}
+
+#[test]
+fn expiry_text_counts_whole_days_up() {
+    let now = 1_000 * DAY;
+    assert_eq!(
+        expiry_text(now - 10 * DAY, now),
+        "This item will be permanently deleted in 20 days unless it is recovered."
+    );
+    // 29 days and one hour left rounds up to 30.
+    assert_eq!(days_left(now - DAY + 3_600_000, now), 30);
+    assert_eq!(
+        expiry_text(now - 29 * DAY - 1, now),
+        "This item will be permanently deleted in 1 day unless it is recovered."
+    );
+    for due in [now - 30 * DAY, now - 45 * DAY, 0] {
+        assert_eq!(
+            expiry_text(due, now),
+            "This item will be permanently deleted today unless it is recovered."
+        );
+    }
+}
+
+/// A `deleted_at` ahead of the clock (a peer's skewed clock) never panics or overflows,
+/// and never promises more than 30 days.
+#[test]
+fn expiry_text_saturates_a_far_future_deleted_at() {
+    let now = 1_000 * DAY;
+    for at in [now + 400 * DAY, u64::MAX - 1, u64::MAX] {
+        assert_eq!(days_left(at, now), 30);
+        assert_eq!(
+            expiry_text(at, now),
+            "This item will be permanently deleted in 30 days unless it is recovered."
+        );
+    }
+    assert_eq!(days_left(u64::MAX, 0), 30);
+}

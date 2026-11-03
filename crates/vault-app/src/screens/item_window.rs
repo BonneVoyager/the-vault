@@ -287,6 +287,8 @@ impl Render for ItemWindow {
                     history_open: self.history_open,
                     actions,
                     standalone: true,
+                    // Hold-⌥ reveal is a main-window feature (05 §2.3).
+                    peek: false,
                 }
                 .render_item(item, s, cx)
             });

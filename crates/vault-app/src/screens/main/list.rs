@@ -20,7 +20,7 @@ use crate::actions::{
 };
 use crate::audit::Issue;
 use crate::listing::{self, Row};
-use crate::state::{AppState, Filter, GeneratorTarget, Sort};
+use crate::state::{AppState, Filter, GeneratorTarget, NO_DELETED_ITEMS, Sort, TRASH_INFO};
 use crate::templates::Template;
 use crate::ui::{self, Clickable as _};
 
@@ -94,6 +94,8 @@ fn render_row(
             let selected = s.selection == Some(*id);
             let (title, subtitle, favorite) =
                 (item.title.clone(), listing::subtitle(item), item.favorite);
+            // A trashed item opens no item window (05 §2.3 "Recently Deleted").
+            let trashed = item.is_deleted();
             let issues = s.listing.issues(*id);
             let badge = (!issues.is_empty()).then(|| issue_badge(ix, issues, cx));
             let (fg, muted) = if selected && list_focused {
@@ -162,6 +164,7 @@ fn render_row(
                             state.update(cx, |s, cx| s.select(id, cx));
                             window.focus(&focus, cx);
                             if event.click_count() == 2
+                                && !trashed
                                 && let Err(err) =
                                     crate::screens::open_item_window(state.clone(), id, cx)
                             {
@@ -235,6 +238,7 @@ pub fn filter_heading(s: &AppState) -> (String, usize) {
     match &s.filter {
         Filter::All => ("All Items".into(), s.counts.all),
         Filter::Favorites => ("Favorites".into(), s.counts.favorites),
+        Filter::RecentlyDeleted => (RECENTLY_DELETED.into(), s.counts.deleted),
         Filter::Tag(tag) => s
             .counts
             .tags
@@ -257,10 +261,18 @@ fn sidebar_toggle(sidebar_visible: bool) -> Button {
 pub const EMPTY_VAULT: &str = "This vault is empty";
 pub const NO_RESULTS: &str = "No results";
 pub const NO_ITEMS_HERE: &str = "No items here";
+pub const RECENTLY_DELETED: &str = "Recently Deleted";
 
 /// The empty-state message the list shows instead of rows, if any.
 pub fn list_placeholder(s: &AppState) -> Option<&'static str> {
-    if s.counts.all == 0 {
+    let trash = s.filter == Filter::RecentlyDeleted;
+    if trash && s.listing.items.is_empty() {
+        Some(if s.query.trim().is_empty() {
+            NO_DELETED_ITEMS
+        } else {
+            NO_RESULTS
+        })
+    } else if s.counts.all == 0 && !trash {
         Some(EMPTY_VAULT)
     } else if s.listing.items.is_empty() && !s.query.trim().is_empty() {
         Some(NO_RESULTS)
@@ -310,6 +322,50 @@ fn empty_state(
         })
 }
 
+/// The muted card above the Recently Deleted rows.
+fn trash_info(cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    div()
+        .flex_none()
+        .debug_selector(|| "trash-info".into())
+        .mx(px(ui::COLUMN_PAD_X - 2.))
+        .mb(px(6.))
+        .px(px(10.))
+        .py(px(8.))
+        .rounded(theme.radius)
+        .bg(theme.muted)
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(TRASH_INFO)
+}
+
+/// Recently Deleted with nothing in it: large trash glyph, title, the retention sentence.
+fn trash_empty_state(cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    ui::v_flex()
+        .flex_1()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap(px(12.))
+        .px(px(24.))
+        .debug_selector(|| "trash-empty".into())
+        .child(ui::illustration(IconName::Trash, None, cx))
+        .child(
+            div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_center()
+                .child(NO_DELETED_ITEMS),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .text_center()
+                .child(TRASH_INFO),
+        )
+}
+
 impl MainScreen {
     pub(super) fn render_list(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let list_focused = self.list_focus.is_focused(window);
@@ -324,6 +380,7 @@ impl MainScreen {
         let generator_open = s.generator_target == Some(GeneratorTarget::Global);
         let collapsed = self.sidebar_collapsed();
         let heading = collapsed.then(|| filter_heading(s));
+        let trash = s.filter == Filter::RecentlyDeleted;
 
         let sort_button = ui::icon_button("sort", IconName::SortAscending, "Sort items")
             .dropdown_menu(move |menu, _, _| {
@@ -415,6 +472,19 @@ impl MainScreen {
                 cx,
             )
             .into_any_element()
+        } else if placeholder == Some(NO_DELETED_ITEMS) {
+            trash_empty_state(cx).into_any_element()
+        } else if placeholder == Some(NO_RESULTS) && trash {
+            // Nothing to create from a search of the trash.
+            empty_state(
+                IconName::Search,
+                Some(IconName::CircleX),
+                NO_RESULTS,
+                None,
+                &self.state,
+                cx,
+            )
+            .into_any_element()
         } else if placeholder == Some(NO_RESULTS) {
             empty_state(
                 IconName::Search,
@@ -438,11 +508,19 @@ impl MainScreen {
         } else {
             let state = self.state.clone();
             let focus = self.list_focus.clone();
-            list(self.list_state.clone(), move |ix, _window, cx| {
+            let rows = list(self.list_state.clone(), move |ix, _window, cx| {
                 render_row(&rows, ix, &state, &focus, list_focused, cx)
             })
-            .size_full()
-            .into_any_element()
+            .size_full();
+            if trash {
+                ui::v_flex()
+                    .size_full()
+                    .child(trash_info(cx))
+                    .child(div().flex_1().min_h_0().child(rows))
+                    .into_any_element()
+            } else {
+                rows.into_any_element()
+            }
         };
 
         let footer = super::column_footer(theme.border, cx)

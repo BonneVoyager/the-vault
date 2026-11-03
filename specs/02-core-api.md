@@ -96,7 +96,11 @@ impl UnlockedVault {
     pub fn set_field_named(&mut self, id: Uuid, name: &str, value: SecretString, now: Millis) -> Result<(), VaultError>;  // first non-Section field matching the name ASCII case-insensitively; FieldNotFound / AmbiguousField
     pub fn remove_field(&mut self, id: Uuid, field_id: Uuid, now: Millis) -> Result<(), VaultError>;   // writes a removed_fields marker
     pub fn upgrade_format(&mut self, password: &SecretString, now: Millis) -> Result<(), VaultError>;   // version 1 → 2; drops non-password slots (01 §9); no-op when current
-    pub fn delete(&mut self, id: Uuid, now: Millis) -> Result<(), VaultError>;    // tombstone, keeps id
+    pub fn delete(&mut self, id: Uuid, now: Millis) -> Result<(), VaultError>;    // tombstone, keeps id AND content (the item moves to Recently Deleted; 2026-11-03)
+    pub fn recover(&mut self, id: Uuid, now: Millis) -> Result<(), VaultError>;   // clears deleted_at on a tombstone that still has content; restamps (03 §5: a later edit resurrects). Err on unknown id, a live item, or a stripped tombstone
+    pub fn delete_permanently(&mut self, id: Uuid, now: Millis) -> Result<(), VaultError>; // strips a tombstone (see below) and restamps so it wins the merge; Err on unknown id or a live item
+    pub fn expire_deleted(&mut self, cutoff: Millis, now: Millis) -> usize;       // strips every tombstone with content whose deleted_at < cutoff, restamping each; returns how many. Idempotent
+    pub fn deleted_items(&self) -> impl Iterator<Item = &Item>;                    // tombstones that still have content (the Recently Deleted list)
     pub fn purge_tombstones_older_than(&mut self, cutoff: Millis) -> usize;
 
     // keys
@@ -127,6 +131,8 @@ pub struct MergeReport { pub added: usize, pub updated: usize, pub deleted: usiz
 `set_field` on a `password`-kind field pushes the previous value onto `history` (cap 10).
 
 `update` recomputes `item.modified_at = max(all field.modified_at, deleted_at, now)` after `f` runs. It diffs fields by id against the pre-call copy: a field whose name, kind, value or section changed without a bumped `modified_at` is bumped to `now` (a rename is an edit, not a delete + add); an id that vanished gets a `removed_fields` marker stamped `now`; a re-added id is stamped past its marker and the marker dropped; a duplicate id within an item is rejected and the item restored. `Item::field(name)` returns the first non-Section field whose name matches ASCII case-insensitively (an empty name never matches); `Item::field_by_id(id)` is the identity lookup.
+
+**Recently Deleted (2026-11-03).** `delete` keeps the whole item under its tombstone: fields, history, attachment refs, extras and the removal markers. Such a tombstone is "in the trash". **Stripping** a tombstone empties `fields`, `history`, `attachments`, `removed_fields`, `removed_attachments`, `removed_history` and `extras`, keeps `id`, `title`, `tags`, `favorite`, `icon`, `created_at`, `deleted_at` and the per-attribute stamps, and restamps `modified_at = stamp(now, previous)` with `device_id = self.device_id`, so the stripped version wins the whole-item merge of two tombstones (03 §5) and the content disappears on every device. `Item::has_content()` is true when any of the emptied lists is non-empty. The retention window is the caller's (`vault-app` uses 30 days from `deleted_at`); the core only exposes `expire_deleted(cutoff, now)`. A stripped tombstone is what every tombstone was before 2026-11-03; the format is unchanged (01 §4: fields may be empty on a tombstone) and `FORMAT_VERSION` does not change. `purge_tombstones_older_than` is unchanged and still unused by the app.
 
 ## `kdf`
 

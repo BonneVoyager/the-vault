@@ -20,6 +20,9 @@ mod collapse_tests;
 mod prompts;
 mod sidebar;
 mod sync_banners;
+#[cfg(test)]
+#[path = "main/trash_tests.rs"]
+mod trash_tests;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -180,6 +183,8 @@ pub struct MainScreen {
     seen_locked: bool,
     /// Sidebar visibility the layout last applied.
     seen_sidebar: bool,
+    /// Whether the menu bar last installed carries the Recently Deleted rows.
+    seen_trash: bool,
     /// The sidebar's slide; finished at rest.
     slide: Slide,
     /// Tests pin the slide clock here instead of reading real time.
@@ -208,8 +213,30 @@ impl MainScreen {
         let generator = cx.new(|cx| GeneratorView::new(state.clone(), window, cx));
         let editor = cx.new(|cx| Editor::new(state.clone(), generator.clone(), window, cx));
         let list_focus = cx.focus_handle();
-        let subscriptions = vec![
+        let sidebar_focus = cx.focus_handle();
+        let detail_focus = cx.focus_handle();
+        let search_focus = gpui::Focusable::focus_handle(search.read(cx), cx);
+        // The ⌥ listener hears only key events whose focus path runs through this
+        // screen: once focus leaves it (a dialog, a popover under Root), a key-up would
+        // be missed, so the hold-⌥ reveal ends there.
+        let focus_outs = [&sidebar_focus, &list_focus, &detail_focus, &search_focus].map(|h| {
+            cx.on_focus_out(h, window, |this: &mut Self, _, window, cx| {
+                if !this.focus_in_screen(window, cx) {
+                    this.state
+                        .update(cx, |s, cx| s.set_option_reveal(false, cx));
+                }
+            })
+        });
+        let mut subscriptions = vec![
             cx.observe_in(&state, window, |this, _, window, cx| this.sync(window, cx)),
+            // A key-up while another app is frontmost never reaches us: drop the hold-⌥
+            // reveal when the window loses key status.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() {
+                    this.state
+                        .update(cx, |s, cx| s.set_option_reveal(false, cx));
+                }
+            }),
             cx.subscribe_in(
                 &search,
                 window,
@@ -232,9 +259,11 @@ impl MainScreen {
                 },
             ),
         ];
+        subscriptions.extend(focus_outs);
         Self {
             seen_locked: state.read(cx).locked,
             seen_sidebar: state.read(cx).sidebar_visible(),
+            seen_trash: false,
             slide: Slide::settled(
                 state.read(cx).sidebar_visible(),
                 state.read(cx).sidebar_toggles,
@@ -250,8 +279,8 @@ impl MainScreen {
             editor,
             generator,
             list_focus,
-            sidebar_focus: cx.focus_handle(),
-            detail_focus: cx.focus_handle(),
+            sidebar_focus,
+            detail_focus,
             list_state: ListState::new(0, ListAlignment::Top, px(200.)),
             seen_listing: u64::MAX,
             seen_selection: None,
@@ -281,6 +310,20 @@ impl MainScreen {
     }
 
     /// Called by the root view whenever the main screen becomes visible.
+    /// Focus is inside this screen: the sidebar, the search field, the list or the
+    /// detail column (whose editor, banners and anchored popovers sit inside it).
+    pub(super) fn focus_in_screen(&self, window: &Window, cx: &App) -> bool {
+        use gpui::Focusable as _;
+        self.sidebar_focus.contains_focused(window, cx)
+            || self.list_focus.contains_focused(window, cx)
+            || self.detail_focus.contains_focused(window, cx)
+            || self
+                .search
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx)
+    }
+
     pub fn appear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.list_focus, cx);
     }
@@ -348,6 +391,13 @@ impl MainScreen {
             ui::clear_input(&self.key_input, window, cx);
         }
         self.seen_locked = locked;
+        // Item ▸ Recover / Delete Permanently exist only while the trash shows.
+        let trash = self.state.read(cx).viewing_trash();
+        if trash != self.seen_trash {
+            self.seen_trash = trash;
+            self.state
+                .update(cx, |s, cx| crate::actions::refresh_menus(s, cx));
+        }
         cx.notify();
     }
 
@@ -559,6 +609,13 @@ impl Render for MainScreen {
             .size_full()
             .text_size(cx.theme().font_size)
             .relative()
+            // Hold ⌥ to reveal (05 §2.3). Reaches us while focus is in this screen.
+            .on_modifiers_changed(
+                cx.listener(|this, ev: &gpui::ModifiersChangedEvent, _, cx| {
+                    let held = ui::option_alone(&ev.modifiers);
+                    this.state.update(cx, |s, cx| s.set_option_reveal(held, cx));
+                }),
+            )
             .child(ui::window_drag_band())
             .children(drag_end)
             .child(
@@ -926,6 +983,39 @@ mod tests {
         vcx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
         vcx.run_until_parked();
         ui::window_moves() - before
+    }
+
+    /// ⌘M and the Window menu's Minimize/Zoom reach the window. They used to update the
+    /// active window from inside its own dispatch, which fails silently.
+    #[gpui::test]
+    fn cmd_m_and_window_menu_reach_the_window(cx: &mut TestAppContext) {
+        use crate::actions::{Minimize, WINDOW_COMMANDS, WindowCommand, Zoom};
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, mut vcx) = open(true, dir.path(), cx);
+        WINDOW_COMMANDS.with(|c| c.borrow_mut().clear());
+        vcx.update(|w, _| w.activate_window());
+        vcx.simulate_keystrokes("cmd-m");
+        vcx.run_until_parked();
+        assert_eq!(
+            WINDOW_COMMANDS.with(|c| c.borrow().clone()),
+            vec![WindowCommand::Minimize],
+            "keystroke"
+        );
+        // The menu path: the app dispatches the item's action to the active window.
+        vcx.cx.update(|cx| {
+            cx.dispatch_action(&Minimize);
+            cx.dispatch_action(&Zoom);
+        });
+        vcx.run_until_parked();
+        assert_eq!(
+            WINDOW_COMMANDS.with(|c| c.borrow().clone()),
+            vec![
+                WindowCommand::Minimize,
+                WindowCommand::Minimize,
+                WindowCommand::Zoom
+            ],
+            "menu items"
+        );
     }
 
     #[gpui::test]

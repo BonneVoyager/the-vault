@@ -445,6 +445,22 @@ impl Item {
         self.deleted_at.is_some()
     }
 
+    /// `true` when any of the seven lists a stripped tombstone empties (02 "Recently
+    /// Deleted") is non-empty: `fields`, `history`, `attachments`, `removed_fields`,
+    /// `removed_attachments`, `removed_history` or `extras`. A tombstone with content is "in
+    /// the trash" and listed by [`crate::UnlockedVault::deleted_items`]; one without is what
+    /// every tombstone was before 2026-11-03. Meaningful on live items too (an empty live
+    /// item has no content), but only tombstones are ever stripped.
+    pub fn has_content(&self) -> bool {
+        !(self.fields.is_empty()
+            && self.history.is_empty()
+            && self.attachments.is_empty()
+            && self.removed_fields.is_empty()
+            && self.removed_attachments.is_empty()
+            && self.removed_history.is_empty()
+            && self.extras.is_empty())
+    }
+
     /// The effective stamp of each attribute for the merge (03 §5): the stored stamp, or
     /// the item's `modified_at` when the item carries none.
     pub fn title_stamp(&self) -> Millis {

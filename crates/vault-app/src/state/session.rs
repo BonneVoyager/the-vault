@@ -65,6 +65,7 @@ impl AppState {
         self.selection = None;
         self.mode = Mode::View;
         self.revealed.clear();
+        self.option_reveal = false;
         self.history_open = false;
         self.query.clear();
         self.listing = listing::Listing::default();
@@ -106,6 +107,10 @@ impl AppState {
             .unlocked_vault()
             .map(listing::counts)
             .unwrap_or_default();
+        // The trash emptied (recovered, purged, swept, merged): back to All Items.
+        if self.filter == Filter::RecentlyDeleted && self.counts.deleted == 0 {
+            self.filter = Filter::All;
+        }
         // Password warnings depend only on the contents, so audit here, not per refresh.
         self.listing.issues = Rc::new(
             self.unlocked_vault()
@@ -140,6 +145,7 @@ impl AppState {
         if self.selection != id {
             self.selection = id;
             self.revealed.clear();
+            self.option_reveal = false;
             self.history_open = false;
             self.delete_confirm = None;
         }
@@ -241,7 +247,7 @@ impl AppState {
         if !self.main_active() {
             return;
         }
-        let Some(item) = self.selected_item() else {
+        let Some(item) = self.viewed_item() else {
             return;
         };
         let (value, what) = match target {
@@ -312,7 +318,7 @@ impl AppState {
         if !self.main_active() {
             return;
         }
-        let raw = self.selected_item().and_then(|item| match ix {
+        let raw = self.viewed_item().and_then(|item| match ix {
             Some(i) => item.fields.get(i).filter(|f| f.kind == FieldKind::Url),
             None => first_of(item, FieldKind::Url),
         });
@@ -339,13 +345,22 @@ impl AppState {
         cx.notify();
     }
 
+    /// Follows the ⌥ key in the main window (05 §2.3 "Hold ⌥ to reveal"). Changes
+    /// nothing in `revealed`; re-renders only when the flag flips.
+    pub fn set_option_reveal(&mut self, held: bool, cx: &mut Context<Self>) {
+        if self.option_reveal != held {
+            self.option_reveal = held;
+            cx.notify();
+        }
+    }
+
     /// ⌘⇧R: toggles the first password field of the selected item.
     pub fn toggle_reveal_password(&mut self, cx: &mut Context<Self>) {
         if !self.main_active() {
             return;
         }
         let field = self
-            .selected_item()
+            .viewed_item()
             .and_then(|item| first_of(item, FieldKind::Password))
             .map(|f| f.id);
         if let Some(field) = field {

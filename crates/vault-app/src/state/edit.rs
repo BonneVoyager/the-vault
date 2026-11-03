@@ -896,7 +896,7 @@ impl AppState {
 
     /// Selects a just-created item, widening the filter or clearing the search if they
     /// would hide it.
-    fn reveal_new(&mut self, id: Uuid) {
+    pub(super) fn reveal_new(&mut self, id: Uuid) {
         if !self.listing.items.contains(&id) && self.filter != Filter::All {
             self.filter = Filter::All;
             self.refresh();
@@ -917,7 +917,8 @@ impl AppState {
         if !self.main_active() || self.is_editing() {
             return;
         }
-        if let Some(id) = self.selected_item().map(|i| i.id) {
+        // In Recently Deleted the same confirm deletes permanently (`confirm_delete`).
+        if let Some(id) = self.viewed_item().map(|i| i.id) {
             self.delete_confirm = Some(id);
             cx.notify();
         }
@@ -936,6 +937,9 @@ impl AppState {
         if !self.main_active() || self.selection != Some(id) {
             cx.notify();
             return;
+        }
+        if self.trashed_item().is_some_and(|i| i.id == id) {
+            return self.purge(id, cx);
         }
         let at = self.listing.items.iter().position(|i| *i == id);
         let now = text::now_millis();

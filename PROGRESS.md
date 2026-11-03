@@ -604,3 +604,54 @@ fix for the permission-denied lock path; attachment display order for files drop
 millisecond is by id (production never relied on insertion order, but the UI could sort by name).
 
 Bug hunt: run for the previous two waves (2026-11-01 report); not yet run for this wave.
+
+## Recently Deleted wave (2026-11-03)
+
+Specs edited first: 01 §4 (tombstone keeps content), 02 ("Recently Deleted" paragraph + API),
+03 §5 (both-tombstone row; recover-vs-strip race: the item survives; backups not scrubbed),
+05 §2.3/§3/§4 (sidebar row, filter, read-only detail, sweep scope, pinned header, hold-⌥ reveal, ⌘M).
+
+- **RD-A (done): vault-core.** `Item::has_content`, `recover`, `delete_permanently`,
+  `expire_deleted(cutoff, now)`, `deleted_items`; private `strip_tombstone` drops the seven lists in
+  place (zeroize on drop) and restamps so the strip wins the whole-item tombstone LWW. `delete` on a
+  stripped tombstone is a no-op (re-arming `deleted_at` could erase a peer's recovery). No format
+  change. Errors are `Malformed` with distinct messages. 14 tests in `tests/recently_deleted.rs`
+  incl. merge propagation both ways, tie-break re-sweep, u64::MAX saturation. Security review: SHIP.
+- **RD-B (done): vault-app Recently Deleted.** `Filter::RecentlyDeleted`; sidebar row with trash
+  glyph and count, hidden at 0 (filter falls back to All); list newest `deleted_at` first, search on
+  title+tags; info card and empty state; read-only detail (`viewed_item()` for display, `selected_item()`
+  still never returns a tombstone so every mutating action is inert); expiry card with Delete (red,
+  confirm "Delete permanently? This cannot be undone.") and Recover; ⌘⇧Z Recover, ⌘⌫ permanent
+  delete under the filter only; Item menu swaps entries when entering/leaving the trash (macOS
+  enables any item with a global handler, so they are omitted rather than greyed). Sweep after unlock
+  (schedules an autosave if it stripped) and before autosave/lock-save. All Items confirm gains
+  "You can recover it from Recently Deleted for 30 days." Code review: FIX FIRST → fixed.
+- **UI-C/D (done): pinned detail header** (icon, title, buttons, inline confirm, tags, rule stay;
+  fields scroll; tags block capped at 64 px with its own scroll; item window same), **hold ⌥ to
+  reveal** (`option_reveal` flag + live modifier check; cleared on selection change, lock, vault
+  switch, blur and focus leaving the main screen; ⌥ alone only; not in edit mode, list or item
+  windows; TOTP/history stay masked), **⌘M fix**: the Minimize/Zoom handlers ran inside the window's
+  own dispatch and re-entered the same window update, which gpui refuses with "window not found"
+  swallowed by `.ok()`; now deferred via `cx.defer`. Code review: SHIP + two warnings closed.
+- Known gaps (owner call): trash search is title+tags only (core search is private to live items);
+  hold-⌥ not in item windows. (Image icons for trashed rows: fixed the same day, owner-reported;
+  `icon_images.rs` now scans `items().chain(deleted_items())`; test
+  `trashed_item_keeps_its_image_icon_until_purged`.)
+- Owner layout change (2026-11-03): expiry card moved into the pinned header under icon+title; the
+  red permanent-delete confirm appears directly under the card; tags and rule follow. Test
+  `expiry_card_and_confirm_sit_between_title_and_tags`.
+
+## CHECKPOINT — Recently Deleted wave complete (2026-11-03)
+
+fmt and clippy clean. `cargo test --workspace`: 1020 passed, 0 failed, 13 ignored before the last
+two vault-app fixes; vault-app re-run after them: 397 passed. QA ledger 169/169, CLI 81/81.
+Uncommitted: 28 modified + 4 new source files, +1037/−112 (vault-app alone ≈ 400 production +
+650 test lines, over the 400-line guideline; natural split = (1) pinned header/⌥/⌘M, (2) Recently
+Deleted; `detail.rs` hunks interleave, needs `git add -p`).
+
+Owner eye checks: sidebar row position/glyph/count; info card inset and empty state; expiry card
+spacing and the red "Delete" text; two-line confirm wrapping in a narrow detail; Item menu order in
+and out of the trash; ⌘M and Window ▸ Zoom really minimise/zoom; ⌥ reveals and a dialog opened while
+⌥ is held re-masks at once; pinned header with long tags, sync banner, delete confirm open.
+
+Bug hunt: not yet run for this wave.

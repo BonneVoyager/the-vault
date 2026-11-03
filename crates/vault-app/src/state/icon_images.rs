@@ -207,8 +207,8 @@ impl AppState {
         }
     }
 
-    /// The attachment ids image icons point at now, each with its item: every live item's
-    /// stored icon, plus the edit buffer's (an image chosen in this edit), provided the
+    /// The attachment ids image icons point at now, each with its item: every live or
+    /// trashed item's stored icon (Recently Deleted rows and detail draw them too), plus the edit buffer's (an image chosen in this edit), provided the
     /// stored item still carries that reference.
     fn wanted_icon_images(&self) -> HashMap<Uuid, (Uuid, u64)> {
         let mut wanted = HashMap::new();
@@ -222,7 +222,7 @@ impl AppState {
                 wanted.insert(id, (item.id, r.size));
             }
         };
-        for item in vault.items().filter(|i| !i.is_deleted()) {
+        for item in vault.items().chain(vault.deleted_items()) {
             add(item, item.icon.as_ref());
         }
         if let Some(b) = self.edit_buffer()

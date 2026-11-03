@@ -329,7 +329,7 @@ impl AppState {
         };
         let bio = self.biometrics.clone();
         let reason = format!("Unlock {}", self.vault_name());
-        self.run_bg(
+        self.run_bg_cx(
             Busy::TouchUnlocking,
             cx,
             move || {
@@ -338,7 +338,7 @@ impl AppState {
                     .map(|(slot, kek)| vault.unlock_with_kek(slot, &kek));
                 (vault, result)
             },
-            move |this, (mut vault, result), outcome| {
+            move |this, (mut vault, result), outcome, cx| {
                 if outcome == Outcome::Closed {
                     this.report_lock(None, &vault.lock());
                     return;
@@ -378,7 +378,7 @@ impl AppState {
                 match (outcome, unlocked) {
                     (Outcome::Fresh, true) => {
                         this.vault = Some(vault);
-                        this.unlocked();
+                        this.unlocked_cx(cx);
                     }
                     (_, true) => {
                         this.report_lock(None, &vault.lock());

@@ -8,7 +8,7 @@
 //! | absent | present | take theirs (tombstones included) |
 //! | present | absent | keep ours |
 //! | one tombstone | — | tombstone wins iff `deleted_at >= other.modified_at`; else the live item (edit after delete resurrects) |
-//! | both tombstones | — | the side with greater `(modified_at, device_id)`; tie -> greater canonical item bytes |
+//! | both tombstones | — | the side with greater `(modified_at, device_id)`; tie -> greater canonical item bytes. A stripped tombstone (02 "Recently Deleted", `delete_permanently` / `expire_deleted`) is restamped when stripped, so it beats the content tombstone it came from and the strip propagates; a recovery (live, restamped) beats the older tombstone by the row above |
 //! | both live | — | field-level merge, see [`merge_items`] |
 //!
 //! The result's `modified_at` is always `max(ours, theirs)`, and its `created_at` (v1.3) is

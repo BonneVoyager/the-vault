@@ -47,8 +47,10 @@ actions!(
         OpenUrl,
         /// ⌘D.
         ToggleFavorite,
-        /// ⌘⌫: inline confirm, then delete.
+        /// ⌘⌫: inline confirm, then delete (in Recently Deleted: delete permanently).
         DeleteItem,
+        /// ⌘⇧Z in Recently Deleted: recover the trashed item.
+        RecoverItem,
         /// ⌘G: password generator popover.
         Generator,
         /// ⌃⌘S, View ▸ Hide Sidebar / Show Sidebar.
@@ -120,6 +122,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-o", OpenUrl, None),
         KeyBinding::new("cmd-d", ToggleFavorite, None),
         KeyBinding::new("cmd-backspace", DeleteItem, None),
+        KeyBinding::new("cmd-shift-z", RecoverItem, None),
         KeyBinding::new("cmd-g", Generator, None),
         KeyBinding::new(TOGGLE_SIDEBAR_KEYS, ToggleSidebar, None),
         KeyBinding::new("down", NextItem, list),
@@ -133,12 +136,32 @@ pub fn bind_keys(cx: &mut App) {
 
 /// Installs the menu bar from the state's sort and sidebar visibility.
 pub fn refresh_menus(s: &AppState, cx: &mut App) {
-    set_menus(s.sort, s.sidebar_visible(), cx);
+    install_menus(s.sort, s.sidebar_visible(), s.viewing_trash(), cx);
 }
 
 /// Installs the menu bar. Called again when the sort changes, to move the checkmark, and
 /// when the sidebar toggles, to flip "Hide Sidebar" / "Show Sidebar".
 pub fn set_menus(sort: Sort, sidebar_visible: bool, cx: &mut App) {
+    install_menus(sort, sidebar_visible, false, cx);
+}
+
+/// The Item menu's delete rows. In Recently Deleted (`trash`) ⌘⌫ deletes permanently and
+/// Recover joins it; elsewhere Recover is absent. Absent rather than disabled: the macOS
+/// menu enables an item whenever its action has a handler (`validateMenuItem:`), so
+/// `MenuItem::disabled` does not stick for globally handled actions.
+fn delete_items(trash: bool) -> Vec<MenuItem> {
+    if trash {
+        vec![
+            MenuItem::action("Recover", RecoverItem),
+            MenuItem::action("Delete Permanently\u{2026}", DeleteItem),
+        ]
+    } else {
+        vec![MenuItem::action("Delete\u{2026}", DeleteItem)]
+    }
+}
+
+/// [`set_menus`] with the Recently Deleted rows when `trash`.
+fn install_menus(sort: Sort, sidebar_visible: bool, trash: bool, cx: &mut App) {
     cx.set_menus([
         Menu::new("Vault").items([
             MenuItem::action("About Vault", About),
@@ -169,26 +192,31 @@ pub fn set_menus(sort: Sort, sidebar_visible: bool, cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Find", Search),
         ]),
-        Menu::new("Item").items([
-            MenuItem::action("New Item", NewItem),
-            MenuItem::action("Edit", EditItem),
-            MenuItem::action("Save", SaveItem),
-            MenuItem::action("Cancel Edit", CancelEdit),
-            MenuItem::separator(),
-            MenuItem::action("Next Item", NextItem),
-            MenuItem::action("Previous Item", PrevItem),
-            MenuItem::separator(),
-            MenuItem::action("Copy Username", CopyUsername),
-            MenuItem::action("Copy Password", CopyPassword),
-            MenuItem::action("Copy One-Time Code", CopyTotp),
-            MenuItem::action("Reveal Password", RevealPassword),
-            MenuItem::action("Open Website", OpenUrl),
-            MenuItem::separator(),
-            MenuItem::action("Favorite", ToggleFavorite),
-            MenuItem::action("Delete…", DeleteItem),
-            MenuItem::separator(),
-            MenuItem::action("Password Generator", Generator),
-        ]),
+        Menu::new("Item").items(
+            [
+                MenuItem::action("New Item", NewItem),
+                MenuItem::action("Edit", EditItem),
+                MenuItem::action("Save", SaveItem),
+                MenuItem::action("Cancel Edit", CancelEdit),
+                MenuItem::separator(),
+                MenuItem::action("Next Item", NextItem),
+                MenuItem::action("Previous Item", PrevItem),
+                MenuItem::separator(),
+                MenuItem::action("Copy Username", CopyUsername),
+                MenuItem::action("Copy Password", CopyPassword),
+                MenuItem::action("Copy One-Time Code", CopyTotp),
+                MenuItem::action("Reveal Password", RevealPassword),
+                MenuItem::action("Open Website", OpenUrl),
+                MenuItem::separator(),
+                MenuItem::action("Favorite", ToggleFavorite),
+            ]
+            .into_iter()
+            .chain(delete_items(trash))
+            .chain([
+                MenuItem::separator(),
+                MenuItem::action("Password Generator", Generator),
+            ]),
+        ),
         Menu::new("View").items([
             MenuItem::submenu(
                 Menu::new("Sort By").items([
@@ -297,18 +325,52 @@ pub fn register(state: &Entity<AppState>, cx: &mut App) {
     on_main::<SaveItem>(state, cx, |s, cx| s.save_edit(cx));
     on_main::<CancelEdit>(state, cx, |s, cx| s.cancel_edit(cx));
     on_main::<DeleteItem>(state, cx, |s, cx| s.request_delete(cx));
+    on_main::<RecoverItem>(state, cx, |s, cx| s.recover_selected(cx));
     on_main::<Generator>(state, cx, |s, cx| {
         s.open_generator(GeneratorTarget::Global, cx)
     });
 
-    cx.on_action(|_: &Minimize, cx| {
-        if let Some(window) = cx.active_window() {
-            window.update(cx, |_, w, _| w.minimize_window()).ok();
-        }
-    });
-    cx.on_action(|_: &Zoom, cx| {
-        if let Some(window) = cx.active_window() {
-            window.update(cx, |_, w, _| w.zoom_window()).ok();
-        }
+    cx.on_action(|_: &Minimize, cx| on_active_window(cx, WindowCommand::Minimize));
+    cx.on_action(|_: &Zoom, cx| on_active_window(cx, WindowCommand::Zoom));
+}
+
+/// A platform command on the active window (Window menu, ⌘M).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowCommand {
+    Minimize,
+    Zoom,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Commands that reached a window (the test platform cannot minimize or zoom).
+    pub static WINDOW_COMMANDS: std::cell::RefCell<Vec<WindowCommand>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `command` on the active window once the current dispatch ends. Global action
+/// handlers run inside the window's own update (keystrokes and menu items are both
+/// dispatched through `Window::dispatch_action`), where that window is checked out of
+/// the app: updating it again from here fails with "window not found", so the update
+/// must be deferred.
+fn on_active_window(cx: &mut App, command: WindowCommand) {
+    let Some(handle) = cx.active_window() else {
+        return;
+    };
+    cx.defer(move |cx| {
+        handle
+            .update(cx, |_, window, _| {
+                #[cfg(test)]
+                {
+                    let _ = window;
+                    WINDOW_COMMANDS.with(|c| c.borrow_mut().push(command));
+                }
+                #[cfg(not(test))]
+                match command {
+                    WindowCommand::Minimize => window.minimize_window(),
+                    WindowCommand::Zoom => window.zoom_window(),
+                }
+            })
+            .ok();
     });
 }

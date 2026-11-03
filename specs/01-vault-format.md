@@ -100,7 +100,7 @@ AAD = `vault_id || item.id || modified_at_be64 || format_version_be16`.
 {
   "kind":        (removed 2026-10-30: categories replaced by template tags; writers omit it, readers keep it as an unknown key)
   "title":       tstr
-  "deleted_at":  u64 | null     tombstone when non-null; fields may be empty then
+  "deleted_at":  u64 | null     tombstone when non-null; fields may be empty then (since 2026-11-03 a fresh tombstone keeps its content for the Recently Deleted window and is stripped later; 02 "Recently Deleted")
   "device_id":   bytes(16)      device that made the latest change
   "favorite":    bool
   "tags":        [tstr]

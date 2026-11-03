@@ -50,6 +50,8 @@ impl Listing {
 pub struct Counts {
     pub all: usize,
     pub favorites: usize,
+    /// Items in Recently Deleted (`deleted_items`); counted in nothing else.
+    pub deleted: usize,
     /// Tags case-insensitively merged, sorted alphabetically, with their item counts.
     pub tags: Vec<(String, usize)>,
 }
@@ -75,6 +77,7 @@ pub fn counts(vault: &UnlockedVault) -> Counts {
         }
     }
     tags.sort_by(|a, b| a.0.cmp(&b.0));
+    counts.deleted = vault.deleted_items().count();
     counts.tags = tags.into_iter().map(|(_, name, n)| (name, n)).collect();
     counts
 }
@@ -100,6 +103,9 @@ pub fn compute(
     sort: Sort,
     issues: Rc<Issues>,
 ) -> Listing {
+    if *filter == Filter::RecentlyDeleted {
+        return trash(vault, query, issues);
+    }
     let q = Query {
         text: query,
         tag: match filter {
@@ -140,6 +146,33 @@ pub fn compute(
     Listing {
         items: hits.iter().map(|i| i.id).collect(),
         rows: Rc::new(rows),
+        issues,
+    }
+}
+
+/// Recently Deleted: the trashed items, most recently deleted first, no group headers.
+/// The core search only ranks live items, so the query here matches title and tags
+/// (case-insensitive substring); secret field values are not searched in the trash.
+fn trash(vault: &UnlockedVault, query: &str, issues: Rc<Issues>) -> Listing {
+    let q = query.trim().to_lowercase();
+    let mut hits: Vec<&Item> = vault
+        .deleted_items()
+        .filter(|i| {
+            q.is_empty()
+                || i.title.to_lowercase().contains(&q)
+                || i.tags.iter().any(|t| t.to_lowercase().contains(&q))
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        b.deleted_at
+            .cmp(&a.deleted_at)
+            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let items: Vec<Uuid> = hits.iter().map(|i| i.id).collect();
+    Listing {
+        rows: Rc::new(items.iter().copied().map(Row::Item).collect()),
+        items,
         issues,
     }
 }
@@ -347,6 +380,85 @@ mod tests {
         assert_eq!(c.tags[0].0.to_lowercase(), "infra");
         assert_eq!(c.tags[0].1, 2);
         assert_eq!(c.tags[1], ("work".to_owned(), 1));
+    }
+
+    /// Recently Deleted lists the trashed items newest-deleted first, search applies, and
+    /// stripped tombstones are not listed.
+    #[test]
+    fn trash_lists_deleted_items_newest_first() {
+        let mut v = vault();
+        // Only a tombstone with content is in the trash: give each item a field.
+        let mut add = |title: &str| {
+            let mut item = Item::new(title, v.device_id(), 1);
+            item.fields.push(Field::new(
+                "notes",
+                FieldKind::Notes,
+                SecretString::new("n".into()),
+                1,
+            ));
+            v.insert(item, 1)
+        };
+        let (a, b, gone) = (add("Alpha"), add("Beta"), add("Gone"));
+        add("Live");
+        v.delete(b, 100).unwrap();
+        v.delete(a, 200).unwrap();
+        v.delete(gone, 50).unwrap();
+        v.delete_permanently(gone, 300).unwrap();
+        let all = |q: &str| {
+            compute(
+                &v,
+                q,
+                &Filter::RecentlyDeleted,
+                Sort::Alphabetical,
+                Rc::default(),
+            )
+        };
+        let l = all("");
+        assert_eq!(l.items, [a, b]);
+        assert_eq!(*l.rows, [Row::Item(a), Row::Item(b)]);
+        assert_eq!(all("BET").items, [b]);
+        assert!(all("live").items.is_empty());
+        assert_eq!(counts(&v).deleted, 2);
+    }
+
+    /// A trashed item shows up only under Recently Deleted: not in All Items, Favorites,
+    /// its tags, a search, the counts or the password audit.
+    #[test]
+    fn trashed_item_appears_nowhere_else() {
+        let mut v = vault();
+        let pw = SecretString::new("hunter2".into());
+        let mut ids = Vec::new();
+        for title in ["Twin", "Trashed"] {
+            let mut item = Item::new(title, v.device_id(), 1);
+            item.favorite = true;
+            item.tags = vec!["work".into()];
+            item.fields
+                .push(Field::new("password", FieldKind::Password, pw.clone(), 1));
+            ids.push(v.insert(item, 1));
+        }
+        let (twin, trashed) = (ids[0], ids[1]);
+        assert!(
+            crate::audit::audit(&v).contains_key(&trashed),
+            "reused before"
+        );
+        v.delete(trashed, 10).unwrap();
+        for filter in [Filter::All, Filter::Favorites, Filter::Tag("work".into())] {
+            for q in ["", "tras"] {
+                let l = compute(&v, q, &filter, Sort::Alphabetical, Rc::default());
+                assert!(!l.items.contains(&trashed), "{filter:?} {q:?}");
+            }
+        }
+        let c = counts(&v);
+        assert_eq!((c.all, c.favorites, c.deleted), (1, 1, 1));
+        assert_eq!(c.tags, [("work".to_owned(), 1)]);
+        let issues = crate::audit::audit(&v);
+        assert!(!issues.contains_key(&trashed));
+        assert!(
+            issues
+                .get(&twin)
+                .is_none_or(|i| !i.iter().any(|x| matches!(x, Issue::Reused { .. }))),
+            "the live twin no longer counts as reused"
+        );
     }
 
     #[test]
