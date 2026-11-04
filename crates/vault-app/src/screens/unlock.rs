@@ -10,12 +10,12 @@ use std::f32::consts::PI;
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, Entity, FontWeight, InteractiveElement as _,
+    Animation, AnimationExt as _, AnyElement, Context, Entity, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
     Subscription, Transformation, Window, div, ease_in_out, img, percentage,
     prelude::FluentBuilder as _, px, rgb, svg,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
@@ -23,8 +23,7 @@ use gpui_kit_assets::IconName;
 /// Side of the app icon on the unlock card, in points (the raster is 2x this).
 const APP_ICON_SIZE: f32 = 128.;
 /// `wheel.svg`'s 512-unit view box, centred on the hub at (486, 503) of the 1024-unit
-/// icon, in points of the 128 pt icon slot: (28.75, 30.875), snapped to the half points
-/// layout rounds to on Retina. The 1/8 pt offset is invisible.
+/// icon, scaled to the 128 pt icon slot.
 const WHEEL_SIZE: f32 = 64.;
 const WHEEL_LEFT: f32 = 28.5;
 const WHEEL_TOP: f32 = 31.;
@@ -50,7 +49,7 @@ pub struct UnlockScreen {
 
 impl UnlockScreen {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let password = ui::password_input("Master password", window, cx);
+        let password = ui::password_input("Enter master password", window, cx);
         let subscriptions = vec![
             cx.observe_in(&state, window, |this, state, window, cx| {
                 let s = state.read(cx);
@@ -128,22 +127,16 @@ fn unlocking_overlay(cx: &gpui::App) -> impl IntoElement {
         )
 }
 
-/// The icon's spokes, turning over the spoke-less icon (same motion as gpui-component's
-/// `Spinner`). Only built while an unlock runs and Reduce Motion is off.
-fn wheel() -> impl IntoElement {
+/// The icon's spokes are mounted from the first frame, so the SVG is ready when
+/// unlocking starts. Only the animation changes with the unlock state.
+fn wheel() -> gpui::Svg {
     svg()
         .path(crate::assets::APP_ICON_WHEEL)
-        .debug_selector(|| "unlock-wheel-animation".into())
         .absolute()
         .left(px(WHEEL_LEFT))
         .top(px(WHEEL_TOP))
         .size(px(WHEEL_SIZE))
         .text_color(rgb(WHEEL_STEEL))
-        .with_animation(
-            "unlock-wheel",
-            Animation::new(WHEEL_TURN).repeat().with_easing(ease_in_out),
-            |wheel, t| wheel.with_transformation(Transformation::rotate(percentage(t))),
-        )
 }
 
 /// Damped sine: three swings that settle back to 0 at `t = 1`.
@@ -155,11 +148,6 @@ impl Render for UnlockScreen {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let name = state.vault_name();
-        let path = state
-            .vault_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
         let unlocking = is_unlocking(state.busy);
         let touch = state.touch_policy();
         let touch_hint = touch.err().and_then(TouchDenied::hint);
@@ -167,23 +155,45 @@ impl Render for UnlockScreen {
         let failures = state.unlock_failures;
         let reduce_motion = state.reduce_motion;
         let theme = cx.theme();
-        let spinning = unlocking && !reduce_motion;
-        let still = if spinning {
-            crate::assets::APP_ICON_SPOKELESS
+        let vault_label_color = if theme.mode.is_dark() {
+            rgb(0xb8b8be).into()
         } else {
-            crate::assets::APP_ICON
+            theme.muted_foreground
+        };
+        let spinning = unlocking && !reduce_motion;
+        let wheel: AnyElement = if spinning {
+            wheel()
+                .debug_selector(|| "unlock-wheel-animation".into())
+                .with_animation(
+                    "unlock-wheel",
+                    Animation::new(WHEEL_TURN).repeat().with_easing(ease_in_out),
+                    |wheel, t| wheel.with_transformation(Transformation::rotate(percentage(t))),
+                )
+                .into_any_element()
+        } else {
+            wheel()
+                .debug_selector(|| "unlock-wheel-still".into())
+                .into_any_element()
         };
         let icon = div()
             .relative()
             .size_full()
             .child(
-                img(still)
+                img(crate::assets::APP_ICON_SPOKELESS)
                     .size_full()
-                    .debug_selector(|| "unlock-icon-still".into()),
+                    .debug_selector(|| "unlock-icon-background".into()),
             )
-            .when(spinning, |icon| icon.child(wheel()));
+            .child(wheel)
+            .child(
+                img(crate::assets::APP_ICON)
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+                    .debug_selector(|| "unlock-icon-still".into())
+                    .when(spinning, |image| image.invisible()),
+            );
 
-        let mut controls = ui::v_flex().w_full().gap(px(14.)).child(
+        let mut controls = ui::v_flex().w_full().gap(px(12.)).child(
             div()
                 .w_full()
                 .debug_selector(|| "unlock-password".into())
@@ -235,16 +245,28 @@ impl Render for UnlockScreen {
                 )
             })
             .child(
-                Button::new("switch")
-                    .ghost()
-                    .small()
-                    .label("Open another vault…  ⌘O")
-                    .disabled(unlocking)
-                    .clickable_when(!unlocking)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.state
-                            .update(cx, |s, cx| s.switch_vault(ChooseIntent::Home, cx));
-                    })),
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .debug_selector(|| "unlock-switch".into())
+                    .child(
+                        Button::new("switch")
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .foreground(theme.foreground.opacity(0.8)),
+                            )
+                            .small()
+                            .accessibility_label("Open another vault")
+                            .child("Open another vault…")
+                            .child(div().text_color(theme.muted_foreground).child("⌘O"))
+                            .disabled(unlocking)
+                            .clickable_when(!unlocking)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state
+                                    .update(cx, |s, cx| s.switch_vault(ChooseIntent::Home, cx));
+                            })),
+                    ),
             )
             // Hidden, not removed: the card keeps its size and nothing jumps. A hidden
             // div paints none of its children, so the field takes no clicks or keys.
@@ -252,33 +274,32 @@ impl Render for UnlockScreen {
 
         let card = ui::card(cx)
             .w(px(360.))
+            .gap(px(20.))
             .items_center()
             .debug_selector(|| "unlock-card".into())
             // The app icon (its PNG already has the macOS squircle and shadow). The
             // fixed box keeps the card size even before the image has decoded.
             .child(
-                div()
-                    .size(px(APP_ICON_SIZE))
-                    .relative()
-                    .flex_shrink_0()
-                    .debug_selector(|| "unlock-icon".into())
-                    .child(icon),
-            )
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(name),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .text_xs()
-                    .text_center()
-                    .text_color(theme.muted_foreground)
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(path),
+                ui::v_flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .size(px(APP_ICON_SIZE))
+                            .relative()
+                            .flex_shrink_0()
+                            .debug_selector(|| "unlock-icon".into())
+                            .child(icon),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(vault_label_color)
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .debug_selector(|| "unlock-vault-name".into())
+                            .child(name),
+                    ),
             )
             .child(
                 div()
@@ -405,6 +426,27 @@ mod tests {
         assert!(vcx.debug_bounds("unlocking").is_some());
         assert!(vcx.debug_bounds("unlock-wheel-animation").is_none());
         assert_eq!(vcx.debug_bounds("unlock-icon-still"), Some(icon));
+        assert_eq!(vcx.debug_bounds("unlock-icon-background"), Some(icon));
+    }
+
+    #[gpui::test]
+    fn unlock_keeps_the_background_icon_mounted(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _, mut vcx) = open(dir.path(), cx);
+        let icon = vcx.debug_bounds("unlock-icon").unwrap();
+        assert_eq!(
+            vcx.debug_bounds("unlock-icon-background"),
+            Some(icon),
+            "the spoke-less background must be decoded before the first unlock"
+        );
+        assert!(vcx.debug_bounds("unlock-wheel-still").is_some());
+        state.update(&mut vcx, |s, cx| {
+            s.busy = Some(Busy::Unlocking);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert_eq!(vcx.debug_bounds("unlock-icon-background"), Some(icon));
+        assert!(vcx.debug_bounds("unlock-wheel-animation").is_some());
     }
 
     #[gpui::test]
@@ -416,11 +458,15 @@ mod tests {
         assert!(vcx.debug_bounds("unlocking").is_none());
         let field = vcx.debug_bounds("unlock-password").unwrap();
         let card = vcx.debug_bounds("unlock-card").unwrap();
-        // The app icon sits at the top of the card at 128 pt, above the field.
+        // The 256 px asset is drawn at 128 pt.
         let icon = vcx.debug_bounds("unlock-icon").expect("app icon");
-        assert_eq!(icon.size, gpui::size(px(APP_ICON_SIZE), px(APP_ICON_SIZE)));
+        assert_eq!(icon.size, gpui::size(px(128.), px(128.)));
         assert!(icon.bottom() <= field.top());
         assert!(icon.top() >= card.top());
+        let vault_name = vcx.debug_bounds("unlock-vault-name").unwrap();
+        assert_eq!(vault_name.top() - icon.bottom(), px(10.));
+        assert!(vault_name.bottom() < field.top());
+        assert_eq!(field.top() - vault_name.bottom(), px(20.));
 
         for busy in [Busy::Unlocking, Busy::TouchUnlocking] {
             state.update(&mut vcx, |s, cx| {
@@ -440,17 +486,19 @@ mod tests {
             // Nothing jumps: the card keeps its size and place.
             assert_eq!(vcx.debug_bounds("unlock-card"), Some(card));
             assert_eq!(vcx.debug_bounds("unlock-icon"), Some(icon), "icon stays");
+            assert_eq!(vcx.debug_bounds("unlock-icon-background"), Some(icon));
             assert_eq!(
                 vcx.debug_bounds("unlock-icon-still"),
                 Some(icon),
-                "still icon remains behind the animation"
+                "the original PNG stays mounted during animation"
             );
             let wheel = vcx
                 .debug_bounds("unlock-wheel-animation")
                 .expect("animated wheel over the still icon");
             assert_eq!(wheel.size, gpui::size(px(WHEEL_SIZE), px(WHEEL_SIZE)));
-            assert_eq!(wheel.left(), icon.left() + px(WHEEL_LEFT));
-            assert_eq!(wheel.top(), icon.top() + px(WHEEL_TOP));
+            // GPUI snaps quarter-point offsets to Retina pixel boundaries.
+            assert!((wheel.left() - icon.left() - px(WHEEL_LEFT)).abs() <= px(0.5));
+            assert!((wheel.top() - icon.top() - px(WHEEL_TOP)).abs() <= px(0.5));
 
             // Esc does nothing while unlocking.
             vcx.simulate_keystrokes("escape");
@@ -470,6 +518,16 @@ mod tests {
             field_focused(&screen, &mut vcx),
             "re-focused after unlocking"
         );
+    }
+
+    #[gpui::test]
+    fn open_another_vault_is_a_clickable_secondary_action(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _, mut vcx) = open(dir.path(), cx);
+        let switch = vcx.debug_bounds("unlock-switch").unwrap();
+        vcx.simulate_click(switch.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| assert_eq!(s.screen, Screen::Choose));
     }
 
     #[gpui::test]

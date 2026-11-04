@@ -383,6 +383,7 @@ Shipped: default-colour dot removed, Automatic row previews shape+colour live; v
 Not verified by eye: the popover surviving the modal panel's focus change; the panel filter in Finder; the Automatic row preview.
 Follow-ups: O_NOFOLLOW would need libc (accepted gap); sync testing plan proposed to the owner (sync lab script, two-device checklist, simulation wave).
 Bug hunt: not yet run for this wave.
+
 - Owner 2026-10-31: eye checks for the icons, sidebar, detail and picker waves all passed. Open list restated to the owner (commit, bug hunt, sync testing layer, passkey domain, signing identity, logged follow-ups). The deprecated `evaluatedPolicyDomainState` → `domainState` swap explained: same meaning, warning only, ride along with the next vault-macos change.
 
 ## Created date + Sections + detail focus ring (2026-10-31) — owner-requested, in flight
@@ -655,3 +656,15 @@ and out of the trash; ⌘M and Window ▸ Zoom really minimise/zoom; ⌥ reveals
 ⌥ is held re-masks at once; pinned header with long tags, sync banner, delete confirm open.
 
 Bug hunt: not yet run for this wave.
+
+## Lock screen polish (2026-11-04)
+
+The existing icon assets now render at 128 × 128 pt. The password field
+says "Enter master password"; a small vault name sits 10 pt beneath the icon, with a lighter dark-mode colour. The
+transparent "Open another vault" action remains clickable, with readable muted text and a subdued
+shortcut. The footer divider was removed and the vertical gaps tightened. The spoke-less icon background and wheel
+are mounted before the first unlock to prevent the image swap that caused a brief blink. All ten
+unlock-screen tests pass, including first-frame asset presence and vault switching. Workspace
+build, formatting, and Clippy checks pass. The full workspace run encountered Touch ID and
+file-watcher failures in this sandbox and stalled for over 60 seconds in
+`first_frame_after_unlock_is_at_rest_when_collapsed`; it was stopped before a final count.
