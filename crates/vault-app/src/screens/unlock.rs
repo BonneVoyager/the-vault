@@ -27,6 +27,13 @@ const APP_ICON_SIZE: f32 = 128.;
 const WHEEL_SIZE: f32 = 64.;
 const WHEEL_LEFT: f32 = 28.5;
 const WHEEL_TOP: f32 = 31.;
+/// The two PNGs differ only in source pixels x=60..181, y=60..195. Clip the
+/// full icon to that area (with a 4 px margin) so its translucent outer border
+/// is not painted twice over the spoke-less background. Coordinates are points.
+const STILL_OVERLAY_LEFT: f32 = 28.;
+const STILL_OVERLAY_TOP: f32 = 28.;
+const STILL_OVERLAY_WIDTH: f32 = 65.;
+const STILL_OVERLAY_HEIGHT: f32 = 72.;
 /// One ease-in-out turn of the wheel.
 const WHEEL_TURN: Duration = Duration::from_millis(1920);
 /// Mid-tone of the icon's `steelBar` gradient: gpui draws SVGs as a one-colour mask.
@@ -35,9 +42,9 @@ const WHEEL_STEEL: u32 = 0xbccadd;
 use crate::state::{AppState, Busy, ChooseIntent, Screen, TouchDenied};
 use crate::ui::{self, Clickable as _};
 
-const SHAKE: Duration = Duration::from_millis(400);
+const SHAKE: Duration = Duration::from_millis(300);
 /// Peak horizontal displacement of the shake.
-const SHAKE_PX: f32 = 10.;
+const SHAKE_PX: f32 = 4.;
 
 pub struct UnlockScreen {
     state: Entity<AppState>,
@@ -139,9 +146,9 @@ fn wheel() -> gpui::Svg {
         .text_color(rgb(WHEEL_STEEL))
 }
 
-/// Damped sine: three swings that settle back to 0 at `t = 1`.
+/// Damped sine: two small swings that settle back to 0 at `t = 1`.
 fn shake_offset(t: f32) -> f32 {
-    (t * PI * 6.).sin() * SHAKE_PX * (1. - t)
+    (t * PI * 4.).sin() * SHAKE_PX * (1. - t)
 }
 
 impl Render for UnlockScreen {
@@ -151,7 +158,6 @@ impl Render for UnlockScreen {
         let unlocking = is_unlocking(state.busy);
         let touch = state.touch_policy();
         let touch_hint = touch.err().and_then(TouchDenied::hint);
-        let error = state.error.clone();
         let failures = state.unlock_failures;
         let reduce_motion = state.reduce_motion;
         let theme = cx.theme();
@@ -185,20 +191,44 @@ impl Render for UnlockScreen {
             )
             .child(wheel)
             .child(
-                img(crate::assets::APP_ICON)
+                div()
                     .absolute()
-                    .inset_0()
-                    .size_full()
-                    .debug_selector(|| "unlock-icon-still".into())
-                    .when(spinning, |image| image.invisible()),
+                    .left(px(STILL_OVERLAY_LEFT))
+                    .top(px(STILL_OVERLAY_TOP))
+                    .w(px(STILL_OVERLAY_WIDTH))
+                    .h(px(STILL_OVERLAY_HEIGHT))
+                    .overflow_hidden()
+                    .debug_selector(|| "unlock-icon-still-clip".into())
+                    .child(
+                        img(crate::assets::APP_ICON)
+                            .absolute()
+                            .left(px(-STILL_OVERLAY_LEFT))
+                            .top(px(-STILL_OVERLAY_TOP))
+                            .size(px(APP_ICON_SIZE))
+                            .debug_selector(|| "unlock-icon-still".into())
+                            .when(spinning, |image| image.invisible()),
+                    ),
             );
 
-        let mut controls = ui::v_flex().w_full().gap(px(12.)).child(
+        let password_field = div()
+            .w_full()
+            .debug_selector(|| "unlock-password".into())
+            .child(ui::input(&self.password).disabled(unlocking));
+        // Animate only the input. The card and buttons keep their positions.
+        let password_field: AnyElement = if failures == 0 || reduce_motion {
+            password_field.into_any_element()
+        } else {
             div()
                 .w_full()
-                .debug_selector(|| "unlock-password".into())
-                .child(ui::input(&self.password).disabled(unlocking)),
-        );
+                .debug_selector(|| "unlock-input-shake".into())
+                .child(password_field.relative().with_animation(
+                    ("shake", failures),
+                    Animation::new(SHAKE),
+                    |field, t| field.left(px(shake_offset(t))),
+                ))
+                .into_any_element()
+        };
+        let mut controls = ui::v_flex().w_full().gap(px(12.)).child(password_field);
         if let Some(hint) = touch_hint {
             controls = controls.child(
                 div()
@@ -206,15 +236,6 @@ impl Render for UnlockScreen {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(hint),
-            );
-        }
-        if let Some(error) = error {
-            controls = controls.child(
-                div()
-                    .w_full()
-                    .text_sm()
-                    .text_color(theme.danger)
-                    .child(error),
             );
         }
         controls = controls
@@ -309,21 +330,6 @@ impl Render for UnlockScreen {
                     .when(unlocking, |area| area.child(unlocking_overlay(cx))),
             );
 
-        // Each wrong password gets a fresh element id, which restarts the animation. The
-        // count is zero after a lock or unlock (`AppState::lock`), so the screen appearing
-        // never replays an old shake.
-        let card: AnyElement = if failures == 0 || reduce_motion {
-            card.into_any_element()
-        } else {
-            div()
-                .debug_selector(|| "unlock-shake".into())
-                .child(card.relative().with_animation(
-                    ("shake", failures),
-                    Animation::new(SHAKE),
-                    |card, t| card.left(px(shake_offset(t))),
-                ))
-                .into_any_element()
-        };
         ui::centered(cx).child(card)
     }
 }
@@ -461,6 +467,17 @@ mod tests {
         // The 256 px asset is drawn at 128 pt.
         let icon = vcx.debug_bounds("unlock-icon").expect("app icon");
         assert_eq!(icon.size, gpui::size(px(128.), px(128.)));
+        let still_clip = vcx.debug_bounds("unlock-icon-still-clip").unwrap();
+        assert_eq!(still_clip.left(), icon.left() + px(STILL_OVERLAY_LEFT));
+        assert_eq!(still_clip.top(), icon.top() + px(STILL_OVERLAY_TOP));
+        assert_eq!(
+            still_clip.size,
+            gpui::size(px(STILL_OVERLAY_WIDTH), px(STILL_OVERLAY_HEIGHT))
+        );
+        assert!(
+            still_clip.right() < icon.right(),
+            "outer border stays single-layered"
+        );
         assert!(icon.bottom() <= field.top());
         assert!(icon.top() >= card.top());
         let vault_name = vcx.debug_bounds("unlock-vault-name").unwrap();
@@ -534,6 +551,8 @@ mod tests {
     fn wrong_password_returns_to_the_focused_field(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (state, screen, mut vcx) = open(dir.path(), cx);
+        let card = vcx.debug_bounds("unlock-card").unwrap();
+        let switch = vcx.debug_bounds("unlock-switch").unwrap();
         vcx.update(|window, cx| window.blur(cx));
         state.update(&mut vcx, |s, cx| {
             s.unlock(SecretString::new("wrong".into()), cx);
@@ -547,6 +566,9 @@ mod tests {
         });
         assert!(vcx.debug_bounds("unlock-password").is_some());
         assert!(vcx.debug_bounds("unlocking").is_none());
+        assert_eq!(vcx.debug_bounds("unlock-card"), Some(card));
+        assert_eq!(vcx.debug_bounds("unlock-switch"), Some(switch));
+        assert!(vcx.debug_bounds("unlock-input-shake").is_some());
         assert!(field_focused(&screen, &mut vcx));
     }
 
@@ -554,7 +576,7 @@ mod tests {
     fn lock_does_not_replay_the_shake(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (state, _, mut vcx) = open(dir.path(), cx);
-        assert!(vcx.debug_bounds("unlock-shake").is_none());
+        assert!(vcx.debug_bounds("unlock-input-shake").is_none());
 
         // Wrong password: shake.
         state.update(&mut vcx, |s, cx| {
@@ -562,17 +584,16 @@ mod tests {
         });
         vcx.run_until_parked();
         assert!(
-            vcx.debug_bounds("unlock-shake").is_some(),
+            vcx.debug_bounds("unlock-input-shake").is_some(),
             "wrong password shakes"
         );
 
-        // ⌘L / idle / sidebar Lock while the error is showing: the next unlock screen
-        // starts still.
+        // ⌘L / idle / sidebar Lock after a failure: the next unlock screen starts still.
         state.update(&mut vcx, |s, cx| s.lock(cx));
         vcx.run_until_parked();
         state.read_with(&vcx, |s, _| assert_eq!(s.unlock_failures, 0));
         assert!(
-            vcx.debug_bounds("unlock-shake").is_none(),
+            vcx.debug_bounds("unlock-input-shake").is_none(),
             "no shake after lock"
         );
 
@@ -581,7 +602,7 @@ mod tests {
             s.unlock(SecretString::new("bad".into()), cx)
         });
         vcx.run_until_parked();
-        assert!(vcx.debug_bounds("unlock-shake").is_some());
+        assert!(vcx.debug_bounds("unlock-input-shake").is_some());
         state.update(&mut vcx, |s, cx| {
             s.unlock(SecretString::new("pw".into()), cx)
         });
@@ -591,7 +612,7 @@ mod tests {
         vcx.run_until_parked();
         state.read_with(&vcx, |s, _| assert_eq!(s.screen, Screen::Unlock));
         assert!(
-            vcx.debug_bounds("unlock-shake").is_none(),
+            vcx.debug_bounds("unlock-input-shake").is_none(),
             "no shake after lock"
         );
         assert!(vcx.debug_bounds("unlock-card").is_some());
@@ -601,7 +622,7 @@ mod tests {
             s.unlock(SecretString::new("bad".into()), cx)
         });
         vcx.run_until_parked();
-        assert!(vcx.debug_bounds("unlock-shake").is_some());
+        assert!(vcx.debug_bounds("unlock-input-shake").is_some());
     }
 
     #[gpui::test]
@@ -652,13 +673,16 @@ mod tests {
         state.read_with(&vcx, |s, _| {
             assert!(s.error.is_none() && s.unlock_failures == 0);
         });
-        assert!(vcx.debug_bounds("unlock-shake").is_none(), "no early shake");
+        assert!(
+            vcx.debug_bounds("unlock-input-shake").is_none(),
+            "no early shake"
+        );
         advance(MS, &mut vcx);
         state.read_with(&vcx, |s, _| {
             assert!(s.busy.is_none() && s.error.is_some());
             assert_eq!(s.unlock_failures, 1);
         });
-        assert!(vcx.debug_bounds("unlock-shake").is_some());
+        assert!(vcx.debug_bounds("unlock-input-shake").is_some());
 
         // A slow failure shows the moment it is known.
         timed(&state, 800 * MS, &mut vcx);

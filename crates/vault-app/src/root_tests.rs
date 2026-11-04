@@ -117,6 +117,72 @@ fn password_unlock_focuses_search(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn close_window_locks_before_closing_and_reopens_locked(cx: &mut TestAppContext) {
+    use std::sync::Arc;
+    use vault_core::{KdfParams, SecretString};
+    use vault_sync::{NoopHooks, SyncedVault};
+
+    let dir = tempfile::tempdir().unwrap();
+    let vault = SyncedVault::create(
+        &dir.path().join("t.vault"),
+        &SecretString::new("pw".into()),
+        KdfParams::for_tests(),
+        Uuid::new_v4(),
+        Arc::new(NoopHooks),
+    )
+    .unwrap();
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        actions::bind_keys(cx);
+        actions::register(&state, cx);
+        cx.set_global(crate::RunningVault(state.clone()));
+    });
+    state.update(cx, |s, _| s.install_unlocked_for_tests(vault));
+    let main = cx.add_window(|window, cx| {
+        theme::apply(window, cx);
+        let view = cx.new(|cx| VaultRoot::new(state.clone(), None, window, cx));
+        Root::new(view, window, cx)
+    });
+    let main: gpui::AnyWindowHandle = main.into();
+    cx.run_until_parked();
+    assert_eq!(state.read_with(cx, |s, _| s.screen), Screen::Main);
+
+    let closed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = closed.clone();
+    let checked = state.clone();
+    let _closed_subscription = cx.update(|cx| {
+        cx.on_window_closed(move |cx, id| {
+            if id == main.window_id() {
+                assert!(
+                    checked.read(cx).locked,
+                    "vault locked before the window closes"
+                );
+                observed.set(true);
+            }
+        })
+    });
+    cx.update_window(main, |_, window, _| window.activate_window())
+        .unwrap();
+    cx.simulate_keystrokes(main, "cmd-w");
+    cx.run_until_parked();
+    assert!(closed.get());
+    assert!(cx.update(|cx| cx.windows().is_empty()));
+    state.read_with(cx, |s, _| {
+        assert!(s.locked);
+        assert_eq!(s.screen, Screen::Unlock);
+    });
+
+    cx.update(crate::reopen_main_window);
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+    state.read_with(cx, |s, _| {
+        assert!(s.locked);
+        assert_eq!(s.screen, Screen::Unlock);
+    });
+}
+
+#[gpui::test]
 fn choose_screen_moves_by_the_title_band(cx: &mut TestAppContext) {
     use gpui::{Modifiers, MouseButton, point};
     let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));

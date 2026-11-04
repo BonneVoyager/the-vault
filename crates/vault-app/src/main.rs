@@ -25,6 +25,47 @@ use gpui::{App, AppContext as _, Entity, QuitMode};
 use crate::root::VaultRoot;
 use crate::state::{AppState, Sort};
 
+/// The vault session outlives its main window so a Dock click can restore the UI.
+struct RunningVault(Entity<AppState>);
+
+impl gpui::Global for RunningVault {}
+
+fn reopen_main_window(cx: &mut App) {
+    let Some(state) = cx
+        .try_global::<RunningVault>()
+        .map(|running| running.0.clone())
+    else {
+        return;
+    };
+    if let Some(main) = cx.try_global::<actions::MainWindow>().map(|main| main.0)
+        && let Some(handle) = cx.windows().into_iter().find(|w| w.window_id() == main)
+    {
+        cx.activate(true);
+        handle
+            .update(cx, |_, window, _| window.activate_window())
+            .ok();
+        return;
+    }
+
+    let restore = persist::load_window_state();
+    let sidebar_visible = state.read(cx).sidebar_visible();
+    match ui::open_main_window(restore, sidebar_visible, cx, |window, cx| {
+        theme::apply(window, cx);
+        cx.new(|cx| VaultRoot::new(state.clone(), restore, window, cx))
+    }) {
+        Ok(handle) => {
+            cx.activate(true);
+            handle
+                .update(cx, |_, window, _| window.activate_window())
+                .ok();
+            if !sidebar_visible {
+                ui::apply_main_min_size(false);
+            }
+        }
+        Err(err) => eprintln!("vault: failed to reopen main window: {err:#}"),
+    }
+}
+
 /// Global action handlers plus the quit hook.
 fn register_actions(state: &Entity<AppState>, cx: &mut App) {
     actions::register(state, cx);
@@ -45,44 +86,46 @@ fn main() {
     // TOTP secrets, item contents). Default level `warn`; RUST_LOG overrides.
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("warn"));
 
-    gpui_platform::application()
-        .with_quit_mode(QuitMode::LastWindowClosed)
-        .with_assets(assets::AppAssets)
-        .run(|cx: &mut App| {
-            gpui_component::init(cx);
-            actions::bind_keys(cx);
-            let settings = persist::load_settings();
-            actions::set_menus(Sort::default(), !settings.sidebar_hidden, cx);
-            theme::set_prefs(&settings, cx);
-            let state = cx.new(|_| {
-                AppState::new(vault_macos::device_id(), persist::load_recent(), true)
-                    .with_settings(settings)
-            });
-            register_actions(&state, cx);
+    let app = gpui_platform::application()
+        .with_quit_mode(QuitMode::Explicit)
+        .with_assets(assets::AppAssets);
+    app.on_reopen(reopen_main_window);
+    app.run(|cx: &mut App| {
+        gpui_component::init(cx);
+        actions::bind_keys(cx);
+        let settings = persist::load_settings();
+        actions::set_menus(Sort::default(), !settings.sidebar_hidden, cx);
+        theme::set_prefs(&settings, cx);
+        let state = cx.new(|_| {
+            AppState::new(vault_macos::device_id(), persist::load_recent(), true)
+                .with_settings(settings)
+        });
+        cx.set_global(RunningVault(state.clone()));
+        register_actions(&state, cx);
 
-            let restore = persist::load_window_state();
-            let sidebar_visible = state.read(cx).sidebar_visible();
-            let opened = ui::open_main_window(restore, sidebar_visible, cx, |window, cx| {
-                theme::apply(window, cx);
-                cx.new(|cx| VaultRoot::new(state.clone(), restore, window, cx))
-            });
-            if let Err(err) = opened {
-                eprintln!("vault: failed to open main window: {err:#}");
-                cx.quit();
-                return;
-            }
+        let restore = persist::load_window_state();
+        let sidebar_visible = state.read(cx).sidebar_visible();
+        let opened = ui::open_main_window(restore, sidebar_visible, cx, |window, cx| {
+            theme::apply(window, cx);
+            cx.new(|cx| VaultRoot::new(state.clone(), restore, window, cx))
+        });
+        if let Err(err) = opened {
+            eprintln!("vault: failed to open main window: {err:#}");
+            cx.quit();
+            return;
+        }
 
-            // A remembered vault skips the choose screen (05 §2.1).
-            state.update(cx, |s, cx| {
-                if let Some(path) = s.recent_vaults.first().cloned() {
-                    s.open_vault(path, cx);
-                }
-            });
-            cx.activate(true);
-            // The window opened with this minimum already; re-applied through the one
-            // hook (best effort: the window may not be key yet).
-            if !sidebar_visible {
-                ui::apply_main_min_size(false);
+        // A remembered vault skips the choose screen (05 §2.1).
+        state.update(cx, |s, cx| {
+            if let Some(path) = s.recent_vaults.first().cloned() {
+                s.open_vault(path, cx);
             }
         });
+        cx.activate(true);
+        // The window opened with this minimum already; re-applied through the one
+        // hook (best effort: the window may not be key yet).
+        if !sidebar_visible {
+            ui::apply_main_min_size(false);
+        }
+    });
 }

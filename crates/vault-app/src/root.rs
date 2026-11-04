@@ -192,16 +192,17 @@ impl VaultRoot {
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |this, cx| {
-                this.geometry = ui::window_geometry(window, this.geometry.columns);
-                this.save_geometry = None;
-                persist::save_window_state(&this.geometry);
-                this.state.update(cx, |s, cx| s.lock(cx));
+                this.prepare_to_close(window, cx);
             })
             .ok();
             true
         });
 
-        cx.set_global(actions::MainWindow(window.window_handle().window_id()));
+        let main_root = cx.entity().downgrade();
+        cx.set_global(actions::MainWindow(
+            window.window_handle().window_id(),
+            main_root,
+        ));
         let screen = state.read(cx).screen;
         cx.defer_in(window, |this, window, cx| {
             exclude_windows_from_capture(cx);
@@ -222,6 +223,17 @@ impl VaultRoot {
             _triggers: triggers,
             _system_accent: system_accent,
         }
+    }
+
+    /// Shared by the title-bar close and ⌘W paths: persist geometry and lock
+    /// before the main window can be removed.
+    pub(crate) fn prepare_to_close(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.geometry = ui::window_geometry(window, self.geometry.columns);
+        self.save_geometry = None;
+        // Tests exercise close/reopen without writing the developer's real window.json.
+        #[cfg(not(test))]
+        persist::save_window_state(&self.geometry);
+        self.state.update(cx, |s, cx| s.lock(cx));
     }
 
     /// Focus the right control for the screen that just became visible.

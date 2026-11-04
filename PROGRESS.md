@@ -657,14 +657,19 @@ and out of the trash; ⌘M and Window ▸ Zoom really minimise/zoom; ⌥ reveals
 
 Bug hunt: not yet run for this wave.
 
-## Lock screen polish (2026-11-04)
+## Unlock and window polish (2026-11-04)
 
-The existing icon assets now render at 128 × 128 pt. The password field
-says "Enter master password"; a small vault name sits 10 pt beneath the icon, with a lighter dark-mode colour. The
-transparent "Open another vault" action remains clickable, with readable muted text and a subdued
-shortcut. The footer divider was removed and the vertical gaps tightened. The spoke-less icon background and wheel
-are mounted before the first unlock to prevent the image swap that caused a brief blink. All ten
-unlock-screen tests pass, including first-frame asset presence and vault switching. Workspace
-build, formatting, and Clippy checks pass. The full workspace run encountered Touch ID and
-file-watcher failures in this sandbox and stalled for over 60 seconds in
-`first_frame_after_unlock_is_at_rest_when_collapsed`; it was stopped before a final count.
+- Lock screen: render the existing icon at 128 × 128 pt; use "Enter master password"; place the
+  small vault name 10 pt below the icon; tighten the gaps; keep "Open another vault" as a muted,
+  transparent action with a subdued ⌘O hint. The footer divider is gone.
+- Icon animation: mount the spoke-less background, wheel SVG, and full PNG from the first frame to
+  avoid the first-unlock blink. Clip the full PNG to the wheel area so its translucent outer border
+  is painted once in both idle and unlocking states. Source icon assets are unchanged.
+- Failed unlock: shake only the password input (4 pt peak, 300 ms). No inline error is rendered;
+  the card and button stay in place.
+- Window lifecycle: ⌘W and File ▸ Close Window close the active window. Closing the main window
+  locks first and leaves the app in the Dock; reopening from the Dock shows the locked window.
+  The title-bar close follows the same lock path, while ⌘Q still quits.
+- Checks: all 10 unlock-screen tests and the ⌘W close/reopen test pass; workspace build, formatting,
+  and Clippy pass. The broader workspace run, with one previously stalled UI test skipped, ended
+  with 385 passed and 16 macOS service/file-watcher failures in this sandbox.

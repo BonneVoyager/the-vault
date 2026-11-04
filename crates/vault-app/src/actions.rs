@@ -5,9 +5,12 @@
 //! handler mutates `AppState`; focus moves go through `AppState::request_focus`, which
 //! the main screen applies.
 
-use gpui::{Action, App, Context, Entity, KeyBinding, Menu, MenuItem, OsAction, actions};
+use gpui::{
+    Action, App, Context, Entity, KeyBinding, Menu, MenuItem, OsAction, WeakEntity, actions,
+};
 use gpui_component::input;
 
+use crate::root::VaultRoot;
 use crate::state::{AppState, ChooseIntent, CopyTarget, FocusTarget, GeneratorTarget, Sort};
 
 actions!(
@@ -25,6 +28,8 @@ actions!(
         About,
         /// ⌘Q.
         Quit,
+        /// ⌘W: close the active window; lock first when closing the vault window.
+        CloseWindow,
         /// ⌘F: focus the search field.
         Search,
         /// ⌘N: new item (Templates menu).
@@ -109,6 +114,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-o", OpenVault, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("cmd-f", Search, None),
         KeyBinding::new("cmd-n", NewItem, None),
         KeyBinding::new("cmd-e", EditItem, None),
@@ -173,6 +179,7 @@ fn install_menus(sort: Sort, sidebar_visible: bool, trash: bool, cx: &mut App) {
         Menu::new("File").items([
             MenuItem::action("New Vault…", NewVault),
             MenuItem::action("Open Vault…", OpenVault),
+            MenuItem::action("Close Window", CloseWindow),
             MenuItem::separator(),
             MenuItem::action("Import CSV\u{2026}", Import),
             MenuItem::action("Import 1Password (1PUX)\u{2026}", Import1Pux),
@@ -238,8 +245,8 @@ fn install_menus(sort: Sort, sidebar_visible: bool, trash: bool, cx: &mut App) {
     ]);
 }
 
-/// The main window's id. Item shortcuts act on the live vault only from this window.
-pub struct MainWindow(pub gpui::WindowId);
+/// The main window's id and view. Item shortcuts act on the live vault only from this window.
+pub struct MainWindow(pub gpui::WindowId, pub WeakEntity<VaultRoot>);
 
 impl gpui::Global for MainWindow {}
 
@@ -300,6 +307,33 @@ pub fn register(state: &Entity<AppState>, cx: &mut App) {
     on::<ImportKdbx>(state, cx, |s, cx| s.choose_import_kdbx(cx));
     on::<Export>(state, cx, |s, cx| s.request_export(cx));
     cx.on_action(|_: &Quit, cx| cx.quit());
+    let close_state = state.clone();
+    cx.on_action(move |_: &CloseWindow, cx| {
+        let Some(handle) = cx.active_window() else {
+            return;
+        };
+        let main = cx
+            .try_global::<MainWindow>()
+            .map(|main| (main.0, main.1.clone()));
+        let state = close_state.clone();
+        // Actions run inside the active window's dispatch. Defer the update until
+        // that window is available again, as for Minimize and Zoom.
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, cx| {
+                    if let Some((id, root)) = &main
+                        && handle.window_id() == *id
+                        && root
+                            .update(cx, |root, cx| root.prepare_to_close(window, cx))
+                            .is_err()
+                    {
+                        state.update(cx, |s, cx| s.lock(cx));
+                    }
+                    window.remove_window();
+                })
+                .ok();
+        });
+    });
 
     on_main::<Search>(state, cx, |s, cx| s.request_focus(FocusTarget::Search, cx));
     on_main::<FocusList>(state, cx, |s, cx| s.request_focus(FocusTarget::List, cx));
