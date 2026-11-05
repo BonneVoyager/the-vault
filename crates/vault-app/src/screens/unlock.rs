@@ -12,8 +12,8 @@ use std::time::Duration;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, Entity, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Transformation, Window, div, ease_in_out, img, percentage,
-    prelude::FluentBuilder as _, px, rgb, svg,
+    Subscription, Transformation, Window, div, img, percentage, prelude::FluentBuilder as _, px,
+    rgb, svg,
 };
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::input::{InputEvent, InputState};
@@ -34,8 +34,10 @@ const STILL_OVERLAY_LEFT: f32 = 28.;
 const STILL_OVERLAY_TOP: f32 = 28.;
 const STILL_OVERLAY_WIDTH: f32 = 65.;
 const STILL_OVERLAY_HEIGHT: f32 = 72.;
-/// One ease-in-out turn of the wheel.
+/// The wheel makes one quick turn, then continues at a steady pace.
+const WHEEL_START: Duration = Duration::from_millis(950);
 const WHEEL_TURN: Duration = Duration::from_millis(1920);
+const WHEEL_DECAY: f32 = 5.;
 /// Mid-tone of the icon's `steelBar` gradient: gpui draws SVGs as a one-colour mask.
 const WHEEL_STEEL: u32 = 0xbccadd;
 
@@ -151,6 +153,14 @@ fn shake_offset(t: f32) -> f32 {
     (t * PI * 4.).sin() * SHAKE_PX * (1. - t)
 }
 
+/// One complete turn with an exponentially decaying burst of speed. The linear
+/// part matches the following loop's speed, so the handoff stays smooth.
+fn wheel_start_progress(t: f32) -> f32 {
+    let steady = WHEEL_START.as_secs_f32() / WHEEL_TURN.as_secs_f32();
+    let burst = (1. - (-WHEEL_DECAY * t).exp()) / (1. - (-WHEEL_DECAY).exp());
+    steady * t + (1. - steady) * burst
+}
+
 impl Render for UnlockScreen {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
@@ -170,10 +180,13 @@ impl Render for UnlockScreen {
         let wheel: AnyElement = if spinning {
             wheel()
                 .debug_selector(|| "unlock-wheel-animation".into())
-                .with_animation(
+                .with_animations(
                     "unlock-wheel",
-                    Animation::new(WHEEL_TURN).repeat().with_easing(ease_in_out),
-                    |wheel, t| wheel.with_transformation(Transformation::rotate(percentage(t))),
+                    vec![
+                        Animation::new(WHEEL_START).with_easing(wheel_start_progress),
+                        Animation::new(WHEEL_TURN).repeat(),
+                    ],
+                    |wheel, _, t| wheel.with_transformation(Transformation::rotate(percentage(t))),
                 )
                 .into_any_element()
         } else {
@@ -348,6 +361,18 @@ mod tests {
     use crate::state::MIN_UNLOCK_HOLD;
 
     const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn wheel_start_ends_at_loop_speed() {
+        assert!(wheel_start_progress(0.).abs() < 1e-6);
+        assert!((wheel_start_progress(1.) - 1.).abs() < 1e-6);
+        assert!(wheel_start_progress(0.25) > 0.25);
+
+        let step = 0.001;
+        let end_speed = (1. - wheel_start_progress(1. - step)) / (step * WHEEL_START.as_secs_f32());
+        let loop_speed = 1. / WHEEL_TURN.as_secs_f32();
+        assert!((end_speed - loop_speed).abs() < 0.05);
+    }
 
     /// Holds unlocks for the real minimum and makes every background task take `work`
     /// on the fake clock.
