@@ -6,14 +6,16 @@
 //! in the layout so the card does not change size) while the icon's wheel turns: a
 //! rotated SVG of the six spokes over a copy of the icon without them.
 
+use std::cell::Cell;
 use std::f32::consts::PI;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, Entity, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Transformation, Window, div, img, percentage, prelude::FluentBuilder as _, px,
-    rgb, svg,
+    Subscription, Task, Transformation, Window, div, ease_out_quint, img, percentage,
+    prelude::FluentBuilder as _, px, rgb, svg,
 };
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::input::{InputEvent, InputState};
@@ -38,6 +40,8 @@ const STILL_OVERLAY_HEIGHT: f32 = 72.;
 const WHEEL_START: Duration = Duration::from_millis(950);
 const WHEEL_TURN: Duration = Duration::from_millis(1920);
 const WHEEL_DECAY: f32 = 5.;
+const WHEEL_SETTLE: Duration = Duration::from_millis(280);
+const WHEEL_CROSSFADE: Duration = Duration::from_millis(160);
 /// Mid-tone of the icon's `steelBar` gradient: gpui draws SVGs as a one-colour mask.
 const WHEEL_STEEL: u32 = 0xbccadd;
 
@@ -53,6 +57,11 @@ pub struct UnlockScreen {
     password: Entity<InputState>,
     /// Whether the last state notification saw an unlock in flight.
     was_unlocking: bool,
+    seen_failures: u32,
+    wheel_phase: Rc<Cell<f32>>,
+    settling_from: Option<f32>,
+    crossfading: bool,
+    settle_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -63,9 +72,38 @@ impl UnlockScreen {
             cx.observe_in(&state, window, |this, state, window, cx| {
                 let s = state.read(cx);
                 let unlocking = is_unlocking(s.busy);
+                let failed = s.unlock_failures != this.seen_failures;
+                this.seen_failures = s.unlock_failures;
+                let reduce_motion = s.reduce_motion;
+                let on_unlock_screen = s.screen == Screen::Unlock;
                 // A failed unlock brings the field back: put the cursor in it again.
-                if this.was_unlocking && !unlocking && s.screen == Screen::Unlock {
+                if this.was_unlocking && !unlocking && on_unlock_screen {
                     ui::focus_input(&this.password, window, cx);
+                    if !reduce_motion && failed {
+                        let phase = this.wheel_phase.get().fract();
+                        if phase > 0.01 {
+                            this.settling_from = Some(phase);
+                            this.settle_task = Some(cx.spawn(async move |this, cx| {
+                                cx.background_executor().timer(WHEEL_SETTLE).await;
+                                this.update(cx, |this, cx| {
+                                    this.settling_from = None;
+                                    this.crossfading = true;
+                                    cx.notify();
+                                })
+                                .ok();
+                                cx.background_executor().timer(WHEEL_CROSSFADE).await;
+                                this.update(cx, |this, cx| {
+                                    this.crossfading = false;
+                                    cx.notify();
+                                })
+                                .ok();
+                            }));
+                        }
+                    }
+                } else if unlocking && !this.was_unlocking {
+                    this.settling_from = None;
+                    this.crossfading = false;
+                    this.settle_task = None;
                 }
                 this.was_unlocking = unlocking;
                 cx.notify();
@@ -86,6 +124,11 @@ impl UnlockScreen {
             state,
             password,
             was_unlocking: false,
+            seen_failures: 0,
+            wheel_phase: Rc::new(Cell::new(0.)),
+            settling_from: None,
+            crossfading: false,
+            settle_task: None,
             _subscriptions: subscriptions,
         }
     }
@@ -177,7 +220,10 @@ impl Render for UnlockScreen {
             theme.muted_foreground
         };
         let spinning = unlocking && !reduce_motion;
+        let settling = !spinning && !reduce_motion && self.settling_from.is_some();
+        let crossfading = !spinning && !settling && self.crossfading;
         let wheel: AnyElement = if spinning {
+            let phase = self.wheel_phase.clone();
             wheel()
                 .debug_selector(|| "unlock-wheel-animation".into())
                 .with_animations(
@@ -186,13 +232,49 @@ impl Render for UnlockScreen {
                         Animation::new(WHEEL_START).with_easing(wheel_start_progress),
                         Animation::new(WHEEL_TURN).repeat(),
                     ],
-                    |wheel, _, t| wheel.with_transformation(Transformation::rotate(percentage(t))),
+                    move |wheel, _, t| {
+                        phase.set(t);
+                        wheel.with_transformation(Transformation::rotate(percentage(t)))
+                    },
+                )
+                .into_any_element()
+        } else if let Some(from) = self.settling_from.filter(|_| settling) {
+            wheel()
+                .debug_selector(|| "unlock-wheel-settling".into())
+                .with_animation(
+                    "unlock-wheel-settle",
+                    Animation::new(WHEEL_SETTLE).with_easing(ease_out_quint()),
+                    move |wheel, t| {
+                        wheel.with_transformation(Transformation::rotate(percentage(
+                            from + (1. - from) * t,
+                        )))
+                    },
                 )
                 .into_any_element()
         } else {
             wheel()
                 .debug_selector(|| "unlock-wheel-still".into())
                 .into_any_element()
+        };
+        let still_image = img(crate::assets::APP_ICON)
+            .absolute()
+            .left(px(-STILL_OVERLAY_LEFT))
+            .top(px(-STILL_OVERLAY_TOP))
+            .size(px(APP_ICON_SIZE))
+            .debug_selector(|| "unlock-icon-still".into());
+        let still_image: AnyElement = if spinning || settling {
+            still_image.invisible().into_any_element()
+        } else if crossfading {
+            still_image
+                .debug_selector(|| "unlock-icon-crossfade".into())
+                .with_animation(
+                    "unlock-icon-crossfade",
+                    Animation::new(WHEEL_CROSSFADE - Duration::from_millis(20)),
+                    |image, t| image.opacity(t),
+                )
+                .into_any_element()
+        } else {
+            still_image.into_any_element()
         };
         let icon = div()
             .relative()
@@ -212,15 +294,7 @@ impl Render for UnlockScreen {
                     .h(px(STILL_OVERLAY_HEIGHT))
                     .overflow_hidden()
                     .debug_selector(|| "unlock-icon-still-clip".into())
-                    .child(
-                        img(crate::assets::APP_ICON)
-                            .absolute()
-                            .left(px(-STILL_OVERLAY_LEFT))
-                            .top(px(-STILL_OVERLAY_TOP))
-                            .size(px(APP_ICON_SIZE))
-                            .debug_selector(|| "unlock-icon-still".into())
-                            .when(spinning, |image| image.invisible()),
-                    ),
+                    .child(still_image),
             );
 
         let password_field = div()
@@ -458,6 +532,33 @@ mod tests {
         assert!(vcx.debug_bounds("unlock-wheel-animation").is_none());
         assert_eq!(vcx.debug_bounds("unlock-icon-still"), Some(icon));
         assert_eq!(vcx.debug_bounds("unlock-icon-background"), Some(icon));
+    }
+
+    #[gpui::test]
+    fn failed_unlock_finishes_wheel_before_restoring_still_icon(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, screen, mut vcx) = open(dir.path(), cx);
+        state.update(&mut vcx, |s, cx| {
+            s.busy = Some(Busy::Unlocking);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| screen.read(cx).wheel_phase.set(0.4));
+        state.update(&mut vcx, |s, cx| {
+            s.busy = None;
+            s.unlock_failures += 1;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("unlock-wheel-settling").is_some());
+        assert!(vcx.debug_bounds("unlock-password").is_some());
+        advance(WHEEL_SETTLE, &mut vcx);
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("unlock-icon-crossfade").is_some());
+        assert!(vcx.debug_bounds("unlock-wheel-settling").is_none());
+        advance(Duration::from_millis(160), &mut vcx);
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("unlock-wheel-still").is_some());
     }
 
     #[gpui::test]
