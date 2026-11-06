@@ -109,8 +109,8 @@ impl SystemAccentWatch {
     }
 }
 
-/// Locked → unlocked crossfade (§2.3).
-const CROSSFADE: Duration = Duration::from_millis(150);
+/// Locked → unlocked crossfade (§2.3), right after the unlock finish.
+const CROSSFADE: Duration = crate::state::UNLOCK_CROSSFADE;
 /// Window geometry is written this long after the last resize/move.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 

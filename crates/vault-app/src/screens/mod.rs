@@ -7,7 +7,7 @@ mod kdbx_import;
 mod main;
 mod security;
 mod settings;
-mod unlock;
+pub(crate) mod unlock;
 
 pub use backup::open_backup_window;
 pub use choose::ChooseScreen;

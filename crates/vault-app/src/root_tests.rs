@@ -71,14 +71,16 @@ fn capture_exclusion_gating() {
     assert!(capture_exclusion_enabled(false, None));
 }
 
-#[gpui::test]
-fn password_unlock_focuses_search(cx: &mut TestAppContext) {
+/// A root window with a fresh vault (password "pw") opened, locked.
+fn root_with_vault(
+    dir: &std::path::Path,
+    cx: &mut TestAppContext,
+) -> (Entity<AppState>, Entity<VaultRoot>, VisualTestContext) {
     use std::sync::Arc;
     use vault_core::{KdfParams, SecretString};
     use vault_sync::{NoopHooks, SyncedVault};
 
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("t.vault");
+    let path = dir.join("t.vault");
     drop(
         SyncedVault::create(
             &path,
@@ -105,14 +107,53 @@ fn password_unlock_focuses_search(cx: &mut TestAppContext) {
     let mut vcx = VisualTestContext::from_window(window.into(), cx);
     state.update(&mut vcx, |s, cx| s.open_vault(path, cx));
     vcx.run_until_parked();
+    (state, root.unwrap(), vcx)
+}
+
+#[gpui::test]
+fn password_unlock_focuses_search(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, root, mut vcx) = root_with_vault(dir.path(), cx);
     state.update(&mut vcx, |s, cx| {
-        s.unlock(SecretString::new("pw".into()), cx)
+        s.unlock(vault_core::SecretString::new("pw".into()), cx)
     });
     vcx.run_until_parked();
     assert_eq!(state.read_with(&vcx, |s, _| s.screen), Screen::Main);
     vcx.update(|window, cx| {
-        let main = root.as_ref().unwrap().read(cx).main.clone();
+        let main = root.read(cx).main.clone();
         assert!(main.read(cx).search_focused(window, cx));
+    });
+}
+
+/// The unlock screen is gone before the main screen fades in (05 §2.2, §2.3).
+#[gpui::test]
+fn unlock_finish_ends_before_the_crossfade(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, root, mut vcx) = root_with_vault(dir.path(), cx);
+    let ms = Duration::from_millis(1);
+    state.update(&mut vcx, |s, cx| {
+        s.unlock_hold = crate::state::MIN_UNLOCK_HOLD;
+        s.fake_work_time = 50 * ms;
+        s.unlock(vault_core::SecretString::new("pw".into()), cx)
+    });
+    vcx.executor().advance_clock(350 * ms - ms);
+    assert!(vcx.debug_bounds("unlock-keyhole-flare").is_some());
+    vcx.executor().advance_clock(ms);
+    assert_eq!(state.read_with(&vcx, |s, _| s.screen), Screen::Main);
+    for gone in [
+        "unlock-card",
+        "unlocking",
+        "unlock-keyhole-flare",
+        "unlock-icon",
+    ] {
+        assert!(vcx.debug_bounds(gone).is_none(), "{gone} during the fade");
+    }
+    vcx.update(|window, cx| {
+        let main = root.read(cx).main.clone();
+        assert!(
+            main.read(cx).search_focused(window, cx),
+            "focused during the fade"
+        );
     });
 }
 

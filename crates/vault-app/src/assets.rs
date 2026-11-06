@@ -54,11 +54,13 @@ gpui_kit_assets::icon_assets!(
 /// Asset path of the app icon raster (`img(APP_ICON)`): 256 px, drawn at 128 pt so it is
 /// sharp on Retina. Rendered from `assets/icon/vault.svg`.
 pub const APP_ICON: &str = "icon/vault-256.png";
-/// The same raster without the wheel's spokes, shown while an unlock runs.
-pub const APP_ICON_SPOKELESS: &str = "icon/vault-256-spokeless.png";
-/// The six spokes as an SVG mask (`svg().path(APP_ICON_WHEEL)`), rotated over
-/// [`APP_ICON_SPOKELESS`] while an unlock runs. Built by `assets/icon/build-unlock-wheel.sh`.
-pub const APP_ICON_WHEEL: &str = "icon/wheel.svg";
+/// Twenty-four 256 px frames of the original icon across one 60-degree spoke sector.
+/// Frame zero matches [`APP_ICON`] exactly. Built by `assets/icon/build-unlock-wheel.sh`.
+pub const APP_ICON_WHEEL_STRIP: &str = "icon/vault-wheel-strip.png";
+/// The icon's keyhole (glow, body, highlight) on a transparent background at the icon's
+/// 256 px scale, cropped to `screens::unlock::KEYHOLE_*`: the successful-unlock flare.
+/// Built by `assets/icon/build-unlock-wheel.sh`.
+pub const APP_ICON_KEYHOLE: &str = "icon/vault-keyhole.png";
 
 static EMBEDDED: [(&str, &[u8]); 3] = [
     (
@@ -66,12 +68,12 @@ static EMBEDDED: [(&str, &[u8]); 3] = [
         include_bytes!("../../../assets/icon/vault-256.png"),
     ),
     (
-        APP_ICON_SPOKELESS,
-        include_bytes!("../../../assets/icon/vault-256-spokeless.png"),
+        APP_ICON_WHEEL_STRIP,
+        include_bytes!("../../../assets/icon/vault-wheel-strip.png"),
     ),
     (
-        APP_ICON_WHEEL,
-        include_bytes!("../../../assets/icon/wheel.svg"),
+        APP_ICON_KEYHOLE,
+        include_bytes!("../../../assets/icon/vault-keyhole.png"),
     ),
 ];
 
@@ -134,16 +136,18 @@ mod tests {
             AppAssets.load("icons/lock.svg").unwrap().is_some(),
             "icons still load"
         );
-        let spokeless = AppAssets
-            .load(APP_ICON_SPOKELESS)
+        let strip = AppAssets
+            .load(APP_ICON_WHEEL_STRIP)
             .unwrap()
             .expect("embedded");
-        assert_eq!(&spokeless[..8], b"\x89PNG\r\n\x1a\n");
-        assert_eq!(spokeless[16..24], bytes[16..24], "same size as the icon");
-        let wheel = AppAssets.load(APP_ICON_WHEEL).unwrap().expect("embedded");
-        let wheel = std::str::from_utf8(&wheel).unwrap();
-        assert!(wheel.starts_with("<svg"));
-        assert!(wheel.len() < 2048, "a small vector, not a frame animation");
+        let original = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        let frames = image::load_from_memory(&strip).unwrap().to_rgba8();
+        assert_eq!(frames.dimensions(), (256 * 24, 256));
+        for y in 0..256 {
+            for x in 0..256 {
+                assert_eq!(frames.get_pixel(x, y), original.get_pixel(x, y));
+            }
+        }
         let brand = AppAssets
             .load("brand/github.svg")
             .unwrap()
@@ -151,8 +155,36 @@ mod tests {
         assert!(brand.starts_with(b"<svg"));
         assert!(AppAssets.load("brand/no-such-brand.svg").unwrap().is_none());
         let listed = AppAssets.list("icon/").unwrap();
-        for path in [APP_ICON_SPOKELESS, APP_ICON_WHEEL] {
-            assert!(listed.iter().any(|p| p == path), "{path} listed");
+        assert!(listed.iter().any(|p| p == APP_ICON_WHEEL_STRIP));
+
+        let keyhole = AppAssets.load(APP_ICON_KEYHOLE).unwrap().expect("embedded");
+        assert_eq!(&keyhole[..8], b"\x89PNG\r\n\x1a\n");
+        let (w, h) = crate::screens::unlock::KEYHOLE_SIZE;
+        assert_eq!(
+            u32::from_be_bytes(keyhole[16..20].try_into().unwrap()),
+            2 * w as u32
+        );
+        assert_eq!(
+            u32::from_be_bytes(keyhole[20..24].try_into().unwrap()),
+            2 * h as u32
+        );
+        assert!(keyhole.len() < 32 * 1024, "small overlay");
+        // Placed right: the keyhole's body (opaque pixels 3 px inside the opaque area, so
+        // not its edge over the flare) matches the icon under it.
+        let overlay = image::load_from_memory(&keyhole).unwrap().to_rgba8();
+        let (x0, y0) = crate::screens::unlock::KEYHOLE_ORIGIN;
+        let (x0, y0) = (2 * x0 as u32, 2 * y0 as u32);
+        let opaque = |x: u32, y: u32| overlay.get_pixel_checked(x, y).is_some_and(|p| p[3] == 255);
+        let mut body = 0;
+        for (x, y, px) in overlay.enumerate_pixels() {
+            let inner =
+                (0..49).all(|i| opaque((x + i % 7).wrapping_sub(3), (y + i / 7).wrapping_sub(3)));
+            if inner {
+                assert_eq!(px, original.get_pixel(x0 + x, y0 + y), "keyhole at {x},{y}");
+                body += 1;
+            }
         }
+        assert!(body > 400, "{body} keyhole body pixels");
+        assert!(listed.iter().any(|p| p == APP_ICON_KEYHOLE));
     }
 }

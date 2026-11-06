@@ -329,7 +329,7 @@ impl AppState {
         };
         let bio = self.biometrics.clone();
         let reason = format!("Unlock {}", self.vault_name());
-        self.run_bg_cx(
+        self.run_bg_timed(
             Busy::TouchUnlocking,
             cx,
             move || {
@@ -338,6 +338,7 @@ impl AppState {
                     .map(|(slot, kek)| vault.unlock_with_kek(slot, &kek));
                 (vault, result)
             },
+            |(_, result)| matches!(result, Ok(Ok(()))),
             move |this, (mut vault, result), outcome, cx| {
                 if outcome == Outcome::Closed {
                     this.report_lock(None, &vault.lock());
@@ -716,16 +717,16 @@ mod tests {
         let ms = Duration::from_millis(1);
         state.update(cx, |s, _| s.unlock_hold = super::super::MIN_UNLOCK_HOLD);
         state.update(cx, |s, cx| s.touch_unlock(cx));
-        // The fake Touch ID answers at once; the result waits for the hold.
-        cx.executor()
-            .advance_clock(super::super::MIN_UNLOCK_HOLD - ms);
+        // The fake Touch ID answers at once; the result waits for the hold, less the
+        // 150 ms main-screen fade that follows it (05 §2.2).
+        cx.executor().advance_clock(350 * ms - ms);
         state.read_with(cx, |s, _| {
             assert_eq!(s.busy, Some(Busy::TouchUnlocking), "held");
-            assert!(s.locked);
+            assert!(s.locked && s.unlock_finish.is_some());
         });
         cx.executor().advance_clock(ms);
         state.read_with(cx, |s, _| {
-            assert!(s.busy.is_none() && !s.locked);
+            assert!(s.busy.is_none() && !s.locked && s.unlock_finish.is_none());
             assert_eq!(s.screen, Screen::Main);
         });
     }

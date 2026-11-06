@@ -65,6 +65,20 @@ const BACKGROUND_QUIT_WAIT: Duration = Duration::from_secs(30);
 /// Shortest time "Unlocking…" stays up, from the start of a password or Touch ID unlock
 /// to its result (success or failure), so the card never flashes (specs/05-ui.md §2.2).
 pub const MIN_UNLOCK_HOLD: Duration = Duration::from_millis(500);
+/// Shortest finish animation after a successful unlock (05 §2.2).
+pub const MIN_UNLOCK_FINISH: Duration = Duration::from_millis(200);
+/// Locked → unlocked crossfade (05 §2.3): the main screen alone, after the finish.
+pub const UNLOCK_CROSSFADE: Duration = Duration::from_millis(150);
+
+/// A successful unlock's finish: the unlock screen stops the wheel and flares the
+/// keyhole for `duration`, then the main screen replaces it and fades in for
+/// [`UNLOCK_CROSSFADE`]; the hold covers both when the result is fast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnlockFinish {
+    pub(crate) duration: Duration,
+    /// `lock_gen` when it started: unique per finish, keys its animations.
+    pub(crate) id: u64,
+}
 
 /// Whether the world moved on while a background task ran (see `AppState::run_bg`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,6 +447,8 @@ pub struct AppState {
     /// macOS "Reduce motion": skip the unlock crossfade, the shake and the TOTP pulse.
     /// Refreshed by the 1 s tick.
     pub reduce_motion: bool,
+    /// The successful-unlock finish in progress; cleared by `lock`.
+    pub(crate) unlock_finish: Option<UnlockFinish>,
 
     device_id: Uuid,
     sync_events: Option<Receiver<SyncEvent>>,
@@ -526,6 +542,7 @@ impl AppState {
             unlock_failures: 0,
             unlock_count: 0,
             reduce_motion: false,
+            unlock_finish: None,
             device_id,
             sync_events: None,
             epoch: 0,
@@ -797,7 +814,7 @@ impl AppState {
         let stale = self.stale_enrollment();
         let bio = self.biometrics.clone();
         let (device_id, hooks) = (self.device_id, cloud::hooks());
-        self.run_bg_cx(
+        self.run_bg_timed(
             Busy::Unlocking,
             cx,
             move || {
@@ -815,6 +832,7 @@ impl AppState {
                 };
                 (vault, result, cleaned, upgraded)
             },
+            |(_, result, _, _)| result.is_ok(),
             |this, (mut vault, result, cleaned, upgraded), outcome, cx| match (outcome, result) {
                 // The user switched or closed the vault meanwhile; dropping zeroizes it.
                 (Outcome::Closed, _) => this.report_lock(None, &vault.lock()),
@@ -873,6 +891,19 @@ impl AppState {
         work: impl FnOnce() -> R + Send + 'static,
         finish: impl FnOnce(&mut Self, R, Outcome, &mut Context<Self>) + 'static,
     ) {
+        self.run_bg_timed(busy, cx, work, |_| false, finish);
+    }
+
+    /// [`Self::run_bg_cx`] for unlocks: a held result for which `succeeded` holds plays
+    /// the [`UnlockFinish`] first (05 §2.2), then shows.
+    fn run_bg_timed<R: Send + 'static>(
+        &mut self,
+        busy: Busy,
+        cx: &mut Context<Self>,
+        work: impl FnOnce() -> R + Send + 'static,
+        succeeded: fn(&R) -> bool,
+        finish: impl FnOnce(&mut Self, R, Outcome, &mut Context<Self>) + 'static,
+    ) {
         self.busy = Some(busy);
         self.error = None;
         cx.notify();
@@ -906,8 +937,18 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let remaining = hold.saturating_sub(executor.now().saturating_duration_since(started));
-            if !remaining.is_zero() {
-                executor.timer(remaining).await;
+            let ending = if hold.is_zero() || !succeeded(&result) {
+                None
+            } else {
+                this.update(cx, |this, cx| {
+                    this.start_unlock_finish(remaining, lock_gen, cx)
+                })
+                .ok()
+                .flatten()
+            };
+            let wait = ending.map_or(remaining, |f| f.duration);
+            if !wait.is_zero() {
+                executor.timer(wait).await;
             }
             this.update(cx, |this, cx| {
                 let outcome = if epoch != this.epoch {
@@ -920,12 +961,38 @@ impl AppState {
                 if outcome != Outcome::Closed {
                     this.busy = None;
                 }
+                // Over with the result; a lock already cleared it, a later one has another id.
+                if ending.is_some() && this.unlock_finish == ending {
+                    this.unlock_finish = None;
+                }
                 finish(this, result, outcome, cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Starts the finish of a successful unlock with `remaining` hold left, unless Reduce
+    /// Motion is on or the vault locked (or closed, which locks) since `lock_gen`.
+    fn start_unlock_finish(
+        &mut self,
+        remaining: Duration,
+        lock_gen: u64,
+        cx: &mut Context<Self>,
+    ) -> Option<UnlockFinish> {
+        if self.reduce_motion || lock_gen != self.lock_gen {
+            return None;
+        }
+        let finish = UnlockFinish {
+            duration: remaining
+                .saturating_sub(UNLOCK_CROSSFADE)
+                .max(MIN_UNLOCK_FINISH),
+            id: lock_gen,
+        };
+        self.unlock_finish = Some(finish);
+        cx.notify();
+        Some(finish)
     }
 
     /// [`Self::unlocked`] from a context that can schedule work: content the unlock sweep
@@ -992,6 +1059,7 @@ impl AppState {
         }
         self.unlocked_with_password_at = None;
         self.unlock_failures = 0;
+        self.unlock_finish = None;
         self.locked = true;
         self.autosave = None;
         self.autosave_pending = false;

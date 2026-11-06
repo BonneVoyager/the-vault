@@ -762,3 +762,41 @@ shows "The vault changed while saving; retrying…" and recovers.
 
 Bug hunt: not yet run for this wave (recommended: D-1/D-2/D-6/D-9 changed sync and merge
 semantics; a hunt covering this wave and the Recently Deleted wave is worth it before release).
+
+## Unlock wheel as a frame strip (2026-11-06, implemented by Codex, reviewed by the orchestrator)
+
+gpui rotates only single-colour SVG masks (`Svg::with_transformation`); `Img` has no
+transform, so the shaded spokes could not be rotated as a vector without losing their
+gradient and shadow. The wheel is now a 24-frame strip (`assets/icon/vault-wheel-strip.png`,
+6144 × 256, 343 KB, one 60° sector at 2.5° steps) rendered from `vault.svg` by
+`assets/icon/build-unlock-wheel.sh`; frame 0 is pixel-identical to `vault-256.png` (asserted by
+a test), so idle, spinning, and settling share one image and the crossfade is gone.
+`wheel.svg` and `vault-256-spokeless.png` removed. Rebuild is pixel-reproducible (PNG
+metadata differs). Orchestrator checks: fmt, clippy, and the 32 unlock/asset tests pass; the
+full app suite could not finish in this session (machine load average 40). Option if stepping
+is visible at 120 Hz: 48 frames (≈700 KB).
+
+## Unlock success finish (2026-11-06, owner chose option A "snap stop + keyhole release")
+
+On a successful unlock at elapsed E the finish lasts D = max(350 ms − E, 200 ms), entirely on the unlock screen: the wheel
+continues at its *current* speed (fast-start slope or loop speed), gets a short acceleration
+beat, decelerates and lands exactly on frame 0 at 0.7·D; the keyhole glow (`assets/icon/
+vault-keyhole.png`, 44 × 58 px crop at (100, 100), 2.8 KB, mounted from frame one at opacity 0)
+flashes from t = 0 (full by 0.2·D, held to 0.6·D, gone at D; eye check 3: start at success,
+stronger) with a wide #1f7dff halo (blur 28 ×6) and white core; crop 68 × 82 px at (88, 88), 7 KB;
+no element scaling (would enlarge the keyhole body); at D the unlock screen is unmounted and main fades in
+alone (root as at HEAD). Owner eye check 1: the D − 150 switch showed items mid-spin →
+serialised; eye check 2: any underlay overlap rejected → underlay removed (2026-11-06). Failure path, Reduce Motion
+and the 500 ms minimum are unchanged; a lock or switch during the finish discards it (finish
+keyed by `lock_gen`). `run_bg_cx` → `run_bg_timed` with a success predicate. Three success
+tests renamed to the new timeline. Code review: speed discontinuity at success fixed,
+wall-clock test replaced by a deterministic one, keyhole crop asserted pixel-for-pixel against
+the icon, Search focus asserted during the crossfade. Diff ≈ +530/−50 (over the 400-line
+guideline; implementer's split: state/root/timing tests vs wheel/keyhole/tests, if wanted
+as two commits). fmt, clippy clean; 49 unlock/assets/root tests pass. Full suite not re-run
+(machine load). Spec 05 §2.2 updated.
+
+Known, accepted: a lock during the finish before D − 150 ms leaves "Unlocking…" up until that
+timer fires (≤ 350 ms), same as a lock during the old hold.
+
+Bug hunt: not yet run for this wave.
