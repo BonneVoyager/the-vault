@@ -79,9 +79,11 @@ impl UnlockedVault {
     /// rules. `other` is only read.
     ///
     /// **Header merge** (03 §5). The header winner is chosen by the tuple
-    /// `(format_version, slots_modified_at, slots_device_id)`: if theirs is greater (a
-    /// missing stamp reads as 0, a missing device id sorts below any present one, greater
-    /// device-id bytes win like item metadata), our **format version**, whole slot set (key
+    /// `(format_version, slots_modified_at, slots_device_id, canonical CBOR of the slot set)`:
+    /// if theirs is greater (a missing stamp reads as 0, a missing device id sorts below any
+    /// present one, greater device-id bytes win like item metadata, and the canonical slot
+    /// bytes break an otherwise-exact tie so two divergent headers from a cloned device id in
+    /// the same millisecond still converge — D-9, 2026-11-06), our **format version**, whole slot set (key
     /// slots *and* opaque slots, in their order), KDF parameters (with the unknown keys of
     /// the `kdf` map), stamp and device id are replaced by theirs and
     /// `report.header_updated` is set; otherwise ours stay. The version leads the tuple
@@ -155,15 +157,23 @@ impl UnlockedVault {
         // that binds it (01 §2), so slots and version must always be adopted together, and
         // a greater version always wins regardless of stamp (an upgrade is never undone;
         // a merge can never lower the version). `Option` ordering puts a missing device id
-        // below every present one.
+        // below every present one. The final component, the canonical CBOR bytes of the slot
+        // set (03 §5, D-9, 2026-11-06), breaks an exact `(version, stamp, device id)` tie so
+        // two divergent headers from a cloned device id written in the same millisecond still
+        // converge instead of each side keeping its own header forever: the greater bytes win
+        // on both sides, and the loser adopts the winner's slots (which wrap the winner's key).
+        // Equal bytes mean identical slot sets (the same change seen twice), so "keep ours" is
+        // still idempotent. The slice comparison runs only on an otherwise-exact tie.
         let theirs_newer = (
             other.header.format_version,
             other.header.slots_stamp(),
             other.header.slots_device_id,
+            other.header.slots_canonical_bytes(),
         ) > (
             self.header.format_version,
             self.header.slots_stamp(),
             self.header.slots_device_id,
+            self.header.slots_canonical_bytes(),
         );
         if theirs_newer {
             self.header.format_version = other.header.format_version;

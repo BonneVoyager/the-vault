@@ -673,3 +673,92 @@ Bug hunt: not yet run for this wave.
 - Checks: all 10 unlock-screen tests and the ⌘W close/reopen test pass; workspace build, formatting,
   and Clippy pass. The broader workspace run, with one previously stalled UI test skipped, ended
   with 385 passed and 16 macOS service/file-watcher failures in this sandbox.
+
+## External security review response (daybreak-03-10-2026.md, started 2026-11-06)
+
+Twelve findings (2 medium, 10 low) against commit 67c443c. Disposition:
+
+| # | Finding | Decision |
+|---|---|---|
+| 1 | Package ops not bound to validated inodes (medium) | fix, vault-sync |
+| 2 | Atomic publish not bound to reconciled primary / temp inode (medium) | fix, vault-sync |
+| 3 | KDBX decompression has no output budget | **accepted by owner 2026-11-06**: gzip is inside the encrypted payload; import is user-initiated on a chosen file; worst case is an OOM during import with nothing written. Fix would mean replacing the keepass parser. |
+| 4 | Backup-viewer secrets across a lock race | fix, vault-app |
+| 5 | Notarisation password in argv (fallback path) | fix, scripts/package.sh |
+| 6 | Conflict absorption installs unauthenticated blobs | fix, vault-sync |
+| 7 | LF in conflict filenames forges CLI lines | fix, vault-cli |
+| 8 | Malformed KDBX4 inner header panics the session | fix, vault-core (+ dist profile keeps panic=unwind) |
+| 9 | Equal header stamps never converge | fix, vault-core (canonical-CBOR tie-break, 03 §5) |
+| 10 | Unbounded import / backup-viewer reads | fix, vault-app + vault-cli |
+| 11 | Unbounded watcher queues / candidate scans | fix, vault-sync |
+| 12 | KDF ceilings run before authentication | **accepted by owner 2026-11-06**: inherent to password KDFs; ceilings are spec 01 parameters; requires write access to the vault file; impact is a slow failed unlock. |
+
+### Fixes (2026-11-06)
+
+- **D-1 (vault-sync):** `package::open_regular` (O_NOFOLLOW via rustix + fstat regular-file check)
+  for `.lock`, `vault.bin`, backups, blobs, conflict sources; `SyncError::UnsafePackageEntry`;
+  restore refuses symlinked entries and a symlinked `backups/`; symlinked blob reports Missing
+  and never triggers a download. Sub-claims rejected: backup listing already skipped links,
+  `remove_file` never follows, symlinked `attachments/`/`backups/` dirs were already refused.
+- **D-2 (vault-sync):** tmp handle kept open and (dev, ino) re-checked before rename;
+  `Mode::ReplaceIf(FileId)` (dev, ino, size, mtime; (size, blake3) fallback when only the inode
+  changed, for SMB/FUSE/iCloud renumbering); `SyncError::PrimaryChangedDuringSave`; `save`
+  retries 3× with re-merge; restore bound the same way. App: treated like the busy lock (friendly
+  message without the path, one scheduled retry). Spec 03 §2 updated.
+- **D-4 (vault-app):** backup viewer captures `(epoch, lock_gen)` at unlock start and discards a
+  late result; viewer copy refuses unless main window active; lock drops the viewer vault via the
+  lock observer. Viewer copy now shows its own "Copied" status instead of a main-window toast.
+- **D-6 (vault-sync):** blob publication requires exact sealed length and per-chunk AEAD
+  authentication with the ref's key during copy (plaintext to a zeroized sink); applies to
+  packages with and without `vault.bin`. Pre-2026-11-06 blobs not re-verified. Spec 03 §2.
+- **D-7 (vault-cli):** `sanitize_line` (LF/CR/C0/C1/U+2028-9 escaped) on every one-line output
+  incl. non-Notes values in `get` and the top-level `error:` line; multi-line sanitizer kept for
+  Notes and revealed values. Titles with LF now print `\n`.
+- **D-8 (vault-core):** `Database::parse` wrapped in `catch_unwind` → `ImportError::KdbxMalformed`
+  (fixed message); crafted-file test proves HMAC passed before the caught panic. The inner header
+  is encrypted and cannot be pre-validated. **dist profile must keep `panic = "unwind"`.**
+- **D-9 (vault-core):** header merge tuple gains canonical CBOR of the slot set; divergent same-
+  stamp, same-device headers now converge; tests rewritten (one stale flaky assertion fixed).
+- **D-10 (vault-app, vault-cli):** `vault_sync::read_capped` made public; app `bounded_read.rs`
+  and CLI wrap it with `Zeroizing` buffers; 64 MiB cap for CSV/1PUX imports and the backup
+  viewer; `import_1pux_from` split out for tests. Not added: a record-count cap in core.
+- **D-11 (vault-sync):** bounded channel (1024, try_send + rescan flag), deduplicated candidate
+  queue capped at 256, 8 candidates per poll, paged scans; overflow is a log warning only.
+  `vault sync` loops on `poll()` until 0. Residual: locked-state candidate list is uncapped
+  (bounded by distinct paths on disk).
+- **D-5 (scripts/package.sh):** with Apple ID credentials only, a temporary keychain profile is
+  stored once (argv exposure for milliseconds) and every `submit --wait` uses `--keychain-profile`;
+  a trap deletes the temporary profile best-effort (keychain naming unverified without real
+  credentials; manual command in scripts/README.md). Owner eye check on the next real notarisation.
+
+Reviews: security-reviewer SHIP on D-8/D-9 (after one test fix); code-reviewer SHIP on D-1/D-2,
+FIX FIRST → fixed on D-4/D-7/D-10 and on D-6/D-11. Workspace: fmt, clippy clean; 1069 passed,
+0 failed, 13 ignored; QA ledger 169/169; CLI 81/81.
+
+## Dist profile (2026-11-06)
+
+`[profile.dist]` (inherits release): `lto = "fat"`, `codegen-units = 1`, `strip = "symbols"`,
+`debug = "line-tables-only"`, `split-debuginfo = "packed"`. `[profile.release]` untouched.
+`scripts/package.sh` builds `--profile dist`, copies from `target/dist/`, and places
+`Vault.app.dSYM` next to the app (outside bundle and dmg; UUID verified with `atos`).
+Measured (best of N, noisy host): vault-app 39.5 → 24.7 MB, vault 3.07 → 1.93 MB; unlock×5 and
+merge proptest within noise; packaging build ≈4 min. Rejected: `panic = "abort"` (−3.7 MB, but
+D-8's `catch_unwind` needs unwinding), `opt-level = "s"` (−18% unlock, −30% merge), thin LTO
+(larger). Next size win if wanted: `assets/brand-icons.tsv` is ≈4.5 MB of `__const` via
+`include_str!`; compressing it at build time is an app change, not done.
+Note: `cargo test --profile dist` fails 108 vault-app UI tests because gpui layout checks need
+debug assertions; with `debug-assertions = true` 412/412 pass. Use dev tests as the gate.
+
+## CHECKPOINT — Security-review wave + dist profile complete (2026-11-06)
+
+fmt and clippy clean. `cargo test --workspace`: 1069 passed, 0 failed, 13 ignored. QA ledger
+169/169. CLI 81/81. Uncommitted: 42 files, ≈+2519/−262 (the owner staged the tree).
+
+Owner eye checks: launch `target/package/Vault.app` (dist build) and unlock; re-run
+`scripts/package.sh --skip-sign` for a fresh dmg; the next real notarisation with Apple ID
+credentials (temporary profile created and deleted); backup viewer copy shows its own pill;
+`vault get` prints `\n` in a title containing a newline; a save while the file is replaced
+shows "The vault changed while saving; retrying…" and recovers.
+
+Bug hunt: not yet run for this wave (recommended: D-1/D-2/D-6/D-9 changed sync and merge
+semantics; a hunt covering this wave and the Recently Deleted wave is worth it before release).

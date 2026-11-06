@@ -11,12 +11,14 @@
 //!
 //! Every name and path comparison here is normalisation-insensitive (NFC per component, see
 //! [`package::nfc`]): a provider may deliver `A\u{308}` where we wrote `\u{c4}`.
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, NoCache, new_debouncer_opt};
 
@@ -26,6 +28,17 @@ use crate::package::{self, VAULT_FILE_NAME, fold_name, strip_prefix_nfc};
 
 /// Debounce window (03 §3).
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Capacity of the watcher-to-`poll` signal channel. When it is full the watcher thread drops
+/// the signal and sets the rescan flag instead, so nothing is lost: the next `poll` treats
+/// the primary as changed and rescans for candidates.
+pub(crate) const SIGNAL_CAPACITY: usize = 1024;
+/// Most conflict candidates queued for `poll` at once. More are not lost: a dropped event
+/// requests a rescan, and a rescan that finds more than this pages through them by path.
+pub(crate) const MAX_PENDING_CANDIDATES: usize = 256;
+/// Most conflict candidates one `poll` processes; the rest stay queued for the next one, so
+/// the caller's thread is never held for long by a directory full of candidates.
+pub(crate) const CANDIDATES_PER_POLL: usize = 8;
 
 /// What the watcher thread tells `SyncedVault::poll`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,15 +115,24 @@ fn pattern_kind(stem: &str, name: &str) -> ConflictKind {
     ConflictKind::Generic
 }
 
-/// Owns the debouncer; dropping it stops both notify threads.
+/// Owns the debouncer; dropping it stops both notify threads. Also holds the candidate
+/// queue, which only the caller's thread (`poll`) touches.
 pub(crate) struct Watcher {
     _debouncer: Debouncer<RecommendedWatcher, NoCache>,
     pub(crate) signals: Receiver<WatchSignal>,
+    /// Set by the watcher thread when a signal could not be queued (channel full) or the OS
+    /// asked for a rescan; `poll` then reconciles the primary and rescans for candidates.
+    pub(crate) rescan: Arc<AtomicBool>,
+    pub(crate) queue: CandidateQueue,
+    package: PathBuf,
+    parent: PathBuf,
+    package_name: String,
 }
 
 impl Watcher {
-    /// Watch the package's parent directory recursively, then queue every existing candidate
-    /// sibling once so conflicted packages created while we were not running are seen too.
+    /// Watch the package's parent directory recursively, then queue the existing candidate
+    /// siblings (up to [`MAX_PENDING_CANDIDATES`], the rest page in as the queue drains) so
+    /// conflicted packages created while we were not running are seen too.
     pub(crate) fn start(package: &Path) -> Result<Self, SyncError> {
         let parent = parent_dir(package).to_owned();
         let package_name = package
@@ -120,13 +142,15 @@ impl Watcher {
         // FSEvents reports resolved paths (/private/var/... for /var/...), so match events
         // against both spellings of each directory.
         let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-        let (tx, signals) = crossbeam_channel::unbounded();
+        let (tx, signals) = crossbeam_channel::bounded(SIGNAL_CAPACITY);
+        let rescan = Arc::new(AtomicBool::new(false));
 
         let classifier = Classifier {
             package: [package.to_owned(), canonical(package)],
             parent: [parent.clone(), canonical(&parent)],
             package_name: package_name.clone(),
-            tx: tx.clone(),
+            tx,
+            rescan: rescan.clone(),
         };
         let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, _>(
             DEBOUNCE,
@@ -139,21 +163,39 @@ impl Watcher {
         debouncer
             .watch(&parent, RecursiveMode::Recursive)
             .map_err(|e| SyncError::Watch(e.to_string()))?;
-        // Scan only once events are flowing, so a package created in between is not missed
-        // (seeing it twice is harmless: poll dedupes and absorption is idempotent).
-        scan_candidates(&parent, package, &package_name, &tx);
-        tracing::info!(package = %package.display(), "watching vault package");
-        Ok(Self {
+        let mut watcher = Self {
             _debouncer: debouncer,
             signals,
-        })
+            rescan,
+            queue: CandidateQueue::default(),
+            package: package.to_owned(),
+            parent,
+            package_name,
+        };
+        // Scan only once events are flowing, so a package created in between is not missed
+        // (seeing it twice is harmless: the queue dedupes and absorption is idempotent).
+        watcher.queue.request_scan();
+        watcher.scan_if_due();
+        tracing::info!(package = %package.display(), "watching vault package");
+        Ok(watcher)
+    }
+
+    /// Run the next page of a requested or unfinished scan if the queue is empty.
+    pub(crate) fn scan_if_due(&mut self) {
+        if !self.queue.scan_due() {
+            return;
+        }
+        let (parent, package, name) = (&self.parent, &self.package, &self.package_name);
+        self.queue
+            .scan_page(|offer| scan_candidates(parent, package, name, offer));
     }
 }
 
 /// Every candidate sibling of the package (named `package_name`) currently in `dir`, and
-/// every per-file candidate inside `package`.
-fn scan_candidates(dir: &Path, package: &Path, package_name: &str, tx: &Sender<WatchSignal>) {
-    let send_matching = |d: &Path, matches: &dyn Fn(&str) -> bool| {
+/// every per-file candidate inside `package`, handed to `offer` one at a time (never
+/// collected: the directory may hold any number of entries).
+fn scan_candidates(dir: &Path, package: &Path, package_name: &str, offer: &mut dyn FnMut(PathBuf)) {
+    let mut send_matching = |d: &Path, matches: &dyn Fn(&str) -> bool| {
         let Ok(entries) = fs::read_dir(d) else {
             return;
         };
@@ -162,12 +204,121 @@ fn scan_candidates(dir: &Path, package: &Path, package_name: &str, tx: &Sender<W
             if let Some(name) = name.to_str()
                 && matches(name)
             {
-                let _ = tx.send(WatchSignal::CandidateConflict(d.join(name)));
+                offer(d.join(name));
             }
         }
     };
     send_matching(dir, &|n| classify(n, package_name).is_some());
     send_matching(package, &|n| classify_inner(n).is_some());
+}
+
+/// The bounded, deduplicated set of conflict candidates waiting for `poll`, plus the state
+/// of a paged scan. Keys are [`package::path_key`]s (NFC), so an event and a scan spelling the
+/// same name in NFC and NFD queue it once; candidates are taken in key order.
+///
+/// Bounds: at most [`MAX_PENDING_CANDIDATES`] entries. A candidate offered while full is
+/// dropped and a rescan is requested. A scan runs only once the queue is empty, and keeps
+/// only the smallest keys above its cursor that fit; if more matched, the cursor advances
+/// and the next page runs when the queue is empty again. So every candidate present on disk
+/// is eventually queued, with memory bounded by the cap however many entries the directory
+/// holds.
+#[derive(Debug, Default)]
+pub(crate) struct CandidateQueue {
+    pending: BTreeMap<PathBuf, PathBuf>,
+    /// A full scan from the start was requested (dropped candidate, rescan signal, start).
+    scan_requested: bool,
+    /// A scan is in progress: the next page starts after this key (`Some(None)` = from the
+    /// start).
+    cursor: Option<Option<PathBuf>>,
+    /// More candidates than fit were seen (dropped, or left for a later scan page) since
+    /// the last [`CandidateQueue::take_overflow_report`].
+    overflowed: bool,
+    /// The overflow warning was emitted for the current episode (reset once idle).
+    overflow_reported: bool,
+}
+
+impl CandidateQueue {
+    /// Queue `path` unless already queued. `false` if it was dropped because the queue is
+    /// full (a rescan is then requested).
+    pub(crate) fn push(&mut self, path: PathBuf) -> bool {
+        let key = package::path_key(&path);
+        if self.pending.contains_key(&key) {
+            return true;
+        }
+        if self.pending.len() >= MAX_PENDING_CANDIDATES {
+            self.scan_requested = true;
+            self.overflowed = true;
+            return false;
+        }
+        self.pending.insert(key, path);
+        true
+    }
+
+    /// The next candidate to process, in key order.
+    pub(crate) fn pop(&mut self) -> Option<PathBuf> {
+        let next = self.pending.pop_first().map(|(_, p)| p);
+        if self.is_idle() {
+            self.overflow_reported = false;
+        }
+        next
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub(crate) fn request_scan(&mut self) {
+        self.scan_requested = true;
+    }
+
+    /// Whether the overflow warning should be emitted now: `true` once per episode (from the
+    /// first overflow until the queue is empty with no scan outstanding).
+    pub(crate) fn take_overflow_report(&mut self) -> bool {
+        std::mem::take(&mut self.overflowed)
+            && !std::mem::replace(&mut self.overflow_reported, true)
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pending.is_empty() && !self.scan_requested && self.cursor.is_none()
+    }
+
+    /// A scan page may run now: one is requested or unfinished, and the queue is empty.
+    pub(crate) fn scan_due(&self) -> bool {
+        self.pending.is_empty() && (self.scan_requested || self.cursor.is_some())
+    }
+
+    /// Run one page: `visit` offers every matching path; the smallest keys above the cursor
+    /// (up to the cap) are queued. Returns whether more matched than fit.
+    pub(crate) fn scan_page(&mut self, visit: impl FnOnce(&mut dyn FnMut(PathBuf))) -> bool {
+        let after = match self.cursor.take() {
+            Some(after) => after,
+            None => {
+                self.scan_requested = false;
+                None
+            }
+        };
+        let room = MAX_PENDING_CANDIDATES.saturating_sub(self.pending.len());
+        let mut page: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+        let mut capped = false;
+        visit(&mut |path| {
+            let key = package::path_key(&path);
+            if after.as_ref().is_some_and(|a| key <= *a) || self.pending.contains_key(&key) {
+                return;
+            }
+            page.insert(key, path);
+            if page.len() > room {
+                page.pop_last();
+                capped = true;
+            }
+        });
+        if capped {
+            self.cursor = Some(page.last_key_value().map(|(k, _)| k.clone()).or(after));
+            self.overflowed = true;
+        }
+        self.pending.extend(page);
+        capped
+    }
 }
 
 /// Where an event path lies relative to the package.
@@ -192,9 +343,24 @@ struct Classifier {
     parent: [PathBuf; 2],
     package_name: String,
     tx: Sender<WatchSignal>,
+    /// Shared with [`Watcher::rescan`].
+    rescan: Arc<AtomicBool>,
 }
 
 impl Classifier {
+    /// Queue `signal` without blocking; if the channel is full, drop it and ask `poll` for a
+    /// rescan (which also reconciles the primary), so the drop loses nothing.
+    fn send(&self, signal: WatchSignal) {
+        match self.tx.try_send(signal) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(_)) => {
+                if !self.rescan.swap(true, Ordering::AcqRel) {
+                    tracing::warn!("watcher signal queue full; rescanning on the next poll");
+                }
+            }
+        }
+    }
+
     fn place<'a>(&self, path: &'a Path) -> Place<'a> {
         for pkg in &self.package {
             if let Some(rel) = strip_prefix_nfc(path, pkg) {
@@ -242,7 +408,7 @@ impl Classifier {
             Ok(events) => events,
             Err(errors) => {
                 for e in errors {
-                    let _ = self.tx.send(WatchSignal::Error(format!("watcher: {e}")));
+                    self.send(WatchSignal::Error(format!("watcher: {e}")));
                 }
                 return;
             }
@@ -254,29 +420,21 @@ impl Classifier {
                 continue;
             }
             if event.need_rescan() {
+                // The scan itself runs in `poll`, bounded by the candidate queue.
+                self.rescan.store(true, Ordering::Release);
                 primary = true;
-                scan_candidates(
-                    &self.parent[0],
-                    &self.package[0],
-                    &self.package_name,
-                    &self.tx,
-                );
             }
             for path in &event.paths {
                 match self.place(path) {
                     Place::Primary => primary = true,
                     Place::Sibling(name) => {
                         if classify(name, &self.package_name).is_some() && seen.insert(name) {
-                            let _ = self
-                                .tx
-                                .send(WatchSignal::CandidateConflict(self.parent[0].join(name)));
+                            self.send(WatchSignal::CandidateConflict(self.parent[0].join(name)));
                         }
                     }
                     Place::Inner(name) => {
                         if classify_inner(name).is_some() && seen.insert(name) {
-                            let _ = self
-                                .tx
-                                .send(WatchSignal::CandidateConflict(self.package[0].join(name)));
+                            self.send(WatchSignal::CandidateConflict(self.package[0].join(name)));
                         }
                     }
                     Place::Ignored => {}
@@ -284,7 +442,7 @@ impl Classifier {
             }
         }
         if primary {
-            let _ = self.tx.send(WatchSignal::PrimaryChanged);
+            self.send(WatchSignal::PrimaryChanged);
         }
     }
 }
@@ -334,6 +492,7 @@ mod tests {
             parent: [PathBuf::from("/d"), PathBuf::from("/private/d")],
             package_name: "Test.vault".to_owned(),
             tx,
+            rescan: Arc::default(),
         };
         (c, rx)
     }
@@ -452,6 +611,7 @@ mod tests {
             parent: [PathBuf::from(NFC_DIR), PathBuf::from(NFC_DIR)],
             package_name: NFC_NAME.to_owned(),
             tx,
+            rescan: Arc::default(),
         };
         (c, rx)
     }
@@ -556,6 +716,101 @@ mod tests {
                 WatchSignal::CandidateConflict(PathBuf::from(NFC_DIR).join("A\u{308}rzte 2.vault")),
                 WatchSignal::PrimaryChanged,
             ]
+        );
+    }
+
+    fn cand(i: usize) -> PathBuf {
+        PathBuf::from(format!("/d/Test {i:04}.vault"))
+    }
+
+    #[test]
+    fn queue_dedupes_and_caps() {
+        let mut q = CandidateQueue::default();
+        assert!(q.push(cand(1)));
+        assert!(q.push(cand(1)));
+        // The same name in NFD is the same candidate.
+        assert!(q.push(PathBuf::from("/d/\u{c4}rzte 2.vault")));
+        assert!(q.push(PathBuf::from("/d/A\u{308}rzte 2.vault")));
+        assert_eq!(q.len(), 2);
+        for i in 2..MAX_PENDING_CANDIDATES {
+            assert!(q.push(cand(i)));
+        }
+        assert_eq!(q.len(), MAX_PENDING_CANDIDATES);
+        assert!(!q.take_overflow_report());
+        assert!(!q.push(cand(9999)), "pushed past the cap");
+        assert_eq!(q.len(), MAX_PENDING_CANDIDATES);
+        assert!(q.take_overflow_report());
+        assert!(!q.take_overflow_report(), "reported twice in one episode");
+        // Not due until the queue is empty.
+        assert!(!q.scan_due());
+        while q.pop().is_some() {}
+        assert!(q.scan_due(), "the drop must request a rescan");
+    }
+
+    /// 300 candidates on disk: pages of at most the cap, every one queued exactly once, and
+    /// the scan finishes.
+    #[test]
+    fn paged_scan_covers_every_candidate_once() {
+        let all: Vec<PathBuf> = (0..300).rev().map(cand).collect();
+        let mut q = CandidateQueue::default();
+        q.request_scan();
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        while q.scan_due() {
+            pages += 1;
+            assert!(pages < 10, "scan does not terminate");
+            q.scan_page(|offer| all.iter().cloned().for_each(offer));
+            assert!(q.len() <= MAX_PENDING_CANDIDATES);
+            while let Some(p) = q.pop() {
+                seen.push(p);
+            }
+        }
+        assert_eq!(pages, 2);
+        let mut want = all.clone();
+        want.sort();
+        assert_eq!(seen, want);
+        assert!(q.take_overflow_report());
+    }
+
+    #[test]
+    fn full_channel_drops_and_requests_rescan() {
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let rescan = Arc::new(AtomicBool::new(false));
+        let c = Classifier {
+            package: [
+                PathBuf::from("/d/Test.vault"),
+                PathBuf::from("/d/Test.vault"),
+            ],
+            parent: [PathBuf::from("/d"), PathBuf::from("/d")],
+            package_name: "Test.vault".to_owned(),
+            tx,
+            rescan: rescan.clone(),
+        };
+        c.send(WatchSignal::PrimaryChanged);
+        c.send(WatchSignal::PrimaryChanged);
+        assert!(!rescan.load(Ordering::Acquire));
+        c.send(WatchSignal::CandidateConflict(cand(1)));
+        assert!(
+            rescan.load(Ordering::Acquire),
+            "drop did not request a rescan"
+        );
+        assert_eq!(rx.try_iter().count(), 2);
+    }
+
+    /// An OS "rescan" event no longer scans on the watcher thread; it sets the flag.
+    #[test]
+    fn need_rescan_event_sets_the_flag() {
+        use notify::event::Flag;
+        use notify_debouncer_full::DebouncedEvent;
+        use std::time::Instant;
+
+        let (c, rx) = classifier();
+        let event = notify::Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        c.handle(Ok(vec![DebouncedEvent::new(event, Instant::now())]));
+        assert!(c.rescan.load(Ordering::Acquire));
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            [WatchSignal::PrimaryChanged]
         );
     }
 }

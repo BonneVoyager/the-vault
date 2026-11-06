@@ -966,6 +966,30 @@ fn sync_absorbs_in_package_copy() {
     assert!(!copy.exists(), "copy must be moved to backups");
 }
 
+/// More conflict copies than one `poll` processes (8): one `vault sync` absorbs them all.
+#[test]
+fn sync_absorbs_more_copies_than_one_poll_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (f, remote) = sync_setup(dir.path());
+    let copies: Vec<_> = (1..=10)
+        .map(|n| f.join(format!("vault (host's conflicted copy 2026-01-{n:02}).bin")))
+        .collect();
+    for copy in &copies {
+        std::fs::copy(remote.join("vault.bin"), copy).unwrap();
+    }
+    std::fs::remove_dir_all(&remote).unwrap();
+    let out = ok(&vault(&f, PW, &["sync"]));
+    assert!(out.contains("10 conflict copies absorbed"), "{out}");
+    assert!(
+        copies.iter().all(|c| !c.exists()),
+        "every copy moved to backups"
+    );
+    let list = ok(&vault(&f, PW, &["list"]));
+    assert!(list.contains("Local") && list.contains("Remote"), "{list}");
+    let again = ok(&vault(&f, PW, &["sync"]));
+    assert!(again.contains("0 conflict copies absorbed"), "{again}");
+}
+
 #[test]
 fn sync_output_escapes_conflict_file_names() {
     let dir = tempfile::tempdir().unwrap();
@@ -1088,4 +1112,27 @@ fn export_survives_closed_stderr() {
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
     assert!(std::fs::read_to_string(&csv).unwrap().contains("Exp"));
+}
+
+/// `import` refuses a CSV over 64 MiB before reading it (sparse file) and leaves the vault
+/// unchanged.
+#[test]
+fn import_refuses_an_oversized_csv() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    let csv = dir.path().join("big.csv");
+    std::fs::File::create(&csv)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    let o = vault(
+        &f,
+        PW,
+        &["import", "--format", "csv", "--in", csv.to_str().unwrap()],
+    );
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("larger than the 64 MiB limit"), "{err}");
+    assert!(ok(&vault(&f, PW, &["list"])).trim().is_empty());
 }

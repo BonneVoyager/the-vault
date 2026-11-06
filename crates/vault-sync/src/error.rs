@@ -80,6 +80,18 @@ pub enum SyncError {
     /// retention deletes outside the package. Move the entry away to recover.
     #[error("{} is a symlink or not a directory; refusing to use it", .0.display())]
     UnsafePackageDir(PathBuf),
+    /// A file inside the package (`.lock`, `vault.bin`, a backup, a blob, a tmp file) is a
+    /// symlink, is not a regular file, or was swapped for another file while in use. Never
+    /// followed or acted on: it could redirect reads, writes or deletes outside the package.
+    /// Move the entry away to recover.
+    #[error("{} is a symlink, not a regular file, or was swapped while in use; refusing to use it", .0.display())]
+    UnsafePackageEntry(PathBuf),
+    /// The primary changed on disk between the save's pre-write read (and merge) and the
+    /// rename that would have replaced it, outside the package lock (a sync client or another
+    /// non-cooperating writer). Nothing was replaced; `save` already re-merged and retried a
+    /// few times before returning this. The vault stays dirty; retry.
+    #[error("{} changed while saving; not overwriting it", .0.display())]
+    PrimaryChangedDuringSave(PathBuf),
     /// A vault file (`vault.bin`, a backup or a conflicted copy) is larger than
     /// [`crate::MAX_VAULT_FILE_SIZE`]; refused before parsing. No vault this app writes gets
     /// near that size.

@@ -18,6 +18,7 @@ use vault_core::{
     strength_bits,
 };
 use vault_sync::{AttachmentState, NoopHooks, SyncError, SyncedVault};
+use zeroize::Zeroizing;
 
 mod edit;
 
@@ -282,16 +283,46 @@ fn replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
-/// Escape characters that could act on a terminal when vault content is printed.
-/// C0 controls, DEL, C1 controls and bidi/format controls become `\u{XXXX}`;
-/// tab becomes a single space and line feed is kept.
+/// Largest CSV file `import` reads: 64 MiB, the same cap vault-sync puts on a vault file.
+const MAX_IMPORT_FILE_SIZE: u64 = 64 * 1024 * 1024;
+
+/// `vault_sync::read_capped` (refuses non-regular files and anything over `cap` before
+/// allocating; follows symlinks, fine for a path the user typed), with the bytes wiped on
+/// drop and the too-large error worded like the app's.
+fn read_capped(path: &Path, cap: u64) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    match vault_sync::read_capped(path, cap) {
+        Ok(bytes) => Ok(Zeroizing::new(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("file is larger than the {} MiB limit", cap / (1024 * 1024)),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+/// Escape characters that could act on a terminal when multi-line vault content (a revealed
+/// value, notes) is printed. C0 controls, DEL, C1 controls and bidi/format controls become
+/// `\u{XXXX}`; tab becomes a single space and line feed is kept.
 fn sanitize_for_terminal(s: &str) -> String {
+    sanitize(s, true)
+}
+
+/// [`sanitize_for_terminal`] for text that must stay on one physical line (titles, names,
+/// paths, sync events, errors): line feed and carriage return become a visible `\n` / `\r`,
+/// so a crafted name cannot forge extra output lines.
+fn sanitize_line(s: &str) -> String {
+    sanitize(s, false)
+}
+
+fn sanitize(s: &str, keep_newlines: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '\t' => out.push(' '),
-            '\n' => out.push('\n'),
+            '\n' if keep_newlines => out.push('\n'),
+            '\n' => out.push_str("\\n"),
+            '\r' if !keep_newlines => out.push_str("\\r"),
             '\u{0}'..='\u{1f}'
             | '\u{7f}'
             | '\u{80}'..='\u{9f}'
@@ -329,7 +360,7 @@ fn totp_field(item: &Item) -> Option<&Field> {
 fn list_username(item: &Item) -> Option<String> {
     named_field(item, "username")
         .filter(|f| !f.kind.is_sensitive())
-        .map(|f| sanitize_for_terminal(f.value.expose_secret()))
+        .map(|f| sanitize_line(f.value.expose_secret()))
         .filter(|u| !u.is_empty())
 }
 
@@ -371,11 +402,11 @@ fn stamp_lines(item: &Item) -> Vec<String> {
 /// heading or another labelled line. With `show_id`, the field id trails.
 fn field_line(item: &Item, f: &Field, reveal: bool, show_id: bool) -> String {
     let mut line = if f.kind == FieldKind::Section {
-        sanitize_for_terminal(&f.name.to_uppercase())
+        sanitize_line(&f.name.to_uppercase())
     } else {
         format!(
             "{}: {}",
-            sanitize_for_terminal(&f.name),
+            sanitize_line(&f.name),
             display_value(item, f, reveal)
         )
     };
@@ -406,7 +437,7 @@ fn sync_report(events: impl Iterator<Item = vault_sync::SyncEvent>) -> SyncRepor
                 r.absorbed += 1;
                 r.lines.push(format!(
                     "absorbed conflict copy -> {}",
-                    sanitize_for_terminal(&p.display().to_string())
+                    sanitize_line(&p.display().to_string())
                 ));
             }
             SyncEvent::Merged(m) => r.lines.push(format!(
@@ -424,15 +455,13 @@ fn sync_report(events: impl Iterator<Item = vault_sync::SyncEvent>) -> SyncRepor
             SyncEvent::ForeignVault => r
                 .lines
                 .push("note: a different vault sits next to this one; left alone".to_owned()),
-            SyncEvent::Error(m) => r
-                .problems
-                .push(sanitize_for_terminal(&format!("error: {m}"))),
+            SyncEvent::Error(m) => r.problems.push(sanitize_line(&format!("error: {m}"))),
             SyncEvent::KeyMismatch | SyncEvent::KeyRotatedOnDisk => r
                 .problems
                 .push("the vault on disk no longer opens with this key".to_owned()),
             SyncEvent::SaveBlocked(b) => r
                 .problems
-                .push(sanitize_for_terminal(&format!("save blocked: {b:?}"))),
+                .push(sanitize_line(&format!("save blocked: {b:?}"))),
             SyncEvent::CloudUnavailable => r
                 .problems
                 .push("cloud copy not downloaded in time".to_owned()),
@@ -450,8 +479,16 @@ fn format_hint(v: &UnlockedVault) -> Option<&'static str> {
 /// What `get` prints for a field: secrets are masked unless `reveal` is set.
 fn display_value(item: &Item, f: &Field, reveal: bool) -> String {
     let raw = f.value.expose_secret();
+    // Only notes are multi-line; any other value with a line break would forge a line.
+    let shown = |raw: &str| {
+        if f.kind == FieldKind::Notes {
+            sanitize_for_terminal(raw)
+        } else {
+            sanitize_line(raw)
+        }
+    };
     if reveal {
-        return sanitize_for_terminal(raw);
+        return shown(raw);
     }
     if f.name.eq_ignore_ascii_case("number")
         && item.tags.iter().any(|t| t.eq_ignore_ascii_case("card"))
@@ -467,7 +504,7 @@ fn display_value(item: &Item, f: &Field, reveal: bool) -> String {
     }
     match f.kind {
         _ if f.kind.is_sensitive() => "********".to_owned(),
-        _ => sanitize_for_terminal(raw),
+        _ => shown(raw),
     }
 }
 
@@ -537,7 +574,7 @@ fn find_item(vault: &UnlockedVault, key: &str) -> Result<Uuid> {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let shown = sanitize_for_terminal(key);
+    let shown = sanitize_line(key);
     match (by_title.as_slice(), by_prefix.as_slice()) {
         ([t], [p]) if t.id == p.id => Ok(t.id),
         ([], []) => bail!("no item matches \"{shown}\""),
@@ -690,7 +727,7 @@ fn run_attach(cli: &Cli, cmd: &AttachCmd) -> Result<()> {
                 println!(
                     "{}  {}  {}  {}",
                     a.id,
-                    sanitize_for_terminal(&a.name),
+                    sanitize_line(&a.name),
                     a.size,
                     state_str(sv.attachment_state(a.id))
                 );
@@ -887,13 +924,13 @@ fn run(cli: Cli) -> Result<()> {
                 .get(find_item(vault, id_or_title)?)
                 .context("item vanished")?;
             println!("id:    {}", item.id);
-            println!("title: {}", sanitize_for_terminal(&item.title));
-            println!("tags:  {}", sanitize_for_terminal(&item.tags.join(", ")));
+            println!("title: {}", sanitize_line(&item.title));
+            println!("tags:  {}", sanitize_line(&item.tags.join(", ")));
             if *ids {
                 println!("Device: {}", item.device_id);
             }
             if let Some(icon) = &item.icon {
-                println!("Icon: {}", sanitize_for_terminal(&icon_summary(item, icon)));
+                println!("Icon: {}", sanitize_line(&icon_summary(item, icon)));
             }
             for f in &item.fields {
                 println!("{}", field_line(item, f, *reveal, *ids));
@@ -920,8 +957,8 @@ fn run(cli: Cli) -> Result<()> {
             for item in search(vault, &q) {
                 let short = &item.id.simple().to_string()[..8];
                 let user = list_username(item);
-                let tags = sanitize_for_terminal(&item.tags.join(","));
-                let title = sanitize_for_terminal(&item.title);
+                let tags = sanitize_line(&item.tags.join(","));
+                let title = sanitize_line(&item.title);
                 match user {
                     Some(u) => println!("{short}  {title}  {u}  [{tags}]"),
                     None => println!("{short}  {title}  [{tags}]"),
@@ -976,7 +1013,9 @@ fn run(cli: Cli) -> Result<()> {
             let mut sv = open_synced(&path, &pw)?;
             let rx = sv.subscribe();
             let run = sv.start_watching().map_err(sync_err).and_then(|()| {
-                sv.poll();
+                // One poll handles a bounded batch of conflict candidates; drain them all.
+                // `poll` returns 0 once the queue is empty and no rescan is due.
+                while sv.poll() > 0 {}
                 if sv.is_dirty() {
                     sv.save().map_err(sync_err)?;
                 }
@@ -1047,7 +1086,7 @@ fn run(cli: Cli) -> Result<()> {
             let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             println!(
                 "{} ({}s remaining)",
-                sanitize_for_terminal(&totp.code(secs)),
+                sanitize_line(&totp.code(secs)),
                 totp.seconds_remaining(secs)
             );
         }
@@ -1082,7 +1121,8 @@ fn run(cli: Cli) -> Result<()> {
                 bail!("unsupported format {format:?}");
             }
             let mut sv = open_cli(&cli)?;
-            let bytes = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+            let bytes = read_capped(input, MAX_IMPORT_FILE_SIZE)
+                .with_context(|| format!("reading {}", input.display()))?;
             let now = now_millis();
             let items = import_csv(&bytes, &CsvMapping::default(), sv.device_id(), now)?;
             let count = items.len();
@@ -1119,7 +1159,8 @@ fn main() -> ExitCode {
                 );
                 return ExitCode::FAILURE;
             }
-            eprintln!("error: {e:#}");
+            // Error text can carry file names from disk (conflict copies, backups).
+            eprintln!("error: {}", sanitize_line(&format!("{e:#}")));
             ExitCode::FAILURE
         }
     }
@@ -1147,6 +1188,82 @@ mod tests {
             sanitize_for_terminal("Plain \u{e9}\u{4e16}"),
             "Plain \u{e9}\u{4e16}"
         );
+    }
+
+    #[test]
+    fn sanitize_line_keeps_everything_on_one_line() {
+        assert_eq!(sanitize_line("a\nb"), "a\\nb");
+        assert_eq!(sanitize_line("a\rb"), "a\\rb");
+        assert_eq!(sanitize_line("a\r\nb"), "a\\r\\nb");
+        assert_eq!(sanitize_line("a\tb"), "a b");
+        assert_eq!(sanitize_line("\u{1b}[2J"), "\\u{1b}[2J");
+        assert_eq!(sanitize_line("\u{85}x\u{2028}"), "\\u{85}x\\u{2028}");
+        assert_eq!(sanitize_line("Plain \u{e9}"), "Plain \u{e9}");
+        for c in ('\u{0}'..='\u{9f}').chain(['\u{2028}', '\u{2029}']) {
+            let out = sanitize_line(&format!("a{c}b"));
+            assert!(
+                !out.contains(['\n', '\r', '\u{b}', '\u{c}', '\u{85}']),
+                "{c:?}"
+            );
+            assert!(!out.chars().any(char::is_control), "{c:?} -> {out:?}");
+        }
+    }
+
+    /// A non-notes value with a line break stays on its line, masked or revealed.
+    #[test]
+    fn get_values_cannot_forge_lines() {
+        let mut i = Item::new("t", Uuid::nil(), 0);
+        for kind in [
+            FieldKind::Text,
+            FieldKind::Url,
+            FieldKind::Email,
+            FieldKind::Password,
+        ] {
+            i.fields.push(Field::new(
+                "f",
+                kind,
+                SecretString::new("v\npassword: forged".into()),
+                0,
+            ));
+        }
+        for f in &i.fields {
+            for reveal in [false, true] {
+                let line = field_line(&i, f, reveal, false);
+                assert!(!line.contains(['\n', '\r']), "{:?} {line:?}", f.kind);
+            }
+        }
+        assert_eq!(
+            field_line(&i, &i.fields[0], false, false),
+            "f: v\\npassword: forged"
+        );
+    }
+
+    #[test]
+    fn single_line_outputs_escape_newlines() {
+        let mut i = Item::new("t", Uuid::nil(), 0);
+        i.fields.push(Field::new(
+            "evil\nforged: line",
+            FieldKind::Text,
+            SecretString::new("v".into()),
+            0,
+        ));
+        i.fields.push(Field::new(
+            "sec\nx",
+            FieldKind::Section,
+            SecretString::new(String::new()),
+            0,
+        ));
+        let line = field_line(&i, &i.fields[0], false, false);
+        assert_eq!(line, "evil\\nforged: line: v");
+        assert_eq!(field_line(&i, &i.fields[1], false, false), "SEC\\nX");
+        // Notes stay multi-line where intended.
+        i.fields.push(Field::new(
+            "notes",
+            FieldKind::Notes,
+            SecretString::new("one\ntwo".into()),
+            0,
+        ));
+        assert_eq!(field_line(&i, &i.fields[2], true, false), "notes: one\ntwo");
     }
 
     fn item(card: bool, fname: &str, fkind: FieldKind, v: &str) -> Item {
@@ -1191,7 +1308,7 @@ mod tests {
     }
 
     fn icon_line(i: &Item) -> String {
-        sanitize_for_terminal(&icon_summary(i, i.icon.as_ref().unwrap()))
+        sanitize_line(&icon_summary(i, i.icon.as_ref().unwrap()))
     }
 
     fn add_blob(i: &mut Item, size: u64) -> Uuid {
@@ -1416,6 +1533,50 @@ mod tests {
         assert!(!all.contains('\u{1b}'), "{all}");
         assert!(r.lines[0].contains("\\u{1b}[31mred"));
         assert_eq!(r.problems.len(), 2);
+    }
+
+    #[test]
+    fn read_capped_refuses_files_over_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.csv");
+        fs::write(&path, b"abcd").unwrap();
+        assert_eq!(read_capped(&path, 4).unwrap().as_slice(), b"abcd");
+        let e = read_capped(&path, 3).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::FileTooLarge);
+        // Sparse: refused on its size, nothing is read or allocated.
+        let big = dir.path().join("big.csv");
+        fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_IMPORT_FILE_SIZE + 1)
+            .unwrap();
+        let e = read_capped(&big, MAX_IMPORT_FILE_SIZE).unwrap_err();
+        assert_eq!(e.to_string(), "file is larger than the 64 MiB limit");
+        assert_eq!(
+            read_capped(dir.path(), 4).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// A synced conflict name or error text with LF/CR cannot forge extra report lines.
+    #[test]
+    fn sync_report_lines_are_one_physical_line() {
+        use vault_sync::SyncEvent;
+        let r = sync_report(
+            vec![
+                SyncEvent::ConflictAbsorbed(PathBuf::from(
+                    "/x/vault 2.vault\nmerged: 0 added, 0 updated, 0 deleted",
+                )),
+                SyncEvent::Error("disk\r\nerror: forged".to_owned()),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(r.lines.len(), 1);
+        assert_eq!(r.problems.len(), 1);
+        for line in r.lines.iter().chain(&r.problems) {
+            assert!(!line.contains(['\n', '\r']), "{line:?}");
+        }
+        assert!(r.lines[0].ends_with("vault 2.vault\\nmerged: 0 added, 0 updated, 0 deleted"));
+        assert_eq!(r.problems[0], "error: disk\\r\\nerror: forged");
     }
 
     #[test]

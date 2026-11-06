@@ -17,6 +17,7 @@ use vault_core::{CsvMapping, ExposeSecret as _, SecretVec, export_csv, import_cs
 use super::AppState;
 use super::edit::edit_result;
 use super::sync::TRANSFER_TAB;
+use crate::bounded_read::{MAX_IMPORT_FILE_SIZE, read_capped};
 use crate::{text, ui};
 
 /// Publishes `bytes` at `path` owner-read/write only, atomically.
@@ -157,14 +158,15 @@ impl AppState {
         .detach();
     }
 
-    /// Inserts every row of the CSV at `path` as a new item. Returns how many.
+    /// Inserts every row of the CSV at `path` as a new item. Returns how many. A file over
+    /// [`MAX_IMPORT_FILE_SIZE`] is refused before it is read.
     pub fn import_csv_from(&mut self, path: &Path, cx: &mut Context<Self>) -> usize {
         if !self.main_active() {
             self.show_toast("Unlock the vault to import into it", cx);
             return 0;
         }
-        let bytes = match std::fs::read(path) {
-            Ok(b) => SecretVec::new(b),
+        let bytes = match read_capped(path, MAX_IMPORT_FILE_SIZE) {
+            Ok(mut b) => SecretVec::new(std::mem::take(&mut *b)),
             Err(e) => {
                 self.show_toast(format!("Could not read {}: {e}", text::file_name(path)), cx);
                 return 0;
@@ -200,20 +202,30 @@ impl AppState {
                     if s.panel_session() != session {
                         return;
                     }
-                    match std::fs::read(&path) {
-                        Ok(bytes) => {
-                            s.import_1pux_bytes(&SecretVec::new(bytes), cx);
-                        }
-                        Err(e) => s.show_toast(
-                            format!("Could not read {}: {e}", text::file_name(&path)),
-                            cx,
-                        ),
-                    };
+                    s.import_1pux_from(&path, cx);
                 })
                 .ok();
             }
         })
         .detach();
+    }
+
+    /// Reads the 1PUX at `path` (refused over [`MAX_IMPORT_FILE_SIZE`] before anything is
+    /// allocated), then [`Self::import_1pux_bytes`]. Returns how many items were inserted.
+    pub fn import_1pux_from(&mut self, path: &Path, cx: &mut Context<Self>) -> usize {
+        if !self.main_active() {
+            self.show_toast("Unlock the vault to import into it", cx);
+            return 0;
+        }
+        match read_capped(path, MAX_IMPORT_FILE_SIZE) {
+            Ok(mut bytes) => {
+                self.import_1pux_bytes(&SecretVec::new(std::mem::take(&mut *bytes)), cx)
+            }
+            Err(e) => {
+                self.show_toast(format!("Could not read {}: {e}", text::file_name(path)), cx);
+                0
+            }
+        }
     }
 
     /// Inserts every item of a 1Password export (`.1pux`). Returns how many. Errors are
@@ -398,6 +410,45 @@ mod tests {
             assert!(message.contains("not a valid zip archive"), "{message}");
             assert_eq!(s.item_count(), 3);
         });
+    }
+
+    /// A CSV or 1PUX over 64 MiB is refused before it is read (a sparse file, so the test
+    /// allocates nothing); a small 1PUX on disk still imports through the same path.
+    #[gpui::test]
+    fn imports_refuse_files_over_64_mib(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = unlocked_state(&dir.path().join("t.vault"), &["Existing"], cx);
+        for name in ["big.csv", "big.1pux"] {
+            let path = dir.path().join(name);
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(MAX_IMPORT_FILE_SIZE + 1)
+                .unwrap();
+            state.update(cx, |s, cx| {
+                let n = if name.ends_with(".csv") {
+                    s.import_csv_from(&path, cx)
+                } else {
+                    s.import_1pux_from(&path, cx)
+                };
+                assert_eq!(n, 0);
+                let message = s.toast.as_ref().unwrap().message.to_string();
+                assert!(
+                    message.contains("larger than the 64 MiB limit"),
+                    "{message}"
+                );
+                assert_eq!(s.item_count(), 1);
+            });
+        }
+        let small = dir.path().join("small.1pux");
+        std::fs::write(
+            &small,
+            onepux(serde_json::json!([
+                {"uuid": "a", "state": "active", "categoryUuid": "003",
+                 "details": {"notesPlain": "n"}, "overview": {"title": "Note"}}
+            ])),
+        )
+        .unwrap();
+        assert_eq!(state.update(cx, |s, cx| s.import_1pux_from(&small, cx)), 1);
     }
 
     #[gpui::test]

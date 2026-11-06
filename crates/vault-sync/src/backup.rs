@@ -324,6 +324,8 @@ pub(crate) fn list_backups(package: &Path) -> Result<Vec<BackupInfo>, SyncError>
         let Some((taken_at, seq, kind)) = parse_file_name(file, &name) else {
             continue;
         };
+        // `DirEntry::metadata` is an `lstat` on unix: a symlinked entry is neither a file
+        // nor a directory here and is skipped, never followed.
         let meta = match entry.metadata() {
             Ok(m) => m,
             // Raced with a deletion (another device's retention, say).
@@ -333,7 +335,10 @@ pub(crate) fn list_backups(package: &Path) -> Result<Vec<BackupInfo>, SyncError>
         let size = if meta.is_file() {
             meta.len()
         } else if meta.is_dir() && kind == BackupKind::Conflict {
-            fs::metadata(package::vault_file(&entry.path())).map_or(0, |m| m.len())
+            fs::symlink_metadata(package::vault_file(&entry.path()))
+                .ok()
+                .filter(|m| m.is_file())
+                .map_or(0, |m| m.len())
         } else {
             continue;
         };

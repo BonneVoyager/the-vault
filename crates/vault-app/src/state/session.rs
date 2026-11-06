@@ -295,6 +295,10 @@ impl AppState {
         value: SecretString,
         cx: &mut Context<Self>,
     ) -> Option<u32> {
+        // Nothing reaches the clipboard once locked, whichever window asks.
+        if self.locked {
+            return None;
+        }
         let generation = self.clipboard.copy(&value);
         drop(value);
         let Some(generation) = generation else {

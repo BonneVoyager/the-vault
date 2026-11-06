@@ -61,8 +61,9 @@ pub struct SyncUi {
     pub export_confirm: bool,
     /// The last save attempt failed; the tick does not retry until something changes.
     pub save_failing: bool,
-    /// An autosave hit the save lock (`SaveLockTimeout`) and was retried once; the next
-    /// failure is not retried. Reset by any other save outcome.
+    /// An autosave hit the save lock (`SaveLockTimeout`) or found the file changed under it
+    /// (`PrimaryChangedDuringSave`) and was retried once; the next such failure is not
+    /// retried. Reset by any other save outcome.
     pub busy_retried: bool,
 }
 
@@ -71,6 +72,13 @@ pub const KEY_ROTATED_RESOLVED: &str = "Now using the vault's new key";
 
 /// Toast when another process held the vault's save lock for too long (03 §2).
 pub const SAVE_BUSY: &str = "Another process is writing this vault. Try again in a moment.";
+
+/// Toast when the vault file changed while a save was writing it, and a retry is scheduled.
+/// No path: the file is the open vault.
+pub const SAVE_CHANGED_RETRYING: &str = "The vault changed while saving; retrying\u{2026}";
+
+/// [`SAVE_CHANGED_RETRYING`] once the single retry has been used.
+pub const SAVE_CHANGED: &str = "The vault changed while saving. Try again in a moment.";
 
 impl SyncUi {
     /// True when a banner or prompt sits at the top of the detail column.
@@ -141,21 +149,30 @@ impl AppState {
     }
 
     /// Bookkeeping and toast for one autosave attempt. A save that waited out another
-    /// process's lock is retried once, `AUTOSAVE_DEBOUNCE` later.
+    /// process's lock, or found the file changed while writing it (the vault stays dirty,
+    /// nothing was overwritten), is retried once, `AUTOSAVE_DEBOUNCE` later.
     pub(super) fn autosave_finished(
         &mut self,
         result: Result<(), SyncError>,
         cx: &mut Context<Self>,
     ) {
         let busy = matches!(result, Err(SyncError::SaveLockTimeout(_)));
+        let changed = matches!(result, Err(SyncError::PrimaryChangedDuringSave(_)));
+        let retry = (busy || changed) && !self.sync.busy_retried && !self.locked;
         if let Some(e) = self.record_save(result) {
             if busy {
                 self.show_toast(SAVE_BUSY, cx);
+            } else if changed {
+                let message = if retry {
+                    SAVE_CHANGED_RETRYING
+                } else {
+                    SAVE_CHANGED
+                };
+                self.show_toast(message, cx);
             } else {
                 self.show_toast(format!("Could not save: {e}"), cx);
             }
         }
-        let retry = busy && !self.sync.busy_retried && !self.locked;
         self.sync.busy_retried = retry;
         if retry {
             self.schedule_autosave(cx);
@@ -1021,6 +1038,47 @@ mod tests {
             assert!(!s.autosave_pending, "no second retry");
             assert!(!s.sync.busy_retried, "the next edit's save may retry again");
             assert_eq!(s.toast.as_ref().unwrap().message.as_ref(), SAVE_BUSY);
+        });
+    }
+
+    /// The file changed under a save (`PrimaryChangedDuringSave`): a path-free toast, the
+    /// vault stays dirty, and the one scheduled retry saves it.
+    #[gpui::test]
+    fn changed_during_save_retries_once_without_the_path(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        let file = dir.path().join("t.vault").join("vault.bin");
+        let changed = || Err(SyncError::PrimaryChangedDuringSave(file.clone()));
+        state.update(cx, |s, cx| {
+            s.toggle_favorite(cx);
+            s.autosave = None;
+            s.autosave_pending = false;
+            // The save fails once with the error, as vault-sync reports it.
+            s.autosave_finished(changed(), cx);
+            let message = s.toast.as_ref().unwrap().message.to_string();
+            assert_eq!(message, SAVE_CHANGED_RETRYING);
+            assert!(!message.contains(&dir.path().display().to_string()));
+            assert!(s.vault.as_ref().unwrap().is_dirty(), "still dirty");
+            assert!(
+                s.sync.busy_retried && s.autosave_pending,
+                "one retry scheduled"
+            );
+        });
+        // ...then the retry goes through the real autosave path and succeeds.
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE);
+        cx.run_until_parked();
+        state.read_with(cx, |s, _| {
+            assert!(!s.vault.as_ref().unwrap().is_dirty(), "the retry saved");
+            assert!(!s.sync.save_failing && !s.sync.busy_retried);
+        });
+        // Failing again right after a retry gives up until the next edit.
+        state.update(cx, |s, cx| {
+            s.autosave_finished(changed(), cx);
+            s.autosave = None;
+            s.autosave_pending = false;
+            s.autosave_finished(changed(), cx);
+            assert!(!s.autosave_pending, "no second retry");
+            assert_eq!(s.toast.as_ref().unwrap().message.as_ref(), SAVE_CHANGED);
         });
     }
 

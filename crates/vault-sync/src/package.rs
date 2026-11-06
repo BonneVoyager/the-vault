@@ -12,8 +12,9 @@
 
 use std::borrow::Cow;
 use std::ffi::OsStr;
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use unicode_normalization::{UnicodeNormalization, is_nfc};
@@ -171,6 +172,63 @@ pub(crate) fn ensure_dir(dir: &Path) -> Result<(), SyncError> {
         }),
         Err(e) => Err(SyncError::io(dir, e)),
     }
+}
+
+/// `O_NOFOLLOW | O_NONBLOCK` for opening a package entry: a final symlink fails with ELOOP
+/// instead of being followed, and a FIFO planted under a vault file's name cannot block the
+/// open.
+pub(crate) fn no_follow_flags() -> i32 {
+    use rustix::fs::OFlags;
+    // The flag bits are small positive values on every target; the cast cannot truncate.
+    (OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32
+}
+
+/// Marker payload of the `io::Error` [`check_regular`] returns.
+#[derive(Debug)]
+struct NotRegularFile;
+
+impl std::fmt::Display for NotRegularFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not a regular file")
+    }
+}
+
+impl std::error::Error for NotRegularFile {}
+
+/// `fstat` the open handle and refuse anything but a regular file.
+pub(crate) fn check_regular(file: &File) -> io::Result<fs::Metadata> {
+    let meta = file.metadata()?;
+    if meta.file_type().is_file() {
+        Ok(meta)
+    } else {
+        Err(io::Error::new(ErrorKind::InvalidInput, NotRegularFile))
+    }
+}
+
+/// Open an existing file inside a package for reading, never through a final symlink
+/// (`O_NOFOLLOW`), and only if the handle is a regular file. Reads then go through this one
+/// handle, so a link or swap after the open cannot redirect them. A symlink or non-regular
+/// file is an error for which [`is_unsafe_entry`] holds.
+pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(no_follow_flags())
+        .open(path)?;
+    check_regular(&file)?;
+    // O_NONBLOCK only guarded the open; reads of a (possibly dataless, cloud-backed) regular
+    // file block normally.
+    let flags = fcntl_getfl(&file)?;
+    fcntl_setfl(&file, flags.difference(OFlags::NONBLOCK))?;
+    Ok(file)
+}
+
+/// Whether `e` (from [`open_regular`], [`check_regular`] or an `O_NOFOLLOW` open) means the
+/// entry is a symlink or not a regular file.
+pub(crate) fn is_unsafe_entry(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+        || e.get_ref()
+            .is_some_and(|inner| inner.is::<NotRegularFile>())
 }
 
 #[cfg(test)]

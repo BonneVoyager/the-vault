@@ -78,7 +78,7 @@ scripts/package.sh --skip-sign --skip-notarize   # unsigned local bundle
 scripts/package.sh --dry-run                     # print the signing commands only
 ```
 
-Output goes to `target/package/` as `Vault.app` and a `.dmg`. A signed build needs a Developer ID identity in `VAULT_SIGN_IDENTITY` and a notarytool keychain profile in `VAULT_NOTARY_KEYCHAIN_PROFILE`. The entitlement checker (`scripts/check-entitlements.sh`) refuses builds with weakened hardened-runtime entitlements. Details are in [scripts/README.md](scripts/README.md).
+Output goes to `target/package/` as `Vault.app`, a `.dmg`, and `Vault.app.dSYM` (crash symbols, kept out of the bundle). The script builds with `cargo build --profile dist` (fat LTO, stripped binary; see `[profile.dist]` in `Cargo.toml`), which is slower than `--release`; use `--release` for day-to-day builds. A signed build needs a Developer ID identity in `VAULT_SIGN_IDENTITY` and a notarytool keychain profile in `VAULT_NOTARY_KEYCHAIN_PROFILE`. The entitlement checker (`scripts/check-entitlements.sh`) refuses builds with weakened hardened-runtime entitlements. Details are in [scripts/README.md](scripts/README.md).
 
 ## Vault file layout
 

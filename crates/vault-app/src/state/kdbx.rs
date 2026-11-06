@@ -1,7 +1,6 @@
 //! KeePass import credentials stay in the view; decrypted entries arrive from a
 //! background task and are discarded if the session was locked or switched.
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use gpui::{Context, SharedString};
@@ -19,14 +18,13 @@ pub struct KdbxImportUi {
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<Zeroizing<Vec<u8>>, ImportError> {
-    let mut bytes = Zeroizing::new(Vec::new());
-    std::fs::File::open(path)
-        .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
-        .map_err(|_| ImportError::Malformed("could not read the selected file".into()))?;
-    if bytes.len() as u64 > limit {
-        return Err(ImportError::Malformed("selected file is too large".into()));
-    }
-    Ok(bytes)
+    crate::bounded_read::read_capped(path, limit).map_err(|e| {
+        ImportError::Malformed(if e.kind() == std::io::ErrorKind::FileTooLarge {
+            e.to_string()
+        } else {
+            "could not read the selected file".into()
+        })
+    })
 }
 
 impl AppState {

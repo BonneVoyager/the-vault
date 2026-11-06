@@ -13,19 +13,26 @@ use std::collections::hash_map::Entry;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use vault_core::{Header, LockedVault, Slot, SlotKind, UnlockedVault, Uuid, VaultError};
 
-use super::attachments::blob_budget;
-use super::{DOWNLOAD_TIMEOUT, SyncedVault, fingerprint, read_capped, read_error};
+use super::attachments::wanted_blobs;
+use super::{
+    DOWNLOAD_TIMEOUT, MAX_VAULT_FILE_SIZE, SyncedVault, fingerprint, read_error, read_handle_capped,
+};
+use crate::atomic::FileId;
 use crate::attachments;
 use crate::backup;
 use crate::cloud::CloudError;
 use crate::error::{SaveBlocked, SyncError};
 use crate::event::SyncEvent;
 use crate::package;
-use crate::watch::{ConflictKind, WatchSignal, Watcher, classify, classify_inner};
+use crate::watch::{
+    CANDIDATES_PER_POLL, ConflictKind, MAX_PENDING_CANDIDATES, WatchSignal, Watcher, classify,
+    classify_inner,
+};
 
 /// Which report was last made for a sibling `*.vault` (see `report_sibling_once`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,32 +76,61 @@ impl SyncedVault {
         self.watcher.is_some()
     }
 
-    /// Process every queued watcher signal on this thread: the primary first (03 §3), then
-    /// each candidate conflicted package (03 §6). Outcomes are reported as [`SyncEvent`]s,
-    /// never as errors. Returns the number of signals drained (0 when not watching). Call it
+    /// Process queued watcher work on this thread: the primary first (03 §3), then up to
+    /// [`CANDIDATES_PER_POLL`] candidate conflicted packages (03 §6); further candidates stay
+    /// queued for the next call, so one call never holds the caller's thread for long.
+    /// Outcomes are reported as [`SyncEvent`]s, never as errors. Returns the amount of work
+    /// done (signals drained plus candidates processed; 0 when idle or not watching). Call it
     /// from the app's tick.
+    ///
+    /// Bounds (review finding [11]): the watcher's channel holds [`SIGNAL_CAPACITY`] signals;
+    /// a signal that does not fit sets a flag that makes this call reconcile the primary and
+    /// rescan. At most [`MAX_PENDING_CANDIDATES`] candidates are queued; more (a dropped
+    /// event, or a scan that matched more) are picked up by paged rescans as the queue
+    /// drains. The first overflow in an episode is logged as a warning only, never a
+    /// [`SyncEvent`]: it is benign, and the app would show an event as an error (03 §2
+    /// "Watcher bounds").
+    ///
+    /// [`CANDIDATES_PER_POLL`]: crate::watch::CANDIDATES_PER_POLL
+    /// [`SIGNAL_CAPACITY`]: crate::watch::SIGNAL_CAPACITY
+    /// [`MAX_PENDING_CANDIDATES`]: crate::watch::MAX_PENDING_CANDIDATES
     pub fn poll(&mut self) -> usize {
-        let Some(watcher) = &self.watcher else {
+        let Some(watcher) = &mut self.watcher else {
             return 0;
         };
-        let signals: Vec<WatchSignal> = watcher.signals.try_iter().collect();
+        let mut drained = 0;
         let mut primary = false;
-        let mut conflicts: Vec<PathBuf> = Vec::new();
-        let mut keys: HashSet<PathBuf> = HashSet::new();
-        for signal in &signals {
+        let mut errors = Vec::new();
+        // Bounded: the channel never holds more than SIGNAL_CAPACITY.
+        for signal in watcher.signals.try_iter() {
+            drained += 1;
             match signal {
                 WatchSignal::PrimaryChanged => primary = true,
                 WatchSignal::CandidateConflict(p) => {
-                    // An event and a rescan may spell the same name in NFC and NFD.
-                    if keys.insert(package::path_key(p)) {
-                        conflicts.push(p.clone());
-                    }
+                    watcher.queue.push(p);
                 }
-                WatchSignal::Error(msg) => {
-                    tracing::warn!(error = %msg, "watcher error");
-                    self.emit(SyncEvent::Error(msg.clone()));
-                }
+                WatchSignal::Error(msg) => errors.push(msg),
             }
+        }
+        if watcher.rescan.swap(false, Ordering::AcqRel) {
+            drained += 1;
+            primary = true;
+            watcher.queue.request_scan();
+        }
+        watcher.scan_if_due();
+        let batch: Vec<PathBuf> = std::iter::from_fn(|| watcher.queue.pop())
+            .take(CANDIDATES_PER_POLL)
+            .collect();
+        let report_overflow = watcher.queue.take_overflow_report();
+        for msg in errors {
+            tracing::warn!(error = %msg, "watcher error");
+            self.emit(SyncEvent::Error(msg));
+        }
+        if report_overflow {
+            tracing::warn!(
+                cap = MAX_PENDING_CANDIDATES,
+                "too many conflict candidates; processing them in batches"
+            );
         }
         if primary && self.reconcile_primary_reporting() {
             self.dirty = true;
@@ -102,10 +138,31 @@ impl SyncedVault {
                 self.emit_error(e);
             }
         }
-        for path in conflicts {
+        let processed = batch.len();
+        for path in batch {
             self.on_candidate_conflict(&path);
         }
-        signals.len()
+        drained + processed
+    }
+
+    /// Tests only: candidates queued for `poll` (0 when not watching).
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn pending_candidates_for_tests(&self) -> usize {
+        self.watcher.as_ref().map_or(0, |w| w.queue.len())
+    }
+
+    /// Tests only: lose every queued signal and candidate, as if the channel had been full
+    /// when they were sent, and set the flag the watcher thread sets then (the next `poll`
+    /// reconciles the primary and rescans).
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn simulate_signal_overflow_for_tests(&mut self) {
+        if let Some(w) = &mut self.watcher {
+            w.signals.try_iter().for_each(drop);
+            while w.queue.pop().is_some() {}
+            w.rescan.store(true, Ordering::Release);
+        }
     }
 
     /// 03 §3 steps 1-6 for `<name>.vault/vault.bin`. Returns `true` when ours now holds something the
@@ -191,8 +248,8 @@ impl SyncedVault {
         self.ensure_primary_downloaded()?;
         // Step 1: (mtime, ctime, inode, size) pre-check against our own last write. One handle
         // for the stat and the read, so both describe the same file even if the path is
-        // replaced meanwhile.
-        let mut file = match fs::File::open(&self.file) {
+        // replaced meanwhile. Never through a symlink, only a regular file.
+        let mut file = match package::open_regular(&self.file) {
             Ok(f) => f,
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 // Deleted (or a provider's delete-then-create). Nothing to merge, but our
@@ -201,15 +258,19 @@ impl SyncedVault {
                 self.note_primary_missing();
                 return Ok(None);
             }
-            Err(e) => return Err(SyncError::io(&self.file, e)),
+            Err(e) => return Err(read_error(&self.file, e)),
         };
         self.primary_missing = false;
         let meta = file.metadata().map_err(|e| SyncError::io(&self.file, e))?;
-        if self.last_written.is_some_and(|lw| lw.stat_matches(&meta)) {
+        // What a following save may replace (and nothing else).
+        self.primary_seen = Some(FileId::of(&meta));
+        if let Some(lw) = self.last_written.filter(|lw| lw.stat_matches(&meta)) {
+            // Unchanged since we last wrote or read it: those bytes' hash identifies it.
+            self.primary_seen = Some(FileId::of(&meta).with_hash(lw.hash));
             return Ok(None);
         }
         // Step 2: hash check, on at most `MAX_VAULT_FILE_SIZE` bytes.
-        let bytes = match read_capped(&mut file, &meta) {
+        let bytes = match read_handle_capped(&mut file, &meta, MAX_VAULT_FILE_SIZE) {
             Ok(b) => b,
             Err(e) => {
                 if e.kind() == ErrorKind::FileTooLarge {
@@ -223,9 +284,9 @@ impl SyncedVault {
                 return Err(read_error(&self.file, e));
             }
         };
-        let unchanged = self
-            .last_written
-            .is_some_and(|lw| lw.hash == *blake3::hash(&bytes).as_bytes());
+        let hash = *blake3::hash(&bytes).as_bytes();
+        self.primary_seen = Some(FileId::of(&meta).with_hash(hash));
+        let unchanged = self.last_written.is_some_and(|lw| lw.hash == hash);
         // Either way this version has now been seen: refresh the stat so repeated events for
         // the same bytes stop at step 1.
         self.last_written = Some(fingerprint(Some(&meta), &bytes));
@@ -390,10 +451,11 @@ impl SyncedVault {
             if kind != ConflictKind::Generic {
                 // Blobs that arrived after the package was absorbed (or before its
                 // `vault.bin`): take the ones we lack, but only those our own items
-                // reference (nothing here is authenticated). The remnant stays where it is:
+                // reference, and only after each authenticates against our reference (the
+                // package itself is unauthenticated). The remnant stays where it is:
                 // a `vault.bin` arriving later must still find it there to be merged.
                 let wanted = match &self.unlocked {
-                    Some(ours) => blob_budget(&[ours]),
+                    Some(ours) => wanted_blobs(&[ours]),
                     None => Default::default(),
                 };
                 match self.copy_missing_blobs(path, &wanted) {
@@ -415,8 +477,8 @@ impl SyncedVault {
         // the package stays where it is and is retried on its next event or unlock. Only
         // blobs that the opened (authenticated) copy or ours reference.
         let wanted = match &self.unlocked {
-            Some(ours) => blob_budget(&[ours, &opened]),
-            None => blob_budget(&[&opened]),
+            Some(ours) => wanted_blobs(&[ours, &opened]),
+            None => wanted_blobs(&[&opened]),
         };
         match self.copy_missing_blobs(path, &wanted) {
             Ok(0) => {}
@@ -488,7 +550,8 @@ impl SyncedVault {
             self.report_sibling_once(path, hash, SiblingReport::Foreign, SyncEvent::ForeignVault);
             return None;
         }
-        // Step 2: no key while locked; defer.
+        // Step 2: no key while locked; defer. The list is uncapped by design: it is
+        // deduplicated by path key, so it is bounded by the distinct candidates on disk.
         if self.unlocked.is_none() {
             let key = package::path_key(path);
             if !self

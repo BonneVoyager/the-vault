@@ -17,7 +17,7 @@ use vault_core::{
     KdfParams, LockedVault, SecretString, SecretVec, SlotKind, UnlockedVault, Uuid, VaultError,
 };
 
-use crate::atomic::{Mode, write_atomic_stat};
+use crate::atomic::{FileId, Mode, write_atomic_stat};
 use crate::attachments::prune_stale_vault_tmp;
 use crate::backup::{self, BackupInfo, BackupKind};
 use crate::cloud::CloudHooks;
@@ -128,6 +128,8 @@ pub struct SyncedVault {
     /// `Some` between `start_watching` and `stop_watching`.
     watcher: Option<Watcher>,
     /// Conflicted copies seen while locked (03 §6 step 2), absorbed at the next unlock.
+    /// Uncapped by design (unlike the watcher's candidate queue): deduplicated by path key,
+    /// so bounded by the distinct candidate paths on disk.
     pending_conflicts: Vec<PathBuf>,
     /// The primary was found corrupt while locked: mark dirty at unlock so it is rewritten.
     rewrite_on_unlock: bool,
@@ -158,6 +160,10 @@ pub struct SyncedVault {
     /// The primary was found missing while unlocked ([`SyncEvent::PrimaryMissing`] emitted,
     /// vault marked dirty). Cleared when the primary is read or written again, and on lock.
     primary_missing: bool,
+    /// `(dev, ino, size, mtime)` of the primary as the last pre-write read opened it (`None`
+    /// when missing or not read yet). A dirty save replaces the primary only if it is still
+    /// exactly this file right before the rename (finding [2] of the 2026-03-10 review).
+    primary_seen: Option<FileId>,
     /// Added to the clock by orphan cleanup. Always zero unless the `test-support` feature is
     /// on (file ages count from ctime, which tests cannot set back).
     prune_clock_offset: Duration,
@@ -224,6 +230,7 @@ impl SyncedVault {
             sibling_reports: HashMap::new(),
             waiting_for_blobs: HashMap::new(),
             primary_missing: false,
+            primary_seen: None,
             prune_clock_offset: Duration::ZERO,
         };
         let written = match this.write(&bytes, Mode::NoReplace) {
@@ -327,6 +334,7 @@ impl SyncedVault {
             sibling_reports: HashMap::new(),
             waiting_for_blobs: HashMap::new(),
             primary_missing: false,
+            primary_seen: None,
             prune_clock_offset: Duration::ZERO,
         })
     }
@@ -583,6 +591,11 @@ impl SyncedVault {
     /// from the pre-write read through the rename, the backup and the cleanup, so another
     /// process saving the same vault cannot interleave its read-modify-write with ours (V-02).
     /// [`SyncError::SaveLockTimeout`] if the lock is not free within 10 s; nothing is written then.
+    ///
+    /// The rename replaces the primary only if it is still the file the pre-write read saw
+    /// (same dev, inode, size, mtime). If a writer outside the lock replaced it meanwhile,
+    /// the save reads and merges again, up to 3 attempts in all, then fails with
+    /// [`SyncError::PrimaryChangedDuringSave`] (still dirty, nothing overwritten).
     pub fn save(&mut self) -> Result<(), SyncError> {
         if self.unlocked.is_none() {
             return Err(SyncError::Locked);
@@ -596,10 +609,28 @@ impl SyncedVault {
         } else {
             None
         };
+        let blocked_before = self.save_blocked;
+        // A writer outside the lock (a sync client) can replace the primary between the
+        // pre-write read and the rename; the rename then refuses and we merge again.
+        let mut attempt = 1;
+        loop {
+            match self.save_locked(blocked_before) {
+                Err(SyncError::PrimaryChangedDuringSave(p)) if attempt < SAVE_ATTEMPTS => {
+                    tracing::info!(path = %p.display(), attempt, "primary changed during save; merging again");
+                    attempt += 1;
+                }
+                r => return r,
+            }
+        }
+    }
+
+    /// One attempt of [`SyncedVault::save`] under its lock: pre-write read and merge, then
+    /// the write, bound to the primary that read saw.
+    fn save_locked(&mut self, blocked_before: Option<SaveBlocked>) -> Result<(), SyncError> {
         // A primary we cannot read (cloud timeout, I/O) may hold a peer's unmerged version:
         // fail rather than overwrite it.
-        let blocked_before = self.save_blocked;
         if self.dirty {
+            self.primary_seen = None;
             self.reconcile_primary()?;
         }
         if self.key_mismatch {
@@ -626,7 +657,11 @@ impl SyncedVault {
         let mode = if self.primary_missing {
             Mode::NoReplace
         } else {
-            Mode::Replace
+            // Always set by the pre-write read when the primary exists; fail closed if not.
+            Mode::ReplaceIf(
+                self.primary_seen
+                    .ok_or_else(|| SyncError::PrimaryChangedDuringSave(self.file.clone()))?,
+            )
         };
         run_before_primary_write();
         let durable = self.write(&bytes, mode)?;
@@ -657,8 +692,8 @@ impl SyncedVault {
     }
 
     /// Steps 2-6 of 03 §2. `create` uses [`Mode::NoReplace`] so a file that appeared after its
-    /// existence check is never clobbered; `save` uses [`Mode::Replace`] (`NoReplace` while the
-    /// primary is missing).
+    /// existence check is never clobbered; `save` uses [`Mode::ReplaceIf`] bound to the primary
+    /// its pre-write read saw (`NoReplace` while the primary is missing).
     ///
     /// Outer `Err`: nothing was written. Inner `Err`: `bytes` ARE the primary now (recorded as
     /// such), but the directory fsync failed, so the write is not known durable; the caller
@@ -866,12 +901,18 @@ impl SyncedVault {
         backup: &Path,
         password: &SecretString,
     ) -> Result<(), SyncError> {
-        let source = if backup.is_dir() {
-            package::vault_file(backup)
-        } else {
-            backup.to_owned()
+        // Our own `backups/` must not be a link (03 §1): a backup read through it, and the
+        // pre-restore snapshot written into it, would live outside the package.
+        package::check_dir(&package::backups_dir(&self.path))?;
+        // Never through a symlink: neither the entry itself nor (by `read_parsed`) the file.
+        let source = match fs::symlink_metadata(backup) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(SyncError::UnsafePackageEntry(backup.to_owned()));
+            }
+            Ok(m) if m.is_dir() => package::vault_file(backup),
+            _ => backup.to_owned(),
         };
-        let ReadParsed { bytes, parsed } = self
+        let ReadParsed { bytes, parsed, .. } = self
             .read_parsed(&source)?
             .ok_or_else(|| not_found(&source))?;
         let locked = parsed?;
@@ -885,18 +926,28 @@ impl SyncedVault {
         // Like `save`: no other writer between our read of the current primary and the
         // replace. Released before `after_unlock`, whose conflict absorption saves (and locks).
         let write_lock = PackageLock::exclusive(&self.path)?;
+        let mut oversized = false;
         let current = match self.read_parsed(&self.file) {
             // Not a vault this app wrote; too large to keep a copy of. Restoring replaces it.
             Err(SyncError::PrimaryTooLarge(p)) => {
                 tracing::warn!(path = %p.display(), "primary is oversized; restoring without a pre-restore copy");
+                oversized = true;
                 None
             }
             r => r?,
+        };
+        // The replace below is bound to the primary read here (finding [2]); a missing one is
+        // only created, never replaced. An oversized one (not a vault) is replaced unbound.
+        let mode = match &current {
+            Some(read) => Mode::ReplaceIf(read.id),
+            None if oversized => Mode::Replace,
+            None => Mode::NoReplace,
         };
         match current {
             Some(ReadParsed {
                 bytes: current,
                 parsed: Ok(_),
+                ..
             }) => {
                 self.snapshot(&current, SystemTime::now(), BackupKind::Snapshot)?;
             }
@@ -910,6 +961,7 @@ impl SyncedVault {
             Some(ReadParsed {
                 bytes: current,
                 parsed: Err(e),
+                ..
             }) => {
                 // Not openable, but maybe recoverable by hand: keep the raw bytes, unpruned.
                 tracing::warn!(path = %self.path.display(), error = %e, "primary is unparseable; keeping a raw copy before restoring");
@@ -920,7 +972,8 @@ impl SyncedVault {
             }
         }
 
-        let durable = self.write(&bytes, Mode::Replace)?;
+        run_before_primary_write();
+        let durable = self.write(&bytes, mode)?;
         drop(write_lock);
         self.locked = locked;
         self.locked_fallback = None;
@@ -1017,9 +1070,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Tests only: run `f` once on this thread inside the next dirty `save`, after its pre-write
-/// read and merge and right before the primary is written (another device's write landing
-/// in that window).
+/// Tests only: run `f` once on this thread inside the next dirty `save` or `restore_from`,
+/// after its pre-write read (and merge, or pre-restore snapshot) and right before the primary
+/// is written (another device's write landing in that window).
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn before_next_primary_write_for_tests(f: impl FnOnce() + 'static) {
@@ -1043,10 +1096,15 @@ fn run_before_primary_write() {
 #[cfg(not(any(test, feature = "test-support")))]
 fn run_before_primary_write() {}
 
+/// Attempts per [`SyncedVault::save`] when the primary keeps changing under it.
+const SAVE_ATTEMPTS: u32 = 3;
+
 /// A file read through the cloud hooks, with its parse result.
 pub(crate) struct ReadParsed {
     pub(crate) bytes: Vec<u8>,
     pub(crate) parsed: Result<LockedVault, VaultError>,
+    /// Identity of the file read (from the handle the bytes came from).
+    pub(crate) id: FileId,
 }
 
 impl SyncedVault {
@@ -1055,13 +1113,14 @@ impl SyncedVault {
     /// [`SyncError::PrimaryTooLarge`] beyond [`MAX_VAULT_FILE_SIZE`].
     pub(crate) fn read_parsed(&self, path: &Path) -> Result<Option<ReadParsed>, SyncError> {
         self.hooks.ensure_downloaded(path, DOWNLOAD_TIMEOUT)?;
-        let bytes = match read_with_stat(path) {
-            Ok((b, _)) => b,
+        let (bytes, meta) = match read_with_stat(path) {
+            Ok(r) => r,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(read_error(path, e)),
         };
         let parsed = LockedVault::parse(&bytes);
-        Ok(Some(ReadParsed { bytes, parsed }))
+        let id = FileId::of(&meta).with_hash(*blake3::hash(&bytes).as_bytes());
+        Ok(Some(ReadParsed { bytes, parsed, id }))
     }
 }
 
@@ -1072,7 +1131,8 @@ fn not_found(path: &Path) -> SyncError {
 /// Open `path` once, `fstat` the handle, then read through that same handle, so the stat
 /// describes exactly the file whose bytes are returned even if the path is replaced meanwhile
 /// (03 §2 step 6). The stat is taken before the read: an in-place write after it changes the
-/// file's stat, so the next echo check reads again.
+/// file's stat, so the next echo check reads again. Never follows a final symlink and reads
+/// only a regular file (see [`package::open_regular`]).
 pub(crate) fn read_with_stat(path: &Path) -> std::io::Result<(Vec<u8>, fs::Metadata)> {
     read_with_stat_hooked(path, || {})
 }
@@ -1083,37 +1143,71 @@ fn read_with_stat_hooked(
     path: &Path,
     between: impl FnOnce(),
 ) -> std::io::Result<(Vec<u8>, fs::Metadata)> {
-    let mut file = fs::File::open(path)?;
+    let mut file = package::open_regular(path)?;
     between();
     let meta = file.metadata()?;
-    let bytes = read_capped(&mut file, &meta)?;
+    let bytes = read_handle_capped(&mut file, &meta, MAX_VAULT_FILE_SIZE)?;
     Ok((bytes, meta))
 }
 
-/// Read all of `file` (whose `fstat` is `meta`), refusing more than [`MAX_VAULT_FILE_SIZE`]
-/// bytes with [`ErrorKind::FileTooLarge`] (see [`read_error`]): checked against the stat
-/// before reading, and enforced while reading in case the file grows.
-pub(crate) fn read_capped(file: &mut fs::File, meta: &fs::Metadata) -> std::io::Result<Vec<u8>> {
+/// Read all of the regular file at `path`, refusing one larger than `cap` bytes with
+/// [`ErrorKind::FileTooLarge`]: checked against the handle's `fstat` before anything is
+/// allocated, and enforced while reading in case the file grows. Follows symlinks (the path
+/// is the caller's choice), but opens non-blocking and refuses anything that is not a regular
+/// file ([`ErrorKind::InvalidInput`]), so a FIFO or device cannot hang or flood the caller.
+/// For vault files pass [`MAX_VAULT_FILE_SIZE`]; the returned bytes are not wiped, so wrap
+/// them in `Zeroizing` when they hold plaintext.
+pub fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    use std::os::unix::fs::OpenOptionsExt;
+    // The flag bits are small positive values on every target; the cast cannot truncate.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(OFlags::NONBLOCK.bits() as i32)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let flags = fcntl_getfl(&file)?;
+    fcntl_setfl(&file, flags.difference(OFlags::NONBLOCK))?;
+    read_handle_capped(&mut file, &meta, cap)
+}
+
+/// Read all of `file` (whose `fstat` is `meta`), refusing more than `cap` bytes with
+/// [`ErrorKind::FileTooLarge`] (see [`read_error`]): checked against the stat before
+/// reading, and enforced while reading in case the file grows.
+pub(crate) fn read_handle_capped(
+    file: &mut fs::File,
+    meta: &fs::Metadata,
+    cap: u64,
+) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
-    let too_large = || std::io::Error::new(ErrorKind::FileTooLarge, "vault file too large");
-    if meta.len() > MAX_VAULT_FILE_SIZE {
+    let too_large = || std::io::Error::new(ErrorKind::FileTooLarge, "file too large");
+    if meta.len() > cap {
         return Err(too_large());
     }
     let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
     file.by_ref()
-        .take(MAX_VAULT_FILE_SIZE + 1)
+        .take(cap.saturating_add(1))
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_VAULT_FILE_SIZE {
+    if bytes.len() as u64 > cap {
         return Err(too_large());
     }
     Ok(bytes)
 }
 
 /// A read error on vault file `path` as a [`SyncError`]: `FileTooLarge` (from
-/// [`read_capped`]) becomes [`SyncError::PrimaryTooLarge`].
+/// [`read_handle_capped`]) becomes [`SyncError::PrimaryTooLarge`], a symlink or non-regular file
+/// (from [`package::open_regular`]) [`SyncError::UnsafePackageEntry`].
 pub(crate) fn read_error(path: &Path, e: std::io::Error) -> SyncError {
     if e.kind() == ErrorKind::FileTooLarge {
         SyncError::PrimaryTooLarge(path.to_owned())
+    } else if package::is_unsafe_entry(&e) {
+        SyncError::UnsafePackageEntry(path.to_owned())
     } else {
         SyncError::io(path, e)
     }
@@ -1130,7 +1224,7 @@ fn fingerprint_after_write(
     bytes: &[u8],
 ) -> LastWritten {
     use std::os::unix::fs::MetadataExt;
-    let post = match fs::metadata(path) {
+    let post = match fs::symlink_metadata(path) {
         Ok(m) => Some(m),
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "could not stat vault; echo check will use the hash");
@@ -1259,5 +1353,46 @@ mod tests {
         assert_eq!(a.try_recv().unwrap(), SyncEvent::CorruptOnDisk);
         assert_eq!(b.try_recv().unwrap(), SyncEvent::CorruptOnDisk);
         assert_eq!(v.subscribers.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn public_read_capped_enforces_cap_and_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"abcd").unwrap();
+        assert_eq!(read_capped(&path, 4).unwrap(), b"abcd");
+        assert_eq!(
+            read_capped(&path, 3).unwrap_err().kind(),
+            ErrorKind::FileTooLarge
+        );
+        // Sparse: the stat check refuses it before anything is read.
+        let big = dir.path().join("big");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_VAULT_FILE_SIZE + 1)
+            .unwrap();
+        assert_eq!(
+            read_capped(&big, MAX_VAULT_FILE_SIZE).unwrap_err().kind(),
+            ErrorKind::FileTooLarge
+        );
+        assert_eq!(
+            read_capped(dir.path(), 4).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        // A FIFO is refused without blocking on the open.
+        let fifo = dir.path().join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert_eq!(
+            read_capped(&fifo, 4).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        // Symlinks are followed (the caller chose the path).
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(read_capped(&link, 4).unwrap(), b"abcd");
     }
 }

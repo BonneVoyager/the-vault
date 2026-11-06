@@ -5,6 +5,7 @@ mod assets;
 mod audit;
 mod autolock;
 mod biometric;
+mod bounded_read;
 mod clipboard;
 mod cloud;
 mod cursor_audit;

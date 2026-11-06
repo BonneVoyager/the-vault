@@ -259,7 +259,7 @@ fn enclave_slot_added_on_b_survives_a_merge() {
 }
 
 #[test]
-fn greater_stamp_wins_in_both_directions_and_tie_keeps_ours() {
+fn greater_stamp_wins_in_both_directions_and_divergent_tie_converges() {
     let (mut a, mut b) = two_devices();
     let pw_a = secret("A's password");
     let pw_b = secret("B's password");
@@ -294,9 +294,23 @@ fn greater_stamp_wins_in_both_directions_and_tie_keeps_ours() {
         VaultError::WrongPassword
     );
 
-    // Exact tie on stamp *and* `slots_device_id` (e.g. the same change seen twice): keep
-    // ours, so the merge stays idempotent. The device-id tie-break itself is covered by
-    // `equal_stamps_are_broken_by_device_id_and_converge_both_ways`.
+    // Exact equal header (the same change seen twice, so identical slots): the canonical
+    // slot bytes also tie, so the merge keeps ours and stays idempotent.
+    let (mut a, _) = two_devices();
+    a.change_password(&pw(), &pw_a, KdfParams::for_tests(), T1)
+        .unwrap();
+    let b = opens_with(&a.serialize(), &pw_a).unwrap();
+    assert_eq!(a.header(), b.header());
+    let ha = a.header().clone();
+    assert!(!a.merge_from(&b).unwrap().header_updated);
+    assert_eq!(a.header(), &ha);
+
+    // [9] D-9 (2026-11-06): two authentic *divergent* credential changes sharing both the
+    // `slots_device_id` (a cloned/duplicated id) and the millisecond. The tuple
+    // `(format_version, slots_modified_at, slots_device_id)` is an exact tie, so before the
+    // canonical-CBOR tie-break each side kept its own header forever (non-convergence). Now
+    // the greater slot bytes win on both sides, so the two peers converge on one header and
+    // the loser adopts the winner's slots, which wrap the winner's key.
     let (mut a, mut b) = two_devices();
     b.set_device_id(a.device_id());
     a.change_password(&pw(), &pw_a, KdfParams::for_tests(), T1)
@@ -304,11 +318,35 @@ fn greater_stamp_wins_in_both_directions_and_tie_keeps_ours() {
     b.change_password(&pw(), &pw_b, KdfParams::for_tests(), T1)
         .unwrap();
     assert_eq!(a.header().slots_device_id, b.header().slots_device_id);
-    let (ha, hb) = (a.header().clone(), b.header().clone());
-    assert!(!a.merge_from(&b).unwrap().header_updated);
-    assert!(!b.merge_from(&a).unwrap().header_updated);
-    assert_eq!(a.header(), &ha);
-    assert_eq!(b.header(), &hb);
+    assert_eq!(a.header().slots_stamp(), b.header().slots_stamp());
+    let a_snap = opens_with(&a.serialize(), &pw_a).unwrap();
+    let b_snap = opens_with(&b.serialize(), &pw_b).unwrap();
+    // Exactly one side reports a header update; both converge on the same header.
+    let a_updated = a.merge_from(&b_snap).unwrap().header_updated;
+    let b_updated = b.merge_from(&a_snap).unwrap().header_updated;
+    assert!(a_updated ^ b_updated, "exactly one side adopts the other");
+    assert_eq!(
+        a.header(),
+        b.header(),
+        "divergent tie converges to one header"
+    );
+    assert_eq!(a.header().slots, b.header().slots);
+    // The winner's slots wrap the winner's key: one password opens both, the other neither.
+    let (bytes_a, bytes_b) = (a.serialize(), b.serialize());
+    let (win, lose) = if opens_with(&bytes_a, &pw_a).is_ok() {
+        (&pw_a, &pw_b)
+    } else {
+        (&pw_b, &pw_a)
+    };
+    for bytes in [&bytes_a, &bytes_b] {
+        assert!(opens_with(bytes, win).is_ok());
+        assert_eq!(
+            opens_with(bytes, lose).unwrap_err(),
+            VaultError::WrongPassword
+        );
+    }
+    // Idempotent once converged.
+    assert!(!a.merge_from(&b_snap).unwrap().header_updated);
 
     // A side that has never stamped loses to any stamp, and never wins over one.
     let (mut a, mut b) = two_devices();
@@ -316,6 +354,48 @@ fn greater_stamp_wins_in_both_directions_and_tie_keeps_ours() {
         .unwrap();
     assert!(a.merge_from(&b).unwrap().header_updated);
     assert!(!b.merge_from(&a).unwrap().header_updated);
+}
+
+/// [9] D-9 (2026-11-06): the canonical-CBOR slot-set tie-break is commutative. For a tie on
+/// `(format_version, slots_modified_at, slots_device_id)`, whichever header has the greater
+/// canonical slot bytes wins regardless of which side runs `merge_from`, so the outcome does
+/// not depend on merge direction.
+#[test]
+fn divergent_header_tie_break_is_commutative() {
+    let pw_a = secret("A's password");
+    let pw_b = secret("B's password");
+    // One divergent tie (same stamp, same cloned device id, different slots), then merge each
+    // direction from a snapshot of the *same* pre-merge pair.
+    let (mut a, mut b) = two_devices();
+    b.set_device_id(a.device_id());
+    a.change_password(&pw(), &pw_a, KdfParams::for_tests(), T1)
+        .unwrap();
+    b.change_password(&pw(), &pw_b, KdfParams::for_tests(), T1)
+        .unwrap();
+    assert_eq!(a.header().slots_stamp(), b.header().slots_stamp());
+    assert_eq!(a.header().slots_device_id, b.header().slots_device_id);
+    let a_snap = opens_with(&a.serialize(), &pw_a).unwrap();
+    let b_snap = opens_with(&b.serialize(), &pw_b).unwrap();
+    // Direction 1: A folds B. Direction 2: B folds A (from the same snapshots).
+    a.merge_from(&b_snap).unwrap();
+    b.merge_from(&a_snap).unwrap();
+    // The winner is the same regardless of which side ran the merge.
+    assert_eq!(
+        a.header().slots,
+        b.header().slots,
+        "tie winner is independent of merge direction"
+    );
+    assert_eq!(a.header(), b.header());
+    // The same credential opens whichever side initiated the merge.
+    let both = [a.serialize(), b.serialize()];
+    let win = if opens_with(&both[0], &pw_a).is_ok() {
+        &pw_a
+    } else {
+        &pw_b
+    };
+    for bytes in &both {
+        assert!(opens_with(bytes, win).is_ok());
+    }
 }
 
 /// 03 §5: equal `slots_modified_at` -> the greater `slots_device_id` bytes win, on both
@@ -381,17 +461,23 @@ fn equal_stamps_are_broken_by_device_id_and_converge_both_ways() {
         .unwrap();
     assert_eq!(a.header().slots_device_id, Some(Uuid::nil()));
     assert_eq!(b.header().slots_device_id, Some(Uuid::nil()));
-    assert!(
-        !a.merge_from(&b).unwrap().header_updated,
-        "equal: keep ours"
-    );
+    // Equal stamp and equal (nil) device id with *different* slots: resolved by the canonical
+    // slot bytes (D-9), so exactly one side adopts and both converge. Which side wins depends
+    // on the random slot nonces, so the test only asserts the symmetric outcome.
+    let a_snap = opens_with(&a.serialize(), &pw_lo).unwrap();
+    let b_snap = opens_with(&b.serialize(), &pw_hi).unwrap();
+    let a_updated = a.merge_from(&b_snap).unwrap().header_updated;
+    let b_updated = b.merge_from(&a_snap).unwrap().header_updated;
+    assert!(a_updated ^ b_updated, "exactly one side adopts the other");
+    assert_eq!(a.header(), b.header(), "nil-device tie converges");
+    let win = if a_updated { &pw_hi } else { &pw_lo };
     // A stamped header *without* a device id is never written by this crate, and since the
     // id is digest-bound (01 §4) it cannot be produced by editing a file either; the
     // "missing sorts below any present" rule is `Option`'s ordering and is only reachable
     // through a future writer.
     let bytes = rewrite(&a.serialize(), |f| f.header.slots_device_id = None);
     assert_eq!(
-        opens_with(&bytes, &pw_lo).unwrap_err(),
+        opens_with(&bytes, win).unwrap_err(),
         VaultError::Tampered(TamperKind::Manifest)
     );
 }

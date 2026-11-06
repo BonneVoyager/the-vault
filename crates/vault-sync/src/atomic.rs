@@ -1,8 +1,10 @@
 //! Atomic replace of the package's `vault.bin` (03 §2 steps 2-5) and of attachment blobs (03 §1.1).
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -27,11 +29,86 @@ fn tmp_path(path: &Path) -> PathBuf {
     parent_dir(path).join(format!(".{name}.tmp-{suffix:08x}"))
 }
 
+/// Identity of a file version: `(dev, ino, size, mtime)`, plus the blake3 of its bytes when
+/// the reader knows them. Every atomic replace makes a new inode, and an in-place write
+/// changes size or mtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileId {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: Option<SystemTime>,
+    hash: Option<[u8; 32]>,
+}
+
+impl FileId {
+    pub(crate) fn of(meta: &fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.len(),
+            mtime: meta.modified().ok(),
+            hash: None,
+        }
+    }
+
+    /// The same identity, recording that the version's bytes hash to `hash` (blake3).
+    pub(crate) fn with_hash(self, hash: [u8; 32]) -> Self {
+        Self {
+            hash: Some(hash),
+            ..self
+        }
+    }
+
+    /// Whether the file now at `path` is still this version (03 §2 step 4): the same
+    /// `(dev, ino, size, mtime)`, or, when only `(dev, ino)` differ, the same size and blake3
+    /// of its current bytes (SMB/FUSE mounts renumber inodes on lookup; iCloud rewrites the
+    /// same bytes). The bytes are read through one no-follow handle, at most `size + 1` of
+    /// them. Missing, symlinked or unreadable counts as changed.
+    fn still_at(&self, path: &Path) -> bool {
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        let current = FileId::of(&meta);
+        if (current.dev, current.ino, current.size, current.mtime)
+            == (self.dev, self.ino, self.size, self.mtime)
+        {
+            return true;
+        }
+        let (Some(hash), true) = (
+            self.hash,
+            (current.size, current.mtime) == (self.size, self.mtime),
+        ) else {
+            return false;
+        };
+        let Ok(file) = crate::package::open_regular(path) else {
+            return false;
+        };
+        let mut bytes = Vec::with_capacity(usize::try_from(self.size).unwrap_or(0));
+        if file
+            .take(self.size.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            return false;
+        }
+        let same = bytes.len() as u64 == self.size && *blake3::hash(&bytes).as_bytes() == hash;
+        if same {
+            tracing::debug!(path = %path.display(), "target renumbered but unchanged; replacing it");
+        }
+        same
+    }
+}
+
 /// How the finished tmp file becomes the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
-    /// `rename(tmp, target)`: atomically replaces an existing target (`save`).
+    /// `rename(tmp, target)`: atomically replaces an existing target (blobs).
     Replace,
+    /// [`Mode::Replace`], but only if the target is still exactly the file identified (its
+    /// `lstat` right before the rename); otherwise
+    /// [`SyncError::PrimaryChangedDuringSave`] and nothing is renamed (`save`, restore).
+    ReplaceIf(FileId),
     /// `renameatx_np(tmp, target, RENAME_EXCL)` (or, where unsupported, `link` then unlink
     /// tmp): fails with [`SyncError::AlreadyExists`] if the target appeared since the caller
     /// checked (`create`, backups, blobs), never clobbering it.
@@ -72,12 +149,16 @@ struct FsOps {
     hard_link: fn(&Path, &Path) -> std::io::Result<()>,
     /// fsync of the directory at the given path.
     sync_dir: fn(&Path) -> std::io::Result<()>,
+    /// Runs right before the pre-rename identity checks with `(tmp, target)`; a no-op except
+    /// in tests, which swap files there.
+    before_checks: fn(&Path, &Path),
 }
 
 const REAL_FS: FsOps = FsOps {
     rename_exclusive,
     hard_link: |src, dst| fs::hard_link(src, dst),
     sync_dir: |dir| File::open(dir).and_then(|d| d.sync_all()),
+    before_checks: |_, _| {},
 };
 
 /// `renameatx_np(from, to, RENAME_EXCL)` on macOS (`renameat2(RENAME_NOREPLACE)` on Linux):
@@ -123,8 +204,10 @@ pub(crate) struct Written {
 }
 
 /// Write `bytes` to a fresh tmp file (O_CREAT|O_EXCL, 0600), fsync it, move it to `path` per
-/// `mode`, then fsync the directory. On any failure before the move the tmp is removed and
-/// `path` is untouched. A directory fsync failure other than "unsupported" is returned as an
+/// `mode`, then fsync the directory. The tmp stays open until the move; right before it, the
+/// tmp path must still be the inode written through that handle (`lstat` vs `fstat`: same
+/// dev and ino) or the write fails with [`SyncError::UnsafePackageEntry`]. On any failure
+/// before the move the tmp is removed and `path` is untouched. A directory fsync failure other than "unsupported" is returned as an
 /// error although `path` already holds the new file.
 #[cfg(test)]
 fn write_atomic(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), SyncError> {
@@ -183,11 +266,28 @@ fn write_atomic_inner(
 
     fill(&mut file, &tmp)?;
     file.sync_all().map_err(|e| SyncError::io(&tmp, e))?;
-    let tmp_stat = file.metadata().ok();
-    drop(file);
+    let tmp_meta = file.metadata().map_err(|e| SyncError::io(&tmp, e))?;
+
+    // Bind the rename to what was written and, for `ReplaceIf`, to what it replaces. A
+    // same-uid process can still swap either path between these checks and the rename; it
+    // can no longer do so earlier, during the (much longer) write, undetected.
+    (ops.before_checks)(&tmp, path);
+    match fs::symlink_metadata(&tmp) {
+        Ok(m) if m.dev() == tmp_meta.dev() && m.ino() == tmp_meta.ino() => {}
+        _ => {
+            tracing::warn!(tmp = %tmp.display(), "tmp file was replaced before the rename; not publishing it");
+            return Err(SyncError::UnsafePackageEntry(tmp.clone()));
+        }
+    }
+    if let Mode::ReplaceIf(expected) = mode
+        && !expected.still_at(path)
+    {
+        tracing::warn!(path = %path.display(), "target changed since it was read; not replacing it");
+        return Err(SyncError::PrimaryChangedDuringSave(path.to_owned()));
+    }
 
     match mode {
-        Mode::Replace => {
+        Mode::Replace | Mode::ReplaceIf(_) => {
             fs::rename(&tmp, path).map_err(|e| SyncError::io(path, e))?;
             guard.defuse();
         }
@@ -215,6 +315,8 @@ fn write_atomic_inner(
         },
     }
     drop(guard);
+    drop(file);
+    let tmp_stat = Some(tmp_meta);
 
     // Step 5: some filesystems cannot fsync a directory (ENOTSUP, EINVAL); that alone is
     // ignored. Any other failure is reported: the rename is done, but not known durable.
@@ -526,6 +628,89 @@ mod tests {
             rename_no_replace_with(&src, &dir.path().join("new"), NO_EXCL_RENAME).unwrap_err();
         assert!(matches!(err, SyncError::Io { .. }), "{err:?}");
         assert!(src.exists());
+    }
+
+    /// Finding [2]: the tmp path is replaced (new inode) after the write and before the
+    /// rename: nothing is published, the target keeps its bytes, no tmp is left.
+    #[test]
+    fn tmp_swapped_before_rename_is_not_published() {
+        fn swap_tmp(tmp: &Path, _: &Path) {
+            fs::remove_file(tmp).unwrap();
+            fs::write(tmp, b"evil").unwrap();
+        }
+        fn link_tmp(tmp: &Path, _: &Path) {
+            let elsewhere = tmp.with_extension("elsewhere");
+            fs::write(&elsewhere, b"evil").unwrap();
+            fs::remove_file(tmp).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, tmp).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.vault");
+        fs::write(&target, b"old").unwrap();
+        for (swap, mode) in [
+            (swap_tmp as fn(&Path, &Path), Mode::Replace),
+            (link_tmp, Mode::Replace),
+            (swap_tmp, Mode::NoReplace),
+        ] {
+            let ops = FsOps {
+                before_checks: swap,
+                ..REAL_FS
+            };
+            let err = write_atomic_with(&target, b"new", mode, ops).err().unwrap();
+            assert!(matches!(err, SyncError::UnsafePackageEntry(_)), "{err:?}");
+            assert_eq!(fs::read(&target).unwrap(), b"old");
+            assert!(leftovers(dir.path()).is_empty());
+        }
+    }
+
+    /// `ReplaceIf`: replaces only the identified version; a replacement (new inode), an
+    /// in-place change or a vanished target is `PrimaryChangedDuringSave`, untouched.
+    #[test]
+    fn replace_if_requires_the_expected_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.vault");
+        fs::write(&target, b"old").unwrap();
+        let id = FileId::of(&fs::symlink_metadata(&target).unwrap());
+        write_atomic(&target, b"new", Mode::ReplaceIf(id)).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+
+        // The id of the file just replaced no longer matches.
+        let err = write_atomic(&target, b"newer", Mode::ReplaceIf(id)).unwrap_err();
+        assert!(
+            matches!(err, SyncError::PrimaryChangedDuringSave(_)),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+
+        fn replace_target(_: &Path, target: &Path) {
+            let other = target.with_extension("other");
+            fs::write(&other, b"theirs").unwrap();
+            fs::rename(&other, target).unwrap();
+        }
+        let id = FileId::of(&fs::symlink_metadata(&target).unwrap());
+        let ops = FsOps {
+            before_checks: replace_target,
+            ..REAL_FS
+        };
+        let err = write_atomic_with(&target, b"ours", Mode::ReplaceIf(id), ops)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, SyncError::PrimaryChangedDuringSave(_)),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"theirs");
+        assert!(leftovers(dir.path()).is_empty());
+
+        let id = FileId::of(&fs::symlink_metadata(&target).unwrap());
+        fs::remove_file(&target).unwrap();
+        let err = write_atomic(&target, b"ours", Mode::ReplaceIf(id)).unwrap_err();
+        assert!(
+            matches!(err, SyncError::PrimaryChangedDuringSave(_)),
+            "{err:?}"
+        );
+        assert!(!target.exists());
+        assert!(leftovers(dir.path()).is_empty());
     }
 
     #[test]

@@ -67,14 +67,26 @@ impl PackageLock {
 /// The lock file opened read-write (created 0600), else read-only (a read-only location
 /// with an existing lock file still shares locks with writers elsewhere). `Ok(None)` only
 /// when permissions forbid both (see the module docs); every other error is returned.
+///
+/// Never follows a symlink (`O_NOFOLLOW`, so a dangling link cannot create its target
+/// elsewhere) and accepts only a regular file (`fstat` of the handle): anything else is
+/// [`SyncError::UnsafePackageEntry`], never the no-lock fallback.
 fn open_lock_file(path: &Path, exclusive: bool) -> Result<Option<File>, SyncError> {
+    let unsafe_entry = || SyncError::UnsafePackageEntry(path.to_owned());
+    let regular = |f: File| match package::check_regular(&f) {
+        Ok(_) => Ok(Some(f)),
+        Err(e) if package::is_unsafe_entry(&e) => Err(unsafe_entry()),
+        Err(e) => Err(SyncError::io(path, e)),
+    };
     let err = match open_rw(path) {
-        Ok(f) => return Ok(Some(f)),
+        Ok(f) => return regular(f),
+        Err(e) if package::is_unsafe_entry(&e) => return Err(unsafe_entry()),
         Err(e) if is_permission(&e) => e,
         Err(e) => return Err(SyncError::io(path, e)),
     };
-    match File::open(path) {
-        Ok(f) => Ok(Some(f)),
+    match open_ro(path) {
+        Ok(f) => regular(f),
+        Err(e) if package::is_unsafe_entry(&e) => Err(unsafe_entry()),
         // Not writable, and either unreadable or absent (read-only package without one).
         Err(e) if is_permission(&e) || e.kind() == ErrorKind::NotFound => {
             if exclusive {
@@ -132,6 +144,14 @@ fn open_rw(path: &Path) -> io::Result<File> {
         .create(true)
         .truncate(false)
         .mode(0o600)
+        .custom_flags(package::no_follow_flags())
+        .open(path)
+}
+
+fn open_ro(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(package::no_follow_flags())
         .open(path)
 }
 
@@ -251,6 +271,40 @@ mod tests {
         let err = PackageLock::exclusive(dir.path()).unwrap_err();
         assert!(matches!(err, SyncError::Io { .. }), "{err:?}");
         assert!(PackageLock::shared(dir.path()).is_err());
+    }
+
+    /// Finding [1]: a `.lock` symlink (dangling or not) or a FIFO is refused with
+    /// `UnsafePackageEntry` for both lock kinds; nothing is created through the link and the
+    /// open never blocks on the FIFO.
+    #[test]
+    fn symlinked_or_special_lock_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = package::lock_file(dir.path());
+        let target = outside.path().join("created-through-link");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        for exclusive in [true, false] {
+            let err = PackageLock::take(dir.path(), exclusive).unwrap_err();
+            assert!(matches!(err, SyncError::UnsafePackageEntry(_)), "{err:?}");
+        }
+        assert!(!target.exists(), "dangling link target must not be created");
+
+        std::fs::write(&target, b"").unwrap();
+        for exclusive in [true, false] {
+            let err = PackageLock::take(dir.path(), exclusive).unwrap_err();
+            assert!(matches!(err, SyncError::UnsafePackageEntry(_)), "{err:?}");
+        }
+
+        std::fs::remove_file(&path).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        for exclusive in [true, false] {
+            let err = PackageLock::take(dir.path(), exclusive).unwrap_err();
+            assert!(matches!(err, SyncError::UnsafePackageEntry(_)), "{err:?}");
+        }
     }
 
     #[test]

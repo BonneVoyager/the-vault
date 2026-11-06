@@ -966,6 +966,104 @@ fn blob_only_conflict_package_contributes_its_blobs() {
     assert!(remnant.exists());
 }
 
+/// Plant a blob-only remnant `test 2.vault` holding `bytes` under attachment `id`, before
+/// watching starts, so the start-up scan queues it and one `poll` processes it.
+fn plant_blob_only_remnant(dir: &Path, id: Uuid, bytes: &[u8]) -> PathBuf {
+    let remnant = dir.join("test 2.vault");
+    let staging = dir.join(".staging-remnant");
+    fs::create_dir_all(staging.join("attachments")).unwrap();
+    fs::write(staging.join("attachments").join(blob_file_name(id)), bytes).unwrap();
+    fs::rename(&staging, &remnant).unwrap();
+    remnant
+}
+
+/// Our vault references `id` but its blob is gone locally; returns the valid sealed bytes.
+fn referenced_but_missing(a: &mut SyncedVault, item: Uuid, plain: &[u8]) -> (Uuid, Vec<u8>) {
+    let id = add(a, item, plain);
+    a.save().unwrap();
+    let valid = fs::read(blob(a, id)).unwrap();
+    fs::remove_file(blob(a, id)).unwrap();
+    assert_eq!(a.attachment_state(id), AttachmentState::Missing);
+    (id, valid)
+}
+
+/// Review [6]: a blob-only remnant whose blob is shorter than the sealed size (truncated, or
+/// empty) is never published, and a valid copy arriving later is still taken.
+#[test]
+fn forged_short_blob_is_rejected_and_a_later_valid_one_taken() {
+    let (dir, _path, mut a, item) = setup();
+    let (id, valid) = referenced_but_missing(&mut a, item, b"precious");
+    for forged in [&valid[..valid.len() - 1], &[][..]] {
+        let remnant = plant_blob_only_remnant(dir.path(), id, forged);
+        a.start_watching().unwrap();
+        a.poll();
+        assert_eq!(a.attachment_state(id), AttachmentState::Missing);
+        assert!(tmp_leftovers(&a.attachments_dir()).is_empty());
+        a.stop_watching();
+        fs::remove_dir_all(&remnant).unwrap();
+    }
+
+    // Exact length, wrong bytes: fails the AEAD check.
+    let mut garbage = valid.clone();
+    let last = garbage.len() - 1;
+    garbage[last] ^= 1;
+    let remnant = plant_blob_only_remnant(dir.path(), id, &garbage);
+    a.start_watching().unwrap();
+    a.poll();
+    assert_eq!(a.attachment_state(id), AttachmentState::Missing);
+    assert!(tmp_leftovers(&a.attachments_dir()).is_empty());
+
+    // The valid blob arrives in the same remnant: verified and published.
+    let src = remnant.join("attachments").join(blob_file_name(id));
+    let arriving = dir.path().join(".arriving.bin");
+    fs::write(&arriving, &valid).unwrap();
+    fs::rename(&arriving, &src).unwrap();
+    assert!(wait_until(|| {
+        a.poll();
+        a.attachment_state(id) == AttachmentState::Present
+    }));
+    assert_eq!(fs::read(blob(&a, id)).unwrap(), valid);
+    assert_eq!(read_all(&a, item, id).unwrap(), b"precious");
+    assert!(remnant.exists());
+}
+
+/// Review [6]: a blob of exactly the right length sealed under another key (same id and
+/// size, as a peer forging it would) does not authenticate and is not published.
+#[test]
+fn wrong_key_blob_is_rejected() {
+    let (dir, _path, mut a, item) = setup();
+    let plain = data(CHUNK_SIZE + 5);
+    let (id, valid) = referenced_but_missing(&mut a, item, &plain);
+    let vault_id = a.vault().unwrap().vault_id();
+    let mut forged_ref = vault_core::attachment::new_ref("x", plain.len() as u64, NOW).unwrap();
+    forged_ref.id = id;
+    let mut forged = Vec::new();
+    vault_core::attachment::seal(vault_id, forged_ref, &plain[..], &mut forged).unwrap();
+    assert_eq!(forged.len(), valid.len());
+    assert_ne!(forged, valid);
+
+    plant_blob_only_remnant(dir.path(), id, &forged);
+    a.start_watching().unwrap();
+    a.poll();
+    assert_eq!(a.attachment_state(id), AttachmentState::Missing);
+    assert!(tmp_leftovers(&a.attachments_dir()).is_empty());
+}
+
+/// Review [6]: the exact valid blob (several chunks) is verified and published byte for byte.
+#[test]
+fn exact_valid_blob_is_published() {
+    let (dir, _path, mut a, item) = setup();
+    let plain = three_chunks();
+    let (id, valid) = referenced_but_missing(&mut a, item, &plain);
+    plant_blob_only_remnant(dir.path(), id, &valid);
+    a.start_watching().unwrap();
+    a.poll();
+    assert_eq!(a.attachment_state(id), AttachmentState::Present);
+    assert_eq!(fs::read(blob(&a, id)).unwrap(), valid);
+    assert_eq!(mode(&blob(&a, id)), 0o600);
+    assert_eq!(read_all(&a, item, id).unwrap(), plain);
+}
+
 /// Plant a conflicted package `test 2.vault` whose item references a new attachment whose blob
 /// is still in transit (held outside the package). Returns the package path, the blob's
 /// in-transit path and the attachment id.

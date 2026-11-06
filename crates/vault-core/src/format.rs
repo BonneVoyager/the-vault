@@ -683,6 +683,19 @@ impl Header {
         self.slots_modified_at.unwrap_or(0)
     }
 
+    /// Canonical CBOR bytes of the whole slot set (key *and* opaque slots, in header order).
+    /// The final, symmetric tie-break for the header merge (03 §5): when two divergent
+    /// headers share `(format_version, slots_modified_at, slots_device_id)` — reachable when
+    /// a cloned/duplicated `slots_device_id` writes two different credential changes in the
+    /// same millisecond — the side with the greater bytes wins, so both peers converge on the
+    /// same header instead of each keeping its own forever. Uses the same canonical encoder as
+    /// the item tie-break ([`canonical_bytes`]) and the same slot encoding as [`Header::digest`].
+    pub(crate) fn slots_canonical_bytes(&self) -> Vec<u8> {
+        canonical_bytes(Value::Array(
+            self.slots.iter().map(Slot::to_value).collect(),
+        ))
+    }
+
     /// The `kdf` sub-map (known keys plus `kdf_extras`), not yet canonicalised.
     fn kdf_value(&self) -> Value {
         build_map(

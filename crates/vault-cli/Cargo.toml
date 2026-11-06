@@ -19,6 +19,8 @@ clap = { version = "4", features = ["derive", "env"] }
 rpassword = "7"
 # Error plumbing in a binary.
 anyhow = "1"
+# Wipes plaintext import buffers on drop (same pin as vault-app).
+zeroize = "^1.8.1"
 
 [dev-dependencies]
 # Temp directories for the CLI integration tests.

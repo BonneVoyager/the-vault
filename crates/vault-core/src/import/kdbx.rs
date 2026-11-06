@@ -90,7 +90,27 @@ pub fn import_kdbx(
             .with_keyfile(&mut Cursor::new(bytes))
             .map_err(|_| ImportError::KdbxCredentials)?;
     }
-    let database = Database::parse(bytes, key).map_err(|_| ImportError::KdbxCredentials)?;
+    // `check_outer_header` validates only the *outer* header: the inner header (which carries
+    // the `random-stream-id` field) lives inside the AEAD/HMAC-protected payload, so it cannot
+    // be inspected until after `Database::parse` has authenticated and decrypted the file.
+    // keepass-rs 0.17.0 reads that field with a fixed-width `LittleEndian::read_u32`, which
+    // panics (slice index out of range) when the field is shorter than four bytes. We cannot
+    // pre-validate it and cannot convert the panic with `map_err`, so the parse runs inside
+    // `catch_unwind`; a panic maps to `ImportError::KdbxMalformed`, whose message is a fixed
+    // string and therefore carries no key material or file content. `Database`/`DatabaseKey`
+    // own the decrypted secrets, so an unwind out of `parse` drops and zeroizes them normally;
+    // the closure touches no local secret, so `AssertUnwindSafe` is sound here.
+    //
+    // This relies on unwinding: the `dist` profile (and any shipping profile) must keep
+    // `panic = "unwind"` — with `panic = "abort"` the panic terminates the process instead of
+    // being caught. vault-core sets no panic hook (`std::panic::set_hook` is never called in
+    // this crate), so the default hook runs; it prints only the panic message and source
+    // location, and the dependency's panic message is a generic slice-bounds string with no
+    // secret payload.
+    let database =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Database::parse(bytes, key)))
+            .map_err(|_| ImportError::KdbxMalformed)?
+            .map_err(|_| ImportError::KdbxCredentials)?;
     let mut items = Vec::new();
     let mut groups = vec![(database.root().id(), Vec::<String>::new())];
     while let Some((id, path)) = groups.pop() {

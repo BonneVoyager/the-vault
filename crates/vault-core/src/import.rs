@@ -27,6 +27,12 @@ pub enum ImportError {
         "Could not open the KeePass database. Check its password and key file. The file may be damaged or use unsupported encryption."
     )]
     KdbxCredentials,
+    /// The KeePass parser panicked on a malformed authenticated structure (e.g. a KDBX4
+    /// inner header whose `random-stream-id` field is shorter than the fixed-width read the
+    /// dependency performs). Carries no payload data: the message is a fixed string so no
+    /// key material or file content can leak through it.
+    #[error("The KeePass database is malformed and could not be read.")]
+    KdbxMalformed,
 }
 
 /// Column names (matched case-insensitively against the header) for each item part.

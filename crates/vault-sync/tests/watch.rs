@@ -1254,3 +1254,88 @@ fn sibling_in_another_normalisation_form_is_absorbed() {
     );
     assert_eq!(ea.count(|e| matches!(e, SyncEvent::ConflictAbsorbed(_))), 1);
 }
+
+/// Review [11]: 300 conflicted copies beside the vault. At most 256 are queued at once, one
+/// poll absorbs at most 8, the overflow is only logged (never an event: 03 §2 "Watcher
+/// bounds"), and every copy is eventually absorbed by paging through them.
+#[test]
+fn many_candidates_are_capped_and_absorbed_in_batches() {
+    const COPIES: usize = 300;
+    let (dir, path, mut a, _b, _id) = two_devices();
+    let bytes = fs::read(&path).unwrap();
+    for i in 0..COPIES {
+        plant_package(&dir.path().join(format!("test {}.vault", i + 2)), &bytes);
+    }
+    a.start_watching().unwrap();
+    assert_eq!(a.pending_candidates_for_tests(), 256);
+    let mut ea = Events::new(&a);
+    let absorbed = |ea: &Events| ea.count(|e| matches!(e, SyncEvent::ConflictAbsorbed(_)));
+    let is_error = |e: &SyncEvent| matches!(e, SyncEvent::Error(_));
+
+    a.poll();
+    ea.pump();
+    assert_eq!(ea.count(is_error), 0, "{:?}", ea.seen);
+    assert!(absorbed(&ea) <= 8, "first poll absorbed {}", absorbed(&ea));
+    assert!(a.pending_candidates_for_tests() <= 256);
+
+    let start = Instant::now();
+    let mut polls = 1;
+    while absorbed(&ea) < COPIES {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "absorbed {}",
+            absorbed(&ea)
+        );
+        let before = absorbed(&ea);
+        a.poll();
+        polls += 1;
+        ea.pump();
+        assert!(
+            absorbed(&ea) - before <= 8,
+            "one poll absorbed {}",
+            absorbed(&ea) - before
+        );
+        assert!(a.pending_candidates_for_tests() <= 256);
+    }
+    assert!(polls >= COPIES / 8, "only {polls} polls");
+    for i in 0..COPIES {
+        assert!(!dir.path().join(format!("test {}.vault", i + 2)).exists());
+    }
+    let conflicts = a
+        .backups()
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.kind == BackupKind::Conflict)
+        .count();
+    assert_eq!(conflicts, COPIES);
+    assert_eq!(ea.count(is_error), 0, "{:?}", ea.seen);
+}
+
+/// Review [11]: signals lost to a full channel are recovered by the rescan the overflow flag
+/// forces: a conflicted copy and a peer's write to the primary are both picked up by the
+/// next single poll.
+#[test]
+fn channel_overflow_forces_a_rescan() {
+    let (dir, _path, mut a, mut b, _id) = two_devices();
+    a.start_watching().unwrap();
+    drain_for(&mut a, 2);
+    let mut ea = Events::new(&a);
+
+    b.edit(|v| v.insert(Item::new("from b's copy", Uuid::nil(), T0), T0))
+        .unwrap();
+    let copy = dir.path().join("test 2.vault");
+    plant_package(&copy, &b.vault().unwrap().serialize());
+    b.edit(|v| v.insert(Item::new("from b's save", Uuid::nil(), T0), T0))
+        .unwrap();
+    b.save().unwrap();
+    // Let their events reach the channel, then lose them.
+    thread::sleep(DEBOUNCE * 3);
+    a.simulate_signal_overflow_for_tests();
+    assert_eq!(a.pending_candidates_for_tests(), 0);
+
+    assert!(a.poll() > 0);
+    ea.pump();
+    assert!(!copy.exists(), "rescan did not absorb the copy");
+    assert!(ea.any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_))));
+    assert_eq!(titles(&a), ["from b's copy", "from b's save", "mail"]);
+}

@@ -4,7 +4,10 @@ Run from anywhere; the script changes to the repo root.
 
     scripts/package.sh [--skip-sign] [--skip-notarize] [--dry-run]
 
-Output: `target/package/Vault.app` and `target/package/Vault-<version>.dmg`.
+Output: `target/package/Vault.app` and `target/package/Vault-<version>.dmg`, plus
+`target/package/Vault.app.dSYM` (debug symbols for crash symbolication; not shipped in the dmg).
+The binary is built with the `dist` profile (fat LTO, one codegen unit, stripped), so it lands in
+`target/dist/`, not `target/release/`.
 
 The app icon is `assets/icon/Vault.icns`, built from `assets/icon/vault.svg` by
 `assets/icon/build-icns.sh` (uses `rsvg-convert` if installed, else `qlmanage` and `sips`).
@@ -21,7 +24,7 @@ Flags: `--skip-sign` (also skips notarization) and `--skip-notarize` drop the ma
 variables. `--dry-run` prints codesign, notarytool and hdiutil commands without running
 them; secrets are never printed. `entitlements.plist` is empty until gpui needs more.
 
-With the Apple ID path the password is visible in `ps` during `--wait`; use a keychain profile to avoid that.
+With the Apple ID path the script first runs `notarytool store-credentials` for a temporary profile (random name); the password is in that call's argv for milliseconds only, and every `submit --wait` uses `--keychain-profile`. An EXIT trap deletes the profile (best-effort: `security delete-generic-password -s com.apple.gke.notary.tool -a <name>`; if a run is killed, remove a leftover `vault-package-*` entry that way). A preconfigured keychain profile avoids even the brief exposure.
 
 Vault files are package directories named `<name>.vault/`. `Info.plist` exports the UTI
 `dev.vault.app` (conforms to `com.apple.package` and `public.data`, extension `vault`) and

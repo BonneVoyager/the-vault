@@ -26,6 +26,7 @@ use vault_core::{
 };
 
 use super::main::item_tile;
+use crate::bounded_read::read_capped;
 use crate::state::{AppState, parse_totp};
 use crate::ui::Clickable as _;
 use crate::{listing, text, theme, ui};
@@ -34,8 +35,12 @@ pub struct BackupWindow {
     state: Entity<AppState>,
     path: PathBuf,
     password: Entity<InputState>,
-    /// The decrypted backup. Dropped (zeroized) with the window.
+    /// The decrypted backup. Dropped (zeroized) with the window, or as soon as the live
+    /// vault locks. Read only through [`Self::live_vault`].
     vault: Option<UnlockedVault>,
+    /// `AppState::session_gen` when the backup was unlocked: the vault is usable only while
+    /// the live session is still that one and unlocked.
+    session: Option<(u64, u64)>,
     /// Live items, by title.
     items: Vec<Uuid>,
     selection: Option<Uuid>,
@@ -94,9 +99,10 @@ impl BackupWindow {
                     this.submit(window, cx);
                 }
             }),
-            // Never outlive the live session: close (and drop the keys) when it locks.
-            cx.observe_in(&state, window, |_, state, window, cx| {
+            // Never outlive the live session: drop the keys and close when it locks.
+            cx.observe_in(&state, window, |this, state, window, cx| {
                 if state.read(cx).locked {
+                    this.forget();
                     window.remove_window();
                 }
             }),
@@ -106,6 +112,7 @@ impl BackupWindow {
             path,
             password,
             vault: None,
+            session: None,
             items: Vec::new(),
             selection: None,
             revealed: HashSet::new(),
@@ -141,8 +148,29 @@ impl BackupWindow {
         &self.items
     }
 
-    fn item(&self, id: Uuid) -> Option<&Item> {
-        self.vault.as_ref()?.get(id)
+    /// True while the live vault is still the unlocked session this backup was opened in.
+    fn session_live(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        !state.locked && self.session == Some(state.session_gen())
+    }
+
+    /// The decrypted backup, only while [`Self::session_live`]: between a lock and the
+    /// window's (deferred) removal nothing can read or copy from it.
+    fn live_vault(&self, cx: &App) -> Option<&UnlockedVault> {
+        self.vault.as_ref().filter(|_| self.session_live(cx))
+    }
+
+    fn item(&self, id: Uuid, cx: &App) -> Option<&Item> {
+        self.live_vault(cx)?.get(id)
+    }
+
+    /// Drops (zeroizes) the decrypted backup and everything derived from it.
+    fn forget(&mut self) {
+        self.vault = None;
+        self.session = None;
+        self.items.clear();
+        self.selection = None;
+        self.revealed.clear();
     }
 
     /// Reads and unlocks the backup on the background executor.
@@ -161,8 +189,11 @@ impl BackupWindow {
         self.error = None;
         cx.notify();
         let path = self.path.clone();
+        let started = self.state.read(cx).session_gen();
         let task = cx.background_executor().spawn(async move {
-            let bytes = std::fs::read(backup_file(&path)).map_err(|e| e.to_string())?;
+            // Capped like every vault-file read (03 §2): a planted huge file is refused.
+            let bytes = read_capped(&backup_file(&path), vault_sync::MAX_VAULT_FILE_SIZE)
+                .map_err(|e| e.to_string())?;
             let locked = LockedVault::parse(&bytes).map_err(|e| e.to_string())?;
             locked.unlock(&password).map_err(|e| match e {
                 vault_core::VaultError::WrongPassword => "Wrong password. Try again.".to_owned(),
@@ -173,8 +204,12 @@ impl BackupWindow {
             let result = task.await;
             this.update(cx, |this, cx| {
                 this.busy = false;
+                let state = this.state.read(cx);
+                let fresh = !state.locked && state.session_gen() == started;
                 match result {
-                    Ok(vault) => this.opened(vault),
+                    Ok(vault) if fresh => this.opened(vault, started),
+                    // The live vault locked (or closed) meanwhile: drop the keys unseen.
+                    Ok(vault) => drop(vault),
                     Err(e) => this.error = Some(e.into()),
                 }
                 cx.notify();
@@ -184,12 +219,13 @@ impl BackupWindow {
         .detach();
     }
 
-    fn opened(&mut self, vault: UnlockedVault) {
+    fn opened(&mut self, vault: UnlockedVault, session: (u64, u64)) {
         let mut items: Vec<&Item> = vault.items().collect();
         items.sort_by_key(|i| i.title.to_lowercase());
         self.items = items.iter().map(|i| i.id).collect();
         self.selection = self.items.first().copied();
         self.vault = Some(vault);
+        self.session = Some(session);
     }
 
     fn select(&mut self, id: Uuid, cx: &mut Context<Self>) {
@@ -203,7 +239,7 @@ impl BackupWindow {
     pub fn copy_field(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(field) = self
             .selection
-            .and_then(|id| self.item(id))
+            .and_then(|id| self.item(id, cx))
             .and_then(|i| i.fields.get(ix))
         else {
             return;
@@ -219,15 +255,16 @@ impl BackupWindow {
         } else {
             field.value.clone()
         };
-        let secs = self.state.read(cx).settings.clipboard_clear_secs;
-        self.state.update(cx, |s, cx| s.copy_value(value, cx));
+        let Some(secs) = self.state.update(cx, |s, cx| s.copy_value(value, cx)) else {
+            return;
+        };
         self.status = Some(format!("Copied \u{2014} clears in {secs} s").into());
         cx.notify();
     }
 
     /// "Copy to current vault". Returns the new item's id in the live vault.
     pub fn copy_to_current(&mut self, cx: &mut Context<Self>) -> Option<Uuid> {
-        let item = self.selection.and_then(|id| self.item(id))?.clone();
+        let item = self.selection.and_then(|id| self.item(id, cx))?.clone();
         let id = self
             .state
             .update(cx, |s, cx| s.copy_item_into_vault(&item, cx));
@@ -324,7 +361,7 @@ impl BackupWindow {
 
     fn render_detail(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let Some(item) = self.selection.and_then(|id| self.item(id)) else {
+        let Some(item) = self.selection.and_then(|id| self.item(id, cx)) else {
             return ui::v_flex()
                 .flex_1()
                 .items_center()
@@ -461,6 +498,9 @@ impl Render for BackupWindow {
             theme.border,
             theme.font_size,
         );
+        if self.vault.is_some() && !self.session_live(cx) {
+            self.forget();
+        }
         let body = match self.vault.take() {
             None => self.render_prompt(cx),
             Some(vault) => {
@@ -798,6 +838,93 @@ mod tests {
         state.update(cx, |s, cx| s.open_backup(backup.clone(), cx));
         cx.run_until_parked();
         assert_eq!(cx.update(|cx| cx.windows().len()), before);
+    }
+
+    /// A backup over vault-sync's 64 MiB vault-file cap is refused before it is read (a
+    /// sparse file, so nothing is allocated).
+    #[gpui::test]
+    fn oversized_backup_is_refused(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = setup(dir.path(), cx);
+        let big = dir.path().join("big.vault.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(vault_sync::MAX_VAULT_FILE_SIZE + 1)
+            .unwrap();
+        let (view, mut vcx) = window(&state, &big, cx);
+        view.update(&mut vcx, |w, cx| w.unlock(SecretString::new(PW.into()), cx));
+        vcx.run_until_parked();
+        view.read_with(&vcx, |w, _| {
+            assert!(!w.is_open());
+            let error = w.error.as_deref().unwrap_or_default();
+            assert!(error.contains("larger than the 64 MiB limit"), "{error}");
+        });
+    }
+
+    /// An unlock that finishes after the live vault locked installs nothing: the decrypted
+    /// backup is dropped unseen, even though the (test-held) viewer entity is still alive.
+    #[gpui::test]
+    fn unlock_finishing_after_lock_installs_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, backup) = setup(dir.path(), cx);
+        let (view, mut vcx) = window(&state, &backup, cx);
+        view.update(&mut vcx, |w, cx| w.unlock(SecretString::new(PW.into()), cx));
+        // The background unlock has not run yet: lock first.
+        state.update(&mut vcx, |s, cx| s.lock(cx));
+        vcx.run_until_parked();
+        view.read_with(&vcx, |w, _| {
+            assert!(!w.is_open(), "stale backup vault installed");
+            assert!(w.item_ids().is_empty());
+            assert!(!w.busy);
+        });
+    }
+
+    /// Once the live vault locks, nothing copied from a backup viewer reaches the clipboard:
+    /// neither the viewer's own copy nor `AppState::copy_value` called directly (the window's
+    /// removal is deferred, so it may still receive an event).
+    #[gpui::test]
+    fn copy_after_lock_leaves_the_clipboard_alone(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, backup) = setup(dir.path(), cx);
+        let board = crate::clipboard::fake::FakePasteboard::default();
+        state.update(cx, |s, _| s.set_pasteboard(Box::new(board.clone())));
+        let (view, mut vcx) = window(&state, &backup, cx);
+        view.update(&mut vcx, |w, cx| w.unlock(SecretString::new(PW.into()), cx));
+        vcx.run_until_parked();
+        let github = view.read_with(&vcx, |w, _| w.item_ids()[1]);
+        view.update(&mut vcx, |w, cx| {
+            w.select(github, cx);
+            w.copy_field(0, cx);
+        });
+        assert_eq!(
+            board.contents().as_deref(),
+            Some("hunter2"),
+            "copies while unlocked"
+        );
+
+        // Lock, then copy inside the same turn, before any deferred close can run.
+        view.update(&mut vcx, |w, cx| {
+            w.state.update(cx, |s, cx| s.lock(cx));
+            w.status = None;
+            w.copy_field(0, cx);
+            assert!(w.status.is_none(), "no 'Copied' status after lock");
+            assert!(w.live_vault(cx).is_none(), "backup unreachable once locked");
+        });
+        assert_eq!(
+            board.contents(),
+            None,
+            "lock cleared ours; nothing new copied"
+        );
+        let secs = state.update(&mut vcx, |s, cx| {
+            s.copy_value(SecretString::new("leak".into()), cx)
+        });
+        assert_eq!(secs, None);
+        assert_eq!(board.contents(), None);
+        vcx.run_until_parked();
+        assert!(
+            !view.read_with(&vcx, |w, _| w.is_open()),
+            "keys dropped on lock"
+        );
     }
 
     /// An absorbed iCloud conflict copy is a whole package directory: the viewer reads its

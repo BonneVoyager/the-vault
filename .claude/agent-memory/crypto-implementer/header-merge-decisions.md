@@ -44,8 +44,19 @@ another agent in the same round; the workspace builds.
 `MergeReport.header_updated = true` (`changed()` includes it, so vault-sync writes). **Tie-break
 (lead's spec amendment, same day):** equal stamp -> greater `Header.slots_device_id` wins
 (optional `bytes(16)` key, written only when set; `bump_slots_stamp` records `self.device_id`;
-compared as `Option<Uuid>`, missing < any present). Compared as the tuple `(stamp, Option<device id>)`. Equal
-stamp AND author -> keep ours (idempotence; two never-stamped headers tie). The in-memory
+compared as `Option<Uuid>`, missing < any present). **D-9 tie-break (2026-11-06, external
+review finding [9]):** the winner tuple now has a 4th component, `Header::slots_canonical_bytes()`
+(pub(crate) in format.rs = `canonical_bytes(Value::Array(slots.map(Slot::to_value)))`, same
+encoder as item tie-break and `Header::digest`). Full tuple: `(format_version, slots_stamp,
+slots_device_id, slots_canonical_bytes)`; greater wins, loser adopts winner's slots+key.
+Reason: two divergent credential changes from a CLONED/duplicated `slots_device_id` in the same
+millisecond were an exact `(version, stamp, device)` tie and each side kept its own header
+forever (non-convergence). Equal canonical bytes == identical slots (same change twice) ->
+still "keep ours", still idempotent. `slots_canonical_bytes` is pub(crate) so integration tests
+cannot call it: decide the expected winner by which password opens the converged file, not by
+comparing bytes. Tests: `greater_stamp_wins_in_both_directions_and_divergent_tie_converges`
+(was `..._tie_keeps_ours`), `divergent_header_tie_break_is_commutative` in header_merge.rs. Equal
+stamp AND author AND slots -> keep ours (idempotence; two never-stamped headers tie). The in-memory
 `UnlockedVault::device_id` is deliberately NOT used: vault-sync opens the disk copy with the
 local device id, so both sides always carry the same one and the tie would never fire. Less ->
 keep ours. Top-level

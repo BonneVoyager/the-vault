@@ -1,10 +1,11 @@
 #![cfg(feature = "kdbx")]
 
+use argon2::{Algorithm, Argon2, Params, Version};
 use keepass::{
     Database, DatabaseKey,
-    config::{KdfConfig, OuterCipherConfig},
+    config::{CompressionConfig, KdfConfig, OuterCipherConfig},
 };
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha512};
 use vault_core::{
     ExposeSecret as _, FieldKind, ImportError, SecretString, Totp, Uuid, import_kdbx,
 };
@@ -529,6 +530,138 @@ fn maps_native_keepass_and_keetraytotp_fields() {
             .unwrap()
             .kind,
         FieldKind::Password
+    );
+}
+
+/// HMAC-SHA256 (RFC 2104), built from `sha2` because no HMAC crate is a dependency. This is
+/// test-fixture code that forges one KDBX4 HMAC block to craft an attack file; it is not a
+/// primitive used by the crate under test.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(msg);
+    let ih = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(ih);
+    outer.finalize().into()
+}
+
+/// `(value offset, length)` of a KDBX4 outer-header TLV by type.
+fn outer_tlv(bytes: &[u8], kind: u8) -> (usize, usize) {
+    let (_, start, len) = header_entries(bytes)
+        .into_iter()
+        .find(|e| e.0 == kind)
+        .unwrap();
+    (start, len)
+}
+
+/// [8] D-8 / finding [9 in the review's numbering]: keepass-rs 0.17.0 reads the KDBX4 inner
+/// header `random-stream-id` with a fixed-width `read_u32` that panics when the field is
+/// shorter than four bytes. That inner header is inside the encrypted, HMAC-protected payload,
+/// so it cannot be pre-validated; the importer wraps `Database::parse` in `catch_unwind` and
+/// maps the panic to `ImportError::KdbxMalformed`. Here we craft such a file.
+///
+/// A valid ChaCha20 + Argon2d + no-compression KDBX4 is saved, then one plaintext byte of the
+/// first HMAC block is flipped via the ChaCha20 stream-cipher XOR property (ciphertext byte
+/// XOR delta == plaintext byte XOR delta) to turn the inner header's `random-stream-id` length
+/// field from 4 into 0, and the block HMAC is recomputed. Authentication therefore still
+/// passes and the parse reaches the panicking read. The master key / HMAC key are reproduced
+/// with RustCrypto `argon2` (same parameters keepass-rs's `rust-argon2` uses); asserting the
+/// result is `KdbxMalformed` (not `KdbxCredentials`) also proves that reproduction is correct.
+#[test]
+fn crafted_kdbx4_inner_header_panic_is_caught_not_propagated() {
+    let mut db = Database::new();
+    db.config.outer_cipher_config = OuterCipherConfig::ChaCha20;
+    db.config.compression_config = CompressionConfig::None;
+    // Keep the default Argon2d config's `version` (keepass's own `argon2::Version`, which this
+    // test crate cannot name since `argon2` resolves to RustCrypto here) and only shrink the
+    // numeric parameters so the test is fast; version 0x13 is reproduced below.
+    if let KdfConfig::Argon2 {
+        iterations,
+        memory,
+        parallelism,
+        ..
+    } = &mut db.config.kdf_config
+    {
+        *iterations = 1;
+        *memory = 64 * 1024;
+        *parallelism = 1;
+    }
+    db.root_mut().add_entry().set_unprotected("Title", "Only");
+    let valid = encoded(&db, Some(PASSWORD), None);
+    // Sanity: the untampered file imports cleanly.
+    assert_eq!(import(&valid, PASSWORD).unwrap().len(), 1);
+
+    // Reproduce the KDBX4 HMAC key: composite = SHA256(SHA256(password)); transformed =
+    // Argon2d(composite, salt S); hmac_key = SHA512(master_seed || transformed || 0x01).
+    let (ms_off, ms_len) = outer_tlv(&valid, 4); // MASTERSEED
+    assert_eq!(ms_len, 32);
+    let master_seed = &valid[ms_off..ms_off + 32];
+    let read = |key: &[u8]| {
+        let (at, len) = kdf_param(&valid, key);
+        &valid[at..at + len]
+    };
+    let salt = read(b"S");
+    let memory = u64::from_le_bytes(read(b"M").try_into().unwrap());
+    let iterations = u64::from_le_bytes(read(b"I").try_into().unwrap());
+    let parallelism = u32::from_le_bytes(read(b"P").try_into().unwrap());
+
+    let composite = Sha256::digest(Sha256::digest(PASSWORD.as_bytes()));
+    let params = Params::new(
+        (memory / 1024) as u32,
+        iterations as u32,
+        parallelism,
+        Some(32),
+    )
+    .unwrap();
+    let mut transformed = [0u8; 32];
+    Argon2::new(Algorithm::Argon2d, Version::V0x13, params)
+        .hash_password_into(&composite, salt, &mut transformed)
+        .unwrap();
+    let mut hmac_in = master_seed.to_vec();
+    hmac_in.extend_from_slice(&transformed);
+    hmac_in.push(0x01); // hmac_block_stream::HMAC_KEY_END
+    let hmac_key = Sha512::digest(&hmac_in);
+
+    // The HMAC block stream begins after the END entry + 32-byte header SHA-256 + 32-byte
+    // header HMAC. Block 0 is `hmac(32) | size(u32 LE) | data`.
+    let mut out = valid.clone();
+    let bs = header_end(&out) + 64;
+    let size = u32::from_le_bytes(out[bs + 32..bs + 36].try_into().unwrap()) as usize;
+    let data = bs + 36;
+    // Flip the inner-header `random-stream-id` length field (plaintext bytes 1..5, value 4)
+    // to 0: one XOR on the stream ciphertext. `read_u32` on the now-empty field panics.
+    out[data + 1] ^= 0x04;
+
+    // Block 0 key: SHA512(block_index u64 LE || hmac_key). Message: index || size || data.
+    let mut block_key_in = 0u64.to_le_bytes().to_vec();
+    block_key_in.extend_from_slice(&hmac_key);
+    let block_key = Sha512::digest(&block_key_in);
+    let mut msg = 0u64.to_le_bytes().to_vec();
+    msg.extend_from_slice(&out[bs + 32..bs + 36]);
+    msg.extend_from_slice(&out[data..data + size]);
+    let mac = hmac_sha256(&block_key, &msg);
+    out[bs..bs + 32].copy_from_slice(&mac);
+
+    // The parse panics on the short field; the importer catches it (no panic escapes) and
+    // reports `KdbxMalformed` rather than the credential error, proving authentication passed.
+    assert!(
+        matches!(import(&out, PASSWORD), Err(ImportError::KdbxMalformed)),
+        "expected KdbxMalformed, got {:?}",
+        import(&out, PASSWORD).err()
     );
 }
 

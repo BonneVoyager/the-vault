@@ -56,9 +56,20 @@ impl AppState {
         close_windows(handles.into_iter().map(|(_, h)| h), cx);
     }
 
-    /// Copies a value shown in the backup window, with the usual clear timer.
-    pub fn copy_value(&mut self, value: SecretString, cx: &mut Context<Self>) {
-        self.copy_secret(value, cx);
+    /// The session a backup viewer binds its decrypted backup to: `(epoch, lock_gen)`
+    /// changes whenever the live vault is closed or locked.
+    pub fn session_gen(&self) -> (u64, u64) {
+        (self.epoch, self.lock_gen)
+    }
+
+    /// Copies a value shown in the backup window, with the usual clear timer. Returns the
+    /// clear delay in seconds. Refused, without touching the clipboard, unless the main
+    /// window is active: the same guard as a copy from the main window.
+    pub fn copy_value(&mut self, value: SecretString, cx: &mut Context<Self>) -> Option<u32> {
+        if !self.main_active() {
+            return None;
+        }
+        self.copy_value_for_window(value, cx)
     }
 
     /// "Copy to current vault": inserts a clone of `item` under a fresh id (so it never

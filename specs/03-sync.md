@@ -39,11 +39,26 @@ Provider label (2026-10-31, pure classifier in vault-sync `cloud`): under `~/Lib
 1. bytes = vault.serialize()
 2. write bytes to <name>.vault/.vault.bin.tmp-<rand>   (O_CREAT|O_EXCL, mode 0600)
 3. fsync(tmp)
-4. rename(tmp, <name>.vault/vault.bin)             atomic on APFS / HFS+ / ext4
+4. bind-check, then rename(tmp, <name>.vault/vault.bin)   atomic on APFS / HFS+ / ext4
+   (2026-11-06, external review D-2): the tmp handle stays open; lstat(tmp path) must match the
+   handle's (dev, ino) or nothing is renamed (`UnsafePackageEntry`). When a primary exists, the
+   rename replaces it only if its (dev, ino, size, mtime) still equal what the pre-write merge read
+   (`Mode::ReplaceIf`); when only (dev, ino) differ, a (size, blake3) match of the current bytes
+   counts as unchanged (SMB/FUSE mounts and iCloud same-bytes rewrites renumber inodes). A mismatch
+   is `PrimaryChangedDuringSave`: `save` re-reads, re-merges and retries up to 3 times, then returns
+   the error with the vault still dirty; the app treats it like a busy lock (friendly message, one
+   scheduled retry). Residual: the microseconds between the checks and rename(2); macOS has no
+   compare-and-rename.
 5. fsync(package dir)                              ignore ENOTSUP/EOPNOTSUPP/EINVAL/ENOSYS (unsupported); any other error → Err, vault stays dirty
 6. record (mtime, ctime, inode, size, blake3(bytes)) as `last_written`   (V-05: mtime+size alone misses a same-size write within one timestamp tick on coarse filesystems)
 7. maybe_backup(bytes)                             §4
 ```
+
+**Blob publication is authenticated (2026-11-06, D-6):** a blob copied from a conflict package (with or without a `vault.bin`) is published only if its length equals the sealed size computed from the reference and every chunk authenticates under the reference's key while it is copied (plaintext goes to a sink, never retained); a bad blob is skipped with a warning and nothing is written. An existing blob is never replaced. Blobs published before this date are not re-verified; the reader's AEAD check and orphan cleanup remain the backstop.
+
+**Watcher bounds (2026-11-06, D-11):** the signal channel is bounded (1024, non-blocking sends); a full channel drops the signal and sets a rescan flag honoured by the next poll. The candidate queue is deduplicated and capped at 256 (overflow → rescan flag and one log warning per episode; no `SyncEvent`, since nothing needs the user's attention). A poll processes at most 8 candidates; the rest wait for the next poll, so one-shot callers (`vault sync`) loop on `poll()` until it returns 0. Directory scans page, so every candidate is eventually seen.
+
+**Not following links (2026-11-06, D-1):** every file the package opens (`.lock`, `vault.bin`, backups, blobs, conflict-copy sources) is opened with `O_NOFOLLOW` and must be a regular file after `fstat`; a symlink or special file is `UnsafePackageEntry`, never a silent fallback (a symlinked `.lock` must not degrade to the no-lock path). `backups/` and `attachments/` must not be symlinks. The package directory itself is resolved once at `open` (documented). Directory components are still path-checked, so a same-uid process that swaps a directory between check and use can race; that is the accepted residual.
 
 Steps 1–7 run under an exclusive advisory lock on `<name>.vault/.lock` (flock), taken before the pre-write merge's read and released after the rename, so two processes (the app and the CLI, or two CLI commands) cannot interleave a read-modify-write and lose items (V-02). On volumes that do not support locking (ENOTSUP/ENOLCK) or where the lock file cannot be created for permission reasons, the save proceeds without the lock and logs a warning once; concurrent writers are then unprotected (accepted). Step 5 ignores only ENOTSUP/EINVAL from the directory fsync; any other error is surfaced and the vault stays dirty. Step 4 uses a native no-replace rename (`renameatx_np(RENAME_EXCL)` via `rustix`) for backups and blobs, with the hard-link fallback only where that is unsupported. Reads of `vault.bin` are capped (64 MiB) and refuse larger files with a typed error before parsing. Never write in place. Never truncate-then-write. If step 4 fails, delete the tmp and surface the error; the old file is intact.
 
@@ -119,7 +134,7 @@ Field-level merge, keyed by `field.id` (2026-10-31; never by name):
 
 Result item `modified_at = max(ours, theirs)`. Merged item takes `device_id` of whichever side supplied the winning metadata.
 
-**Header merge** (added 2026-10-30 after the bug hunt, V-01/V-03): the header carries `slots_modified_at`; `merge_from` takes the whole slot set, KDF parameters and `format_version` from the header that is greater by the tuple (`format_version`, `slots_modified_at`, `slots_device_id`); equal keeps ours (2026-10-31: the version ranks first because every slot AAD binds it, so a version 2 header always beats a version 1 header and an upgrade is never undone; the device id tie-break means both devices converge). When the other side wins, the in-memory vault key is replaced by theirs as well (their slots wrap their key); a later local slot change with a greater stamp wins back by LWW. A password change, slot add/remove, re-calibration or key rotation on one device therefore survives the other device's next save. The vault key is unchanged by a password change, so the other device keeps working with its cached key; a key rotation is detected as before (`KeyRotatedOnDisk`).
+**Header merge** (added 2026-10-30 after the bug hunt, V-01/V-03): the header carries `slots_modified_at`; `merge_from` takes the whole slot set, KDF parameters and `format_version` from the header that is greater by the tuple (`format_version`, `slots_modified_at`, `slots_device_id`, canonical CBOR of the slot set — the last added 2026-11-06 after an external review, D-9: two authentic divergent header writes from a cloned device id in the same millisecond otherwise never converge); equal keeps ours (2026-10-31: the version ranks first because every slot AAD binds it, so a version 2 header always beats a version 1 header and an upgrade is never undone; the device id tie-break means both devices converge). When the other side wins, the in-memory vault key is replaced by theirs as well (their slots wrap their key); a later local slot change with a greater stamp wins back by LWW. A password change, slot add/remove, re-calibration or key rotation on one device therefore survives the other device's next save. The vault key is unchanged by a password change, so the other device keeps working with its cached key; a key rotation is detected as before (`KeyRotatedOnDisk`).
 
 Timestamps are monotone per item: every write stamps `max(now, previous + 1)`, so a clock that went backwards cannot resurrect a deleted item or let an older edit win. If a merge changes an item's content without changing its `modified_at` (possible when both sides carry the same timestamp), the merge bumps `modified_at` by one so the manifest check and the other device see the change. Two devices converge within two merge rounds, or three when the `removed_fields` cap fires, since each side can apply the cap only after it has seen the peer drop the fields (2026-10-31).
 

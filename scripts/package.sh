@@ -79,6 +79,31 @@ run_guarded() {
   fi
 }
 
+# Temporary notarytool keychain profile, used when only Apple ID credentials are set so the
+# password never appears in the argv of the long-running `submit --wait`.
+TEMP_PROFILE=""
+cleanup() {
+  rm -rf "${STAGING:-}"
+  if [[ -n "$TEMP_PROFILE" ]]; then
+    # Best-effort: notarytool stores the profile as a generic password (service
+    # com.apple.gke.notary.tool, account = profile name). Never fail the exit path.
+    security delete-generic-password -s "com.apple.gke.notary.tool" -a "$TEMP_PROFILE" \
+      >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+# Create the temporary profile once (short-lived argv exposure, milliseconds).
+ensure_temp_profile() {
+  [[ -n "$TEMP_PROFILE" ]] && return 0
+  local name="vault-package-$$-$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 12)"
+  TEMP_PROFILE="$name"
+  xcrun notarytool store-credentials "$name" \
+    --apple-id "$VAULT_NOTARY_APPLE_ID" \
+    --team-id "$VAULT_NOTARY_TEAM_ID" \
+    --password "$VAULT_NOTARY_PASSWORD" >/dev/null
+}
+
 # Submit a file (zip or dmg) to the notary service and wait. Secrets are never printed.
 notarize_submit() {
   local file="$1"
@@ -86,24 +111,30 @@ notarize_submit() {
     run_guarded xcrun notarytool submit "$file" \
       --keychain-profile "$VAULT_NOTARY_KEYCHAIN_PROFILE" --wait
   elif [[ $DRY_RUN -eq 1 ]]; then
-    echo "[dry-run] xcrun notarytool submit $file --apple-id <redacted> --team-id <redacted> --password <redacted> --wait"
+    echo "[dry-run] xcrun notarytool store-credentials <temp-profile> --apple-id <redacted> --team-id <redacted> --password <redacted> (once)"
+    echo "[dry-run] xcrun notarytool submit $file --keychain-profile <temp-profile> --wait"
   else
-    xcrun notarytool submit "$file" \
-      --apple-id "$VAULT_NOTARY_APPLE_ID" \
-      --team-id "$VAULT_NOTARY_TEAM_ID" \
-      --password "$VAULT_NOTARY_PASSWORD" \
-      --wait
+    ensure_temp_profile
+    xcrun notarytool submit "$file" --keychain-profile "$TEMP_PROFILE" --wait
   fi
 }
 
-echo "==> Building vault-app (release), version $VERSION"
-cargo build --release -p vault-app
+# `dist` (workspace Cargo.toml): fat LTO, one codegen unit, stripped binary, packed dSYM.
+echo "==> Building vault-app (dist profile), version $VERSION"
+cargo build --profile dist -p vault-app
 
 echo "==> Assembling $APP"
 rm -rf target/package
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/vault-app "$APP/Contents/MacOS/vault-app"
+cp target/dist/vault-app "$APP/Contents/MacOS/vault-app"
 chmod 755 "$APP/Contents/MacOS/vault-app"
+# Debug symbols for crash symbolication stay next to the bundle, never inside it.
+# target/dist/vault-app.dSYM is a symlink into deps/, so copy with -L.
+if [[ -d target/dist/vault-app.dSYM ]]; then
+  cp -RL target/dist/vault-app.dSYM "$PKG_DIR/Vault.app.dSYM"
+else
+  echo "warning: target/dist/vault-app.dSYM not found; crash reports cannot be symbolicated" >&2
+fi
 sed "s/@VERSION@/$VERSION/g" scripts/Info.plist > "$APP/Contents/Info.plist"
 if [[ -f assets/icon/Vault.icns ]]; then
   cp assets/icon/Vault.icns "$APP/Contents/Resources/Vault.icns"
@@ -136,7 +167,6 @@ else
 fi
 
 echo "==> Creating $DMG"
-trap 'rm -rf "$STAGING"' EXIT
 mkdir -p "$STAGING"
 cp -R "$APP" "$STAGING/Vault.app"
 ln -s /Applications "$STAGING/Applications"

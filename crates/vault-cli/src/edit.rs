@@ -6,7 +6,7 @@
 use anyhow::{Result, anyhow, bail};
 use vault_core::{Field, FieldKind, Item, ItemIcon, SecretString, UnlockedVault, Uuid};
 
-use crate::sanitize_for_terminal;
+use crate::sanitize_line;
 
 /// How `--set` names its target.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +109,7 @@ pub fn parse_add(s: &str) -> Result<NewField> {
         "section" => FieldKind::Section,
         other => bail!(
             "unknown field kind \"{}\" (text, password, url, notes, email, section)",
-            sanitize_for_terminal(other)
+            sanitize_line(other)
         ),
     };
     let (name, value) = rest.split_once('=').unwrap_or((rest, ""));
@@ -134,7 +134,7 @@ fn name_matches<'a>(item: &'a Item, name: &'a str) -> impl Iterator<Item = &'a F
 fn ambiguous(name: &str, n: usize) -> anyhow::Error {
     anyhow!(
         "ambiguous: {n} fields named \"{}\"; use the field id instead (`vault get --ids`): --set <id>=<value>",
-        sanitize_for_terminal(name)
+        sanitize_line(name)
     )
 }
 

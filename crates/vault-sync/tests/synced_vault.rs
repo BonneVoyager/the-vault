@@ -339,10 +339,14 @@ fn vault_file_replaced_by_a_directory_is_a_clean_error() {
         matches!(&err, SyncError::NoVault(p) if p == &bin(&path)),
         "{err:?}"
     );
-    // An open vault refuses to save over it, and leaves it alone.
+    // An open vault refuses to save over it, and leaves it alone (the pre-write read only
+    // accepts a regular file).
     insert_item(&mut v, "x");
     let err = v.save().unwrap_err();
-    assert!(matches!(err, SyncError::Io { .. }), "{err:?}");
+    assert!(
+        matches!(&err, SyncError::UnsafePackageEntry(p) if p == &bin(&path)),
+        "{err:?}"
+    );
     assert!(bin(&path).is_dir());
     assert!(tmp_leftovers(&path).is_empty());
 }
