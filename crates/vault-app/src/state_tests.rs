@@ -367,3 +367,49 @@ fn lock_toast_texts() {
         "Could not save before locking (disk full)."
     );
 }
+
+/// ⌘1 … ⌘9 (05 §2.3): All Items, Favorites, Recently Deleted only while the trash is
+/// not empty, then the tags only while the Tags section is open; nothing past the end.
+#[test]
+fn sidebar_row_filter_follows_display_order() {
+    use crate::listing::Counts;
+    let tag = |t: &str| Some(Filter::Tag(t.into()));
+    let tags = vec![("Work".to_string(), 2), ("home".to_string(), 1)];
+    // (trash count, tags open, n, expected)
+    let table = [
+        // No trash, tags open.
+        (0, true, 1, Some(Filter::All)),
+        (0, true, 2, Some(Filter::Favorites)),
+        (0, true, 3, tag("Work")),
+        (0, true, 4, tag("home")),
+        (0, true, 5, None),
+        // Trash present: Recently Deleted third, tags shift by one.
+        (3, true, 3, Some(Filter::RecentlyDeleted)),
+        (3, true, 4, tag("Work")),
+        (3, true, 5, tag("home")),
+        (3, true, 6, None),
+        // Tags collapsed: nothing past Favorites / Recently Deleted.
+        (0, false, 2, Some(Filter::Favorites)),
+        (0, false, 3, None),
+        (3, false, 3, Some(Filter::RecentlyDeleted)),
+        (3, false, 4, None),
+        // Out of range.
+        (0, true, 0, None),
+        (3, true, 9, None),
+    ];
+    let mut s = AppState::new(Uuid::new_v4(), Vec::new(), false);
+    for (deleted, open, n, want) in table {
+        s.counts = Counts {
+            all: 5,
+            favorites: 1,
+            deleted,
+            tags: tags.clone(),
+        };
+        s.tags_open = open;
+        assert_eq!(
+            s.sidebar_row_filter(n),
+            want,
+            "trash={deleted} open={open} n={n}"
+        );
+    }
+}

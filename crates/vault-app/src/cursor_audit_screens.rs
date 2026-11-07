@@ -320,7 +320,7 @@ fn main_sort_menu(cx: &mut TestAppContext) {
     audit(
         Case {
             label: "sort menu",
-            targets: &["items.0", "items.1"],
+            targets: &["sort-name", "sort-modified"],
             disabled: &[],
         },
         &mut vcx,
@@ -481,7 +481,7 @@ fn edit_add_field_menu(cx: &mut TestAppContext) {
     audit(
         Case {
             label: "add field menu",
-            targets: &["items.0", "items.1", "items.2"],
+            targets: &["add-field-text", "add-field-password", "add-field-totp"],
             disabled: &["move-up-0", &last_down],
         },
         &mut vcx,

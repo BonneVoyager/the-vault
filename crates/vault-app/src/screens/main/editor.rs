@@ -15,7 +15,6 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Backspace, InputEvent, InputState, Textarea, TextareaState};
-use gpui_component::menu::DropdownMenu as _;
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
@@ -695,7 +694,37 @@ fn value_placeholder(kind: FieldKind) -> &'static str {
 }
 
 impl Render for Editor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Built first: the menu keeps its focus handles in element state (`&mut App`).
+        let add_field_open = self.state.read(cx).add_field_menu_open;
+        let add_field = {
+            let state = self.state.clone();
+            let rows_state = self.state.clone();
+            ui::menu_popover(
+                "add-field-menu",
+                Button::new("add-field")
+                    .debug_selector(|| "add-field".into())
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(IconName::Plus))
+                    .label("Add field")
+                    .clickable(),
+                Anchor::TopLeft,
+                add_field_open,
+                move |open, _, cx| {
+                    state.update(cx, |s, cx| {
+                        if open {
+                            s.open_add_field_menu(cx);
+                        } else {
+                            s.close_add_field_menu(cx);
+                        }
+                    });
+                },
+                move |_, _| add_field_rows(&rows_state),
+                window,
+                cx,
+            )
+        };
         let s = self.state.read(cx);
         let Some(buffer) = s.edit_buffer() else {
             return div().into_any_element();
@@ -735,28 +764,6 @@ impl Render for Editor {
                 ));
             }
         }
-
-        let add_field = {
-            let state = self.state.clone();
-            Button::new("add-field")
-                .ghost()
-                .small()
-                .icon(Icon::new(IconName::Plus))
-                .label("Add field")
-                .clickable()
-                .dropdown_menu(move |menu, _, _| {
-                    ADDABLE_KINDS.into_iter().fold(menu, |menu, kind| {
-                        let state = state.clone();
-                        menu.item(ui::menu_item(kind_name(kind), false, move |_, _, cx| {
-                            state.update(cx, |s, cx| {
-                                s.edit(cx, |b| {
-                                    b.add_field(kind);
-                                });
-                            });
-                        }))
-                    })
-                })
-        };
 
         let header = ui::h_flex()
             .debug_selector(|| "editor-header".into())
@@ -839,6 +846,26 @@ impl Render for Editor {
             .child(ui::h_flex().child(add_field))
             .into_any_element()
     }
+}
+
+/// Add field menu rows: one per addable kind, no icons (the editor has no per-kind icon).
+fn add_field_rows(state: &Entity<AppState>) -> Vec<ui::MenuRow> {
+    ADDABLE_KINDS
+        .into_iter()
+        .map(|kind| {
+            let state = state.clone();
+            ui::menu_row(format!("add-field-{}", kind.as_str()), kind_name(kind)).on_click(
+                move |_, _, cx| {
+                    state.update(cx, |s, cx| {
+                        s.close_add_field_menu(cx);
+                        s.edit(cx, |b| {
+                            b.add_field(kind);
+                        });
+                    });
+                },
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]

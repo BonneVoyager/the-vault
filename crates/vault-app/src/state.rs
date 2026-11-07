@@ -390,6 +390,10 @@ pub struct AppState {
     pub delete_confirm: Option<Uuid>,
     /// Open Templates menu (⌘N) with the title to pre-fill ("Create '<query>'").
     pub template_picker: Option<String>,
+    /// Open Sort menu in the list header.
+    pub sort_menu_open: bool,
+    /// Open Add field menu in the editor; closed when the edit ends.
+    pub add_field_menu_open: bool,
     pub generator: Generator,
     /// Open generator popover, if any.
     pub generator_target: Option<GeneratorTarget>,
@@ -503,6 +507,8 @@ impl AppState {
             discard_prompt: None,
             delete_confirm: None,
             template_picker: None,
+            sort_menu_open: false,
+            add_field_menu_open: false,
             generator: Generator::default(),
             generator_target: None,
             settings_open: false,
@@ -597,7 +603,12 @@ impl AppState {
 
     /// ⌘, and the app menu's "Settings…" item (the sidebar has no Settings row).
     /// Always notifies on open, so the root re-checks the dialog even if the flag is stale.
+    /// Opening is a no-op unless a vault is unlocked ([`Self::main_active`]): Settings is
+    /// unreachable from the Choose and Unlock screens.
     pub fn open_settings(&mut self, open: bool, cx: &mut Context<Self>) {
+        if open && !self.main_active() {
+            return;
+        }
         if open && !self.settings_open {
             self.refresh_backups();
             self.refresh_touch();

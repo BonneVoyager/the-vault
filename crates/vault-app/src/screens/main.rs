@@ -197,8 +197,8 @@ pub struct MainScreen {
     seen_locked: bool,
     /// Sidebar visibility the layout last applied.
     seen_sidebar: bool,
-    /// Whether the menu bar last installed carries the Recently Deleted rows.
-    seen_trash: bool,
+    /// The menu bar last installed: (Recently Deleted rows, Settings… present).
+    seen_menu: (bool, bool),
     /// The sidebar's slide; finished at rest.
     slide: Slide,
     /// Tests pin the slide clock here instead of reading real time.
@@ -274,10 +274,14 @@ impl MainScreen {
             ),
         ];
         subscriptions.extend(focus_outs);
+        // A (re)opened window installs the menu bar for the current state: a lock while
+        // no main window was open left it as it was.
+        let menu_state = state.clone();
+        cx.defer(move |cx| menu_state.update(cx, |s, cx| crate::actions::refresh_menus(s, cx)));
         Self {
             seen_locked: state.read(cx).locked,
             seen_sidebar: state.read(cx).sidebar_visible(),
-            seen_trash: false,
+            seen_menu: menu_shape(state.read(cx)),
             slide: Slide::settled(
                 state.read(cx).sidebar_visible(),
                 state.read(cx).sidebar_toggles,
@@ -356,7 +360,6 @@ impl MainScreen {
     fn focus(&mut self, target: FocusTarget, window: &mut Window, cx: &mut Context<Self>) {
         match target {
             FocusTarget::Search => ui::focus_input(&self.search, window, cx),
-            FocusTarget::List => window.focus(&self.list_focus, cx),
             FocusTarget::Detail => window.focus(&self.detail_focus, cx),
         }
     }
@@ -406,10 +409,11 @@ impl MainScreen {
             ui::clear_input(&self.key_input, window, cx);
         }
         self.seen_locked = locked;
-        // Item ▸ Recover / Delete Permanently exist only while the trash shows.
-        let trash = self.state.read(cx).viewing_trash();
-        if trash != self.seen_trash {
-            self.seen_trash = trash;
+        // Item ▸ Recover / Delete Permanently exist only while the trash shows, and
+        // Vault ▸ Settings… only while unlocked (lock, unlock, close and open all notify).
+        let menu = menu_shape(self.state.read(cx));
+        if menu != self.seen_menu {
+            self.seen_menu = menu;
             self.state
                 .update(cx, |s, cx| crate::actions::refresh_menus(s, cx));
         }
@@ -499,6 +503,12 @@ impl MainScreen {
 
 /// A column divider: gpui-component's resize handle on the leading edge of the column
 /// to its right (which must be `relative`).
+/// The parts of the menu bar that depend on state beyond sort and sidebar:
+/// (Recently Deleted rows, Settings… present).
+fn menu_shape(s: &AppState) -> (bool, bool) {
+    (s.viewing_trash(), s.main_active())
+}
+
 fn column_handle(drag: ColumnDrag) -> impl IntoElement {
     gpui_component::resizable::resize_handle::<ColumnDrag, ColumnDrag>(
         ("resizable-handle", drag as usize),
@@ -1201,7 +1211,19 @@ mod tests {
         let (state, _, mut vcx) = open(false, dir.path(), cx);
         // Every action on an empty vault is a harmless no-op.
         vcx.simulate_keystrokes("down up enter cmd-d cmd-shift-c cmd-shift-t cmd-shift-r");
-        vcx.simulate_keystrokes("cmd-1 cmd-2 cmd-e cmd-backspace cmd-s cmd-n");
+        // ⌘2 picks Favorites, ⌘1 All Items; ⌘3 (no trash, no tags) does nothing.
+        vcx.simulate_keystrokes("cmd-2");
+        assert_eq!(
+            state.read_with(&vcx, |s, _| s.filter.clone()),
+            Filter::Favorites
+        );
+        vcx.simulate_keystrokes("cmd-3");
+        assert_eq!(
+            state.read_with(&vcx, |s, _| s.filter.clone()),
+            Filter::Favorites
+        );
+        vcx.simulate_keystrokes("cmd-1 cmd-e cmd-backspace cmd-s cmd-n");
+        assert_eq!(state.read_with(&vcx, |s, _| s.filter.clone()), Filter::All);
         state.read_with(&vcx, |s, _| {
             assert!(s.selection.is_none());
             assert_eq!(s.counts.all, 0);
@@ -1228,7 +1250,7 @@ mod tests {
             assert_eq!(item.fields.len(), 4);
         });
         // Delete it again: back to the empty state without a selection.
-        vcx.simulate_keystrokes("cmd-1 cmd-backspace");
+        vcx.simulate_keystrokes("cmd-backspace");
         state.update(&mut vcx, |s, cx| s.confirm_delete(cx));
         vcx.run_until_parked();
         state.read_with(&vcx, |s, _| {
@@ -1349,7 +1371,7 @@ mod tests {
         assert!(state.read_with(&vcx, |s, _| s.generator_target.is_none()));
 
         // ⌘⌫ asks first; Delete tombstones and moves the selection.
-        vcx.simulate_keystrokes("cmd-1 cmd-backspace");
+        vcx.simulate_keystrokes("cmd-backspace");
         let doomed = state.read_with(&vcx, |s, _| {
             assert_eq!(s.delete_confirm, s.selection);
             s.selection.unwrap()

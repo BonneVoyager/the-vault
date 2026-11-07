@@ -20,11 +20,10 @@ pub const AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 /// The "Copied" pill.
 const COPIED_TTL: Duration = Duration::from_secs(2);
 
-/// Focus moves requested by global actions (⌘F, ⌘1, ⌘2, ⏎).
+/// Focus moves requested by global actions (⌘F, ⏎).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusTarget {
     Search,
-    List,
     Detail,
 }
 
@@ -63,7 +62,7 @@ impl AppState {
     pub(super) fn clear_session(&mut self) {
         self.kdbx_import = None;
         self.selection = None;
-        self.mode = Mode::View;
+        self.leave_edit_mode();
         self.revealed.clear();
         self.option_reveal = false;
         self.history_open = false;
@@ -75,6 +74,7 @@ impl AppState {
         self.discard_prompt = None;
         self.delete_confirm = None;
         self.template_picker = None;
+        self.sort_menu_open = false;
         self.generator_target = None;
     }
 
@@ -375,6 +375,23 @@ impl AppState {
     pub fn toggle_history(&mut self, cx: &mut Context<Self>) {
         self.history_open = !self.history_open;
         cx.notify();
+    }
+
+    /// The filter of the `n`th sidebar row (1-based, ⌘1 … ⌘9) in display order: All
+    /// Items, Favorites, Recently Deleted while it is shown (trash not empty), then the
+    /// tags while the Tags section is expanded. `None` past the last row (05 §2.3).
+    pub fn sidebar_row_filter(&self, n: usize) -> Option<Filter> {
+        let mut fixed = vec![Filter::All, Filter::Favorites];
+        if self.counts.deleted > 0 {
+            fixed.push(Filter::RecentlyDeleted);
+        }
+        let tags = self
+            .counts
+            .tags
+            .iter()
+            .filter(|_| self.tags_open)
+            .map(|(tag, _)| Filter::Tag(tag.clone()));
+        fixed.into_iter().chain(tags).nth(n.checked_sub(1)?)
     }
 
     pub fn toggle_tags(&mut self, cx: &mut Context<Self>) {

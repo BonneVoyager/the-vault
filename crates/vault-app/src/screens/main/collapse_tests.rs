@@ -258,6 +258,167 @@ fn lock_is_cmd_l_and_the_file_menu_only(cx: &mut TestAppContext) {
     }
 }
 
+/// Item ▸ Next / Previous Item and Cancel Edit use menu-only actions with no key binding. The macOS menu
+/// derives its key equivalents from the action's bindings without their context, so on
+/// `NextItem` / `PrevItem` bare ↓/↑ would reach the menu from any focus (05 §4: list-only).
+#[gpui::test]
+fn item_menu_next_prev_have_no_key_equivalent(cx: &mut TestAppContext) {
+    use crate::actions::{
+        CancelEdit, DETAIL_CONTEXT, LIST_CONTEXT, MenuCancelEdit, MenuNextItem, MenuPrevItem,
+        NextItem, PrevItem,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, mut vcx) = open(true, dir.path(), cx);
+    let menus = vcx.cx.update(|cx| cx.get_menus()).unwrap();
+    let item = menus
+        .iter()
+        .find(|m| m.name.as_ref() == "Item")
+        .expect("Item menu");
+    let action_of = |label: &str| {
+        item.items
+            .iter()
+            .find_map(|i| match i {
+                OwnedMenuItem::Action { name, action, .. } if name == label => {
+                    Some(action.boxed_clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Item > {label}"))
+    };
+    let next = action_of("Next Item");
+    let prev = action_of("Previous Item");
+    assert!(next.partial_eq(&MenuNextItem));
+    assert!(prev.partial_eq(&MenuPrevItem));
+    assert!(action_of("Cancel Edit").partial_eq(&MenuCancelEdit));
+
+    vcx.cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        assert_eq!(keymap.bindings_for_action(&MenuNextItem).count(), 0);
+        assert_eq!(keymap.bindings_for_action(&MenuPrevItem).count(), 0);
+        assert_eq!(keymap.bindings_for_action(&MenuCancelEdit).count(), 0);
+        for (action, key, context) in [
+            (&NextItem as &dyn gpui::Action, "down", LIST_CONTEXT),
+            (&PrevItem, "up", LIST_CONTEXT),
+            (&CancelEdit, "escape", DETAIL_CONTEXT),
+        ] {
+            let mut scoped = gpui::KeyContext::default();
+            scoped.add(context);
+            let bindings: Vec<_> = keymap.bindings_for_action(action).collect();
+            assert_eq!(bindings.len(), 1, "{key}");
+            let binding = bindings[0];
+            assert_eq!(binding.keystrokes().len(), 1);
+            assert_eq!(binding.keystrokes()[0].key(), key);
+            let predicate = binding.predicate().expect("context-scoped");
+            assert!(
+                predicate.eval(std::slice::from_ref(&scoped)),
+                "{key} in {context}"
+            );
+            assert!(
+                !predicate.eval(&[gpui::KeyContext::default()]),
+                "{key} outside"
+            );
+        }
+    });
+
+    // The menu items still step the selection.
+    let len = state.read_with(&vcx, |s, _| s.listing.items.len());
+    assert!(len >= 2, "fixture needs two items");
+    let ids = state.read_with(&vcx, |s, _| s.listing.items.clone());
+    state.update(&mut vcx, |s, cx| s.select_offset(-(len as isize), cx));
+    vcx.run_until_parked();
+    assert_eq!(state.read_with(&vcx, |s, _| s.selection), Some(ids[0]));
+    vcx.update(|window, cx| window.dispatch_action(next.boxed_clone(), cx));
+    vcx.run_until_parked();
+    assert_eq!(state.read_with(&vcx, |s, _| s.selection), Some(ids[1]));
+    vcx.update(|window, cx| window.dispatch_action(prev.boxed_clone(), cx));
+    vcx.run_until_parked();
+    assert_eq!(state.read_with(&vcx, |s, _| s.selection), Some(ids[0]));
+
+    // Item ▸ Cancel Edit still ends an edit.
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    assert!(state.read_with(&vcx, |s, _| s.is_editing()));
+    vcx.update(|window, cx| window.dispatch_action(action_of("Cancel Edit"), cx));
+    vcx.run_until_parked();
+    assert!(!state.read_with(&vcx, |s, _| s.is_editing()));
+}
+
+/// Vault ▸ Settings… exists only while a vault is unlocked; the menu follows lock, unlock,
+/// close and open without a manual rebuild, and ⌘, does nothing while locked.
+#[gpui::test]
+fn settings_menu_item_only_while_unlocked(cx: &mut TestAppContext) {
+    fn has_settings(vcx: &mut VisualTestContext) -> bool {
+        let menus = vcx.cx.update(|cx| cx.get_menus()).unwrap();
+        menus[0]
+            .items
+            .iter()
+            .any(|item| matches!(item, OwnedMenuItem::Action { name, .. } if name == "Settings…"))
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, mut vcx) = open(true, dir.path(), cx);
+    assert!(has_settings(&mut vcx), "unlocked");
+
+    state.update(&mut vcx, |s, cx| s.lock(cx));
+    vcx.run_until_parked();
+    assert!(!has_settings(&mut vcx), "locked");
+    vcx.simulate_keystrokes("cmd-,");
+    vcx.run_until_parked();
+    assert!(
+        !state.read_with(&vcx, |s, _| s.settings_open),
+        "cmd-, locked"
+    );
+
+    state.update(&mut vcx, |s, cx| s.unlock(SecretString::new(PW.into()), cx));
+    vcx.run_until_parked();
+    assert!(has_settings(&mut vcx), "unlocked again");
+
+    let path = state.read_with(&vcx, |s, _| s.vault_path.clone()).unwrap();
+    state.update(&mut vcx, |s, cx| s.close_vault(cx));
+    vcx.run_until_parked();
+    assert!(!has_settings(&mut vcx), "closed");
+
+    state.update(&mut vcx, |s, cx| s.open_vault(path, cx));
+    vcx.run_until_parked();
+    assert!(!has_settings(&mut vcx), "opened, still locked");
+    state.update(&mut vcx, |s, cx| s.unlock(SecretString::new(PW.into()), cx));
+    vcx.run_until_parked();
+    assert!(has_settings(&mut vcx), "opened and unlocked");
+}
+
+#[gpui::test]
+fn sidebar_row_keys_do_nothing_while_locked(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, mut vcx) = open(true, dir.path(), cx);
+    state.update(&mut vcx, |s, cx| s.lock(cx));
+    vcx.run_until_parked();
+    assert_eq!(state.read_with(&vcx, |s, _| s.filter.clone()), Filter::All);
+
+    vcx.simulate_keystrokes("cmd-2");
+    vcx.run_until_parked();
+    assert_eq!(
+        state.read_with(&vcx, |s, _| s.filter.clone()),
+        Filter::All,
+        "cmd-2 on the Unlock screen"
+    );
+
+    state.update(&mut vcx, |s, cx| s.unlock(SecretString::new(PW.into()), cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        state.read_with(&vcx, |s, _| s.filter.clone()),
+        Filter::All,
+        "still All Items after unlock"
+    );
+    // Unlocked, the same key does pick Favorites.
+    vcx.simulate_keystrokes("cmd-2");
+    vcx.run_until_parked();
+    assert_eq!(
+        state.read_with(&vcx, |s, _| s.filter.clone()),
+        Filter::Favorites
+    );
+}
+
 #[gpui::test]
 fn reduce_motion_toggles_instantly(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -306,7 +467,10 @@ fn toggling_keeps_focus_in_search_list_and_editor(cx: &mut TestAppContext) {
         let top = s.listing.items[0];
         s.select(top, cx);
     });
-    vcx.simulate_keystrokes("cmd-1 ctrl-cmd-s");
+    // Focus the list directly: the search field still holds "visa" (only the state's
+    // query was cleared), so ⌘F ⏎ would re-filter it to one row.
+    vcx.update(|window, cx| main.update(cx, |m, cx| window.focus(&m.list_focus, cx)));
+    vcx.simulate_keystrokes("ctrl-cmd-s");
     settle(&mut vcx);
     let first = state.read_with(&vcx, |s, _| s.selection);
     vcx.simulate_keystrokes("down");
@@ -329,6 +493,18 @@ fn toggling_keeps_focus_in_search_list_and_editor(cx: &mut TestAppContext) {
     vcx.simulate_input("Z");
     vcx.simulate_keystrokes("cmd-s");
     assert!(state.read_with(&vcx, |s, _| s.selected_item().unwrap().title.ends_with('Z')));
+
+    // ⌘1 … ⌘9 number the rows the same way while the sidebar is collapsed.
+    if state.read_with(&vcx, |s, _| s.sidebar_visible()) {
+        vcx.simulate_keystrokes("ctrl-cmd-s");
+        settle(&mut vcx);
+    }
+    assert!(!state.read_with(&vcx, |s, _| s.sidebar_visible()));
+    let filter = |vcx: &mut VisualTestContext| state.read_with(vcx, |s, _| s.filter.clone());
+    vcx.simulate_keystrokes("cmd-2");
+    assert_eq!(filter(&mut vcx), crate::state::Filter::Favorites);
+    vcx.simulate_keystrokes("cmd-1");
+    assert_eq!(filter(&mut vcx), crate::state::Filter::All);
 }
 
 /// The heading's count is the sidebar's count for the same filter, also while a search
@@ -782,11 +958,11 @@ fn toggling_keeps_focus_and_the_list_ring_state(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("cmd-d");
     assert_eq!(list_ring(&main, &mut vcx), (true, false));
 
-    // Focused from the keyboard (⌘F, then ⌘1): ring, and a toggle keeps it.
+    // Focused from the keyboard (⌘F, then ⏎): ring, and a toggle keeps it.
     // (A frame between the keys, as in the app: gpui reports focus changes per frame.)
     vcx.simulate_keystrokes("cmd-f");
     frame(&mut vcx);
-    vcx.simulate_keystrokes("cmd-1");
+    vcx.simulate_keystrokes("enter");
     frame(&mut vcx);
     assert_eq!(list_ring(&main, &mut vcx), (true, true));
     vcx.simulate_keystrokes("ctrl-cmd-s");
@@ -939,14 +1115,16 @@ fn detail_ring_only_after_keyboard_focus(cx: &mut TestAppContext) {
         "ring painted after a shortcut"
     );
 
-    // Keyboard: ⌘1 then ⌘2 moves focus back by key: ring.
-    vcx.simulate_keystrokes("cmd-1");
+    // Keyboard: ⌘F, ⏎ (list), ⏎ (detail) moves focus back by key: ring.
+    vcx.simulate_keystrokes("cmd-f");
     frame(&mut vcx);
-    vcx.simulate_keystrokes("cmd-2");
-    assert_eq!(ring_on(&detail, &mut vcx), (true, true), "⌘2");
+    vcx.simulate_keystrokes("enter");
+    frame(&mut vcx);
+    vcx.simulate_keystrokes("enter");
+    assert_eq!(ring_on(&detail, &mut vcx), (true, true), "⏎");
     assert!(
         ring_painted("detail-column", &mut vcx),
-        "ring painted after ⌘2"
+        "ring painted after ⏎"
     );
     // A click inside clears it again (the footer moved with the resize).
     let footer = bounds("detail-footer", &mut vcx).center();

@@ -5,13 +5,14 @@
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use gpui::{
     Anchor, AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Div, Entity,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, PathPromptOptions,
-    Pixels, Point, Render, Result, SharedString, Stateful, StatefulInteractiveElement as _,
-    Styled as _, Task, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, point,
-    prelude::FluentBuilder as _, px, relative, size,
+    FocusHandle, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
+    PathPromptOptions, Pixels, Point, Render, Result, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, Task, TitlebarOptions, Window, WindowBounds,
+    WindowHandle, WindowOptions, point, prelude::FluentBuilder as _, px, relative, size,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState, TextareaState};
@@ -733,6 +734,276 @@ pub fn popover<T: Selectable + IntoElement + 'static>(
         .content(move |_, window, cx| content(window, cx))
 }
 
+/// Key context of an open `menu_popover` panel (↑/↓). Nested inside gpui-component's
+/// `PopoverContent`, whose `escape` → Cancel still closes the menu.
+pub const MENU_CONTEXT: &str = "VaultMenu";
+
+gpui::actions!(
+    vault_menu,
+    [
+        /// ↑ in a menu popover: focus the row above.
+        MenuUp,
+        /// ↓ in a menu popover: focus the row below.
+        MenuDown,
+    ]
+);
+
+pub fn bind_menu_keys(cx: &mut App) {
+    cx.bind_keys([
+        gpui::KeyBinding::new("up", MenuUp, Some(MENU_CONTEXT)),
+        gpui::KeyBinding::new("down", MenuDown, Some(MENU_CONTEXT)),
+    ]);
+}
+
+/// Width of the icon slot in menu rows, so every label starts at the same x. Reserved
+/// on every row of a menu where at least one row has an icon, on none otherwise.
+pub const MENU_ICON_SLOT: f32 = 20.;
+/// A menu row's side padding.
+const MENU_ROW_PAD: f32 = 8.;
+/// Space between a row's icon slot and its label.
+const MENU_ICON_GAP: f32 = 8.;
+/// Space between a label and the hint / check-mark column after it.
+const MENU_TRAIL_GAP: f32 = 24.;
+/// Width of the check-mark column (a `size_4` icon).
+const MENU_CHECK_COL: f32 = 16.;
+/// Space after the label of a row without a check-mark column.
+const MENU_TRAIL_PAD: f32 = 16.;
+/// Widest a menu panel grows; longer labels truncate.
+const MENU_MAX_W: f32 = 320.;
+
+type MenuClick = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
+/// One row of a `menu_popover`: icon slot, label, optional trailing shortcut hint and
+/// check mark. Built with `menu_row`.
+pub struct MenuRow {
+    id: SharedString,
+    label: SharedString,
+    icon: Option<IconName>,
+    /// `None`: not checkable. A menu with any checkable row gives every row the
+    /// check-mark column.
+    checked: Option<bool>,
+    hint: Option<SharedString>,
+    on_click: Option<MenuClick>,
+}
+
+/// A menu row; `id` is its element id and debug selector.
+pub fn menu_row(id: impl Into<SharedString>, label: impl Into<SharedString>) -> MenuRow {
+    MenuRow {
+        id: id.into(),
+        label: label.into(),
+        icon: None,
+        checked: None,
+        hint: None,
+        on_click: None,
+    }
+}
+
+impl MenuRow {
+    pub fn icon(mut self, icon: IconName) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    /// Makes the row checkable (so its menu reserves the check-mark column, even
+    /// when no row is checked) and shows the mark when `checked`.
+    pub fn checked(mut self, checked: bool) -> Self {
+        self.checked = Some(checked);
+        self
+    }
+
+    // No library menu shows a shortcut yet; kept for the spec's menu row (tests use it).
+    #[allow(dead_code)]
+    pub fn hint(mut self, hint: impl Into<SharedString>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    /// Runs on click, Enter and Space (focusable divs click on both keys).
+    pub fn on_click(mut self, f: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.on_click = Some(Rc::new(f));
+        self
+    }
+
+    /// `icons` / `checkable`: some row of the menu has an icon / is checkable.
+    fn render(self, focus: &FocusHandle, icons: bool, checkable: bool, cx: &App) -> Stateful<Div> {
+        let theme = cx.theme();
+        let (id, muted) = (self.id.clone(), theme.muted_foreground);
+        let label_id = format!("{}-label", self.id);
+        let checked_id = format!("{}-checked", self.id);
+        // Rows stretch to the panel, which is as wide as its widest row.
+        h_flex()
+            .id(self.id)
+            .debug_selector(move || id.to_string())
+            .track_focus(focus)
+            .tab_index(0)
+            .h(crate::theme::scaled(28., cx))
+            // Insets count from the row's edge: the focus ring's border is part of them.
+            .pl(px(MENU_ROW_PAD - FOCUS_RING_WIDTH))
+            .pr(px(if checkable {
+                MENU_ROW_PAD
+            } else {
+                MENU_TRAIL_PAD
+            } - FOCUS_RING_WIDTH))
+            .rounded(theme.radius)
+            .text_sm()
+            .clickable()
+            .hover(|style| style.bg(theme.accent))
+            .active(|style| style.bg(theme.primary.opacity(0.16)))
+            .map(|row| focus_ring(row, cx))
+            .when(icons, |row| {
+                row.child(
+                    h_flex()
+                        .flex_none()
+                        .w(px(MENU_ICON_SLOT))
+                        .mr(px(MENU_ICON_GAP))
+                        .justify_center()
+                        .children(
+                            self.icon
+                                .map(|icon| Icon::new(icon).size_4().text_color(muted)),
+                        ),
+                )
+            })
+            .child(
+                gpui::div()
+                    .debug_selector(move || label_id)
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(self.label),
+            )
+            .when_some(self.hint, |row, hint| {
+                row.child(
+                    gpui::div()
+                        .flex_none()
+                        .ml(px(MENU_TRAIL_GAP))
+                        .text_xs()
+                        .text_color(muted)
+                        .child(hint),
+                )
+            })
+            .when(checkable, |row| {
+                row.child(
+                    h_flex()
+                        .flex_none()
+                        .w(px(MENU_CHECK_COL))
+                        .ml(px(MENU_TRAIL_GAP))
+                        .when(self.checked == Some(true), |col| {
+                            col.child(
+                                gpui::div()
+                                    .debug_selector(move || checked_id)
+                                    .child(Icon::new(IconName::Check).size_4()),
+                            )
+                        }),
+                )
+            })
+            .when_some(self.on_click, |row, f| {
+                row.on_click(move |event, window, cx| f(event, window, cx))
+            })
+    }
+}
+
+/// Focus handles of one menu popover: the panel and one per row, kept across frames.
+struct MenuFocus {
+    panel: FocusHandle,
+    rows: Vec<FocusHandle>,
+}
+
+impl MenuFocus {
+    fn row(&mut self, ix: usize, cx: &mut App) -> FocusHandle {
+        while self.rows.len() <= ix {
+            self.rows.push(cx.focus_handle().tab_stop(true));
+        }
+        self.rows[ix].clone()
+    }
+}
+
+/// The row to focus after ↑ (`down` false) or ↓ from the focused one; the first or
+/// last row while no row has focus. Stops at the ends.
+fn menu_step(rows: &[FocusHandle], down: bool, window: &mut Window, cx: &mut App) {
+    let Some(last) = rows.len().checked_sub(1) else {
+        return;
+    };
+    let at = rows.iter().position(|h| h.is_focused(window));
+    let next = match (at, down) {
+        (None, true) => 0,
+        (None, false) => last,
+        (Some(i), true) => (i + 1).min(last),
+        (Some(i), false) => i.saturating_sub(1),
+    };
+    window.focus(&rows[next], cx);
+}
+
+/// A `popover` whose content is a menu panel of `rows` (state-driven like `popover`).
+/// Opened from the keyboard (trigger Enter/Space, or app state such as ⌘N) the first
+/// row has focus; opened by a click the panel has it and ↓ reaches the first row.
+/// ↑/↓ move between rows, Enter/Space activate, Esc reports `on_toggle(false)`.
+/// Call during render: the focus handles live in element state keyed by `id`.
+#[allow(clippy::too_many_arguments)]
+pub fn menu_popover<T: Selectable + IntoElement + 'static>(
+    id: impl Into<SharedString>,
+    trigger: T,
+    anchor: Anchor,
+    open: bool,
+    on_toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
+    rows: impl Fn(&mut Window, &mut App) -> Vec<MenuRow> + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> Popover {
+    let id: SharedString = id.into();
+    let focus = window.use_keyed_state(SharedString::from(format!("{id}-focus")), cx, |_, cx| {
+        MenuFocus {
+            panel: cx.focus_handle(),
+            rows: Vec::new(),
+        }
+    });
+    let first = focus.update(cx, |f, cx| f.row(0, cx));
+    let panel = focus.read(cx).panel.clone();
+    let panel_id = SharedString::from(format!("{id}-panel"));
+    popover(
+        id,
+        trigger,
+        anchor,
+        open,
+        move |open, window, cx| {
+            // The popover has just focused the first row; a click leaves no row focused.
+            if open && !window.last_input_was_keyboard() {
+                window.focus(&panel, cx);
+            }
+            on_toggle(open, window, cx);
+        },
+        move |window, cx| {
+            let rows = rows(window, cx);
+            let handles: Vec<FocusHandle> = focus.update(cx, |f, cx| {
+                (0..rows.len()).map(|ix| f.row(ix, cx)).collect()
+            });
+            let handles = Rc::new(handles);
+            let (up, down) = (handles.clone(), handles.clone());
+            let icons = rows.iter().any(|row| row.icon.is_some());
+            let checkable = rows.iter().any(|row| row.checked.is_some());
+            let panel_id = panel_id.clone();
+            // No width: the panel takes its widest row's natural width, like a native menu.
+            v_flex()
+                .debug_selector(move || panel_id.to_string())
+                .track_focus(&focus.read(cx).panel)
+                .key_context(MENU_CONTEXT)
+                .max_w(px(MENU_MAX_W))
+                .gap(px(1.))
+                .on_action(move |_: &MenuUp, window, cx| menu_step(&up, false, window, cx))
+                .on_action(move |_: &MenuDown, window, cx| menu_step(&down, true, window, cx))
+                .children(
+                    rows.into_iter()
+                        .zip(handles.iter())
+                        .map(|(row, handle)| row.render(handle, icons, checkable, cx)),
+                )
+                .into_any_element()
+        },
+    )
+    .track_focus(&first)
+    // gpui-component pads popover content with `p_3`; the caller's style is applied
+    // after it, so this replaces it.
+    .p(px(4.))
+}
+
 thread_local! {
     /// Per window: the focus seen at its last render and whether that focus may draw
     /// a ring (it arrived from the keyboard, and no click since).
@@ -1012,3 +1283,7 @@ pub mod probe {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ui_menu_tests.rs"]
+mod menu_tests;

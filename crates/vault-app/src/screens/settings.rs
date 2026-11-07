@@ -874,14 +874,12 @@ mod tests {
         show_tab(TABS.len() - 1, &state, &mut vcx);
         assert!(check_dividers(&mut vcx).is_empty(), "About has no rows");
 
-        // Locked: Security shows only the Touch ID row, without a trailing line.
+        // Locked: lock closes the sheet and it cannot be reopened until unlocked.
         state.update(&mut vcx, |s, cx| {
             s.lock(cx);
             s.open_settings(true, cx);
-            s.settings_tab = SECURITY_TAB;
-            cx.notify();
         });
         vcx.run_until_parked();
-        assert_eq!(check_dividers(&mut vcx), [("security", 1)]);
+        assert!(!state.read_with(&vcx, |s, _| s.settings_open));
     }
 }

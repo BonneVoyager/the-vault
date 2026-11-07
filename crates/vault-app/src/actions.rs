@@ -64,9 +64,16 @@ actions!(
         NextItem,
         /// ↑ in the list.
         PrevItem,
-        /// ⌘1.
-        FocusList,
-        /// ⌘2, and ⏎ in the list.
+        /// Item ▸ Next Item. Unbound on purpose: the macOS menu takes its key equivalent
+        /// from the action's bindings and ignores their context, so a menu item on
+        /// [`NextItem`] would turn bare ↓ into a global shortcut (05 §4: list-only).
+        MenuNextItem,
+        /// Item ▸ Previous Item; unbound like [`MenuNextItem`].
+        MenuPrevItem,
+        /// Item ▸ Cancel Edit; unbound like [`MenuNextItem`], so bare Esc reaches only
+        /// the [`CancelEdit`] binding in the detail column.
+        MenuCancelEdit,
+        /// ⏎ in the list.
         FocusDetail,
         /// View ▸ Sort By ▸ Name.
         SortAlphabetical,
@@ -89,6 +96,12 @@ actions!(
     ]
 );
 
+/// ⌘1 … ⌘9: select the Nth sidebar row in display order (05 §2.3), 1-based; see
+/// [`AppState::sidebar_row_filter`]. Keyboard-only, no menu item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Action)]
+#[action(namespace = vault, no_json)]
+pub struct SelectSidebarRow(pub usize);
+
 /// ⌃⌘S, as in Finder and Passwords.
 pub const TOGGLE_SIDEBAR_KEYS: &str = "ctrl-cmd-s";
 
@@ -109,6 +122,7 @@ pub const DETAIL_CONTEXT: &str = "ItemDetail";
 pub fn bind_keys(cx: &mut App) {
     let list = Some(LIST_CONTEXT);
     crate::screens::icon_view::bind_keys(cx);
+    crate::ui::bind_menu_keys(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-l", Lock, None),
         KeyBinding::new("cmd-o", OpenVault, None),
@@ -134,21 +148,49 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("down", NextItem, list),
         KeyBinding::new("up", PrevItem, list),
         KeyBinding::new("enter", FocusDetail, list),
-        KeyBinding::new("cmd-1", FocusList, None),
-        KeyBinding::new("cmd-2", FocusDetail, None),
         KeyBinding::new("cmd-m", Minimize, None),
     ]);
+    // `KeyBinding::new` takes `&'static str` keystrokes, hence the table.
+    const ROW_KEYS: [&str; 9] = [
+        "cmd-1", "cmd-2", "cmd-3", "cmd-4", "cmd-5", "cmd-6", "cmd-7", "cmd-8", "cmd-9",
+    ];
+    cx.bind_keys(
+        ROW_KEYS
+            .iter()
+            .enumerate()
+            .map(|(i, keys)| KeyBinding::new(keys, SelectSidebarRow(i + 1), None)),
+    );
 }
 
-/// Installs the menu bar from the state's sort and sidebar visibility.
+/// Installs the menu bar from the state's sort, sidebar visibility, trash view and
+/// whether a vault is unlocked (Settings… exists only then).
 pub fn refresh_menus(s: &AppState, cx: &mut App) {
-    install_menus(s.sort, s.sidebar_visible(), s.viewing_trash(), cx);
+    install_menus(
+        s.sort,
+        s.sidebar_visible(),
+        s.viewing_trash(),
+        s.main_active(),
+        cx,
+    );
 }
 
-/// Installs the menu bar. Called again when the sort changes, to move the checkmark, and
-/// when the sidebar toggles, to flip "Hide Sidebar" / "Show Sidebar".
+/// Installs the launch menu bar: nothing unlocked yet, so no Settings…. Later rebuilds go
+/// through [`refresh_menus`] (sort, sidebar, trash, lock/unlock changes).
 pub fn set_menus(sort: Sort, sidebar_visible: bool, cx: &mut App) {
-    install_menus(sort, sidebar_visible, false, cx);
+    install_menus(sort, sidebar_visible, false, false, cx);
+}
+
+/// The app menu's Settings… row, absent unless a vault is unlocked (see [`delete_items`]
+/// for why absent rather than disabled).
+fn settings_items(main_active: bool) -> Vec<MenuItem> {
+    if main_active {
+        vec![
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::separator(),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 /// The Item menu's delete rows. In Recently Deleted (`trash`) ⌘⌫ deletes permanently and
@@ -166,16 +208,19 @@ fn delete_items(trash: bool) -> Vec<MenuItem> {
     }
 }
 
-/// [`set_menus`] with the Recently Deleted rows when `trash`.
-fn install_menus(sort: Sort, sidebar_visible: bool, trash: bool, cx: &mut App) {
+/// [`set_menus`] with the Recently Deleted rows when `trash` and Settings… when
+/// `main_active`.
+fn install_menus(sort: Sort, sidebar_visible: bool, trash: bool, main_active: bool, cx: &mut App) {
     cx.set_menus([
-        Menu::new("Vault").items([
-            MenuItem::action("About Vault", About),
-            MenuItem::separator(),
-            MenuItem::action("Settings…", OpenSettings),
-            MenuItem::separator(),
-            MenuItem::action("Quit Vault", Quit),
-        ]),
+        Menu::new("Vault").items(
+            [
+                MenuItem::action("About Vault", About),
+                MenuItem::separator(),
+            ]
+            .into_iter()
+            .chain(settings_items(main_active))
+            .chain([MenuItem::action("Quit Vault", Quit)]),
+        ),
         Menu::new("File").items([
             MenuItem::action("New Vault…", NewVault),
             MenuItem::action("Open Vault…", OpenVault),
@@ -204,10 +249,10 @@ fn install_menus(sort: Sort, sidebar_visible: bool, trash: bool, cx: &mut App) {
                 MenuItem::action("New Item", NewItem),
                 MenuItem::action("Edit", EditItem),
                 MenuItem::action("Save", SaveItem),
-                MenuItem::action("Cancel Edit", CancelEdit),
+                MenuItem::action("Cancel Edit", MenuCancelEdit),
                 MenuItem::separator(),
-                MenuItem::action("Next Item", NextItem),
-                MenuItem::action("Previous Item", PrevItem),
+                MenuItem::action("Next Item", MenuNextItem),
+                MenuItem::action("Previous Item", MenuPrevItem),
                 MenuItem::separator(),
                 MenuItem::action("Copy Username", CopyUsername),
                 MenuItem::action("Copy Password", CopyPassword),
@@ -234,8 +279,6 @@ fn install_menus(sort: Sort, sidebar_visible: bool, trash: bool, cx: &mut App) {
             ),
             MenuItem::separator(),
             MenuItem::action(sidebar_menu_title(sidebar_visible), ToggleSidebar),
-            MenuItem::action("Item List", FocusList),
-            MenuItem::action("Item Details", FocusDetail),
         ]),
         Menu::new("Window").items([
             MenuItem::action("Minimize", Minimize),
@@ -336,10 +379,25 @@ pub fn register(state: &Entity<AppState>, cx: &mut App) {
     });
 
     on_main::<Search>(state, cx, |s, cx| s.request_focus(FocusTarget::Search, cx));
-    on_main::<FocusList>(state, cx, |s, cx| s.request_focus(FocusTarget::List, cx));
     on_main::<FocusDetail>(state, cx, |s, cx| s.request_focus(FocusTarget::Detail, cx));
+    let row_state = state.clone();
+    cx.on_action(move |&SelectSidebarRow(n): &SelectSidebarRow, cx| {
+        if in_main_window(cx) {
+            row_state.update(cx, |s, cx| {
+                // ⌘1–⌘9 pick sidebar rows only on the unlocked main screen.
+                if !s.main_active() {
+                    return;
+                }
+                if let Some(filter) = s.sidebar_row_filter(n) {
+                    s.set_filter(filter, cx);
+                }
+            });
+        }
+    });
     on_main::<NextItem>(state, cx, |s, cx| s.select_offset(1, cx));
     on_main::<PrevItem>(state, cx, |s, cx| s.select_offset(-1, cx));
+    on_main::<MenuNextItem>(state, cx, |s, cx| s.select_offset(1, cx));
+    on_main::<MenuPrevItem>(state, cx, |s, cx| s.select_offset(-1, cx));
     on_main::<ToggleSidebar>(state, cx, |s, cx| {
         s.toggle_sidebar(cx);
         refresh_menus(s, cx);
@@ -358,6 +416,7 @@ pub fn register(state: &Entity<AppState>, cx: &mut App) {
     on_main::<EditItem>(state, cx, |s, cx| s.begin_edit(cx));
     on_main::<SaveItem>(state, cx, |s, cx| s.save_edit(cx));
     on_main::<CancelEdit>(state, cx, |s, cx| s.cancel_edit(cx));
+    on_main::<MenuCancelEdit>(state, cx, |s, cx| s.cancel_edit(cx));
     on_main::<DeleteItem>(state, cx, |s, cx| s.request_delete(cx));
     on_main::<RecoverItem>(state, cx, |s, cx| s.recover_selected(cx));
     on_main::<Generator>(state, cx, |s, cx| {

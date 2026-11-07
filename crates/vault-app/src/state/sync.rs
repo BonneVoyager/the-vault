@@ -668,7 +668,7 @@ impl AppState {
     /// from it is stale.
     fn restored(&mut self, backup: &Path) {
         let name = text::file_name(backup);
-        self.mode = Mode::View;
+        self.leave_edit_mode();
         self.discard_prompt = None;
         self.delete_confirm = None;
         self.generator_target = None;

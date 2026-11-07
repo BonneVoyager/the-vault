@@ -7,7 +7,6 @@ use gpui::{
     Window, div, list, prelude::FluentBuilder as _, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::menu::DropdownMenu as _;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
@@ -114,6 +113,7 @@ fn render_row(
                 .child(
                     ui::h_flex()
                         .id(("item-row", ix))
+                        .debug_selector(move || format!("item-row {ix}"))
                         .size_full()
                         .px(px(8.))
                         .gap(px(10.))
@@ -180,56 +180,48 @@ fn render_row(
     }
 }
 
-/// Width of the icon slot in menu rows, so every label starts at the same x.
-const MENU_ICON_SLOT: f32 = 20.;
+/// The ⌘N Templates menu rows. Uses the title the picker was opened with.
+fn template_rows(state: &Entity<AppState>) -> Vec<ui::MenuRow> {
+    Template::ALL
+        .into_iter()
+        .map(|template| {
+            let state = state.clone();
+            ui::menu_row(format!("new-{}", template.tag()), template.label())
+                .icon(template.icon())
+                .on_click(move |_, _, cx| {
+                    state.update(cx, |s, cx| {
+                        let title = s.template_picker.clone().unwrap_or_default();
+                        s.begin_new(template, title, cx);
+                    });
+                })
+        })
+        .collect()
+}
 
-/// The ⌘N Templates menu: one row per template. Uses the title the picker was opened with.
-/// Rows are laid out like the sidebar's: fixed icon slot, left-aligned label.
-fn template_picker(state: &Entity<AppState>, cx: &App) -> AnyElement {
-    let theme = cx.theme();
-    let height = crate::theme::scaled(28., cx);
-    let rows = Template::ALL.into_iter().map(|template| {
+/// Sort menu rows, the current order checked.
+fn sort_rows(state: &Entity<AppState>, cx: &App) -> Vec<ui::MenuRow> {
+    let current = state.read(cx).sort;
+    let row = |id: &str, label: &str, sort: Sort, action: fn() -> Box<dyn gpui::Action>| {
         let state = state.clone();
-        ui::h_flex()
-            .id(SharedString::from(format!("new-{}", template.tag())))
-            .debug_selector(move || format!("new-{}", template.tag()))
-            .tab_index(0)
-            .w_full()
-            .h(height)
-            .px(px(8.))
-            .gap(px(8.))
-            .justify_start()
-            .rounded(theme.radius)
-            .text_sm()
-            .clickable()
-            .hover(|style| style.bg(theme.accent))
-            .active(|style| style.bg(theme.primary.opacity(0.16)))
-            .map(|row| ui::focus_ring(row, cx))
-            .child(
-                ui::h_flex()
-                    .flex_none()
-                    .w(px(MENU_ICON_SLOT))
-                    .justify_center()
-                    .child(
-                        Icon::new(template.icon())
-                            .size_4()
-                            .text_color(theme.muted_foreground),
-                    ),
-            )
-            .child(div().flex_1().min_w_0().truncate().child(template.label()))
-            // Focusable divs also fire `on_click` on Enter / Space.
-            .on_click(move |_, _, cx| {
-                state.update(cx, |s, cx| {
-                    let title = s.template_picker.clone().unwrap_or_default();
-                    s.begin_new(template, title, cx);
-                });
+        ui::menu_row(id.to_owned(), label.to_owned())
+            .checked(current == sort)
+            .on_click(move |_, window, cx| {
+                state.update(cx, |s, cx| s.close_sort_menu(cx));
+                window.dispatch_action(action(), cx);
             })
-    });
-    ui::v_flex()
-        .w(px(180.))
-        .gap(px(2.))
-        .children(rows)
-        .into_any_element()
+    };
+    vec![
+        row("sort-name", "Name", Sort::Alphabetical, || {
+            Box::new(SortAlphabetical)
+        }),
+        row(
+            "sort-modified",
+            "Recently Modified",
+            Sort::RecentlyModified,
+            || Box::new(SortRecentlyModified),
+        ),
+        // "Recently Created" stays hidden until core items carry a created_at.
+    ]
 }
 
 /// The list heading while the sidebar is collapsed: the active filter as the sidebar
@@ -368,34 +360,73 @@ fn trash_empty_state(cx: &App) -> impl IntoElement {
 
 impl MainScreen {
     pub(super) fn render_list(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let list_focused = self.list_focus.is_focused(window);
+        // Focus anywhere inside the list (05 §2.3): the selection is drawn active.
+        let list_focused = self.list_focus.contains_focused(window, cx);
+        let picker_open = self.state.read(cx).template_picker.is_some();
+        // Built first: the menu keeps its focus handles in element state (`&mut App`).
+        let kind_picker = {
+            let state = self.state.clone();
+            let picker_state = self.state.clone();
+            ui::menu_popover(
+                "kind-picker",
+                Button::new("new-item")
+                    .debug_selector(|| "new-item".into())
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(IconName::Plus))
+                    .label("New")
+                    .tooltip("New item  ⌘N")
+                    .clickable(),
+                Anchor::BottomLeft,
+                picker_open,
+                move |open, _, cx| {
+                    state.update(cx, |s, cx| {
+                        if open {
+                            s.open_template_picker(String::new(), cx);
+                        } else {
+                            s.close_template_picker(cx);
+                        }
+                    });
+                },
+                move |_, _| template_rows(&picker_state),
+                window,
+                cx,
+            )
+        };
+        let sort_open = self.state.read(cx).sort_menu_open;
+        let sort_button = {
+            let state = self.state.clone();
+            let rows_state = self.state.clone();
+            ui::menu_popover(
+                "sort-menu",
+                ui::icon_button("sort", IconName::SortAscending, "Sort items")
+                    .debug_selector(|| "sort".into()),
+                Anchor::TopLeft,
+                sort_open,
+                move |open, _, cx| {
+                    state.update(cx, |s, cx| {
+                        if open {
+                            s.open_sort_menu(cx);
+                        } else {
+                            s.close_sort_menu(cx);
+                        }
+                    });
+                },
+                move |_, cx| sort_rows(&rows_state, cx),
+                window,
+                cx,
+            )
+        };
         let s = self.state.read(cx);
         let theme = cx.theme();
-        let sort = s.sort;
         let query = s.query.trim().to_owned();
         let placeholder = list_placeholder(s);
         let rows = s.listing.rows.clone();
         let item_count = s.listing.items.len();
-        let picker_open = s.template_picker.is_some();
         let generator_open = s.generator_target == Some(GeneratorTarget::Global);
         let collapsed = self.sidebar_collapsed();
         let heading = collapsed.then(|| filter_heading(s));
         let trash = s.filter == Filter::RecentlyDeleted;
-
-        let sort_button = ui::icon_button("sort", IconName::SortAscending, "Sort items")
-            .dropdown_menu(move |menu, _, _| {
-                menu.item(ui::menu_item(
-                    "Name",
-                    sort == Sort::Alphabetical,
-                    |_, window, cx| window.dispatch_action(Box::new(SortAlphabetical), cx),
-                ))
-                .item(ui::menu_item(
-                    "Recently Modified",
-                    sort == Sort::RecentlyModified,
-                    |_, window, cx| window.dispatch_action(Box::new(SortRecentlyModified), cx),
-                ))
-                // "Recently Created" stays hidden until core items carry a created_at.
-            });
 
         // The search row sits in the title-bar band, centred on the traffic lights.
         // Left padding comes from `slide_header`: wider while the sidebar is collapsed,
@@ -528,33 +559,7 @@ impl MainScreen {
         let footer = super::column_footer(theme.border, cx)
             .debug_selector(|| "list-footer".into())
             .justify_between()
-            .child({
-                let state = self.state.clone();
-                let picker_state = self.state.clone();
-                ui::popover(
-                    "kind-picker",
-                    Button::new("new-item")
-                        .debug_selector(|| "new-item".into())
-                        .ghost()
-                        .small()
-                        .icon(Icon::new(IconName::Plus))
-                        .label("New")
-                        .tooltip("New item  ⌘N")
-                        .clickable(),
-                    Anchor::BottomLeft,
-                    picker_open,
-                    move |open, _, cx| {
-                        state.update(cx, |s, cx| {
-                            if open {
-                                s.open_template_picker(String::new(), cx);
-                            } else {
-                                s.close_template_picker(cx);
-                            }
-                        });
-                    },
-                    move |_, cx| template_picker(&picker_state, cx),
-                )
-            })
+            .child(kind_picker)
             // No Lock button (owner, 2026-10-31): ⌘L and File ▸ Lock only.
             .child(
                 div()
@@ -712,12 +717,13 @@ mod tests {
 
     #[gpui::test]
     fn template_picker_row_activates_with_enter(cx: &mut TestAppContext) {
-        assert_eq!(pick(1, "enter", cx), Some(Template::Login));
+        // ⌘N opens the menu with the first row (Login) focused.
+        assert_eq!(pick(0, "enter", cx), Some(Template::Login));
     }
 
     #[gpui::test]
     fn template_picker_row_activates_with_space(cx: &mut TestAppContext) {
-        assert_eq!(pick(2, "space", cx), Some(Template::Note));
+        assert_eq!(pick(1, "space", cx), Some(Template::Note));
     }
 
     /// "No results" offers "Create '<query>'": it opens the Templates menu, and the
@@ -762,5 +768,60 @@ mod tests {
             }
             other => panic!("not creating: {}", matches!(other, Mode::View)),
         });
+    }
+
+    /// From the search field into the list by keyboard, then ↓: the selected row is drawn
+    /// with the full primary colour, not the inactive tint (05 §2.3).
+    #[gpui::test]
+    fn keyboard_entry_draws_the_selection_active(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut vcx) = open(dir.path(), cx);
+        state.update(&mut vcx, |s, _| {
+            let device = s.device_id();
+            for title in ["Alpha", "Beta"] {
+                s.vault
+                    .as_mut()
+                    .unwrap()
+                    .edit(|v| v.insert(vault_core::Item::new(title, device, 1), 1))
+                    .unwrap();
+            }
+            s.vault_changed();
+        });
+        vcx.run_until_parked();
+        let before = state.read_with(&vcx, |s, _| s.selection);
+        vcx.simulate_keystrokes("cmd-f");
+        // The list and its rows are not Tab stops; Enter in the search field is the
+        // keyboard way into the list.
+        vcx.simulate_keystrokes("enter");
+        vcx.simulate_keystrokes("down");
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        let selected = state.read_with(&vcx, |s, _| s.selection);
+        assert!(
+            selected.is_some() && selected != before,
+            "↓ moved the selection"
+        );
+        let ix = state.read_with(&vcx, |s, _| {
+            s.listing
+                .rows
+                .iter()
+                .position(|r| matches!(r, Row::Item(id) if Some(*id) == selected))
+                .unwrap()
+        });
+        let row = vcx
+            .debug_bounds(Box::leak(format!("item-row {ix}").into_boxed_str()))
+            .expect("selected row drawn");
+        let painted = vcx.update(|window, cx| {
+            let primary = cx.theme().primary;
+            let row = row.scale(window.scale_factor());
+            let near = |a: gpui::ScaledPixels, b: gpui::ScaledPixels| (a.0 - b.0).abs() < 1.;
+            window.painted_quads().iter().any(|q| {
+                near(q.bounds.origin.x, row.origin.x)
+                    && near(q.bounds.origin.y, row.origin.y)
+                    && near(q.bounds.size.width, row.size.width)
+                    && q.background.as_solid() == Some(primary)
+            })
+        });
+        assert!(painted, "selected row painted in theme.primary");
     }
 }

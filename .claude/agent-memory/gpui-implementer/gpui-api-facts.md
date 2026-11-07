@@ -22,6 +22,7 @@ Verified against gpui-pre 0.3.10 + gpui-component 0.8.1 by compiling (see [[gpui
 
 Verified in P2.5 (app shell), all compiled + clippy clean:
 - Actions: `gpui::actions!(vault, [Lock, ..])` (doc comments allowed per item). `KeyBinding::new("cmd-l", Lock, None)`; `cx.bind_keys([..])`. Global handler `cx.on_action(|_: &Lock, cx: &mut App| ..)` runs when no focused element handled it; works for menu items too.
+- Payload actions (verified 2026-11-07, gpui-pre 0.3.10): `#[derive(Clone, Copy, Debug, PartialEq, Eq, gpui::Action)] #[action(namespace = vault, no_json)] pub struct SelectSidebarRow(pub usize);` compiles with no serde/schemars (no_json). There is no `impl_actions!`. Handler destructures: `cx.on_action(move |&SelectSidebarRow(n): &SelectSidebarRow, cx| ..)`. `KeyBinding::new` takes `keystrokes: &'static str`, so a generated binding set (cmd-1..9) needs a `const [&str; 9]` table, not `format!`.
 - Menus: `cx.set_menus([Menu::new("File").items([MenuItem::action("Lock", Lock), MenuItem::separator()])])`. First menu = app menu.
 - Quit hook: `cx.on_app_quit(|cx| async {}) -> Subscription` (call `.detach()`). `window.on_window_should_close(cx: &App, |window, cx| -> bool)`.
 - Spawning: `Context::spawn(async move |weak: WeakEntity<T>, cx: &mut AsyncApp| ..)`; `App::spawn(async move |cx: &mut AsyncApp| ..)`. Background: `cx.background_executor().spawn(fut) -> Task<R>` (Send). Timer: `cx.background_executor().timer(Duration).await`. Dropping a Task cancels it (debounce = replace an `Option<Task<()>>`).
@@ -206,3 +207,14 @@ Verified 2026-11-06 (unlock success finish), compiled + clippy + headless tests:
 - `Hsla::blend(self, other)` composites `other` (with its alpha) over self: `theme.background.blend(theme.danger.opacity(0.10))` gives an opaque tint so lines underneath don't show through.
 - gpui-component 0.8.1 `resize_handle` always paints a 1 px `theme.border` hairline full height of its (relative) parent; anything that must cover it has to come later in child order.
 - gpui-pre 0.3.10 grid is uniform only (`grid_cols(n)` = repeat(n, minmax(0,1fr))); no per-track sizes, so not usable for fixed-width column layouts.
+
+## macOS menu key equivalents ignore binding context (verified 0.3.10)
+`gpui-pre-macos/src/platform.rs` (create_menu_item) picks the NSMenuItem key equivalent via
+`keymap.bindings_for_action(action).find_or_first(|b| predicate none or evals true against a fake
+Workspace>Pane>Editor context)`. So an action whose only binding is context-scoped (e.g. `down` in
+`ItemList`) still gets that key as a menu key equivalent; AppKit routes it to the menu before the
+view, and the menu callback dispatches with no predicate check -> fires from any focus. Fix: give
+menu entries an unbound twin action (vault: `MenuNextItem`/`MenuPrevItem`). If an action has both a
+context binding and a `None` binding, the `None` one wins (CopyUsername shows ⌘⇧U, not ⌘C).
+Test: `cx.key_bindings().borrow().bindings_for_action(&A)`; `binding.predicate().unwrap().eval(&[KeyContext])`;
+`binding.keystrokes()[0].key()`. App has no `bindings_for_action` (Window does).

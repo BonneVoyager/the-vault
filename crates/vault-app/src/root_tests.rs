@@ -263,7 +263,25 @@ fn settings_sheet_opens_applies_and_closes(cx: &mut TestAppContext) {
     let mut vcx = VisualTestContext::from_window(window.into(), cx);
     vcx.run_until_parked();
 
-    // ⌘, works from any screen (here: choose vault) and opens the dialog.
+    // ⌘, does nothing on the choose-vault screen: Settings needs an unlocked vault.
+    vcx.simulate_keystrokes("cmd-,");
+    vcx.run_until_parked();
+    assert!(!state.read_with(&vcx, |s, _| s.settings_open));
+    assert!(!vcx.update(|window, cx| window.has_active_dialog(cx)));
+
+    let dir = tempfile::tempdir().unwrap();
+    let vault = vault_sync::SyncedVault::create(
+        &dir.path().join("t.vault"),
+        &vault_core::SecretString::new("pw".into()),
+        vault_core::KdfParams::for_tests(),
+        Uuid::new_v4(),
+        std::sync::Arc::new(vault_sync::NoopHooks),
+    )
+    .unwrap();
+    state.update(&mut vcx, |s, _| s.install_unlocked_for_tests(vault));
+    vcx.run_until_parked();
+
+    // Unlocked, ⌘, opens the dialog.
     vcx.simulate_keystrokes("cmd-,");
     assert!(state.read_with(&vcx, |s, _| s.settings_open));
     assert!(vcx.update(|window, cx| window.has_active_dialog(cx)));

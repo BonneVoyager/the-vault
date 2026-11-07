@@ -1373,3 +1373,135 @@ fn pasted_note_over_the_field_limit_is_cut_and_saves(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// Key down and up: a focused row's keyboard click fires on key up.
+fn press(vcx: &mut VisualTestContext, key: &'static str) {
+    vcx.simulate_keystrokes(key);
+    vcx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse(key).unwrap(),
+    });
+    vcx.run_until_parked();
+}
+
+fn sort_checked(vcx: &mut VisualTestContext) -> (bool, bool) {
+    (
+        vcx.debug_bounds("sort-name-checked").is_some(),
+        vcx.debug_bounds("sort-modified-checked").is_some(),
+    )
+}
+
+#[gpui::test]
+fn sort_menu_opens_by_click_and_closes_on_esc(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    click(&mut vcx, "sort".into());
+    assert!(state.read_with(&vcx, |s, _| s.sort_menu_open));
+    assert_eq!(sort_checked(&mut vcx), (true, false));
+    press(&mut vcx, "escape");
+    assert!(!state.read_with(&vcx, |s, _| s.sort_menu_open));
+    assert!(vcx.debug_bounds("sort-name").is_none(), "menu gone");
+}
+
+/// Keyboard: focus the Sort button, Space opens with the first row focused; ↓ Enter
+/// picks Recently Modified, and reopening shows the check mark moved.
+#[gpui::test]
+fn sort_menu_by_keyboard_switches_order(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    // A click opens the menu, so Tab from the search field (the next stop is Sort).
+    let search = vcx.debug_bounds("list-search").unwrap();
+    vcx.simulate_click(search.center(), gpui::Modifiers::none());
+    vcx.run_until_parked();
+    press(&mut vcx, "tab");
+    press(&mut vcx, "space");
+    assert!(state.read_with(&vcx, |s, _| s.sort_menu_open));
+    press(&mut vcx, "down");
+    press(&mut vcx, "enter");
+    state.read_with(&vcx, |s, _| {
+        assert_eq!(s.sort, crate::state::Sort::RecentlyModified);
+        assert!(!s.sort_menu_open, "a pick closes the menu");
+    });
+    state.update(&mut vcx, |s, cx| s.open_sort_menu(cx));
+    vcx.run_until_parked();
+    assert_eq!(sort_checked(&mut vcx), (false, true));
+    state.update(&mut vcx, |s, cx| s.lock(cx));
+    vcx.run_until_parked();
+    assert!(
+        !state.read_with(&vcx, |s, _| s.sort_menu_open),
+        "lock closes"
+    );
+}
+
+#[gpui::test]
+fn add_field_menu_adds_the_first_kind_and_closes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    insert_and_select(&state, vault_core::Item::new("Bank", device, 1), &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let fields = |vcx: &VisualTestContext| {
+        state.read_with(vcx, |s, _| s.edit_buffer().unwrap().item.fields.len())
+    };
+    let before = fields(&vcx);
+
+    click(&mut vcx, "add-field".into());
+    assert!(state.read_with(&vcx, |s, _| s.add_field_menu_open));
+    press(&mut vcx, "escape");
+    assert!(!state.read_with(&vcx, |s, _| s.add_field_menu_open), "Esc");
+    // Esc closed the menu first; the edit itself is still open.
+    assert!(
+        state.read_with(&vcx, |s, _| s.is_editing()),
+        "Esc keeps editing"
+    );
+
+    // From app state, as after a key press: the first row has focus.
+    vcx.simulate_keystrokes("shift");
+    state.update(&mut vcx, |s, cx| s.open_add_field_menu(cx));
+    vcx.run_until_parked();
+    press(&mut vcx, "enter");
+    state.read_with(&vcx, |s, _| {
+        let b = s.edit_buffer().unwrap();
+        assert_eq!(b.item.fields.len(), before + 1);
+        assert_eq!(b.item.fields.last().unwrap().kind, ADDABLE_KINDS[0]);
+        assert!(!s.add_field_menu_open, "a pick closes the menu");
+    });
+    assert!(vcx.debug_bounds("add-field-text").is_none(), "menu gone");
+
+    state.update(&mut vcx, |s, cx| s.open_add_field_menu(cx));
+    vcx.run_until_parked();
+    state.update(&mut vcx, |s, cx| s.cancel_edit(cx));
+    assert!(
+        !state.read_with(&vcx, |s, _| s.add_field_menu_open),
+        "Cancel"
+    );
+    state.update(&mut vcx, |s, cx| {
+        s.begin_edit(cx);
+        s.open_add_field_menu(cx);
+        s.lock(cx);
+    });
+    assert!(!state.read_with(&vcx, |s, _| s.add_field_menu_open), "lock");
+}
+
+#[gpui::test]
+fn deleting_while_editing_closes_the_add_field_menu(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    let id = insert_and_select(&state, vault_core::Item::new("Bank", device, 1), &mut vcx);
+    state.update(&mut vcx, |s, cx| {
+        s.begin_edit(cx);
+        s.open_add_field_menu(cx);
+    });
+    vcx.run_until_parked();
+    assert!(state.read_with(&vcx, |s, _| s.add_field_menu_open));
+    state.update(&mut vcx, |s, cx| {
+        s.delete_confirm = Some(id);
+        s.confirm_delete(cx);
+    });
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| {
+        assert!(!s.is_editing(), "the delete ended the edit");
+        assert!(!s.add_field_menu_open, "and closed the menu");
+    });
+}

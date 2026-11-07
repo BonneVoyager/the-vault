@@ -882,6 +882,32 @@ impl AppState {
         }
     }
 
+    pub fn open_sort_menu(&mut self, cx: &mut Context<Self>) {
+        if self.main_active() {
+            self.sort_menu_open = true;
+            cx.notify();
+        }
+    }
+
+    pub fn close_sort_menu(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.sort_menu_open) {
+            cx.notify();
+        }
+    }
+
+    pub fn open_add_field_menu(&mut self, cx: &mut Context<Self>) {
+        if self.is_editing() {
+            self.add_field_menu_open = true;
+            cx.notify();
+        }
+    }
+
+    pub fn close_add_field_menu(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.add_field_menu_open) {
+            cx.notify();
+        }
+    }
+
     /// ⌘N picker result, or "Create '<query>'": a new item of `kind` in edit mode.
     pub fn begin_new(&mut self, template: Template, title: String, cx: &mut Context<Self>) {
         self.template_picker = None;
@@ -901,6 +927,7 @@ impl AppState {
     fn start(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.mode = mode;
         self.edit_session = self.edit_session.wrapping_add(1);
+        self.add_field_menu_open = false;
         self.delete_confirm = None;
         self.discard_prompt = None;
         self.generator_target = None;
@@ -930,8 +957,15 @@ impl AppState {
     /// (see `icon_images`: the blobs go with orphan cleanup).
     pub(super) fn end_edit(&mut self, cx: &mut Context<Self>) {
         self.abandon_icon_adds(cx);
-        self.mode = Mode::View;
+        self.leave_edit_mode();
         self.icon_images.invalidate();
+    }
+
+    /// Back to read mode, with the edit-only UI (Add field menu) closed. Every path that
+    /// ends an edit goes through here: save, cancel, delete, restore, recover, lock.
+    pub(super) fn leave_edit_mode(&mut self) {
+        self.mode = Mode::View;
+        self.add_field_menu_open = false;
     }
 
     /// Removes the references of image icons the edit in progress added (Cancel, lock).
@@ -987,7 +1021,7 @@ impl AppState {
             Ok(id) => id,
             Err(e) => return self.edit_failed(e, cx),
         };
-        self.mode = Mode::View;
+        self.leave_edit_mode();
         self.discard_prompt = None;
         self.generator_target = None;
         self.vault_changed();
@@ -1060,7 +1094,7 @@ impl AppState {
         if let Err(e) = edit_result(vault.edit(|v| v.delete(id, now))) {
             return self.show_toast(format!("Could not delete: {e}"), cx);
         }
-        self.mode = Mode::View;
+        self.leave_edit_mode();
         self.vault_changed();
         // The item that slid into the deleted one's place, else the one before it.
         let items = &self.listing.items;

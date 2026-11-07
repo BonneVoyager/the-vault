@@ -382,6 +382,9 @@ Workspace: fmt PASS, clippy PASS, test PASS — 820 passed, 10 ignored (core 227
 Shipped: default-colour dot removed, Automatic row previews shape+colour live; vault-macos `panel::choose_file` (NSOpenPanel limited by extension, re-entrancy guard, no unsafe); picker's "Drop or choose image…" uses it for png/jpg/jpeg with a one-panel guard; every chosen or dropped path passes a regular-file + size pre-check (twice, then fstat) before magic bytes. Specs 04/05 synced.
 Not verified by eye: the popover surviving the modal panel's focus change; the panel filter in Finder; the Automatic row preview.
 Follow-ups: O_NOFOLLOW would need libc (accepted gap); sync testing plan proposed to the owner (sync lab script, two-device checklist, simulation wave).
+Owner eye checks passed 2026-11-07 (all items incl. the ⌘C / ⇧⌘Z menu conflicts). ↓ from search
+into the list declined for now (spec §4).
+
 Bug hunt: not yet run for this wave.
 
 - Owner 2026-10-31: eye checks for the icons, sidebar, detail and picker waves all passed. Open list restated to the owner (commit, bug hunt, sync testing layer, passkey domain, signing identity, logged follow-ups). The deprecated `evaluatedPolicyDomainState` → `domainState` swap explained: same meaning, warning only, ride along with the next vault-macos change.
@@ -413,6 +416,9 @@ Workspace: fmt PASS, clippy PASS, test PASS — 852 passed, 11 ignored (core 244
 Shipped: `Item.created_at` (optional, min on merge, importers carry source times, fixture `v1-meta.vault`); `FieldKind::Section` (heading, value treated as empty and never rendered/copied/searched/exported anywhere in app and CLI; every name lookup skips it); footer "created … · modified … · device"; section editor row (name "Section", placeholder "Section name", no value); CLI Created/Modified lines in UTC and section headings; focus rings only after keyboard-moved focus across the app with weak handles and close cleanup. Specs 01/02/05 synced.
 Not verified by eye: section heading look (uppercased muted small text, 2 px rule), footer text, no ring after click + resize.
 Pending owner decisions: go/no-go on the field-id wave (format v2, fields identified by UUID, duplicate names allowed, field tombstones); commit; bug hunt.
+Owner eye checks passed 2026-11-07 (all items incl. the ⌘C / ⇧⌘Z menu conflicts). ↓ from search
+into the list declined for now (spec §4).
+
 Bug hunt: not yet run for this wave.
 
 ## Field identity wave (2026-10-31) — owner-approved ("Go with field IDs… field won't then need a name"), in flight
@@ -655,6 +661,9 @@ spacing and the red "Delete" text; two-line confirm wrapping in a narrow detail;
 and out of the trash; ⌘M and Window ▸ Zoom really minimise/zoom; ⌥ reveals and a dialog opened while
 ⌥ is held re-masks at once; pinned header with long tags, sync banner, delete confirm open.
 
+Owner eye checks passed 2026-11-07 (all items incl. the ⌘C / ⇧⌘Z menu conflicts). ↓ from search
+into the list declined for now (spec §4).
+
 Bug hunt: not yet run for this wave.
 
 ## Unlock and window polish (2026-11-04)
@@ -799,6 +808,9 @@ as two commits). fmt, clippy clean; 49 unlock/assets/root tests pass. Full suite
 Known, accepted: a lock during the finish before D − 150 ms leaves "Unlocking…" up until that
 timer fires (≤ 350 ms), same as a lock during the old hold.
 
+Owner eye checks passed 2026-11-07 (all items incl. the ⌘C / ⇧⌘Z menu conflicts). ↓ from search
+into the list declined for now (spec §4).
+
 Bug hunt: not yet run for this wave.
 
 ## Bug hunt 2026-11-06 and fixes (2026-11-06/07)
@@ -892,5 +904,50 @@ Uncommitted: 15 files incl. 2 new (`save_blocked.rs`, `save_blocked_tests.rs`).
 Owner eye checks: at the largest text size the strip sits under the search row and both columns
 start at its bottom edge (needs a too-large vault to see; or trust the test); Settings status
 line clears after lock + unlock.
+
+Owner eye checks passed 2026-11-07 (all items incl. the ⌘C / ⇧⌘Z menu conflicts). ↓ from search
+into the list declined for now (spec §4).
+
+Bug hunt: not yet run for this wave.
+
+## UI wave: Settings gating, ⌘1–⌘9, shared menu popover, menu key equivalents (2026-11-07)
+
+Owner questions after the dropped Quick Access panel led to four decisions (spec 05 updated in place):
+- **Settings only while unlocked** (§2.5): `open_settings(true)` is a no-op unless `main_active()`;
+  "Settings…" absent from the app menu while locked (Recover precedent); menu rebuilt from the
+  main screen's state observer on a `(trash shown, unlocked)` pair plus one deferred install on
+  window open. Known corner: auto-lock with the window closed leaves the item until reopen (inert).
+- **⌘1 … ⌘9 select sidebar rows** (§2.3, §4): `SelectSidebarRow(usize)` payload action
+  (`#[action(namespace = vault, no_json)]`), `sidebar_row_filter` (All, Favorites, Recently Deleted
+  when shown, tags while expanded), guarded by `main_active()`; old ⌘1/⌘2 focus keys and View ▸ Item
+  List / Item Details removed; `FocusList`/`FocusTarget::List` gone. "All Items" heading while the
+  sidebar is collapsed kept as is (owner).
+- **Shared menu popover** (§4 "Menu popovers"): `ui::menu_popover` / `menu_row` / `MenuRow` /
+  `bind_menu_keys` (↑/↓, Enter/Space, Esc; first row focused on keyboard or state open, none on
+  click open; per-popover row focus handles via `use_keyed_state`). Templates, Sort and Add field
+  migrated; open state in `AppState` (`template_picker`, `sort_menu_open`, `add_field_menu_open`),
+  cleared on lock/switch and through one `leave_edit_mode()` on every edit end. Panel sizes to
+  content: icon slot only when a row has an icon, check column only when checkable, 4 px padding,
+  no min width, 320 cap. Settings ▸ General choice dropdowns still on the library menu (owner to
+  decide). `ui::menu_item` kept for them.
+- **Menu key equivalents** (§4): gpui gives a menu item its action's first binding as NSMenu key
+  equivalent regardless of key context, and AppKit routes it before the focused view. ↓/↑ Next/Prev
+  Item and Esc Cancel Edit therefore fired from search, editor and popovers (the "dim highlight after
+  arrows" report). Menu-only unbound actions `MenuNextItem`/`MenuPrevItem`/`MenuCancelEdit`; rule
+  recorded in the spec. Audit: Edit ▸ Copy ⌘C vs list ⌘C and Edit ▸ Redo ⇧⌘Z vs Recover ⇧⌘Z are
+  possible real-Mac conflicts, not yet checked by eye.
+- List selection colour now uses `contains_focused` (harmless; list rows are not Tab stops and the
+  list is reachable only via ⌘F ⏎, a §6 gap noted for the owner).
+
+Code review (Opus): no critical; three warnings fixed (⌘N guard while locked, Add field flag on
+delete/restore/recover, Esc-order assertion); spec drift fixed.
+
+## CHECKPOINT — UI wave (2026-11-07)
+
+fmt and workspace clippy clean. `cargo test -p vault-app`: 464 passed, 0 failed. Only vault-app and
+spec 05 changed. 16 files uncommitted (1 new: `ui_menu_tests.rs`).
+
+Owner eye checks passed 2026-11-07 (all items incl. the ⌘C / ⇧⌘Z menu conflicts). ↓ from search
+into the list declined for now (spec §4).
 
 Bug hunt: not yet run for this wave.

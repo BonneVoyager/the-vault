@@ -6,7 +6,7 @@ use vault_core::{Item, Millis, UnlockedVault, Uuid};
 use vault_sync::SyncedVault;
 
 use super::edit::edit_result;
-use super::{AppState, Filter, Mode};
+use super::{AppState, Filter};
 use crate::text;
 
 /// How long a deleted item stays recoverable.
@@ -94,7 +94,7 @@ impl AppState {
             return self.show_toast(format!("Could not recover: {e}"), cx);
         }
         self.delete_confirm = None;
-        self.mode = Mode::View;
+        self.leave_edit_mode();
         self.filter = Filter::All;
         self.vault_changed();
         self.reveal_new(id);
