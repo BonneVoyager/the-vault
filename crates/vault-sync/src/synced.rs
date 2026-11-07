@@ -35,6 +35,9 @@ pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// planted or corrupt file cannot make us allocate without bound.
 pub const MAX_VAULT_FILE_SIZE: u64 = 64 * 1024 * 1024;
 
+/// A [`SyncedVault::set_before_write`] hook. Returns whether it changed the vault.
+pub type BeforeWrite = Box<dyn FnMut(&mut UnlockedVault) -> bool + Send>;
+
 /// What [`SyncedVault::lock`] did with the in-memory vault before dropping it (03 §8).
 #[derive(Debug)]
 pub enum LockOutcome {
@@ -167,6 +170,8 @@ pub struct SyncedVault {
     /// Added to the clock by orphan cleanup. Always zero unless the `test-support` feature is
     /// on (file ages count from ctime, which tests cannot set back).
     prune_clock_offset: Duration,
+    /// App policy run on the in-memory vault right before it is serialised for a write.
+    before_write: Option<BeforeWrite>,
 }
 
 impl fmt::Debug for SyncedVault {
@@ -232,6 +237,7 @@ impl SyncedVault {
             primary_missing: false,
             primary_seen: None,
             prune_clock_offset: Duration::ZERO,
+            before_write: None,
         };
         let written = match this.write(&bytes, Mode::NoReplace) {
             Ok(durable) => durable.map_err(|e| (e, true)),
@@ -336,6 +342,7 @@ impl SyncedVault {
             primary_missing: false,
             primary_seen: None,
             prune_clock_offset: Duration::ZERO,
+            before_write: None,
         })
     }
 
@@ -481,42 +488,37 @@ impl SyncedVault {
         {
             self.note_primary_missing();
         }
+        let preserve =
+            self.dirty || self.key_mismatch || self.save_blocked.is_some() || self.primary_missing;
+        if preserve {
+            self.run_before_write();
+        }
         let outcome = match &self.unlocked {
-            Some(vault)
-                if self.dirty
-                    || self.key_mismatch
-                    || self.save_blocked.is_some()
-                    || self.primary_missing =>
-            {
-                match self.newest_unsaved_covering(vault) {
-                    Some(path) => LockOutcome::Snapshotted(path),
-                    None => {
-                        let bytes = vault.serialize();
-                        match self.snapshot_unconfirmed(
-                            &bytes,
-                            SystemTime::now(),
-                            BackupKind::Unsaved,
-                        ) {
-                            Ok((path, Ok(()))) => LockOutcome::Snapshotted(path),
-                            Ok((path, Err(e))) => {
-                                tracing::warn!(path = %path.display(), error = %e, "unsaved backup written but not confirmed durable");
-                                self.emit(SyncEvent::Error(format!(
-                                    "unsaved changes were written to {} but may not be durable: {e}",
-                                    path.display()
-                                )));
-                                LockOutcome::Snapshotted(path)
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, "could not preserve unsaved vault before locking");
-                                self.emit(SyncEvent::Error(format!(
-                                    "unsaved changes could not be preserved: {e}"
-                                )));
-                                LockOutcome::Unpreserved(e)
-                            }
+            Some(vault) if preserve => match self.newest_unsaved_covering(vault) {
+                Some(path) => LockOutcome::Snapshotted(path),
+                None => {
+                    let bytes = vault.serialize();
+                    match self.snapshot_unconfirmed(&bytes, SystemTime::now(), BackupKind::Unsaved)
+                    {
+                        Ok((path, Ok(()))) => LockOutcome::Snapshotted(path),
+                        Ok((path, Err(e))) => {
+                            tracing::warn!(path = %path.display(), error = %e, "unsaved backup written but not confirmed durable");
+                            self.emit(SyncEvent::Error(format!(
+                                "unsaved changes were written to {} but may not be durable: {e}",
+                                path.display()
+                            )));
+                            LockOutcome::Snapshotted(path)
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "could not preserve unsaved vault before locking");
+                            self.emit(SyncEvent::Error(format!(
+                                "unsaved changes could not be preserved: {e}"
+                            )));
+                            LockOutcome::Unpreserved(e)
                         }
                     }
                 }
-            }
+            },
             _ => LockOutcome::Clean,
         };
         // A corrupt primary seen while unlocked was scheduled for rewrite only through `dirty`,
@@ -646,6 +648,8 @@ impl SyncedVault {
         if !self.dirty {
             return Ok(());
         }
+        // After the pre-write merge, so the hook also sees what a peer's file brought in.
+        self.run_before_write();
         let vault = self.unlocked.as_ref().ok_or(SyncError::Locked)?;
         // Step 1. Re-parse first: it is cheap, keeps `locked` current for the next unlock, and
         // guarantees we never put bytes on disk that we could not read back.
@@ -1014,6 +1018,30 @@ impl SyncedVault {
 
     pub fn retention_multiplier(&self) -> f32 {
         self.retention_multiplier
+    }
+
+    /// Install (or with `None` remove) a hook that runs on the unlocked vault right before
+    /// every write that serialises it: inside each dirty `save` attempt after the pre-write
+    /// merge (the app's own saves, merge write-backs from [`SyncedVault::poll`], conflict
+    /// absorption, the rewrite after unlock), and before `lock` writes an Unsaved backup. It
+    /// never runs on reads, on a clean (unwritten) save, while locked, on `create`, or on
+    /// `restore_from`'s write of the backup's exact bytes (a save after it runs it as usual).
+    ///
+    /// The hook returns whether it changed the vault; any change must be stamped by the hook
+    /// itself (through core APIs that stamp). A change needs no `dirty` mark: the write that
+    /// follows carries it. [`SyncEvent::Merged`] reports describe the merge before the hook.
+    /// The hook survives `lock`/`unlock`.
+    pub fn set_before_write(&mut self, hook: Option<BeforeWrite>) {
+        self.before_write = hook;
+    }
+
+    /// Runs the [`SyncedVault::set_before_write`] hook on the unlocked vault, if both exist.
+    fn run_before_write(&mut self) {
+        if let (Some(hook), Some(vault)) = (self.before_write.as_mut(), self.unlocked.as_mut())
+            && hook(vault)
+        {
+            tracing::debug!("before-write hook changed the vault");
+        }
     }
 
     pub fn is_dirty(&self) -> bool {

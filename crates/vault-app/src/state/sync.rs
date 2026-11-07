@@ -65,6 +65,19 @@ pub struct SyncUi {
     /// (`PrimaryChangedDuringSave`) and was retried once; the next such failure is not
     /// retried. Reset by any other save outcome.
     pub busy_retried: bool,
+    /// Why saves are refused until one succeeds (too large, or `SaveBlocked`): the main
+    /// window's red strip. Read through [`AppState::save_blocked`], which also requires
+    /// `save_failing`.
+    pub save_blocked: Option<SaveBlockedNotice>,
+}
+
+/// The persistent "edits are not being saved" strip under the main window's title band.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SaveBlockedNotice {
+    /// The status line's text for the same failure.
+    pub message: SharedString,
+    /// Offer "Show Recently Deleted": the vault is too large, and trashed notes count.
+    pub offers_trash: bool,
 }
 
 /// Toast on the Merged that follows re-entering the password after a key rotation.
@@ -112,11 +125,38 @@ impl AppState {
         self.vault.as_ref().is_some_and(SyncedVault::is_watching)
     }
 
+    /// The save-blocked strip, while saves keep failing for a reason that persists in the
+    /// status line (too large, `SaveBlocked`). Gone once a save succeeds.
+    pub fn save_blocked(&self) -> Option<&SaveBlockedNotice> {
+        self.sync
+            .save_blocked
+            .as_ref()
+            .filter(|_| self.sync.save_failing)
+    }
+
+    /// Drops the save-blocked notice and, with it, the status line's copy of its text.
+    pub(super) fn clear_save_blocked(&mut self) {
+        if self.sync.save_blocked.take().is_some() {
+            self.sync_status = SyncStatus::Idle;
+        }
+    }
+
+    /// [`Self::autosave_finished`] for view tests in other modules.
+    #[cfg(test)]
+    pub(crate) fn finish_autosave_for_test(
+        &mut self,
+        result: Result<(), SyncError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.autosave_finished(result, cx);
+    }
+
     /// Bookkeeping after any save attempt by the app. Returns the error message, if any.
     pub(super) fn record_save(&mut self, result: Result<(), SyncError>) -> Option<String> {
         match result {
             Ok(()) => {
                 self.sync.save_failing = false;
+                self.sync.save_blocked = None;
                 self.sync.corrupt = false;
                 self.sync.waiting_for_cloud = false;
                 self.sync.last_saved = Some(SystemTime::now());
@@ -129,9 +169,19 @@ impl AppState {
                 self.sync.save_failing = true;
                 let message = vault_too_large_message(bytes, cap);
                 self.sync_status = SyncStatus::Error(message.clone().into());
+                self.sync.save_blocked = Some(SaveBlockedNotice {
+                    message: message.clone().into(),
+                    offers_trash: true,
+                });
                 Some(message)
             }
+            // Transient: toasted only. A reason already on the strip stays while saves
+            // keep failing (the status line keeps it too); a new run of failures, after a
+            // success or an unlock reset `save_failing`, drops a stale one.
             Err(e) => {
+                if !self.sync.save_failing {
+                    self.sync.save_blocked = None;
+                }
                 self.sync.save_failing = true;
                 Some(e.to_string())
             }
@@ -253,6 +303,7 @@ impl AppState {
                     self.sync.corrupt = false;
                     self.sync.waiting_for_cloud = false;
                     self.sync.save_failing = false;
+                    self.clear_save_blocked();
                 }
             }
             // vault-sync re-reads the file at the next unlock.
@@ -327,6 +378,10 @@ impl AppState {
                     self.show_toast(message, cx);
                 }
                 self.sync.save_failing = true;
+                self.sync.save_blocked = Some(SaveBlockedNotice {
+                    message: message.into(),
+                    offers_trash: false,
+                });
             }
             // Both mean the cached key no longer opens the file on disk (a password change
             // or a key rotation elsewhere, or a rollback, which looks the same). vault-sync
@@ -341,8 +396,12 @@ impl AppState {
                 }
             }
             // Fallback for errors without a typed event (watcher failures, a failed backup).
+            // While the save-blocked strip is up, the status line keeps its text (the
+            // two always agree); the error still toasts.
             SyncEvent::Error(message) => {
-                self.sync_status = SyncStatus::Error(message.clone().into());
+                if self.sync.save_blocked.is_none() {
+                    self.sync_status = SyncStatus::Error(message.clone().into());
+                }
                 // A lock that lost unsaved edits already shows a danger toast; keep it.
                 if !self.toast.as_ref().is_some_and(|t| t.danger) {
                     self.show_toast(message, cx);
@@ -619,6 +678,9 @@ impl AppState {
         };
         self.sync_status = SyncStatus::Idle;
         self.vault_changed();
+        // A backup may hold trash past its 30 days: swept as after an unlock. That
+        // leaves the vault dirty, and the next tick's `needs_save` schedules the write.
+        self.expire_trash();
         self.refresh_backups();
         self.set_toast(Toast::window(format!("Restored from {name}")));
     }
@@ -1128,6 +1190,10 @@ mod tests {
                 cap,
             })
         };
+        let busy = || Err(SyncError::SaveLockTimeout(PathBuf::from("v")));
+        let expected = "The vault is too large to save (70 MiB, limit 64 MiB). Remove large \
+                        notes or field values (also from Recently Deleted); until then, \
+                        changes are not saved.";
         state.update(cx, |s, cx| {
             s.toggle_favorite(cx);
             s.autosave = None;
@@ -1135,12 +1201,12 @@ mod tests {
             s.autosave_finished(too_large(), cx);
             let toast = s.toast.as_ref().unwrap();
             assert!(toast.danger);
-            let expected = "The vault is too large to save (70 MiB, limit 64 MiB). Remove large \
-                            notes or field values (also from Recently Deleted); until then, \
-                            changes are not saved.";
             assert_eq!(toast.message.as_ref(), expected);
             assert_eq!(s.sync_status, SyncStatus::Error(expected.into()));
             assert!(s.sync.save_failing);
+            let strip = s.save_blocked().expect("the main window's strip");
+            assert_eq!(strip.message.as_ref(), expected);
+            assert!(strip.offers_trash);
             assert!(!s.autosave_pending && !s.sync.busy_retried, "not retried");
             assert!(s.vault.as_ref().unwrap().is_dirty());
             // The next edit's refusal does not toast again; the status line carries it.
@@ -1156,6 +1222,83 @@ mod tests {
             s.save_now(cx);
             assert_eq!(s.sync_status, SyncStatus::Idle);
             assert!(!s.sync.save_failing);
+            assert!(
+                s.save_blocked().is_none(),
+                "the strip goes with the success"
+            );
+            // While saves keep failing, a transient failure leaves the strip and the
+            // status line as they are.
+            s.toggle_favorite(cx);
+            s.autosave_finished(too_large(), cx);
+            s.autosave_finished(busy(), cx);
+            assert!(s.save_blocked().is_some());
+            assert_eq!(s.sync_status, SyncStatus::Error(expected.into()));
+        });
+        // A lock and unlock re-read the file: the strip and the status line both clear,
+        // and a later run of transient failures does not bring the notice back. The
+        // real file is small, so the lock's own save would succeed and clear them first;
+        // write it behind the state's back so the lock has nothing to save (a truly
+        // too-large lock save leaves the same notice up into the unlock).
+        state.update(cx, |s, cx| {
+            s.vault.as_mut().unwrap().save().unwrap();
+            s.lock(cx);
+            assert!(s.sync.save_blocked.is_some(), "still up while locked");
+        });
+        cx.run_until_parked();
+        state.update(cx, |s, cx| s.unlock(secret(PW), cx));
+        cx.run_until_parked();
+        state.update(cx, |s, cx| {
+            assert!(!s.locked);
+            assert!(s.save_blocked().is_none());
+            assert!(s.sync.save_blocked.is_none());
+            assert_eq!(s.sync_status, SyncStatus::Idle);
+            s.toggle_favorite(cx);
+            s.sync.busy_retried = true;
+            s.autosave_finished(busy(), cx);
+            assert!(s.sync.save_failing && s.save_blocked().is_none());
+        });
+    }
+
+    /// The save-blocked notice and the status line always agree: an unrelated sync error
+    /// toasts but leaves both; a clean merge (vault-sync's own save worked) and closing
+    /// the vault clear both.
+    #[gpui::test]
+    fn save_blocked_strip_and_status_line_clear_together(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        let cap = vault_sync::MAX_VAULT_FILE_SIZE;
+        let refuse = |s: &mut AppState, cx: &mut Context<AppState>| {
+            s.toggle_favorite(cx);
+            s.autosave_finished(
+                Err(SyncError::VaultTooLarge {
+                    bytes: cap + 1,
+                    cap,
+                }),
+                cx,
+            );
+            let message = s.save_blocked().unwrap().message.clone();
+            assert_eq!(s.sync_status, SyncStatus::Error(message.clone()));
+            message
+        };
+        state.update(cx, |s, cx| {
+            let message = refuse(s, cx);
+            s.handle_sync_event(SyncEvent::Error("merge write-back failed".into()), cx);
+            assert_eq!(s.save_blocked().unwrap().message, message);
+            assert_eq!(s.sync_status, SyncStatus::Error(message));
+
+            // A merge that leaves the vault clean: vault-sync's save worked.
+            s.vault.as_mut().unwrap().save().unwrap();
+            s.handle_sync_event(SyncEvent::Merged(MergeReport::default()), cx);
+            assert!(s.save_blocked().is_none() && s.sync.save_blocked.is_none());
+            assert_eq!(s.sync_status, SyncStatus::Idle);
+            // Without a notice, a sync error reaches the status line as before.
+            s.handle_sync_event(SyncEvent::Error("watcher failed".into()), cx);
+            assert_eq!(s.sync_status, SyncStatus::Error("watcher failed".into()));
+
+            refuse(s, cx);
+            s.close_vault(cx);
+            assert!(s.sync.save_blocked.is_none());
+            assert_eq!(s.sync_status, SyncStatus::Idle);
         });
     }
 
@@ -1335,8 +1478,22 @@ mod tests {
 
     #[gpui::test]
     fn backup_now_and_restore_replace_the_vault(cx: &mut TestAppContext) {
+        const DAY: u64 = 24 * 60 * 60 * 1000;
         let dir = tempfile::tempdir().unwrap();
-        let (state, _other, id) = two_devices(dir.path(), cx);
+        let (state, mut other, id) = two_devices(dir.path(), cx);
+        // A peer without the trash sweep leaves an item deleted 40 days ago, content and
+        // all, in the file the backup snapshots.
+        let now = text::now_millis();
+        let expired = other
+            .edit(|v| {
+                let mut item = Item::new("Old", Uuid::nil(), 1);
+                item.fields = vec![Field::new("notes", FieldKind::Notes, secret("old"), 1)];
+                let gone = v.insert(item, 1);
+                v.delete(gone, now - 40 * DAY).unwrap();
+                gone
+            })
+            .unwrap();
+        other.save().unwrap();
         state.update(cx, |s, cx| {
             s.backup_now(cx);
             assert!(
@@ -1401,6 +1558,20 @@ mod tests {
                     .message
                     .starts_with("Restored from ")
             );
+        });
+        state.update(cx, |s, cx| {
+            // The expired tombstone came back with the backup and was swept at once;
+            // the tick schedules the save that writes the stripped vault.
+            let restored = s.unlocked_vault().unwrap();
+            assert!(restored.get(expired).is_some_and(Item::is_deleted));
+            assert!(
+                restored.deleted_items().all(|i| i.id != expired),
+                "expired content kept after restore"
+            );
+            assert!(s.vault.as_ref().unwrap().is_dirty());
+            s.autosave_pending = false;
+            s.poll_sync(cx);
+            assert!(s.autosave_pending, "the sweep's write is scheduled");
         });
     }
 

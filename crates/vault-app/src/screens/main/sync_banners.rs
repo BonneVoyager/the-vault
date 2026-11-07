@@ -76,7 +76,13 @@ pub fn render(
     });
     Some(
         ui::v_flex()
-            .pt(px(ui::TITLEBAR_HEIGHT))
+            // Clear of the title band, or just below the save-blocked strip, which
+            // already pushed the detail column below the band.
+            .pt(px(if s.save_blocked().is_some() {
+                12.
+            } else {
+                ui::TITLEBAR_HEIGHT
+            }))
             // Same inset as the item and editor below (inside the detail's focus ring).
             .px(px(ui::COLUMN_PAD_X - ui::FOCUS_RING_WIDTH))
             .gap(px(8.))

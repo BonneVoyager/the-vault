@@ -863,3 +863,25 @@ Bug hunt: run for this wave (2026-11-06); the fixes themselves are review-covere
 Owner eye checks passed 2026-11-07 (item-window ⌥ reveal, main stays masked, no hitch on first logo after unlock).
 
 Bug hunt: not yet run for this wave (small, review-covered; fold into the next hunt).
+
+## Gaps wave (2026-11-07): save-blocked strip, before-write sweep hook; trash search kept as is
+
+- **Trash search** stays title + tags (owner decision 2026-11-07, recorded in 05 §2.3 as a design choice).
+- **Before-write hook** (vault-sync): `SyncedVault::set_before_write(Option<BeforeWrite>)`,
+  `BeforeWrite = Box<dyn FnMut(&mut UnlockedVault) -> bool + Send>`; runs inside every dirty
+  save attempt after the pre-write merge and before the size check, and in `lock` before the
+  Unsaved backup; not on reads, clean saves, create, restore-from-bytes, or while locked. App
+  installs the 30-day sweep (shared `sweep_due` guard) at open/create and after unlock;
+  `restored()` now sweeps too. Security review SHIP (W1 restore sweep fixed; clean-lock /
+  locked-save hook tests added). Spec 03 §2 paragraph + §5 wording; 05 sweep scope.
+- **Save-blocked strip** (app): `AppState::save_blocked()` from `save_failing` + stored notice
+  (too-large, or save-refused events without the link); strip under `header_height(cx)` =
+  max(title band, search row) across list + detail (full width with sidebar collapsed), invisible
+  copies in both columns for push-down, visible strip drawn last; "Show Recently Deleted" link →
+  `Filter::RecentlyDeleted`. Code review FIX FIRST → fixed: header height at large text sizes,
+  stale status line after unlock/clean merge (`clear_save_blocked`), status line untouched while
+  a notice is active, tests for clean merge / close / largest text size / real lock+unlock.
+  New files `screens/main/save_blocked.rs`, `save_blocked_tests.rs`. Spec 05 §2.3 paragraph.
+- fmt and workspace clippy clean; full workspace test run in flight (reported in the checkpoint).
+
+Bug hunt: not yet run for this wave.

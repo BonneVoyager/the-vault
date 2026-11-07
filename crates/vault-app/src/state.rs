@@ -1017,9 +1017,15 @@ impl AppState {
     fn unlocked(&mut self) -> usize {
         self.apply_backup_settings();
         self.sync.save_failing = false;
+        // The unlock re-read the file; a refusal from before the lock no longer applies.
+        self.clear_save_blocked();
         self.locked = false;
         self.error = None;
-        // Items past the 30 days go before anything shows them (05 §2.3).
+        // Items past the 30 days go before anything shows them (05 §2.3), and from every
+        // later write, vault-sync's own included (a reopened vault was not `install`ed).
+        if let Some(vault) = self.vault.as_mut() {
+            trash::install_sweep_hook(vault);
+        }
         let stripped = self.expire_trash();
         self.vault_changed();
         self.screen = Screen::Main;
@@ -1176,7 +1182,8 @@ impl AppState {
         system_idle_secs.min(app_idle) >= f64::from(minutes) * 60.0
     }
 
-    fn install(&mut self, vault: SyncedVault, locked: bool) {
+    fn install(&mut self, mut vault: SyncedVault, locked: bool) {
+        trash::install_sweep_hook(&mut vault);
         self.sync_events = Some(vault.subscribe());
         self.vault_path = Some(vault.path().to_owned());
         self.vault_id = Some(vault.locked_summary().vault_id);

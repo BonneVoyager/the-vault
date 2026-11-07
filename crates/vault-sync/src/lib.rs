@@ -41,8 +41,8 @@ pub use error::{SaveBlocked, SyncError};
 pub use event::SyncEvent;
 pub use package::VAULT_FILE_NAME;
 pub use synced::{
-    DOWNLOAD_TIMEOUT, LastWritten, LockOutcome, LockedSummary, MAX_VAULT_FILE_SIZE, SyncedVault,
-    read_capped, read_package_entry_capped,
+    BeforeWrite, DOWNLOAD_TIMEOUT, LastWritten, LockOutcome, LockedSummary, MAX_VAULT_FILE_SIZE,
+    SyncedVault, read_capped, read_package_entry_capped,
 };
 #[cfg(feature = "test-support")]
 #[doc(hidden)]

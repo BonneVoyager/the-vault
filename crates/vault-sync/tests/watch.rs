@@ -10,6 +10,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,11 +18,11 @@ use crossbeam_channel::Receiver;
 use tempfile::TempDir;
 use vault_core::format::VaultFile;
 use vault_core::{
-    ExposeSecret, Field, FieldKind, Item, KdfParams, LockedVault, SecretString, Uuid,
+    ExposeSecret, Field, FieldKind, Item, KdfParams, LockedVault, SecretString, UnlockedVault, Uuid,
 };
 use vault_sync::{
-    BackupKind, DEBOUNCE, NoopHooks, SaveBlocked, SyncError, SyncEvent, SyncedVault,
-    VAULT_FILE_NAME,
+    BackupKind, BeforeWrite, DEBOUNCE, LockOutcome, NoopHooks, SaveBlocked, SyncError, SyncEvent,
+    SyncedVault, VAULT_FILE_NAME,
 };
 
 const T0: u64 = 1_700_000_000_000;
@@ -1338,4 +1339,124 @@ fn channel_overflow_forces_a_rescan() {
     assert!(!copy.exists(), "rescan did not absorb the copy");
     assert!(ea.any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_))));
     assert_eq!(titles(&a), ["from b's copy", "from b's save", "mail"]);
+}
+
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The app's 30-day sweep as a before-write hook, counting its calls.
+fn sweep_hook(calls: &Arc<AtomicUsize>) -> Option<BeforeWrite> {
+    let calls = Arc::clone(calls);
+    Some(Box::new(move |v: &mut UnlockedVault| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        let now = wall_ms();
+        v.expire_deleted(now - 30 * DAY_MS, now) > 0
+    }))
+}
+
+/// A trashed item with content, deleted at `T0` (long past 30 days), in `v`.
+fn insert_expired(v: &mut SyncedVault) -> Uuid {
+    v.edit(|v| {
+        let mut item = Item::new("old", Uuid::nil(), T0);
+        item.fields.push(Field::new(
+            "password",
+            FieldKind::Password,
+            secret("pw"),
+            T0,
+        ));
+        let id = v.insert(item, T0);
+        v.delete(id, T0 + 1).unwrap();
+        id
+    })
+    .unwrap()
+}
+
+fn has_content(v: &UnlockedVault, id: Uuid) -> bool {
+    v.get(id).unwrap().has_content()
+}
+
+/// Bug hunt 2026-11-06: an expired tombstone a peer's file brings back is stripped by the
+/// before-write hook in the merge write-back, before it reaches disk.
+#[test]
+fn before_write_hook_strips_expired_tombstone_in_merge_write_back() {
+    let (_dir, path, mut a, mut b, _id) = two_devices();
+    let calls = Arc::new(AtomicUsize::new(0));
+    a.set_before_write(sweep_hook(&calls));
+    a.start_watching().unwrap();
+    drain_for(&mut a, 2);
+    let mut ea = Events::new(&a);
+    let old = insert_expired(&mut b);
+    plant(&path, &b.vault().unwrap().serialize());
+
+    assert!(
+        wait_until(|| {
+            a.poll();
+            calls.load(Ordering::SeqCst) > 0
+        }),
+        "no write-back"
+    );
+    ea.pump();
+    assert!(ea.any(merged), "{:?}", ea.seen);
+    assert!(!has_content(a.vault().unwrap(), old));
+    let disk = on_disk(&path).unlock(&pw()).unwrap();
+    assert!(!has_content(&disk, old), "expired content reached disk");
+    assert!(!a.is_dirty());
+
+    // The write-back is stable: no second write, no further hook call.
+    let fingerprint = a.last_written();
+    drain_for(&mut a, 3);
+    assert_eq!(a.last_written(), fingerprint);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// A peer's write that brings nothing new is read and merged, never written back: the hook
+/// does not run.
+#[test]
+fn before_write_hook_not_called_on_read_only_poll() {
+    let (_dir, path, mut a, b, _id) = two_devices();
+    let calls = Arc::new(AtomicUsize::new(0));
+    a.set_before_write(sweep_hook(&calls));
+    a.start_watching().unwrap();
+    drain_for(&mut a, 2);
+    let mut ea = Events::new(&a);
+    let bytes = b.vault().unwrap().serialize();
+    plant(&path, &bytes);
+    assert!(wait_until(|| {
+        a.poll();
+        ea.pump();
+        ea.any(merged)
+    }));
+    drain_for(&mut a, 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read(&path).unwrap(), bytes, "nothing to write back");
+    // A clean save writes nothing and does not run the hook either.
+    a.save().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+/// The Unsaved backup `lock` writes from the live vault goes through the hook too.
+#[test]
+fn before_write_hook_runs_before_unsaved_backup() {
+    let (_dir, _path, mut a, _b, _id) = two_devices();
+    let calls = Arc::new(AtomicUsize::new(0));
+    a.set_before_write(sweep_hook(&calls));
+    let old = insert_expired(&mut a);
+    let LockOutcome::Snapshotted(backup) = a.lock() else {
+        panic!("dirty lock must snapshot");
+    };
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let copy = on_disk(&backup).unlock(&pw()).unwrap();
+    assert!(!has_content(&copy, old));
+}
+
+/// Nothing is written, so the hook never runs: a clean `lock`, then `save` while locked.
+#[test]
+fn before_write_hook_not_called_on_clean_lock_or_locked_save() {
+    let (_dir, _path, mut a, _b, _id) = two_devices();
+    let calls = Arc::new(AtomicUsize::new(0));
+    a.set_before_write(sweep_hook(&calls));
+    assert!(matches!(a.lock(), LockOutcome::Clean));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(a.save(), Err(SyncError::Locked)));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }

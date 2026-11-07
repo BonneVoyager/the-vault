@@ -402,8 +402,10 @@ impl MainScreen {
         // so the toggle sits right of the traffic lights.
         let header = ui::h_flex()
             .flex_none()
-            // Symmetric padding: at the default text size the row is exactly the band.
-            .py(px(ui::SEARCH_TOP))
+            // Exactly the band at the default text size, the search field centred on the
+            // traffic lights; the save-blocked strip sits right under this height.
+            .h(super::header_height(cx))
+            .items_center()
             .px(px(ui::COLUMN_PAD_X))
             .gap(px(4.))
             .child(
@@ -599,6 +601,14 @@ impl MainScreen {
             .border_r_1()
             .border_color(theme.border)
             .child(self.slide_header(header))
+            .children(super::save_blocked::spacer(
+                s,
+                &self.state,
+                "save-blocked-spacer-list",
+                Some(self.right_width),
+                0.,
+                cx,
+            ))
             .children(heading)
             .child(
                 ui::v_flex()

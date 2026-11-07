@@ -2,7 +2,8 @@
 //! read-only, Recover, Delete permanently, and the 30-day sweep.
 
 use gpui::Context;
-use vault_core::{Item, Millis, Uuid};
+use vault_core::{Item, Millis, UnlockedVault, Uuid};
+use vault_sync::SyncedVault;
 
 use super::edit::edit_result;
 use super::{AppState, Filter, Mode};
@@ -24,6 +25,24 @@ pub const DELETE_RECOVERABLE: &str = "You can recover it from Recently Deleted f
 pub fn days_left(deleted_at: Millis, now: Millis) -> u64 {
     let left = deleted_at.saturating_add(TRASH_MS).saturating_sub(now);
     left.div_ceil(DAY_MS).min(TRASH_DAYS)
+}
+
+/// Something in the trash was deleted before `cutoff`, i.e. the sweep has work to do.
+fn sweep_due(v: &UnlockedVault, cutoff: Millis) -> bool {
+    v.deleted_items()
+        .any(|i| i.deleted_at.is_some_and(|d| d < cutoff))
+}
+
+/// Makes `vault` run the sweep right before every write of the in-memory vault, including
+/// vault-sync's own merge write-backs and conflict absorptions (03 §5: content a peer
+/// brings back past its window never reaches disk). Like [`AppState::expire_trash`] it
+/// touches nothing when nothing is due, so a clean vault is never restamped.
+pub(super) fn install_sweep_hook(vault: &mut SyncedVault) {
+    vault.set_before_write(Some(Box::new(|v: &mut UnlockedVault| {
+        let now = text::now_millis();
+        let cutoff = now.saturating_sub(TRASH_MS);
+        sweep_due(v, cutoff) && v.expire_deleted(cutoff, now) > 0
+    })));
 }
 
 /// The card under a trashed item's fields.
@@ -122,11 +141,7 @@ impl AppState {
         let Some(vault) = self.vault.as_mut() else {
             return 0;
         };
-        let due = vault.vault().is_some_and(|v| {
-            v.deleted_items()
-                .any(|i| i.deleted_at.is_some_and(|d| d < cutoff))
-        });
-        if !due {
+        if !vault.vault().is_some_and(|v| sweep_due(v, cutoff)) {
             return 0;
         }
         let stripped = vault

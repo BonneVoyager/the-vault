@@ -122,6 +122,62 @@ fn sweep_runs_before_save(cx: &mut TestAppContext) {
     });
 }
 
+/// Bug hunt 2026-11-06: content past its 30 days that a peer's file brings back is
+/// stripped by vault-sync's own merge write-back (the before-write hook), with no app save.
+#[gpui::test]
+fn expired_tombstone_from_a_peer_is_stripped_by_the_merge_write_back(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = vault_file(dir.path());
+    let mut vault = SyncedVault::open(&path, Uuid::new_v4(), Arc::new(NoopHooks)).unwrap();
+    vault.unlock(&SecretString::new("pw".into())).unwrap();
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    state.update(cx, |s, cx| {
+        s.install_unlocked_for_tests(vault);
+        s.save_now(cx);
+    });
+    let disk_has_content = |id| {
+        let mut v = SyncedVault::open(&path, Uuid::new_v4(), Arc::new(NoopHooks)).unwrap();
+        v.unlock(&SecretString::new("pw".into())).unwrap();
+        v.vault().unwrap().get(id).unwrap().has_content()
+    };
+    // A peer without the sweep writes an item it deleted 40 days ago, content and all.
+    let mut peer = SyncedVault::open(&path, Uuid::new_v4(), Arc::new(NoopHooks)).unwrap();
+    peer.unlock(&SecretString::new("pw".into())).unwrap();
+    let now = text::now_millis();
+    let gone = peer
+        .edit(|v| {
+            let mut item = Item::new("Gone", v.device_id(), 1);
+            item.fields.push(vault_core::Field::new(
+                "password",
+                vault_core::FieldKind::Password,
+                SecretString::new("old".into()),
+                1,
+            ));
+            let id = v.insert(item, 1);
+            v.delete(id, now - 40 * DAY).unwrap();
+            id
+        })
+        .unwrap();
+    peer.save().unwrap();
+    assert!(disk_has_content(gone));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while state.read_with(cx, |s, _| s.unlocked_vault().unwrap().get(gone).is_none()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "peer write never merged"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        state.update(cx, |s, cx| s.poll_sync(cx));
+    }
+    assert!(!has_content(&state, gone, cx));
+    state.read_with(cx, |s, _| {
+        assert!(!s.autosave_pending, "no app save involved");
+        assert!(!s.vault.as_ref().unwrap().is_dirty());
+    });
+    assert!(!disk_has_content(gone), "expired content stayed on disk");
+}
+
 /// Locked, the sweep does nothing (there is no vault to read, and it must not try).
 #[gpui::test]
 fn sweep_is_a_no_op_while_locked(cx: &mut TestAppContext) {

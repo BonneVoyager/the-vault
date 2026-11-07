@@ -18,6 +18,10 @@ pub use {detail::detail_placeholder, list::list_placeholder};
 #[path = "main/collapse_tests.rs"]
 mod collapse_tests;
 mod prompts;
+mod save_blocked;
+#[cfg(test)]
+#[path = "main/save_blocked_tests.rs"]
+mod save_blocked_tests;
 mod sidebar;
 mod sync_banners;
 #[cfg(test)]
@@ -62,6 +66,13 @@ fn fit_widths([side, list]: [f32; 2], window: f32, sidebar: bool) -> [f32; 2] {
         side
     };
     [side, list]
+}
+
+/// Height of the list's search row, the band the save-blocked strip sits under: the
+/// title band, or taller once the text size grows the search field.
+fn header_height(cx: &App) -> gpui::Pixels {
+    let row = 2. * ui::SEARCH_TOP + crate::theme::scaled(ui::SEARCH_HEIGHT, cx).as_f32();
+    px(ui::TOP_BAND_HEIGHT.max(row))
 }
 
 /// A column footer: fixed height, full-width 1 px top divider, contents centred
@@ -166,6 +177,9 @@ pub struct MainScreen {
     widths: [f32; 2],
     /// `widths` fitted to the current window by `fit_widths`, as laid out.
     fitted: [f32; 2],
+    /// Width of the list and detail columns together as laid out this frame (the
+    /// save-blocked strip's width, `save_blocked::spacer` in the list column).
+    right_width: f32,
     /// A divider drag is in progress; its end saves the widths.
     column_drag: bool,
     search: Entity<InputState>,
@@ -273,6 +287,7 @@ impl MainScreen {
             state,
             widths,
             fitted: widths,
+            right_width: 0.,
             column_drag: false,
             search,
             key_input,
@@ -514,8 +529,32 @@ impl Render for MainScreen {
             window.viewport_size().width.as_f32(),
             self.seen_sidebar || !slide.is_done(),
         );
+        // The sidebar's width now, as its slide lays it out this frame.
+        let sidebar_now = if self.seen_sidebar || !slide.is_done() {
+            self.fitted[0] * slide.current_at(self.slide_clock())
+        } else {
+            0.
+        };
+        let viewport = window.viewport_size().width.as_f32();
+        self.right_width = (viewport - sidebar_now).max(self.fitted[1]);
         let list = self.render_list(window, cx);
         let detail = self.render_detail(window, cx);
+        let (blocked_spacer, blocked_strip) = {
+            let s = self.state.read(cx);
+            let list_width = self.fitted[1];
+            (
+                save_blocked::spacer(
+                    s,
+                    &self.state,
+                    "save-blocked-spacer-detail",
+                    None,
+                    list_width,
+                    cx,
+                ),
+                save_blocked::overlay(s, &self.state, list_width, cx),
+            )
+        };
+        let blocked = blocked_strip.is_some();
         // `done` is set while laying out the slide's last frame, after this render. In
         // the app a next-frame callback re-renders then; otherwise the next render does.
         let settled = slide.is_done();
@@ -593,15 +632,29 @@ impl Render for MainScreen {
             .when(self.seen_sidebar && settled, |el| {
                 el.child(column_handle(ColumnDrag::Sidebar))
             });
-        let detail_column = gpui::div()
+        // With the save-blocked strip, the detail starts below it and the band above
+        // stays empty (as with the sync banners).
+        let detail_column = ui::v_flex()
             .id("detail-slot")
             .flex_1()
             .min_w_0()
             .h_full()
             .relative()
-            .child(detail)
-            .children(ui::test_probe("detail-probe"))
-            .child(column_handle(ColumnDrag::List));
+            .when(blocked, |el| {
+                el.child(gpui::div().flex_none().h(header_height(cx)))
+            })
+            .children(blocked_spacer)
+            .child(
+                gpui::div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(detail)
+                    .children(ui::test_probe("detail-probe")),
+            )
+            .child(column_handle(ColumnDrag::List))
+            // Last: above both columns and the divider, for paint and clicks.
+            .children(blocked_strip);
 
         // The window claims its titlebar, so it moves only by this band; it paints first
         // (underneath), and the controls in it opt out with `ui::no_window_drag`.
