@@ -7,9 +7,10 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use gpui::{
-    AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, Styled as _, Subscription, Task, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, div, prelude::FluentBuilder as _, px, size,
+    AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, FocusHandle,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Subscription,
+    Task, TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::FluentBuilder as _,
+    px, size,
 };
 use gpui_component::{ActiveTheme as _, Root};
 use vault_core::{ExposeSecret as _, FieldKind, SecretString, Uuid};
@@ -115,7 +116,14 @@ struct ItemWindow {
     ticker: Option<Task<()>>,
     /// The window title last set (the item's title, see [`window_title_for`]).
     title: String,
-    _subscription: Subscription,
+    /// Hold ⌥ to reveal, for this window only (05 §2.3): set while ⌥ alone is held
+    /// and this window is key. Separate from `AppState::option_reveal` so the main
+    /// window's detail never reveals along with it.
+    option_reveal: bool,
+    /// Tracked on the window's root so ⌥ changes reach it (they follow the focus
+    /// path) and a focus move into an overlay ends the reveal.
+    focus: FocusHandle,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl ItemWindow {
@@ -133,6 +141,10 @@ impl ItemWindow {
                 .and_then(|vault| vault.get(id))
                 .is_some_and(|item| !item.is_deleted());
             if !s.main_active() || !exists {
+                // Lock, vault switch, or the item gone. The window is about to go, so
+                // this is defensive: it matters only if something still holds the view
+                // after the close (the tests do).
+                this.option_reveal = false;
                 window.remove_window();
             } else {
                 // A rename (here or merged from another device) retitles the window.
@@ -145,6 +157,23 @@ impl ItemWindow {
                 cx.notify();
             }
         });
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        let subscriptions = vec![
+            subscription,
+            // A key-up while another window is key never reaches this one: drop the
+            // hold-⌥ reveal when it loses key status.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() {
+                    this.set_option_reveal(false, cx);
+                }
+            }),
+            // Focus moved outside the window's view (an overlay under Root): its ⌥ key-up
+            // would miss our listener.
+            cx.on_focus_out(&focus, window, |this: &mut Self, _, _, cx| {
+                this.set_option_reveal(false, cx);
+            }),
+        ];
         let mut this = Self {
             state,
             id,
@@ -154,7 +183,9 @@ impl ItemWindow {
             status: None,
             ticker: None,
             title,
-            _subscription: subscription,
+            option_reveal: false,
+            focus,
+            _subscriptions: subscriptions,
         };
         this.sync_ticker(cx);
         this
@@ -176,6 +207,15 @@ impl ItemWindow {
                     }
                 }
             }));
+        }
+    }
+
+    /// Follows ⌥ in this window; re-renders only when the flag flips. Never touches
+    /// `revealed`.
+    fn set_option_reveal(&mut self, held: bool, cx: &mut Context<Self>) {
+        if self.option_reveal != held {
+            self.option_reveal = held;
+            cx.notify();
         }
     }
 
@@ -270,10 +310,21 @@ impl Render for ItemWindow {
         }
         // Focus rings follow keyboard focus moves only (`ui::update_focus_ring`).
         ui::update_focus_ring(window, cx);
+        // ⌥ follows the focus path, so focus pointing at nothing (a clicked control
+        // that stopped being drawn, a closed overlay) would silence the hold-⌥ reveal.
+        if window.is_window_active() && window.focused(cx).is_none() {
+            window.focus(&self.focus, cx);
+        }
         let weak = cx.entity().downgrade();
         let actions = DetailActions(std::rc::Rc::new(move |action, cx| {
             weak.update(cx, |this, cx| this.act(action, cx)).ok();
         }));
+        // Also checked against the live modifiers, key status and focus, so a key-up
+        // that went elsewhere cannot leave values revealed.
+        let peek = self.option_reveal
+            && ui::option_alone(&window.modifiers())
+            && window.is_window_active()
+            && self.focus.contains_focused(window, cx);
         let s = self.state.read(cx);
         let theme = cx.theme();
         let content = s
@@ -287,14 +338,20 @@ impl Render for ItemWindow {
                     history_open: self.history_open,
                     actions,
                     standalone: true,
-                    // Hold-⌥ reveal is a main-window feature (05 §2.3).
-                    peek: false,
+                    peek,
                 }
                 .render_item(item, s, cx)
             });
         ui::clear_focus_ring_on_click(div())
             .id("item-window")
             .debug_selector(|| "item-window".into())
+            .track_focus(&self.focus)
+            // Hold ⌥ to reveal (05 §2.3), this window only.
+            .on_modifiers_changed(
+                cx.listener(|this, ev: &gpui::ModifiersChangedEvent, _, cx| {
+                    this.set_option_reveal(ui::option_alone(&ev.modifiers), cx);
+                }),
+            )
             .size_full()
             .relative()
             .border_1()
@@ -630,6 +687,241 @@ mod tests {
             None,
             "its handle is pruned"
         );
+    }
+
+    fn option() -> gpui::Modifiers {
+        gpui::Modifiers {
+            alt: true,
+            ..Default::default()
+        }
+    }
+
+    fn hold(mods: gpui::Modifiers, vcx: &mut gpui::VisualTestContext) {
+        vcx.simulate_modifiers_change(mods);
+        vcx.run_until_parked();
+    }
+
+    fn shown(key: &'static str, vcx: &mut gpui::VisualTestContext) -> bool {
+        vcx.debug_bounds(key).is_some()
+    }
+
+    fn option_flag(handle: AnyWindowHandle, cx: &mut TestAppContext) -> bool {
+        let root = handle.downcast::<Root>().unwrap();
+        cx.update(|cx| {
+            let view = root.read(cx).unwrap().view().clone();
+            view.downcast::<ItemWindow>()
+                .unwrap()
+                .read(cx)
+                .option_reveal
+        })
+    }
+
+    /// The main window over `state`, showing `id` in its detail column.
+    fn main_window(
+        state: &Entity<AppState>,
+        id: Uuid,
+        cx: &mut TestAppContext,
+    ) -> gpui::VisualTestContext {
+        let mut main = None;
+        let window = cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let view =
+                cx.new(|cx| super::super::main::MainScreen::new(state.clone(), None, window, cx));
+            main = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let main = main.unwrap();
+        vcx.update(|window, cx| main.update(cx, |m, cx| m.appear(window, cx)));
+        state.update(&mut vcx, |s, cx| s.select(id, cx));
+        vcx.run_until_parked();
+        vcx
+    }
+
+    /// The item window's password row and the main detail's, as (item, main) plain.
+    fn plain_rows(
+        item: &mut gpui::VisualTestContext,
+        main: &mut gpui::VisualTestContext,
+    ) -> (bool, bool) {
+        let item_plain = shown("field-plain 0", item);
+        assert_ne!(item_plain, shown("field-masked 0", item));
+        let main_plain = shown("field-plain 0", main);
+        assert_ne!(main_plain, shown("field-masked 0", main));
+        (item_plain, main_plain)
+    }
+
+    /// 05 §2.3 hold ⌥ in an item window: its own rows reveal while it is key and ⌥ is
+    /// held; the main window's detail of the same item stays masked; release re-masks.
+    #[gpui::test]
+    fn option_held_reveals_only_the_key_item_window(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, _) = setup(dir.path(), cx);
+        let mut main = main_window(&state, plain, cx);
+        let handle = open(&state, plain, cx);
+        let mut item = gpui::VisualTestContext::from_window(handle, cx);
+        item.update(|window, _| window.activate_window());
+        item.run_until_parked();
+        assert_eq!(plain_rows(&mut item, &mut main), (false, false));
+
+        hold(option(), &mut item);
+        assert!(option_flag(handle, cx));
+        assert_eq!(
+            plain_rows(&mut item, &mut main),
+            (true, false),
+            "only the key item window reveals"
+        );
+        assert!(
+            !state.read_with(cx, |s, _| s.option_reveal),
+            "global flag untouched"
+        );
+        assert!(state.read_with(cx, |s, _| s.revealed.is_empty()));
+
+        hold(gpui::Modifiers::none(), &mut item);
+        assert_eq!(plain_rows(&mut item, &mut main), (false, false), "release");
+
+        // ⌥ in a chord does not reveal.
+        hold(
+            gpui::Modifiers {
+                alt: true,
+                platform: true,
+                ..Default::default()
+            },
+            &mut item,
+        );
+        assert_eq!(plain_rows(&mut item, &mut main), (false, false));
+    }
+
+    /// The item window losing key status ends its reveal; so does a ⌥ the window never
+    /// heard (inactive window).
+    #[gpui::test]
+    fn option_reveal_in_item_window_clears_on_blur(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, _) = setup(dir.path(), cx);
+        let mut main = main_window(&state, plain, cx);
+        let handle = open(&state, plain, cx);
+        let mut item = gpui::VisualTestContext::from_window(handle, cx);
+        item.update(|window, _| window.activate_window());
+        item.run_until_parked();
+
+        hold(option(), &mut item);
+        assert_eq!(plain_rows(&mut item, &mut main), (true, false));
+        item.deactivate_window();
+        item.run_until_parked();
+        assert!(!option_flag(handle, cx), "blur clears the flag");
+        assert_eq!(plain_rows(&mut item, &mut main), (false, false));
+
+        // Main window key with ⌥ held: the main detail reveals, the item window not.
+        hold(gpui::Modifiers::none(), &mut item);
+        main.update(|window, _| window.activate_window());
+        main.run_until_parked();
+        hold(option(), &mut main);
+        assert_eq!(plain_rows(&mut item, &mut main), (false, true));
+        // Switching key to the item window drops the main window's reveal.
+        item.update(|window, _| window.activate_window());
+        item.run_until_parked();
+        assert!(!state.read_with(cx, |s, _| s.option_reveal));
+        assert_eq!(plain_rows(&mut item, &mut main), (false, false));
+    }
+
+    /// Lock while ⌥ is held: the window closes as before, nothing stays revealed.
+    #[gpui::test]
+    fn option_reveal_in_item_window_ends_on_lock(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, _) = setup(dir.path(), cx);
+        let handle = open(&state, plain, cx);
+        let mut item = gpui::VisualTestContext::from_window(handle, cx);
+        item.update(|window, _| window.activate_window());
+        item.run_until_parked();
+        hold(option(), &mut item);
+        assert!(option_flag(handle, cx));
+        assert!(shown("field-plain 0", &mut item));
+
+        state.update(cx, |s, cx| s.lock(cx));
+        cx.run_until_parked();
+        assert!(!cx.update(|cx| cx.windows().contains(&handle)), "closed");
+        assert!(state.read_with(cx, |s, _| s.item_windows.is_empty()));
+    }
+
+    fn item_view(handle: AnyWindowHandle, cx: &mut TestAppContext) -> Entity<ItemWindow> {
+        let root = handle.downcast::<Root>().unwrap();
+        cx.update(|cx| {
+            let view = root.read(cx).unwrap().view().clone();
+            view.downcast::<ItemWindow>().unwrap()
+        })
+    }
+
+    /// Focus moving into an overlay under Root (outside the view) ends the reveal, and
+    /// once focus points at nothing the window takes it back, so ⌥ works again.
+    #[gpui::test]
+    fn option_reveal_in_item_window_clears_when_focus_leaves(cx: &mut TestAppContext) {
+        use gpui_component::WindowExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, _) = setup(dir.path(), cx);
+        let handle = open(&state, plain, cx);
+        let mut item = gpui::VisualTestContext::from_window(handle, cx);
+        item.update(|window, _| window.activate_window());
+        item.run_until_parked();
+        hold(option(), &mut item);
+        assert!(shown("field-plain 0", &mut item));
+
+        let overlay = item.update(|window, cx| {
+            let focus = cx.focus_handle();
+            let inner = focus.clone();
+            window.open_dialog(cx, move |dialog, _, _| {
+                dialog
+                    .title("Overlay")
+                    .child(div().track_focus(&inner).child("overlay"))
+            });
+            focus
+        });
+        item.run_until_parked();
+        item.update(|window, cx| window.focus(&overlay, cx));
+        item.run_until_parked();
+        assert!(item.update(|window, _| overlay.is_focused(window)));
+        assert!(!option_flag(handle, cx), "focus left the view");
+        assert!(shown("field-masked 0", &mut item));
+        assert!(!shown("field-plain 0", &mut item));
+
+        // Focus pointing at nothing: the window refocuses its root on the next frame.
+        hold(gpui::Modifiers::none(), &mut item);
+        item.update(|window, cx| {
+            window.close_all_dialogs(cx);
+            window.blur(cx);
+        });
+        item.run_until_parked();
+        let focus = item_view(handle, cx).read_with(cx, |v, _| v.focus.clone());
+        assert!(
+            item.update(|window, _| focus.is_focused(window)),
+            "refocused"
+        );
+        hold(option(), &mut item);
+        assert!(shown("field-plain 0", &mut item), "⌥ works again");
+    }
+
+    /// Soft-deleting the item while ⌥ is held clears the flag and closes the window.
+    #[gpui::test]
+    fn option_reveal_in_item_window_ends_on_delete(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, _) = setup(dir.path(), cx);
+        let handle = open(&state, plain, cx);
+        let view = item_view(handle, cx);
+        let mut item = gpui::VisualTestContext::from_window(handle, cx);
+        item.update(|window, _| window.activate_window());
+        item.run_until_parked();
+        hold(option(), &mut item);
+        assert!(view.read_with(cx, |v, _| v.option_reveal));
+
+        state.update(cx, |s, cx| {
+            s.select(plain, cx);
+            s.request_delete(cx);
+            s.confirm_delete(cx);
+        });
+        cx.run_until_parked();
+        assert!(state.read_with(cx, |s, _| {
+            s.unlocked_vault().unwrap().get(plain).unwrap().is_deleted()
+        }));
+        assert!(!cx.update(|cx| cx.windows().contains(&handle)), "closed");
+        assert!(!view.read_with(cx, |v, _| v.option_reveal), "flag cleared");
     }
 
     #[gpui::test]

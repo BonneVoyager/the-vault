@@ -10,4 +10,5 @@ Format with `rustfmt --edition 2024 <owned files>` and check with `cargo fmt --a
 **Why:** several agents edit vault-core / vault-sync / vault-app at the same time and only some files are mine; a workspace-wide rewrite can collide with their in-flight edits (2026-10-29, attachments UI: it happened to touch only my files, by luck).
 **How to apply:** whenever the lead lists owned files; report fmt failures in others' files instead of fixing them. See [[gpui-version-pins]].
 Careful: `rustfmt src/main.rs` (a crate root, or any file with out-of-line `mod x;`) formats every module it declares, i.e. the whole crate. Pass leaf files only, or confirm with `cargo fmt --all -- --check` that nothing else changed.
+Fallback (2026-11-07): direct `rustfmt ...` Bash calls repeatedly failed in the harness ("no active turn") while `cargo ...` worked; use `cargo fmt -p vault-app -- --check 2>&1 | grep -A30 <file>` (read-only) and apply the shown diff by hand with Edit.
 

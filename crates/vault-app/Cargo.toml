@@ -48,12 +48,19 @@ log = "^0.4.34"
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
 # Wipes decrypted attachment previews and copy buffers. Already in the graph via vault-core.
 zeroize = "^1.8.1"
+# Inflates the embedded brand-icon table (build.rs deflates it: 4.7 MB of TSV to ~2 MB).
+# Pure-Rust miniz_oxide backend; already in the graph via zip, so no new code.
+flate2 = { version = "^1.1.10", default-features = false, features = ["rust_backend"] }
 
 # Compile Metal shaders at launch instead of in build.rs. Building them ahead of time
 # needs Xcode's separate Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`),
 # which is not installed by default. Revisit for release builds.
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_macos = { package = "gpui-pre-macos", version = "=0.3.10", features = ["runtime_shaders"] }
+
+[build-dependencies]
+# Deflates assets/brand-icons.tsv into OUT_DIR (see build.rs). Same version as above.
+flate2 = { version = "^1.1.10", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 # `TestAppContext` + `#[gpui::test]` for AppState tests.

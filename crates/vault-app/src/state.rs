@@ -916,6 +916,15 @@ impl AppState {
         } else {
             Duration::ZERO
         };
+        if busy.is_unlock() {
+            // Inflate and parse the brand pack (~33 ms) while the KDF runs, not on the UI
+            // thread at the first list draw. A concurrent first lookup waits on the LazyLock.
+            executor
+                .spawn(async {
+                    crate::icon::BrandPack::get();
+                })
+                .detach();
+        }
         #[cfg(test)]
         let (work_time, clock) = (self.fake_work_time, executor.clone());
         // Signalled when `work` returns, so quit can wait for it (`wait_for_background`).

@@ -4,4 +4,4 @@
 - [notify watcher](notify-watcher.md) — poll() design, single recursive parent watch + NoCache, FSEvents quirks, NFC matching (APFS masks it in tests), WaitingForBlobs
 - [workspace fmt/concurrency](feedback-workspace-fmt.md) — never cargo fmt --all in write mode; for vault-app use rustfmt --edition 2024 on just your files when others edit the crate; other agents edit other crates concurrently
 - [vault-app session guards](vault-app-session-guards.md) — session_gen/lock_gen for secondary windows, clipboard lock guard, gpui double-lease panic, bounded_read.rs, CLI sanitize_line, slow app tests
-- [build profiles](build-profiles.md) — dist profile choice + numbers, what fills __const (brand-icons.tsv), noisy-bench protocol, panic=abort banned
+- [build profiles](build-profiles.md) — dist profile choice + numbers, brand-icons.tsv now compressed via build.rs (sizes, decode cost), rustfmt blocked -> use cargo fmt --check, noisy-bench protocol, panic=abort banned

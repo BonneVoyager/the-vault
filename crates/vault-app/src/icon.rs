@@ -19,6 +19,10 @@
 //! the label left at the end is the brand slug candidate (`mail.google.com` → `google`,
 //! `bbc.co.uk` → `bbc`). IP addresses, single-label hosts and IPv6 literals have none. No
 //! network lookups and no full public-suffix list.
+//!
+//! The brand pack ships zlib-compressed (~2.0 MB, see `build.rs`) and is inflated on first
+//! use; the unlock paths warm it on the background executor while the KDF runs. The
+//! inflated text (~4.7 MB) is leaked and stays on the heap for the process lifetime.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -29,7 +33,38 @@ use vault_core::{AttachmentRef, ExposeSecret as _, FieldKind, Item, ItemIcon, Uu
 use crate::listing;
 
 /// Brand logos, Simple Icons 24×24 single-path SVGs: `slug\ttitle\thex\tpath` per line.
-const BRAND_TSV: &str = include_str!("../assets/brand-icons.tsv");
+/// `assets/brand-icons.tsv` as compressed by `build.rs` (zlib-wrapped deflate), inflated by
+/// [`brand_tsv`] on the first brand lookup.
+const BRAND_DEFLATE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/brand-icons.tsv.deflate"));
+
+/// Byte length of the uncompressed table, recorded by `build.rs`.
+const BRAND_TSV_LEN: &str = env!("VAULT_BRAND_TSV_LEN");
+
+// The point of compressing: build.rs enforces the same budget; this pins it at compile time
+// for the bytes actually embedded.
+const _: () = assert!(
+    BRAND_DEFLATE.len() < 5 * 1024 * 1024 / 2,
+    "brand blob over 2.5 MiB"
+);
+
+/// Inflates the embedded brand table. The blob is build output, not user data: corruption
+/// is a broken build, so it panics.
+fn brand_tsv() -> String {
+    use std::io::Read as _;
+    let len: usize = BRAND_TSV_LEN
+        .parse()
+        .expect("VAULT_BRAND_TSV_LEN from build.rs is not a number");
+    let mut bytes = Vec::with_capacity(len);
+    flate2::read::ZlibDecoder::new(BRAND_DEFLATE)
+        .read_to_end(&mut bytes)
+        .expect("embedded brand-icon table is corrupt (zlib inflate failed)");
+    assert_eq!(
+        bytes.len(),
+        len,
+        "embedded brand-icon table inflated to the wrong length"
+    );
+    String::from_utf8(bytes).expect("embedded brand-icon table is not UTF-8")
+}
 
 /// Asset path prefix under which [`brand_svg`] serves pack logos (`brand/github.svg`).
 pub const BRAND_ASSET_PREFIX: &str = "brand/";
@@ -119,7 +154,11 @@ pub struct BrandPack {
     brands: HashMap<&'static str, Brand>,
 }
 
-static PACK: LazyLock<BrandPack> = LazyLock::new(|| BrandPack::parse(BRAND_TSV));
+/// The inflated table is leaked here, once per process (a `LazyLock` initialiser runs at
+/// most once), so [`Brand`] and the pack's keys stay `&'static str` as they were when the
+/// table was `include_str!`ed.
+static PACK: LazyLock<BrandPack> =
+    LazyLock::new(|| BrandPack::parse(Box::leak(brand_tsv().into_boxed_str())));
 
 impl BrandPack {
     pub fn get() -> &'static BrandPack {

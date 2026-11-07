@@ -15,8 +15,14 @@ panic=abort (20.9 MB) is banned by the orchestrator: catch_unwind boundaries (KD
 gpui's own catch_unwind uses are all in tests. opt-level="s" (20.8 MB) costs ~22% unlock and ~30% merge proptest time.
 
 **How to apply:**
-- __TEXT,__const is ~6.6 MB, of which ~4.5 MB is `include_str!` of crates/vault-app/assets/brand-icons.tsv (icon.rs BRAND_TSV);
-  compressing it is the next big size win (app-code change). App already embeds only a subset of gpui-kit-assets icons (icon_assets!).
+- brand-icons.tsv (4.69 MB) is now zlib-compressed by crates/vault-app/build.rs into OUT_DIR (2.00 MB) and inflated
+  lazily in icon.rs (2026-11-07): dist 24,978,048 -> 22,303,200 B. First BrandPack::get() in release ~33 ms
+  (inflate ~19 ms miniz_oxide + parse ~13 ms). Warmed by a detached background task in state.rs `run_bg_timed` when
+  `busy.is_unlock()` (covers password + Touch ID); the single Box::leak lives in the PACK initialiser (coordinator review).
+- `collapse_tests::mid_slide_inset_follows_the_sidebar_width` uses real-time sleeps and flakes in the full suite under load;
+  passes alone. Not a regression signal. App already embeds only a subset of gpui-kit-assets icons (icon_assets!).
+- In agent sessions bare `rustfmt` (and shell loops / `$(...)`) can be blocked by the permission layer; `cargo fmt -p X -- --check`
+  works, so read its diff and hand-apply. The repo rustfmt config wraps shorter than 100 cols (don't guess, check).
 - image codecs (exr, webp, tiff...) are hard-enabled by gpui-pre itself; cannot be dropped from vault-app. regex comes via gpui too.
 - Perf benches here are noisy: other agents compile concurrently (load avg 15-60 on 10 cores) and edit crates mid-run
   (builds can break transiently). Use seeded single-thread proptests: `PROPTEST_RNG_SEED=42 VAULT_PROPTEST_CASES=200 <merge_props bin> --test-threads=1`

@@ -76,6 +76,30 @@ fn pack_loads_and_has_github() {
     assert_eq!(brand_svg("no-such-brand"), None);
 }
 
+/// The compressed table inflates to the source TSV byte for byte, so the pack is what the
+/// old `include_str!` produced: same brand count, same GitHub entry.
+#[test]
+fn compressed_pack_matches_source_table() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/brand-icons.tsv"
+    ))
+    .unwrap();
+    // The 2.5 MiB budget is a compile-time assert in icon.rs.
+    assert!(
+        brand_tsv() == src,
+        "inflated table differs from the source TSV"
+    );
+
+    let pack = BrandPack::get();
+    assert_eq!(pack.brand_count(), BRAND_COUNT);
+    let (_, gh) = pack.brand("github").unwrap();
+    assert_eq!((gh.title, gh.hex), ("GitHub", 0x181717));
+}
+
+/// Brands in `assets/brand-icons.tsv` that pass [`BrandPack::parse`]; update with the table.
+const BRAND_COUNT: usize = 3466;
+
 #[test]
 fn every_pack_svg_parses_with_gpuis_renderer() {
     struct NoAssets;

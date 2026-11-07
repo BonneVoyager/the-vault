@@ -843,3 +843,23 @@ large 1PUX → app stays responsive, "Unlocking…"-style busy state; backup vie
 symlinked backup → readable refusal, no path.
 
 Bug hunt: run for this wave (2026-11-06); the fixes themselves are review-covered, not re-hunted.
+
+## Polish (2026-11-07): brand table compressed, hold-⌥ in item windows
+
+- Brand-icon table (4.69 MB TSV) is zlib-compressed by `crates/vault-app/build.rs` (flate2
+  ^1.1.10, `rust_backend`, already in the lock via zip; no new code in the tree) into
+  `$OUT_DIR`, inflated once inside the `PACK` LazyLock (≈19 ms) and leaked (≈4.7 MB heap for
+  the process lifetime), warmed on the background executor during every unlock so the first
+  list frame does not pay it. Dist binary 24 978 048 → 22 303 200 bytes (−2.67 MB).
+  `BRAND_COUNT = 3466` in tests must follow the table.
+- Item windows: per-window `option_reveal`; reveals only while ⌥ alone is held, the window is
+  key and focus is inside; cleared on key loss, focus to overlay, lock, switch, delete; the
+  window refocuses its root when focus points at nothing. Main window never reveals at the
+  same time. Spec 05 updated. Code review SHIP; follow-ups (test leak, warm-up, refocus,
+  two tests) applied.
+- fmt/clippy clean; 106 icon/item_window/option/unlock tests pass. Known flaky under load:
+  `collapse_tests::mid_slide_inset_follows_the_sidebar_width` (real-time sleep; passed alone).
+
+Owner eye checks passed 2026-11-07 (item-window ⌥ reveal, main stays masked, no hitch on first logo after unlock).
+
+Bug hunt: not yet run for this wave (small, review-covered; fold into the next hunt).
