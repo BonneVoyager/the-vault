@@ -2,7 +2,7 @@
 
 # The Vault
 
-A native macOS password manager in Rust: no webview, local-first, and one encrypted file you can put anywhere.
+A native macOS password manager in Rust: efficient, local-first, and one encrypted file you can put anywhere.
 
 ## Status
 
@@ -16,11 +16,13 @@ Pre-release and not yet signed or notarized. It is built and reviewed by an agen
 - Touch ID unlock through a Secure Enclave wrapped key
 - TOTP codes with a countdown, including QR-code import from an image file
 - Password and passphrase generator
+- Hold ⌥ to reveal every masked value of the shown item, in the main window or an item window
 - Tags, search, and weak or reused password warnings (local audit)
 - File attachments, encrypted per file, up to 100 MB each
 - Item icons: automatic brand logos from a bundled, offline icon pack, or a symbol, colour, or custom image chosen per item
 - Sync through any folder (iCloud Drive, Dropbox, NAS) with field-level merge and conflict-copy absorption
 - Rotating encrypted backups
+- Recently Deleted: deleted items can be recovered for 30 days, then they are permanently removed
 - Import from CSV, 1Password (1PUX), and KeePass (KDBX 3/4, with optional key file)
 - Forward-compatible file format: unknown slot, item, and field kinds are preserved
 - Command-line tool for scripting and debugging
@@ -92,6 +94,7 @@ Output goes to `target/package/` as `Vault.app`, a `.dmg`, and `Vault.app.dSYM` 
 - Attachments are not backed up. A restored backup may reference blobs that no longer exist, and the app shows them as missing.
 - Vault format 2 (fields identified by id; duplicate and empty field names allowed) is written for new vaults. A format 1 vault keeps its version until it is upgraded, which the app does automatically on the next password unlock (Touch ID must then be enabled again) and the CLI does with `vault upgrade`. Until then, an older build opening the same format 1 file still merges fields by name and can drop a second field with the same name.
 - HEIC images have no in-app preview.
+- A vault file is limited to 64 MiB and each field value to 1 MiB; the app refuses to save past the limit and shows a banner until large notes are removed (also from Recently Deleted). 1Password exports are read up to 1 GiB; CSV files up to 64 MiB; KeePass databases up to 100 MiB.
 - No leaked-password checks, because the app never uses the network.
 - No YubiKey, hardware key, or key file support for unlocking a Vault file.
 - KeePass import transfers entries and password history, but not attachments, custom icons, or auto-type settings.

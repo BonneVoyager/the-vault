@@ -882,6 +882,15 @@ Bug hunt: not yet run for this wave (small, review-covered; fold into the next h
   stale status line after unlock/clean merge (`clear_save_blocked`), status line untouched while
   a notice is active, tests for clean merge / close / largest text size / real lock+unlock.
   New files `screens/main/save_blocked.rs`, `save_blocked_tests.rs`. Spec 05 §2.3 paragraph.
-- fmt and workspace clippy clean; full workspace test run in flight (reported in the checkpoint).
+- README: Recently Deleted, hold-⌥, size limits added.
+
+## CHECKPOINT — Gaps wave complete (2026-11-07)
+
+fmt and clippy clean. `cargo test --workspace`: 1123 passed, 0 failed, 14 ignored. QA ledger 205/205.
+Uncommitted: 15 files incl. 2 new (`save_blocked.rs`, `save_blocked_tests.rs`).
+
+Owner eye checks: at the largest text size the strip sits under the search row and both columns
+start at its bottom edge (needs a too-large vault to see; or trust the test); Settings status
+line clears after lock + unlock.
 
 Bug hunt: not yet run for this wave.
