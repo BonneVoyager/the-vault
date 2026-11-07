@@ -862,3 +862,161 @@ fn symlinked_blob_is_missing_even_if_the_hook_says_evicted() {
         AttachmentState::NotDownloaded
     );
 }
+
+// --- bug hunt 2026-11-06 M1: never write a vault file over the read cap ---
+
+/// A notes value that makes the sealed vault a little over [`MAX_VAULT_FILE_SIZE`].
+fn huge_item() -> Item {
+    let big = "x".repeat(usize::try_from(MAX_VAULT_FILE_SIZE).unwrap() + 1024 * 1024);
+    let mut it = Item::new("huge", Uuid::nil(), NOW);
+    it.fields.push(vault_core::Field::new(
+        "notes",
+        vault_core::FieldKind::Notes,
+        SecretString::new(big),
+        NOW,
+    ));
+    it
+}
+
+fn assert_too_large(err: &SyncError) {
+    assert!(
+        matches!(err, SyncError::VaultTooLarge { bytes, cap }
+            if *cap == MAX_VAULT_FILE_SIZE && *bytes > MAX_VAULT_FILE_SIZE),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn save_over_the_read_cap_is_refused_and_leaves_the_disk_unchanged() {
+    let (_dir, path, mut v, _item) = setup();
+    let file = path.join(VAULT_FILE_NAME);
+    let before = fs::read(&file).unwrap();
+    let pkg_before = names(&path);
+    let backups_before = names(&path.join("backups"));
+    let rx = v.subscribe();
+    let huge = v.edit(|vault| vault.insert(huge_item(), NOW)).unwrap();
+    let err = v.save().unwrap_err();
+    assert_too_large(&err);
+    assert!(err.to_string().contains("limit 64 MiB"), "{err}");
+    // Nothing on disk changed: no temp file, no snapshot, same primary.
+    assert_eq!(fs::read(&file).unwrap(), before);
+    assert_eq!(names(&path), pkg_before);
+    assert_eq!(names(&path.join("backups")), backups_before);
+    assert!(!events(&rx).contains(&SyncEvent::CorruptOnDisk));
+    // Still dirty and intact; a second attempt fails the same way.
+    assert!(v.is_dirty());
+    assert!(v.vault().unwrap().get(huge).is_some());
+    assert_too_large(&v.save().unwrap_err());
+    // Shrinking it makes the next save work, and the result opens.
+    // (A plain delete keeps the content in Recently Deleted, so it would still be too large.)
+    v.edit(|vault| {
+        vault.delete(huge, NOW + 1)?;
+        vault.delete_permanently(huge, NOW + 2)
+    })
+    .unwrap()
+    .unwrap();
+    v.save().unwrap();
+    assert!(!v.is_dirty());
+    assert_eq!(titles_in(&file), vec!["mail"]);
+}
+
+#[test]
+fn lock_does_not_write_an_unsaved_copy_over_the_read_cap() {
+    let (_dir, path, mut v, _item) = setup();
+    let backups_before = names(&path.join("backups"));
+    v.edit(|vault| vault.insert(huge_item(), NOW)).unwrap();
+    match v.lock() {
+        LockOutcome::Unpreserved(e) => assert_too_large(&e),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(names(&path.join("backups")), backups_before);
+}
+
+/// The merge write-back (03 §3 step 6) of a merged vault over the cap: a peer's readable file
+/// is merged, the write-back is refused, the peer's file stays and is not reported corrupt.
+#[test]
+fn merge_write_back_over_the_cap_overwrites_nothing() {
+    let (_dir, path, mut a, _item) = setup();
+    let file = path.join(VAULT_FILE_NAME);
+    a.start_watching().unwrap();
+    let rx = a.subscribe();
+    a.edit(|vault| vault.insert(huge_item(), NOW)).unwrap();
+    // B (another process) writes a small change.
+    let mut b = SyncedVault::open(&path, DEV_A, Arc::new(NoopHooks)).unwrap();
+    b.unlock(&pw()).unwrap();
+    touch(&mut b, "from-b");
+    b.save().unwrap();
+    drop(b);
+    let peer = fs::read(&file).unwrap();
+    let mut seen = Vec::new();
+    assert!(wait_until(|| {
+        a.poll();
+        seen.extend(events(&rx));
+        seen.iter().any(|e| matches!(e, SyncEvent::Merged(_)))
+    }));
+    // Give the write-back's error a chance to arrive.
+    for _ in 0..5 {
+        a.poll();
+        seen.extend(events(&rx));
+    }
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, SyncEvent::Error(m) if m.contains("too large to save"))),
+        "{seen:?}"
+    );
+    assert!(!seen.contains(&SyncEvent::CorruptOnDisk), "{seen:?}");
+    assert_eq!(fs::read(&file).unwrap(), peer);
+    assert_eq!(titles_in(&file), vec!["from-b", "mail"]);
+    // Ours holds both sides, still dirty; an explicit save is refused the same way.
+    assert!(a.is_dirty());
+    assert!(a.vault().unwrap().items().any(|i| i.title == "from-b"));
+    assert_too_large(&a.save().unwrap_err());
+    assert_eq!(fs::read(&file).unwrap(), peer);
+}
+
+// --- bug hunt 2026-11-06 L3: package entries read without following links ---
+
+#[test]
+fn read_package_entry_capped_refuses_links_and_oversize_files() {
+    let (_dir, path, mut v, _item) = setup();
+    let snap = v.backup_now().unwrap();
+    let bytes = vault_sync::read_package_entry_capped(&snap).unwrap();
+    assert!(LockedVault::parse(&bytes).is_ok());
+    // A symlink in backups/ to a valid vault file elsewhere is refused, not parsed.
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("elsewhere.vault.bin");
+    fs::copy(&snap, &target).unwrap();
+    let link = path.join("backups").join("test-2020-01-01T00-00-00Z.vault");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let err = vault_sync::read_package_entry_capped(&link).unwrap_err();
+    assert!(
+        matches!(err, SyncError::UnsafePackageEntry(ref p) if *p == link),
+        "{err:?}"
+    );
+    // A directory is not a regular file either.
+    let err = vault_sync::read_package_entry_capped(&path.join("backups")).unwrap_err();
+    assert!(matches!(err, SyncError::UnsafePackageEntry(_)), "{err:?}");
+    plant_sized(&snap, MAX_VAULT_FILE_SIZE + 1);
+    let err = vault_sync::read_package_entry_capped(&snap).unwrap_err();
+    assert!(matches!(err, SyncError::PrimaryTooLarge(_)), "{err:?}");
+    let err = vault_sync::read_package_entry_capped(&path.join("backups/none")).unwrap_err();
+    assert!(matches!(err, SyncError::Io { .. }), "{err:?}");
+}
+
+#[test]
+fn conflict_package_with_a_linked_vault_bin_is_not_listed() {
+    let (_dir, path, v, _item) = setup();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("vault.bin");
+    fs::copy(path.join(VAULT_FILE_NAME), &target).unwrap();
+    let backups = path.join("backups");
+    let linked = backups.join("conflict-2026-10-28T14-03-11Z-test 2.vault");
+    fs::create_dir_all(&linked).unwrap();
+    std::os::unix::fs::symlink(&target, linked.join(VAULT_FILE_NAME)).unwrap();
+    // A conflict package without vault.bin is still listed (size 0), as before.
+    let empty = backups.join("conflict-2026-10-28T14-03-12Z-test 3.vault");
+    fs::create_dir_all(&empty).unwrap();
+    let listed = v.backups().unwrap();
+    assert!(!listed.iter().any(|b| b.path == linked), "{listed:?}");
+    assert!(listed.iter().any(|b| b.path == empty && b.size == 0));
+}

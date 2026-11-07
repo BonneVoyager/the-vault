@@ -316,6 +316,68 @@ v sync >"$T/o" 2>&1; rc=$?
 v list >"$T/o2" 2>&1
 if [ $rc -ne 101 ] && grep -q FromWaiting "$T/o2" && [ -e "$T/sy 4.vault" ]; then ok "sync merges a blob-waiting package but does not move it"; else bad "sync waiting package" "rc=$rc exists=$([ -e "$T/sy 4.vault" ] && echo y || echo n) $(cat "$T/o")"; fi
 
+# ---- 2026-11-06: review fixes (D-1 symlinks, D-5 sanitize_line, D-10 caps, D-11 sync drain) ----
+export VAULT_FILE="$T/rv.vault"
+v init --kdf-test-params >/dev/null 2>&1
+ESC=$(printf '\033'); BEL=$(printf '\007'); CR=$(printf '\r')
+EVIL_T="Evil${ESC}[31mRED${ESC}]0;pwned${BEL}${CR}Fake"
+EVIL_TAG="t${ESC}[2J"
+v add --title "$EVIL_T" --tag "$EVIL_TAG" >"$T/o" 2>&1 || bad "add title with control chars" "$(cat "$T/o")"
+EVIL_ID="$EVIL_T"
+v edit "$EVIL_ID" --add "text:n${ESC}[1m=v${ESC}[5m${BEL}" >"$T/o" 2>&1 || echo "INFO edit add evil field: $(cat "$T/o")"
+printf 'x' >"$T/a${ESC}[7m.txt"
+v attach add "$EVIL_ID" "$T/a${ESC}[7m.txt" >"$T/o" 2>&1 || echo "INFO attach add evil name: $(cat "$T/o")"
+san() { local label="$1"; shift; v "$@" >"$T/o" 2>&1
+  if LC_ALL=C grep -q "[$ESC$BEL$CR]" "$T/o"; then bad "sanitize: '$label' prints raw control characters" "$(LC_ALL=C od -c "$T/o" | grep -m2 '033\|007\|\\r')"; else ok "sanitize: '$label' has no raw ESC/BEL/CR"; fi; }
+san "list" list
+san "get" get "$EVIL_ID"
+san "get --reveal" get "$EVIL_ID" --reveal
+san "get --ids" get "$EVIL_ID" --ids
+san "attach list" attach list "$EVIL_ID"
+san "list --tag" list --tag "$EVIL_TAG"
+san "export to stdout?" export --yes --out "$T/evil.csv"
+v get "nope${ESC}]0;x${BEL}" >"$T/o" 2>&1
+LC_ALL=C grep -q "[$ESC$BEL]" "$T/o" && bad "sanitize: not-found error echoes control characters" "$(od -c "$T/o" | head -3)" || ok "sanitize: not-found error"
+# a newline in a title must not forge an extra list row
+NL_T="$(printf 'Line1\nFORGED-ROW')"
+v add --title "$NL_T" >/dev/null 2>&1
+v list >"$T/o" 2>&1
+grep -q "^FORGED-ROW" "$T/o" && bad "sanitize: newline in title forges a list row" "$(cat "$T/o")" || ok "sanitize: newline in title stays on its row"
+
+# vault sync drains more than 8 per-file conflict copies in one invocation (03 §2 D-11)
+cp -R "$VAULT_FILE" "$T/rvbase.vault"
+for i in $(seq 2 21); do
+  rm -rf "$T/st.vault"; cp -R "$T/rvbase.vault" "$T/st.vault"
+  "$V" --vault "$T/st.vault" --password-env MPW add --title "drain$i" >/dev/null 2>&1
+  cp "$T/st.vault/vault.bin" "$VAULT_FILE/vault $i.bin"
+done
+v sync >"$T/o" 2>&1; rc=$?
+n=$(v list 2>/dev/null | grep -c "drain[0-9]")
+left=$(ls "$VAULT_FILE" | grep -c "^vault [0-9]*\.bin$")
+[ $rc -eq 0 ] && [ "$n" = "20" ] && [ "$left" = "0" ] && ok "one 'vault sync' absorbs 20 per-file copies" || bad "sync drain of 20 copies" "rc=$rc merged=$n left=$left $(tail -3 "$T/o")"
+
+# 70 MB attachment: the 64 MiB read caps must not reject a legitimate attachment (01 §4: 100 MB)
+v add --title Big >/dev/null 2>&1
+head -c 70000000 /dev/urandom >"$T/big.bin"
+v attach add Big "$T/big.bin" >"$T/o" 2>&1 && ok "attach add 70 MB" || bad "attach add 70 MB" "$(cat "$T/o")"
+bid=$(v attach list Big 2>/dev/null | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+v attach get Big "$bid" "$T/big.out" >"$T/o" 2>&1
+cmp -s "$T/big.bin" "$T/big.out" && ok "attach get 70 MB round trip" || bad "attach get 70 MB" "$(cat "$T/o")"
+rm -f "$T/big.bin" "$T/big.out"
+
+# symlinked .lock: refused, not degraded to the no-lock path (03 §2 D-1)
+rm -f "$VAULT_FILE/.lock"; ln -s "$T/lock-target" "$VAULT_FILE/.lock"
+cp "$VAULT_FILE/vault.bin" "$T/lk-before.bin"
+v add --title ViaLink >"$T/o" 2>&1; rc=$?
+if [ $rc -ne 0 ] && [ $rc -ne 101 ] && cmp -s "$T/lk-before.bin" "$VAULT_FILE/vault.bin" && [ ! -e "$T/lock-target" ]; then ok "symlinked .lock refused, nothing written"; else bad "symlinked .lock" "rc=$rc target-exists=$([ -e "$T/lock-target" ] && echo y || echo n) $(cat "$T/o")"; fi
+rm -f "$VAULT_FILE/.lock"
+
+# rm puts the item in the trash; the CLI cannot see it but the content is kept (02 delete)
+v add --title TrashMe >/dev/null 2>&1
+v rm TrashMe >"$T/o" 2>&1 && ok "rm into trash" || bad "rm" "$(cat "$T/o")"
+v list >"$T/o" 2>&1
+grep -q TrashMe "$T/o" && bad "rm: item still listed" || ok "rm: item hidden from list"
+
 echo
 echo "CLI checks: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]

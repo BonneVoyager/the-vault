@@ -23,6 +23,11 @@ pub enum ImportError {
     /// Unreadable archive or JSON. Never contains secret values.
     #[error("malformed import: {0}")]
     Malformed(String),
+    /// The input, or the part of it the importer would have to hold in memory, is over a
+    /// size bound (1PUX: the declared or inflated size of `export.data`, bug hunt 2026-11-06
+    /// M2). The payload names the bound, never any content.
+    #[error("import too large: {0}")]
+    TooLarge(String),
     #[error(
         "Could not open the KeePass database. Check its password and key file. The file may be damaged or use unsupported encryption."
     )]
@@ -192,6 +197,67 @@ const MAX_EXPORT_DATA: u64 = 64 * 1024 * 1024;
 
 fn malformed(msg: &str) -> ImportError {
     ImportError::Malformed(msg.to_owned())
+}
+
+fn too_large(msg: &str) -> ImportError {
+    ImportError::TooLarge(msg.to_owned())
+}
+
+/// Upper bound on the number of entries a 1PUX archive may declare (security review
+/// 2026-11-06). `ZipArchive::new` materialises one record per declared entry before any
+/// per-entry bound applies, and the app reads 1PUX files up to 1 GiB, so the count is
+/// checked from the End of Central Directory record first. A real export holds
+/// `export.data`, `export.attributes` and one `files/` entry per document attachment.
+const MAX_ZIP_ENTRIES: u64 = 10_000;
+/// The fixed part of the EOCD record; a comment of up to `u16::MAX` bytes may follow it.
+const EOCD_LEN: usize = 22;
+const EOCD_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
+
+/// Refuse an archive whose End of Central Directory record declares more than
+/// [`MAX_ZIP_ENTRIES`] entries, before the zip reader builds its directory.
+///
+/// Mirrors how zip 2.6.1 finds the record: the signature is searched backwards from the
+/// end over the last `EOCD_LEN + u16::MAX` bytes (the record plus the longest possible
+/// comment). Every candidate whose comment fits in the file is checked, not just the last,
+/// so a fake record appended behind a real one cannot hide the real count; zip 2.6.1 reads
+/// the zip32 count from the "entries on this disk" field, so both count fields are bounded.
+/// An EOCD with either ZIP64 marker (`u16::MAX` entries or a `u32::MAX` directory offset)
+/// is refused too: the reader would take the real values from a ZIP64 record, and no 1PUX
+/// the app can read (1 GiB) needs one. With no plausible record in the window the archive
+/// is `Malformed` (zip would keep scanning through trailing junk; a 1PUX has none). The
+/// messages are fixed strings and never echo bytes from the file.
+fn check_zip_entry_count(bytes: &[u8]) -> Result<(), ImportError> {
+    let len = bytes.len();
+    if len < EOCD_LEN {
+        return Err(malformed("not a valid zip archive"));
+    }
+    let window_start = len.saturating_sub(EOCD_LEN + usize::from(u16::MAX));
+    let mut found = false;
+    for pos in (window_start..=len - EOCD_LEN).rev() {
+        let record = &bytes[pos..pos + EOCD_LEN];
+        if record[..4] != EOCD_SIGNATURE {
+            continue;
+        }
+        let u16_at = |at: usize| u16::from_le_bytes([record[at], record[at + 1]]);
+        let comment_len = usize::from(u16_at(20));
+        if pos + EOCD_LEN + comment_len > len {
+            continue;
+        }
+        found = true;
+        let on_this_disk = u16_at(8);
+        let total = u16_at(10);
+        let directory_offset = u32::from_le_bytes([record[16], record[17], record[18], record[19]]);
+        if total == u16::MAX || directory_offset == u32::MAX {
+            return Err(too_large("1PUX archive declares a ZIP64 central directory"));
+        }
+        if u64::from(on_this_disk.max(total)) > MAX_ZIP_ENTRIES {
+            return Err(too_large("1PUX archive declares more than 10000 entries"));
+        }
+    }
+    if !found {
+        return Err(malformed("not a valid zip archive"));
+    }
+    Ok(())
 }
 
 fn str_of<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
@@ -440,17 +506,36 @@ fn convert_1pux_item(src: &serde_json::Value, device_id: Uuid, now: Millis) -> I
 pub fn import_1pux(bytes: &[u8], device_id: Uuid, now: Millis) -> Result<Vec<Item>, ImportError> {
     use std::io::Read;
 
+    check_zip_entry_count(bytes)?;
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|_| malformed("not a valid zip archive"))?;
+    let index = zip
+        .index_for_name("export.data")
+        .ok_or_else(|| malformed("missing export.data"))?;
+    // Bound `export.data` from the central directory *before* any inflation (bug hunt
+    // 2026-11-06 M2): `by_index_raw` hands back the entry's metadata without building a
+    // decompressor, and `size()` is the uncompressed size the archive declares. The archive
+    // as a whole is not bounded here (a real 1PUX carries document attachments under
+    // `files/`, which this importer never opens), so this is the only bound on the JSON the
+    // caller ends up holding. The declared size can lie, so the inflate path below keeps its
+    // own `take(MAX + 1)` backstop; together they refuse both an honest oversize entry (before
+    // reading a byte of it) and a zip bomb that declares itself small.
+    let declared = zip
+        .by_index_raw(index)
+        .map_err(|_| malformed("cannot read export.data"))?
+        .size();
+    if declared > MAX_EXPORT_DATA {
+        return Err(too_large("export.data is larger than 64 MiB"));
+    }
     let file = zip
-        .by_name("export.data")
-        .map_err(|_| malformed("missing export.data"))?;
+        .by_index(index)
+        .map_err(|_| malformed("cannot read export.data"))?;
     let mut data = Zeroizing::new(Vec::new());
     file.take(MAX_EXPORT_DATA + 1)
         .read_to_end(&mut data)
         .map_err(|_| malformed("cannot read export.data"))?;
     if data.len() as u64 > MAX_EXPORT_DATA {
-        return Err(malformed("export.data too large"));
+        return Err(too_large("export.data inflates past 64 MiB"));
     }
     // NOTE: the `serde_json::Value` tree cannot be zeroized on drop (same limitation as the CBOR
     // tree in format.rs); only the raw buffer and intermediate strings are wiped.

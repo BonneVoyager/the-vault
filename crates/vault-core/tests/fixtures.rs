@@ -1159,8 +1159,8 @@ fn every_fixture_in_the_directory_opens() {
         .collect();
     names.sort();
     assert!(
-        names.len() >= 9,
-        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-icon, v1-meta, v1-stamped, v2-basic, v2-meta; found {names:?}"
+        names.len() >= 10,
+        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-icon, v1-meta, v1-stamped, v2-basic, v2-meta, v2-trash-legacy; found {names:?}"
     );
     assert!(names.iter().any(|n| n.starts_with("v1-")));
     assert!(names.iter().any(|n| n.starts_with("v2-")));
@@ -1174,6 +1174,7 @@ fn every_fixture_in_the_directory_opens() {
                 | "v1-meta.vault"
                 | "v2-basic.vault"
                 | "v2-meta.vault"
+                | "v2-trash-legacy.vault"
         )
     };
     for name in &names {

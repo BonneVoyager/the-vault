@@ -650,6 +650,9 @@ impl SyncedVault {
         // Step 1. Re-parse first: it is cheap, keeps `locked` current for the next unlock, and
         // guarantees we never put bytes on disk that we could not read back.
         let bytes = vault.serialize();
+        // Never write what a read would refuse (03 §2, finding M1): checked before the
+        // re-parse and before any temp file; `dirty` stays set.
+        check_vault_size(&bytes)?;
         let item_count = vault.items().count();
         let locked = LockedVault::parse(&bytes)?;
         // A primary that went missing is recreated without replacing: if a peer's file lands
@@ -699,6 +702,7 @@ impl SyncedVault {
     /// such), but the directory fsync failed, so the write is not known durable; the caller
     /// must keep a retry pending.
     fn write(&mut self, bytes: &[u8], mode: Mode) -> Result<Result<(), SyncError>, SyncError> {
+        check_vault_size(bytes)?;
         let written = write_atomic_stat(&self.file, bytes, mode)?;
         self.last_written = Some(fingerprint_after_write(
             &self.file,
@@ -1124,6 +1128,20 @@ impl SyncedVault {
     }
 }
 
+/// [`SyncError::VaultTooLarge`] if `bytes` exceed [`MAX_VAULT_FILE_SIZE`]: every write of a
+/// vault file (primary or backup) checks this first, so nothing is ever written that the
+/// capped read would refuse.
+pub(crate) fn check_vault_size(bytes: &[u8]) -> Result<(), SyncError> {
+    let len = bytes.len() as u64;
+    if len > MAX_VAULT_FILE_SIZE {
+        return Err(SyncError::VaultTooLarge {
+            bytes: len,
+            cap: MAX_VAULT_FILE_SIZE,
+        });
+    }
+    Ok(())
+}
+
 fn not_found(path: &Path) -> SyncError {
     SyncError::io(path, ErrorKind::NotFound.into())
 }
@@ -1148,6 +1166,20 @@ fn read_with_stat_hooked(
     let meta = file.metadata()?;
     let bytes = read_handle_capped(&mut file, &meta, MAX_VAULT_FILE_SIZE)?;
     Ok((bytes, meta))
+}
+
+/// Read a vault file inside a package (a backup snapshot, the `vault.bin` of an absorbed
+/// conflict package) the way the package itself reads it (03 §2 D-1): opened with
+/// `O_NOFOLLOW`, required to be a regular file after `fstat`, and capped at
+/// [`MAX_VAULT_FILE_SIZE`]. A symlink, FIFO, device or directory is
+/// [`SyncError::UnsafePackageEntry`]; a larger file is [`SyncError::PrimaryTooLarge`]; any
+/// other failure (including a missing file) is [`SyncError::Io`]. Only the final component is
+/// checked: a caller handing in `<dir>/vault.bin` must first make sure `<dir>` itself is not a
+/// symlink (`symlink_metadata`). The bytes are the sealed vault; they are not wiped.
+pub fn read_package_entry_capped(path: &Path) -> Result<Vec<u8>, SyncError> {
+    read_with_stat(path)
+        .map(|(bytes, _)| bytes)
+        .map_err(|e| read_error(path, e))
 }
 
 /// Read all of the regular file at `path`, refusing one larger than `cap` bytes with

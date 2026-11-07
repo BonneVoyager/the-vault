@@ -64,6 +64,11 @@ impl Generator {
         &self.preview
     }
 
+    #[cfg(test)]
+    fn set_preview_for_tests(&mut self, preview: SecretString) {
+        self.preview = preview;
+    }
+
     pub fn regenerate(&mut self) {
         self.preview = match self.tab {
             GenTab::Password => password(&self.password),
@@ -178,11 +183,9 @@ impl AppState {
             return;
         };
         let value = self.generator.preview().clone();
-        if let Mode::Edit(b) | Mode::New(_, b) = &mut self.mode
-            && let Some(i) = b.index(key)
-        {
-            b.item.fields[i].value = value;
-            b.pushed.push(key);
+        if let Mode::Edit(b) | Mode::New(_, b) = &mut self.mode {
+            // Capped like typed input (§2.3).
+            b.fill_value(key, value);
         }
         self.generator_target = None;
         cx.notify();
@@ -191,9 +194,36 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use vault_core::ExposeSecret as _;
+    use gpui::{AppContext as _, TestAppContext};
+    use vault_core::{ExposeSecret as _, Field, Item, Uuid};
 
     use super::*;
+    use crate::state::EditBuffer;
+
+    /// "Use" goes through the edit buffer's cap (§2.3): an over-long preview is cut,
+    /// flagged and pushed to the input.
+    #[gpui::test]
+    fn use_generated_is_capped(cx: &mut TestAppContext) {
+        let limit = EditBuffer::FIELD_LIMIT_BYTES;
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        state.update(cx, |st, cx| {
+            let mut item = Item::new("t", st.device_id(), 1);
+            let blank = SecretString::new(String::new());
+            item.fields = vec![Field::new("password", FieldKind::Password, blank, 1)];
+            st.mode = Mode::Edit(EditBuffer::new(item));
+            let key = st.edit_buffer().unwrap().keys[0];
+            st.generator_target = Some(GeneratorTarget::Field(key));
+            st.generator
+                .set_preview_for_tests(SecretString::new("g".repeat(limit + 3)));
+            st.use_generated(cx);
+
+            let b = st.edit_buffer().unwrap();
+            assert_eq!(b.field(key).unwrap().value.expose_secret().len(), limit);
+            assert!(b.row_limited(key));
+            assert_eq!(b.pushed, vec![key]);
+            assert!(st.generator_target.is_none());
+        });
+    }
 
     #[test]
     fn spec_follows_the_controls() {

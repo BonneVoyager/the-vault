@@ -253,16 +253,79 @@ fn zero_items_is_ok() {
     );
 }
 
+/// Offset of the central-directory header (`PK\x01\x02`) for `name`.
+fn central_dir_entry(zip: &[u8], name: &str) -> usize {
+    (0..zip.len().saturating_sub(46))
+        .find(|&i| {
+            zip[i..i + 4] == [0x50, 0x4b, 0x01, 0x02] && {
+                let n = usize::from(u16::from_le_bytes([zip[i + 28], zip[i + 29]]));
+                zip.get(i + 46..i + 46 + n) == Some(name.as_bytes())
+            }
+        })
+        .expect("central directory entry")
+}
+
+/// The same archive with `name`'s *declared* uncompressed size (central directory offset 24)
+/// replaced; the entry's bytes are untouched.
+fn with_declared_size(mut zip: Vec<u8>, name: &str, size: u32) -> Vec<u8> {
+    let at = central_dir_entry(&zip, name) + 24;
+    zip[at..at + 4].copy_from_slice(&size.to_le_bytes());
+    zip
+}
+
 #[test]
-fn oversized_export_data_is_malformed() {
-    // Valid JSON padded with whitespace past the 64 MiB cap.
+fn oversized_export_data_is_too_large() {
+    // Valid JSON padded with whitespace past the 64 MiB cap. The zip writer records the true
+    // size, so this is refused from the central directory, before inflation.
     let mut big = br#"{"accounts":[]}"#.to_vec();
     big.resize(64 * 1024 * 1024 + 16, b' ');
     let z = zip_with(&[("export.data", &big)]);
     assert!(matches!(
         import_1pux(&z, Uuid::nil(), NOW),
-        Err(ImportError::Malformed(_))
+        Err(ImportError::TooLarge(m)) if m.contains("larger than 64 MiB")
     ));
+    // A declared size that lies small does not get past the inflate backstop either.
+    let lying = with_declared_size(z, "export.data", 16);
+    assert!(matches!(
+        import_1pux(&lying, Uuid::nil(), NOW),
+        Err(ImportError::TooLarge(m)) if m.contains("inflates past 64 MiB")
+    ));
+}
+
+/// Bug hunt 2026-11-06 M2: the bound is on `export.data` as the central directory declares
+/// it, checked before any byte of the entry is inflated, and it is the only bound: the archive
+/// itself may be larger (1PUX exports carry document attachments under `files/`).
+#[test]
+fn declared_oversize_export_data_is_refused_before_inflation() {
+    let data = export(vec![]).to_string();
+    let scan = vec![0u8; 3 * 1024 * 1024];
+    let z = zip_with(&[
+        ("export.attributes", b"{}"),
+        ("export.data", data.as_bytes()),
+        ("files/scan.pdf", &scan),
+    ]);
+    assert!(
+        z.len() > data.len(),
+        "the sibling entry makes the archive bigger than the JSON"
+    );
+    assert!(
+        import_1pux(&z, Uuid::nil(), NOW).unwrap().is_empty(),
+        "a normal export with a large sibling entry imports"
+    );
+    // The entry's bytes are valid, so had the importer inflated them the import would have
+    // succeeded; the typed error proves the declared size was checked first.
+    let forged = with_declared_size(z, "export.data", 64 * 1024 * 1024 + 1);
+    match import_1pux(&forged, Uuid::nil(), NOW) {
+        Err(ImportError::TooLarge(m)) => assert!(m.contains("larger than 64 MiB"), "{m}"),
+        other => panic!("expected TooLarge, got {:?}", other.map(|v| v.len())),
+    }
+    // Exactly at the cap is still accepted (the check is `>`).
+    let at_cap = with_declared_size(
+        zip_with(&[("export.data", data.as_bytes())]),
+        "export.data",
+        64 * 1024 * 1024,
+    );
+    assert!(import_1pux(&at_cap, Uuid::nil(), NOW).is_ok());
 }
 
 #[test]
@@ -315,4 +378,106 @@ fn literal_suffixed_name_does_not_collide_with_generated_suffix() {
     let names: Vec<&str> = items[0].fields.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, ["x (2)", "x", "x (3)", "x (4)"]);
     assert_eq!(val(&items[0], "x (2)"), "literal");
+}
+
+/// Offset of the End of Central Directory record (`PK\x05\x06`), searched from the end.
+fn eocd(zip: &[u8]) -> usize {
+    (0..=zip.len() - 22)
+        .rev()
+        .find(|&i| zip[i..i + 4] == [0x50, 0x4b, 0x05, 0x06])
+        .expect("EOCD")
+}
+
+/// The same archive with both EOCD entry counts ("on this disk" at +8, total at +10)
+/// replaced; the central directory itself is untouched.
+fn with_declared_entries(mut zip: Vec<u8>, count: u16) -> Vec<u8> {
+    let at = eocd(&zip);
+    zip[at + 8..at + 10].copy_from_slice(&count.to_le_bytes());
+    zip[at + 10..at + 12].copy_from_slice(&count.to_le_bytes());
+    zip
+}
+
+/// Security review 2026-11-06: the entry count is bounded from the EOCD record before the zip
+/// reader builds its directory. The archive holds one real entry, so a declared count past
+/// the cap is refused with the typed error before any entry is read (had the reader run, it
+/// would have failed on the missing second entry with `Malformed` instead).
+#[test]
+fn declared_entry_count_over_the_cap_is_refused_before_any_entry_is_read() {
+    let data = export(vec![]).to_string();
+    let z = zip_with(&[("export.data", data.as_bytes())]);
+    assert!(import_1pux(&z, Uuid::nil(), NOW).unwrap().is_empty());
+
+    let over = with_declared_entries(z.clone(), 10_001);
+    match import_1pux(&over, Uuid::nil(), NOW) {
+        Err(ImportError::TooLarge(m)) => assert!(m.contains("more than 10000 entries"), "{m}"),
+        other => panic!("expected TooLarge, got {:?}", other.map(|v| v.len())),
+    }
+    // Exactly the cap passes the count check; the zip reader then trips on the lie.
+    let at_cap = with_declared_entries(z.clone(), 10_000);
+    assert!(matches!(
+        import_1pux(&at_cap, Uuid::nil(), NOW),
+        Err(ImportError::Malformed(_))
+    ));
+    // Only the "on this disk" count forged (the field zip 2.6.1 actually reads).
+    let mut disk_only = z.clone();
+    let at = eocd(&disk_only);
+    disk_only[at + 8..at + 10].copy_from_slice(&60_000u16.to_le_bytes());
+    assert!(matches!(
+        import_1pux(&disk_only, Uuid::nil(), NOW),
+        Err(ImportError::TooLarge(_))
+    ));
+    // ZIP64 markers are refused rather than resolved.
+    let zip64 = with_declared_entries(z.clone(), u16::MAX);
+    assert!(matches!(
+        import_1pux(&zip64, Uuid::nil(), NOW),
+        Err(ImportError::TooLarge(m)) if m.contains("ZIP64")
+    ));
+    let mut offset64 = z.clone();
+    let at = eocd(&offset64);
+    offset64[at + 16..at + 20].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(matches!(
+        import_1pux(&offset64, Uuid::nil(), NOW),
+        Err(ImportError::TooLarge(m)) if m.contains("ZIP64")
+    ));
+    // Errors never echo archive bytes.
+    let err = import_1pux(&over, Uuid::nil(), NOW)
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("export"));
+
+    // A fake small-count EOCD appended behind the real one does not hide the real count:
+    // every plausible record in the trailing window is checked.
+    let mut hidden = over.clone();
+    let mut fake = vec![0x50, 0x4b, 0x05, 0x06];
+    fake.extend_from_slice(&[0; 18]);
+    hidden.extend_from_slice(&fake);
+    assert!(matches!(
+        import_1pux(&hidden, Uuid::nil(), NOW),
+        Err(ImportError::TooLarge(_))
+    ));
+
+    // An archive comment is handled (the record is found behind it), and a normal export
+    // with several entries still imports.
+    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    w.set_comment("exported by a tool");
+    for (name, body) in [
+        ("export.attributes", b"{}".as_slice()),
+        ("export.data", data.as_bytes()),
+        ("files/a.pdf", &[0u8; 100]),
+    ] {
+        w.start_file(name, opts).unwrap();
+        w.write_all(body).unwrap();
+    }
+    let commented = w.finish().unwrap().into_inner();
+    assert!(
+        import_1pux(&commented, Uuid::nil(), NOW)
+            .unwrap()
+            .is_empty()
+    );
+    // Too short to hold a record at all.
+    assert!(matches!(
+        import_1pux(b"PK\x05\x06", Uuid::nil(), NOW),
+        Err(ImportError::Malformed(_))
+    ));
 }

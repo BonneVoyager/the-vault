@@ -16,6 +16,7 @@
 
 use std::io::Cursor;
 
+use keepass::error::{DatabaseFormatError, DatabaseOpenError, Kdbx3OpenError, Kdbx4OpenError};
 use keepass::{Database, DatabaseKey, db::Entry};
 use secrecy::{ExposeSecret as _, SecretString};
 use uuid::Uuid;
@@ -110,7 +111,7 @@ pub fn import_kdbx(
     let database =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Database::parse(bytes, key)))
             .map_err(|_| ImportError::KdbxMalformed)?
-            .map_err(|_| ImportError::KdbxCredentials)?;
+            .map_err(classify_open_error)?;
     let mut items = Vec::new();
     let mut groups = vec![(database.root().id(), Vec::<String>::new())];
     while let Some((id, path)) = groups.pop() {
@@ -141,6 +142,52 @@ pub fn import_kdbx(
 
 fn malformed(what: &str) -> ImportError {
     ImportError::Malformed(what.to_owned())
+}
+
+/// Map a `Database::parse` failure to the two user-facing outcomes (bug hunt 2026-11-06, L2):
+/// `KdbxCredentials` keeps the password prompt open, `KdbxMalformed` does not. keepass-rs
+/// 0.17.0 checks the key *before* it reads the payload, so every error kind below falls on one
+/// side of that check:
+///
+/// - `Key` (the header HMAC in KDBX4 and the stream-start bytes in KDBX3 both surface as
+///   `DatabaseKeyError::IncorrectKey`; also an empty key or an unreadable key file) and
+///   `Cryptography` (Argon2, a bad key length, or the AES-CBC padding error a wrong key
+///   produces in KDBX3) are credential failures.
+/// - The HMAC block stream (KDBX4) and the per-block hashes (KDBX3) are only reached after
+///   the key passed (the header HMAC / stream-start check above), so a mismatch there means
+///   a damaged payload with correct credentials: `KdbxMalformed` (owner decision
+///   2026-11-06). KDBX3 is the one exception by construction: a corrupted *final* AES-CBC
+///   block fails padding before any block hash is read, and that `Cryptography` error is
+///   indistinguishable from a wrong key.
+/// - Everything else is structure: the XML body (including xml-rs's 128-level nesting cap,
+///   which a valid 150-deep group tree trips), the KDBX4 inner header, the outer header and
+///   its SHA-256 (both pre-validated by `check_outer_header`, so rarely seen here), the
+///   version prefix, a truncated payload (`UnexpectedEof`) and I/O errors from the
+///   in-memory decompressor. None of these depend on the password, so retrying it cannot
+///   help: `KdbxMalformed`.
+///
+/// `DatabaseOpenError` is `#[non_exhaustive]`, so the final arm covers a variant a future
+/// keepass-rs adds; it defaults to `KdbxMalformed` (the review's D-8 direction: never let an
+/// unknown failure keep a user retrying a correct password). A dependency bump must re-read
+/// the enum and place any new variant explicitly. Neither variant carries any of the
+/// dependency's text (02 import_kdbx: "Error text never includes dependency parser errors or
+/// secret values").
+fn classify_open_error(error: DatabaseOpenError) -> ImportError {
+    match error {
+        DatabaseOpenError::Key(_) | DatabaseOpenError::Cryptography(_) => {
+            ImportError::KdbxCredentials
+        }
+        DatabaseOpenError::Format(DatabaseFormatError::Kdbx4(Kdbx4OpenError::BlockStream(_)))
+        | DatabaseOpenError::Format(DatabaseFormatError::Kdbx3(
+            Kdbx3OpenError::BlockHashMismatch(_),
+        )) => ImportError::KdbxMalformed,
+        DatabaseOpenError::Io(_)
+        | DatabaseOpenError::UnexpectedEof
+        | DatabaseOpenError::VersionParse(_)
+        | DatabaseOpenError::UnsupportedVersion
+        | DatabaseOpenError::Format(_) => ImportError::KdbxMalformed,
+        _ => ImportError::KdbxMalformed,
+    }
 }
 
 /// `len` bytes at `*pos`, advancing; `Malformed` instead of a panic on overflow or EOF.

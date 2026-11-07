@@ -13,6 +13,8 @@ metadata:
 - vault-cli has two sanitizers: `sanitize_for_terminal` keeps LF and is for values/notes; `sanitize_line` escapes `\n`/`\r` and is for titles, names, paths, sync events and errors.
 - vault-app's full `cargo test` takes more than 10 minutes, so run it in the background.
 - `cargo clippy -p X -- -D warnings` also lints workspace path deps. When another agent's WIP in vault-sync has dead code, use `--no-deps`.
+- `SyncError::VaultTooLarge`: `record_save` sets `sync_status` Error with `sync::vault_too_large_message` and `save_failing` (no tick retry); autosave shows a danger toast only on entering the failing state (`save_failing` was false), no retry; `lock_toast` names it for `Unpreserved(VaultTooLarge)`. `import_1pux_from` runs read+parse via `run_bg_cx(Busy::Importing)` (like kdbx.rs), returns (); `import_1pux_bytes` is `#[cfg(test)]`. Private `state.rs` fns (lock_toast, run_bg_cx) are reachable from child modules `state::*` and their tests. A real banner would need screens/main. 1PUX import cap is `MAX_1PUX_FILE_SIZE` (1 GiB), CSV/KDBX stay 64 MiB. The backup viewer reads through `vault_sync::read_package_entry_capped` (screens/backup.rs `read_backup`), not bounded_read.
+- vault-core is often mid-edit by another agent: when app tests fail to compile in vault-core, loop `cargo test -p vault-app --no-run` in the background until it builds.
 - Autosave: `SaveLockTimeout` and `PrimaryChangedDuringSave` share the single retry (`sync.busy_retried`) in `autosave_finished`.
 
 **Why:** these came out of the daybreak-03-10-2026 review fixes [4], [7] and [10] (2026-11-06).

@@ -1376,6 +1376,13 @@ fn lock_toast(save_error: Option<&str>, outcome: &LockOutcome) -> Option<Toast> 
         (LockOutcome::Snapshotted(_), Some(e)) => Some(Toast::window(format!(
             "Could not save before locking ({e}). {LOCK_KEPT}"
         ))),
+        // Not transient: say why, so the user knows what to shrink before editing on.
+        (LockOutcome::Unpreserved(SyncError::VaultTooLarge { bytes, cap }), _) => {
+            Some(Toast::danger(format!(
+                "{} Unsaved changes were not kept.",
+                sync::vault_too_large_message(*bytes, *cap)
+            )))
+        }
         (LockOutcome::Unpreserved(_), _) => Some(Toast::danger(LOCK_LOST)),
         // Not expected (a failed save leaves the vault dirty); still say the save failed.
         (LockOutcome::Clean, Some(e)) => Some(Toast::window(format!(

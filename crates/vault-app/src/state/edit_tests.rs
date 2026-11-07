@@ -944,3 +944,122 @@ fn remote_rename_during_a_local_value_edit(cx: &mut TestAppContext) {
         assert_eq!(after.fields.iter().filter(|f| f.id == user_id).count(), 1);
     });
 }
+
+/// The field limit keeps whole characters: a code point straddling the limit is dropped,
+/// never split.
+#[test]
+fn field_limit_cuts_on_a_char_boundary() {
+    let limit = EditBuffer::FIELD_LIMIT_BYTES;
+    assert_eq!(limit, 1_048_576);
+    let fits = "a".repeat(limit);
+    assert_eq!(capped(&fits), None, "exactly the limit fits");
+    let over = "a".repeat(limit + 1);
+    assert_eq!(capped(&over).map(str::len), Some(limit));
+    for ch in ['é', '€', '😀'] {
+        // `ch` starts one byte before the limit, so it straddles it.
+        let text = format!("{}{ch}", "a".repeat(limit - 1));
+        let kept = capped(&text).expect("over the limit");
+        assert_eq!(kept.len(), limit - 1, "{ch} dropped whole");
+        assert!(kept.bytes().all(|b| b == b'a'));
+        // Ending exactly on the limit keeps it.
+        let text = format!("{}{ch}x", "a".repeat(limit - ch.len_utf8()));
+        assert_eq!(capped(&text).map(|k| k.ends_with(ch)), Some(true));
+    }
+}
+
+/// Title, name, value and tag input over the limit is cut and flagged; input back under
+/// the limit clears the flag.
+#[test]
+fn edit_buffer_caps_every_field_input() {
+    let limit = EditBuffer::FIELD_LIMIT_BYTES;
+    let mut item = Item::new("t", Uuid::new_v4(), 1);
+    item.fields = vec![Field::new("n", FieldKind::Notes, secret(""), 1)];
+    let mut b = EditBuffer::new(item);
+    let key = b.keys[0];
+    let over = "x".repeat(limit + 1);
+
+    b.set_value(key, SecretString::new(over.clone()));
+    assert_eq!(b.field(key).unwrap().value.expose_secret().len(), limit);
+    assert_eq!(b.limited_values, vec![key]);
+    assert_eq!(b.pushed, vec![key], "the input is given the kept text");
+    b.set_value(key, secret("short"));
+    assert!(b.limited_values.is_empty());
+
+    assert_eq!(b.set_title(over.clone()).map(|t| t.len()), Some(limit));
+    assert_eq!(b.item.title.len(), limit);
+    assert!(b.limited_title);
+    assert_eq!(b.set_title("t".into()), None);
+    assert!(!b.limited_title);
+
+    assert_eq!(b.set_name(key, over.clone()).map(|t| t.len()), Some(limit));
+    assert_eq!(b.item.fields[0].name.len(), limit);
+    assert_eq!(b.limited_names, vec![key]);
+
+    assert_eq!(b.type_tags(&over).map(|t| t.len()), Some(limit));
+    assert_eq!(b.tag_draft.len(), limit);
+    assert!(b.limited_tag);
+}
+
+/// A short name after a cut value (and the reverse) keeps the row's note: name and
+/// value are tracked apart.
+#[test]
+fn name_and_value_limits_are_tracked_apart() {
+    let over = "x".repeat(EditBuffer::FIELD_LIMIT_BYTES + 1);
+    let mut item = Item::new("t", Uuid::new_v4(), 1);
+    item.fields = vec![Field::new("n", FieldKind::Notes, secret(""), 1)];
+    let mut b = EditBuffer::new(item);
+    let key = b.keys[0];
+
+    b.set_value(key, SecretString::new(over.clone()));
+    assert_eq!(b.set_name(key, "short".into()), None);
+    assert!(b.row_limited(key), "the value is still cut");
+    assert_eq!(b.limited_values, vec![key]);
+    assert!(b.limited_names.is_empty());
+
+    b.set_value(key, secret("v"));
+    assert!(!b.row_limited(key));
+
+    assert!(b.set_name(key, over).is_some());
+    b.set_value(key, secret("short"));
+    assert!(b.row_limited(key), "the name is still cut");
+    assert_eq!(b.limited_names, vec![key]);
+    assert!(b.limited_values.is_empty());
+}
+
+/// Enter on a cut tag commits it and clears the input without a Change event, so the
+/// note is reset there.
+#[test]
+fn committing_a_cut_tag_clears_the_note() {
+    let over = "x".repeat(EditBuffer::FIELD_LIMIT_BYTES + 1);
+    let mut b = EditBuffer::new(Item::new("t", Uuid::new_v4(), 1));
+    b.type_tags(&over);
+    assert!(b.limited_tag);
+    b.commit_tag_draft();
+    assert!(!b.limited_tag);
+    assert!(b.tag_draft.is_empty());
+    assert_eq!(b.item.tags.len(), 1);
+    assert_eq!(b.item.tags[0].len(), EditBuffer::FIELD_LIMIT_BYTES);
+}
+
+/// A value set from outside the editor (generator, QR scan) is capped and always pushed
+/// to its input; an unknown row is left alone.
+#[test]
+fn fill_value_caps_and_pushes() {
+    let limit = EditBuffer::FIELD_LIMIT_BYTES;
+    let mut item = Item::new("t", Uuid::new_v4(), 1);
+    item.fields = vec![Field::new("p", FieldKind::Password, secret(""), 1)];
+    let mut b = EditBuffer::new(item);
+    let key = b.keys[0];
+
+    assert!(b.fill_value(key, secret("short")));
+    assert_eq!(b.pushed, vec![key], "pushed even when not cut");
+    assert!(!b.row_limited(key));
+
+    assert!(b.fill_value(key, SecretString::new("y".repeat(limit + 5))));
+    assert_eq!(b.field(key).unwrap().value.expose_secret().len(), limit);
+    assert_eq!(b.pushed, vec![key], "pushed once");
+    assert!(b.row_limited(key));
+
+    assert!(!b.fill_value(key + 100, secret("z")));
+    assert!(!b.limited_values.contains(&(key + 100)));
+}

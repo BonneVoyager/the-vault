@@ -138,12 +138,21 @@ impl Editor {
         let title = ui::text_input("Title", window, cx);
         let tags = ui::text_input("Add tag", window, cx);
         let subscriptions = vec![
-            cx.subscribe_in(&title, window, |this, input, ev: &InputEvent, _, cx| {
-                if let InputEvent::Change = ev {
-                    let text = ui::input_text(input, cx);
-                    this.state.update(cx, |s, cx| s.set_edit_title(text, cx));
-                }
-            }),
+            cx.subscribe_in(
+                &title,
+                window,
+                |this, input, ev: &InputEvent, window, cx| {
+                    if let InputEvent::Change = ev {
+                        let text = ui::input_text(input, cx);
+                        // Over the field limit: the input keeps only what the buffer kept.
+                        if let Some(kept) =
+                            this.state.update(cx, |s, cx| s.set_edit_title(text, cx))
+                        {
+                            ui::set_input(input, &kept, window, cx);
+                        }
+                    }
+                },
+            ),
             cx.subscribe_in(
                 &tags,
                 window,
@@ -297,8 +306,12 @@ impl Editor {
                         }
                     }
                     previous.clone_from(&text);
-                    this.state
-                        .update(cx, |s, cx| s.set_edit_name(key, text, cx));
+                    if let Some(kept) = this
+                        .state
+                        .update(cx, |s, cx| s.set_edit_name(key, text, cx))
+                    {
+                        ui::set_input(input, &kept, window, cx);
+                    }
                 }
             },
         )];
@@ -517,6 +530,11 @@ impl Editor {
                         .children(scan_file),
                 )
             })
+            .when(buffer.row_limited(key), |col| {
+                col.child(
+                    limit_note(("field-limit", key), format!("field-limit {key}"), cx).pl(px(22.)),
+                )
+            })
             .children(totp_hint(key, buffer, cx))
             .when(field.kind == FieldKind::Password, |col| {
                 col.child(div().pl(px(22.)).child(ui::strength_meter(
@@ -526,6 +544,20 @@ impl Editor {
             })
             .into_any_element()
     }
+}
+
+/// "Field limited to 1 MiB": muted, under a field whose input was cut to the limit. Save
+/// stays enabled; the kept text is what is saved.
+/// `selector` names it for tests ("field-limit <key>", "field-limit-title", …).
+fn limit_note(
+    id: impl Into<gpui::ElementId>,
+    selector: String,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    ui::muted(EditBuffer::FIELD_LIMIT_MESSAGE, cx)
+        .id(id)
+        .debug_selector(move || selector.clone())
+        .text_xs()
 }
 
 /// Parse status under a one-time-code row: icon plus text, so not colour alone (§6).
@@ -778,6 +810,13 @@ impl Render for Editor {
             .when(buffer.remote_title, |col| {
                 col.child(remote_badge("remote-title"))
             })
+            .when(buffer.limited_title, |col| {
+                col.child(limit_note(
+                    "field-limit-title",
+                    "field-limit-title".into(),
+                    cx,
+                ))
+            })
             .child(tags_row(
                 &buffer.item.tags,
                 &self.tags,
@@ -785,6 +824,9 @@ impl Render for Editor {
                 &self.state,
                 cx,
             ))
+            .when(buffer.limited_tag, |col| {
+                col.child(limit_note("field-limit-tag", "field-limit-tag".into(), cx))
+            })
             .children(prompts::discard(s, &self.state, cx))
             .when_some(buffer.error.clone(), |col, error| {
                 col.child(div().text_sm().text_color(theme.danger).child(error))

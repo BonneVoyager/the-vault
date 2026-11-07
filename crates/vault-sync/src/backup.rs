@@ -335,10 +335,13 @@ pub(crate) fn list_backups(package: &Path) -> Result<Vec<BackupInfo>, SyncError>
         let size = if meta.is_file() {
             meta.len()
         } else if meta.is_dir() && kind == BackupKind::Conflict {
-            fs::symlink_metadata(package::vault_file(&entry.path()))
-                .ok()
-                .filter(|m| m.is_file())
-                .map_or(0, |m| m.len())
+            match fs::symlink_metadata(package::vault_file(&entry.path())) {
+                // A conflict package whose vault.bin is a link (D-1): never listed, so never
+                // opened, restored or deleted through it. Move it away to recover.
+                Ok(m) if m.file_type().is_symlink() => continue,
+                Ok(m) if m.is_file() => m.len(),
+                _ => 0,
+            }
         } else {
             continue;
         };
@@ -363,6 +366,8 @@ pub(crate) fn write_snapshot(
     now: SystemTime,
     kind: BackupKind,
 ) -> Result<(PathBuf, Result<(), SyncError>), SyncError> {
+    // A snapshot nothing could read back is not a backup (03 §2 read cap).
+    crate::synced::check_vault_size(bytes)?;
     let dir = backups_dir(package);
     ensure_dir(&dir)?;
     let name = vault_name(package);

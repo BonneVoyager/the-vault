@@ -404,7 +404,11 @@ pub fn snap_content(v: &vault_core::UnlockedVault) -> Vec<String> {
 pub fn run_child(bin: &str, args: &[&str], secs: u64, max_rss_mb: u64) -> (String, String) {
     use std::process::{Command, Stdio};
     let exe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/debug")
+        .join(if cfg!(debug_assertions) {
+            "target/debug"
+        } else {
+            "target/release"
+        })
         .join(bin);
     let mut c = Command::new(&exe)
         .args(args)

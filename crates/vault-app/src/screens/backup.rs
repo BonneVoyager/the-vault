@@ -24,9 +24,10 @@ use gpui_kit_assets::IconName;
 use vault_core::{
     ExposeSecret as _, FieldKind, Item, LockedVault, SecretString, UnlockedVault, Uuid,
 };
+use vault_sync::SyncError;
+use zeroize::Zeroizing;
 
 use super::main::item_tile;
-use crate::bounded_read::read_capped;
 use crate::state::{AppState, parse_totp};
 use crate::ui::Clickable as _;
 use crate::{listing, text, theme, ui};
@@ -55,13 +56,33 @@ pub struct BackupWindow {
 }
 
 /// The vault file to read for a backup entry: a snapshot is a `.vault.bin` file, an
-/// absorbed conflict copy is a whole package directory (03 §6).
+/// absorbed conflict copy is a whole package directory (03 §6). Decided without following a
+/// link: a symlinked entry is passed on as itself, and [`read_backup`] refuses it.
 fn backup_file(path: &Path) -> PathBuf {
-    if path.is_dir() {
-        path.join(vault_sync::VAULT_FILE_NAME)
-    } else {
-        path.to_owned()
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => path.join(vault_sync::VAULT_FILE_NAME),
+        _ => path.to_owned(),
     }
+}
+
+/// Reads the backup at `path` like the package reads its own files (03 §2): capped, never
+/// through a link (D-1), only a regular file. Errors are worded for the viewer, without the
+/// path (the window title already names the backup).
+fn read_backup(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
+    vault_sync::read_package_entry_capped(&backup_file(path))
+        .map(Zeroizing::new)
+        .map_err(|e| match e {
+            SyncError::UnsafePackageEntry(_) => "This backup is a link or not a regular file. \
+                 Vault does not open links in the backups folder; move it out of the folder to \
+                 open it."
+                .to_owned(),
+            SyncError::PrimaryTooLarge(_) => format!(
+                "This backup is larger than the {} MiB limit for a vault file.",
+                vault_sync::MAX_VAULT_FILE_SIZE / (1024 * 1024)
+            ),
+            SyncError::Io { source, .. } => format!("Could not read the backup: {source}"),
+            other => other.to_string(),
+        })
 }
 
 /// Opens the viewer for `path` in a new window.
@@ -191,9 +212,8 @@ impl BackupWindow {
         let path = self.path.clone();
         let started = self.state.read(cx).session_gen();
         let task = cx.background_executor().spawn(async move {
-            // Capped like every vault-file read (03 §2): a planted huge file is refused.
-            let bytes = read_capped(&backup_file(&path), vault_sync::MAX_VAULT_FILE_SIZE)
-                .map_err(|e| e.to_string())?;
+            // Capped and never through a link, like every vault-file read (03 §2).
+            let bytes = read_backup(&path)?;
             let locked = LockedVault::parse(&bytes).map_err(|e| e.to_string())?;
             locked.unlock(&password).map_err(|e| match e {
                 vault_core::VaultError::WrongPassword => "Wrong password. Try again.".to_owned(),
@@ -606,6 +626,56 @@ mod tests {
         });
         let vcx = VisualTestContext::from_window(window.into(), cx);
         (view.unwrap(), vcx)
+    }
+
+    /// 03 §2 D-1 (bug hunt 2026-11-06 L3): a symlink planted in `backups/` that points at a
+    /// valid vault file (here, a real snapshot moved outside) is refused with a readable
+    /// message and never parsed or unlocked; so is a conflict package that is itself a link.
+    #[gpui::test]
+    fn symlinked_backup_is_refused_not_followed(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, backup) = setup(dir.path(), cx);
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("real.vault.bin");
+        std::fs::rename(&backup, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &backup).unwrap();
+        let pkg_target = outside.path().join("pkg.vault");
+        std::fs::create_dir(&pkg_target).unwrap();
+        std::fs::copy(&target, pkg_target.join(vault_sync::VAULT_FILE_NAME)).unwrap();
+        let linked_pkg = backup
+            .parent()
+            .unwrap()
+            .join("conflict-2026-10-28T14-03-11Z-t 2.vault");
+        std::os::unix::fs::symlink(&pkg_target, &linked_pkg).unwrap();
+        for path in [&backup, &linked_pkg] {
+            let err = read_backup(path).unwrap_err();
+            assert!(err.contains("is a link"), "{err}");
+            assert!(!err.contains(&*outside.path().to_string_lossy()), "{err}");
+            let (view, mut vcx) = window(&state, path, cx);
+            view.update(&mut vcx, |w, cx| w.unlock(SecretString::new(PW.into()), cx));
+            vcx.run_until_parked();
+            view.read_with(&vcx, |w, _| {
+                assert!(!w.is_open(), "not unlocked through the link");
+                let error = w.error.as_ref().expect("an error is shown").to_string();
+                assert!(error.contains("is a link"), "{error}");
+            });
+        }
+        // The real file still opens where it is read directly.
+        std::fs::remove_file(&backup).unwrap();
+        std::fs::rename(&target, &backup).unwrap();
+        assert!(read_backup(&backup).is_ok());
+    }
+
+    #[test]
+    fn oversized_backup_is_refused_with_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t-2026-01-01T00-00-00Z.vault.bin");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(vault_sync::MAX_VAULT_FILE_SIZE + 1)
+            .unwrap();
+        let err = read_backup(&path).unwrap_err();
+        assert!(err.contains("larger than the 64 MiB limit"), "{err}");
     }
 
     /// A field kind from a newer app version is concealed like a password until revealed.

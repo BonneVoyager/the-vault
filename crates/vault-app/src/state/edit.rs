@@ -47,9 +47,45 @@ pub struct EditBuffer {
     pub icon_added: Vec<Uuid>,
     /// A chosen image is being checked, scaled and sealed.
     pub icon_loading: bool,
+    /// The last title input was cut to [`Self::FIELD_LIMIT_BYTES`].
+    pub limited_title: bool,
+    /// Rows whose last name input was cut to [`Self::FIELD_LIMIT_BYTES`].
+    pub limited_names: Vec<u64>,
+    /// Rows whose last value input (typed, generated or scanned) was cut likewise.
+    pub limited_values: Vec<u64>,
+    /// The last tag input was cut to [`Self::FIELD_LIMIT_BYTES`].
+    pub limited_tag: bool,
+}
+
+/// The first [`EditBuffer::FIELD_LIMIT_BYTES`] of `text`, ending on a character
+/// boundary, when `text` is longer; `None` when it fits.
+fn capped(text: &str) -> Option<&str> {
+    let limit = EditBuffer::FIELD_LIMIT_BYTES;
+    (text.len() > limit).then(|| &text[..text.floor_char_boundary(limit)])
+}
+
+/// Puts `key` in `keys` when `limited`, else takes it out.
+fn mark_limited(keys: &mut Vec<u64>, key: u64, limited: bool) {
+    keys.retain(|k| *k != key);
+    if limited {
+        keys.push(key);
+    }
+}
+
+/// `value` cut like [`capped`], or `None` when it fits.
+fn capped_secret(value: &SecretString) -> Option<SecretString> {
+    capped(value.expose_secret()).map(|c| SecretString::new(c.to_owned()))
 }
 
 impl EditBuffer {
+    /// Largest text one field may hold, in UTF-8 bytes: the title, a field's name or
+    /// value, a tag. Input past it is cut (owner decision 2026-11-06), far below the
+    /// vault's 64 MiB read cap.
+    pub const FIELD_LIMIT_BYTES: usize = 1024 * 1024;
+
+    /// Inline note next to a field whose input was cut to [`Self::FIELD_LIMIT_BYTES`].
+    pub const FIELD_LIMIT_MESSAGE: &str = "Field limited to 1 MiB";
+
     pub fn new(item: Item) -> Self {
         let keys = (0..item.fields.len() as u64).collect();
         Self {
@@ -66,7 +102,67 @@ impl EditBuffer {
             icon_picker: None,
             icon_added: Vec::new(),
             icon_loading: false,
+            limited_title: false,
+            limited_names: Vec::new(),
+            limited_values: Vec::new(),
+            limited_tag: false,
         }
+    }
+
+    /// Sets the title, cut to [`Self::FIELD_LIMIT_BYTES`]. Returns the kept text when it was cut
+    /// (the title input should then show just that).
+    pub fn set_title(&mut self, title: String) -> Option<String> {
+        let cut = capped(&title).map(str::to_owned);
+        self.limited_title = cut.is_some();
+        self.item.title = cut.clone().unwrap_or(title);
+        cut
+    }
+
+    /// Sets row `key`'s name, cut like [`Self::set_title`].
+    pub fn set_name(&mut self, key: u64, name: String) -> Option<String> {
+        let cut = capped(&name).map(str::to_owned);
+        mark_limited(&mut self.limited_names, key, cut.is_some());
+        if let Some(f) = self.field_mut(key) {
+            f.name = cut.clone().unwrap_or(name);
+        }
+        cut
+    }
+
+    /// Sets row `key`'s value, cut to [`Self::FIELD_LIMIT_BYTES`]. A cut value is pushed back
+    /// to the row's input (`pushed`) so the input holds what will be saved.
+    pub fn set_value(&mut self, key: u64, value: SecretString) {
+        let cut = capped_secret(&value);
+        let limited = cut.is_some();
+        mark_limited(&mut self.limited_values, key, limited);
+        if let Some(f) = self.field_mut(key) {
+            f.value = cut.unwrap_or(value);
+            if limited {
+                self.push_to_input(key);
+            }
+        }
+    }
+
+    /// Sets row `key`'s value from outside the editor (generator "Use", QR scan): capped
+    /// like [`Self::set_value`], and always pushed to the row's input. Returns false when
+    /// there is no such row.
+    pub fn fill_value(&mut self, key: u64, value: SecretString) -> bool {
+        if self.index(key).is_none() {
+            return false;
+        }
+        self.set_value(key, value);
+        self.push_to_input(key);
+        true
+    }
+
+    fn push_to_input(&mut self, key: u64) {
+        if !self.pushed.contains(&key) {
+            self.pushed.push(key);
+        }
+    }
+
+    /// True when row `key`'s name or value was cut: the row shows the limit note.
+    pub fn row_limited(&self, key: u64) -> bool {
+        self.limited_names.contains(&key) || self.limited_values.contains(&key)
     }
 
     /// Image attachments Save removes: the image the item had when editing began and the
@@ -230,10 +326,14 @@ impl EditBuffer {
     /// Takes the tag input's text as the draft. Every comma-terminated part is committed
     /// as a tag; returns the text after the last comma when there was one (the input
     /// should then show just that).
+    /// Text past [`Self::FIELD_LIMIT_BYTES`] is cut first, and the kept text returned.
     pub fn type_tags(&mut self, text: &str) -> Option<String> {
+        let cut = capped(text);
+        self.limited_tag = cut.is_some();
+        let text = cut.unwrap_or(text);
         let Some((done, rest)) = text.rsplit_once(',') else {
             self.tag_draft = text.to_owned();
-            return None;
+            return cut.map(str::to_owned);
         };
         for part in done.split(',') {
             self.add_tag(part);
@@ -248,8 +348,10 @@ impl EditBuffer {
             .is_some_and(|d| !crate::templates::has_tag(&self.item.tags, &d))
     }
 
-    /// Enter in the tag input: commits the draft.
+    /// Enter in the tag input: commits the draft. The input is then cleared (without a
+    /// Change event), so the limit note goes too.
     pub fn commit_tag_draft(&mut self) {
+        self.limited_tag = false;
         let draft = std::mem::take(&mut self.tag_draft);
         self.add_tag(&draft);
     }
@@ -614,24 +716,28 @@ impl AppState {
         }
     }
 
-    pub fn set_edit_title(&mut self, title: String, cx: &mut Context<Self>) {
-        self.edit(cx, |b| b.item.title = title);
+    /// Returns the kept title when it was cut to [`EditBuffer::FIELD_LIMIT_BYTES`].
+    pub fn set_edit_title(&mut self, title: String, cx: &mut Context<Self>) -> Option<String> {
+        let mut cut = None;
+        self.edit(cx, |b| cut = b.set_title(title));
+        cut
     }
 
-    pub fn set_edit_name(&mut self, key: u64, name: String, cx: &mut Context<Self>) {
-        self.edit(cx, |b| {
-            if let Some(f) = b.field_mut(key) {
-                f.name = name;
-            }
-        });
+    /// Returns the kept name when it was cut to [`EditBuffer::FIELD_LIMIT_BYTES`].
+    pub fn set_edit_name(
+        &mut self,
+        key: u64,
+        name: String,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let mut cut = None;
+        self.edit(cx, |b| cut = b.set_name(key, name));
+        cut
     }
 
+    /// A value past [`EditBuffer::FIELD_LIMIT_BYTES`] is cut and pushed back to its input.
     pub fn set_edit_value(&mut self, key: u64, value: SecretString, cx: &mut Context<Self>) {
-        self.edit(cx, |b| {
-            if let Some(f) = b.field_mut(key) {
-                f.value = value;
-            }
-        });
+        self.edit(cx, |b| b.set_value(key, value));
     }
 
     /// Opens (on the current choice) or closes the icon picker. Not an edit by itself.
@@ -783,8 +889,13 @@ impl AppState {
             return;
         }
         let now = text::now_millis();
-        let item = template.new_item(title, self.device_id, now);
-        self.start(Mode::New(template, EditBuffer::new(item)), cx);
+        // "Create '<query>'" carries the search text: the same cap as a typed title.
+        let cut = capped(&title).map(str::to_owned);
+        let limited = cut.is_some();
+        let item = template.new_item(cut.unwrap_or(title), self.device_id, now);
+        let mut buffer = EditBuffer::new(item);
+        buffer.limited_title = limited;
+        self.start(Mode::New(template, buffer), cx);
     }
 
     fn start(&mut self, mode: Mode, cx: &mut Context<Self>) {

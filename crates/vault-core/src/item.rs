@@ -447,10 +447,10 @@ impl Item {
 
     /// `true` when any of the seven lists a stripped tombstone empties (02 "Recently
     /// Deleted") is non-empty: `fields`, `history`, `attachments`, `removed_fields`,
-    /// `removed_attachments`, `removed_history` or `extras`. A tombstone with content is "in
-    /// the trash" and listed by [`crate::UnlockedVault::deleted_items`]; one without is what
-    /// every tombstone was before 2026-11-03. Meaningful on live items too (an empty live
-    /// item has no content), but only tombstones are ever stripped.
+    /// `removed_attachments`, `removed_history` or `extras`. Content is what a strip removes;
+    /// whether a tombstone is *in the trash* is [`Item::is_trashed`], which also covers a
+    /// tombstone that never had content (a title-only item). Meaningful on live items too (an
+    /// empty live item has no content), but only tombstones are ever stripped.
     pub fn has_content(&self) -> bool {
         !(self.fields.is_empty()
             && self.history.is_empty()
@@ -459,6 +459,40 @@ impl Item {
             && self.removed_attachments.is_empty()
             && self.removed_history.is_empty()
             && self.extras.is_empty())
+    }
+
+    /// `true` when this is a tombstone in Recently Deleted (02 "Recently Deleted",
+    /// 2026-11-06 L1): `deleted_at` is set and either the tombstone still
+    /// [has content](Item::has_content) or it has not been restamped since the delete
+    /// (`modified_at <= deleted_at`). The second half is what puts a tombstone with nothing
+    /// but a title and tags in the trash, and it is read off the stamps, not a new key:
+    ///
+    /// - `UnlockedVault::delete` leaves `deleted_at == modified_at` by construction (it
+    ///   restamps and then copies the resulting `modified_at` into `deleted_at`).
+    /// - A strip (`delete_permanently`, `expire_deleted`) restamps with
+    ///   `stamp(now, previous) > previous >= deleted_at` and never moves `deleted_at`, so a
+    ///   stripped tombstone always has `modified_at > deleted_at`. A strip is the only local
+    ///   mutation that advances a content-less tombstone without re-deleting it.
+    /// - A merge takes a tombstone whole, so the relation between its two stamps travels
+    ///   with it. The one exception is the 03 §5 "+1 bump" on an equal-stamp tie: whenever a
+    ///   merge replaces our item with a peer's tombstone whose `modified_at` equals ours
+    ///   (two devices deleting at the same stamp, or a delete against an edit at the same
+    ///   stamp), the merged copy is stamped one past `deleted_at` and a title-only tombstone
+    ///   then reads as stripped on that device (its title and tags are still on the shell,
+    ///   nothing else was ever there). A tombstone with content is unaffected: the first half
+    ///   of the rule keeps it in the trash however its stamps moved (that bump, or an
+    ///   attachment added to a tombstone).
+    ///
+    /// A tombstone written before 2026-11-03 (fields emptied at delete time, both stamps
+    /// equal) therefore counts as trashed until the first `expire_deleted` sweep restamps it.
+    /// At `u64::MAX` the restamp saturates and cannot move past `deleted_at`, so a shell
+    /// stripped there still reads as trashed (recovering it yields a live title-only item;
+    /// nothing else is on it). Live items are never trashed.
+    pub fn is_trashed(&self) -> bool {
+        match self.deleted_at {
+            Some(deleted_at) => self.has_content() || self.modified_at <= deleted_at,
+            None => false,
+        }
     }
 
     /// The effective stamp of each attribute for the merge (03 §5): the stored stamp, or

@@ -1,18 +1,25 @@
-//! Size-capped reads of files that a user picks or a sync peer can plant: backups opened in
-//! the viewer, CSV / 1PUX / KDBX imports. A thin wrapper over `vault_sync::read_capped` (the
-//! same reader vault files go through, 03 §2): it wipes the bytes on drop and words the
-//! too-large error for the user.
+//! Size-capped reads of files that a user picks: CSV / 1PUX / KDBX imports. A thin wrapper
+//! over `vault_sync::read_capped` (the same reader vault files go through, 03 §2): it wipes
+//! the bytes on drop and words the too-large error for the user.
 //!
-//! The shared reader follows symlinks. That is fine here: every path is one the user chose
-//! (an open panel, a backup row the user clicked), not one found by scanning a synced folder.
+//! The shared reader follows symlinks. That is fine here: every path is one the user chose in
+//! an open panel, not one found by scanning a synced folder. Backups (found by listing the
+//! synced `backups/` folder) go through `vault_sync::read_package_entry_capped` instead,
+//! which never follows a link (03 §2 D-1).
 
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
 use zeroize::Zeroizing;
 
-/// Largest CSV or 1PUX file an import reads: 64 MiB, the same as a vault file.
+/// Largest CSV file an import reads: 64 MiB, the same as a vault file. (KDBX has its own
+/// limits in `state/kdbx.rs`: database 100 MiB, key file 1 MiB, per 02.)
 pub const MAX_IMPORT_FILE_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Largest 1PUX archive an import reads: 1 GiB. A 1Password export carries document
+/// attachments under `files/`, which the import skips; vault-core bounds the one entry it
+/// does read (`export.data`), so this cap only keeps the whole-file read finite.
+pub const MAX_1PUX_FILE_SIZE: u64 = 1024 * 1024 * 1024;
 
 /// Reads all of the regular file at `path`, refusing one larger than `cap` bytes with
 /// [`ErrorKind::FileTooLarge`] (checked on `fstat` before allocating, and while reading) and
@@ -29,7 +36,10 @@ pub fn read_capped(path: &Path, cap: u64) -> io::Result<Zeroizing<Vec<u8>>> {
 
 /// The same wording in the app and the CLI.
 fn too_large(cap: u64) -> io::Error {
-    let limit = if cap >= 1024 * 1024 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let limit = if cap >= GIB && cap.is_multiple_of(GIB) {
+        format!("{} GiB", cap / GIB)
+    } else if cap >= 1024 * 1024 {
         format!("{} MiB", cap / (1024 * 1024))
     } else {
         format!("{cap} byte")
@@ -68,6 +78,19 @@ mod tests {
         let err = read_capped(&path, MAX_IMPORT_FILE_SIZE).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::FileTooLarge);
         assert_eq!(err.to_string(), "file is larger than the 64 MiB limit");
+    }
+
+    #[test]
+    fn the_1pux_cap_is_1_gib_and_worded_in_gib() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.1pux");
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_1PUX_FILE_SIZE + 1)
+            .unwrap();
+        let err = read_capped(&path, MAX_1PUX_FILE_SIZE).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::FileTooLarge);
+        assert_eq!(err.to_string(), "file is larger than the 1 GiB limit");
     }
 
     #[test]

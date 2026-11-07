@@ -800,3 +800,46 @@ Known, accepted: a lock during the finish before D − 150 ms leaves "Unlocking�
 timer fires (≤ 350 ms), same as a lock during the old hold.
 
 Bug hunt: not yet run for this wave.
+
+## Bug hunt 2026-11-06 and fixes (2026-11-06/07)
+
+Hunt (`docs/qa/bug-hunt-2026-11-06.md`, 51 new checks, whole ledger 301): 2 medium, 3 low, 0 high.
+All five fixed; reviewed by code-reviewer (sync/app) and security-reviewer (core, verdict ship).
+
+- **M1** save could write `vault.bin` over the 64 MiB read cap → `SyncError::VaultTooLarge
+  { bytes, cap }` before any temp file in save/create/restore/write_snapshot/merge write-back/
+  conflict absorption; file unchanged, vault stays dirty; app shows a persistent warning once
+  (status line keeps it), no busy-lock retry; lock reports the reason (`Unpreserved(VaultTooLarge)`).
+  UX guard: every editor input (title, name, value, tag, generator Use, QR scan, pre-filled
+  title) capped at 1 MiB on a char boundary with "Field limited to 1 MiB"; name/value limits
+  tracked apart. rf15 rewritten to assert the refusal and the recovery (shrink → peer merges).
+- **M2** app refused 1PUX over 64 MiB → `MAX_1PUX_FILE_SIZE` 1 GiB, read + parse moved to the
+  background executor like KDBX; core bounds `export.data` at 64 MiB from the central
+  directory and while inflating (`ImportError::TooLarge`), parses the EOCD itself and refuses
+  > 10 000 entries or ZIP64 (security review W2). CSV stays 64 MiB, KDBX 100 MiB.
+- **L1** title-only items skipped Recently Deleted → `Item::is_trashed()` (deleted_at set and
+  has_content || modified_at <= deleted_at); `delete` leaves deleted_at == modified_at; strip and
+  recover restamp past max(modified_at, deleted_at) (security review W1, hostile shell test);
+  app trash list uses it; legacy fixture `v2-trash-legacy.vault`. Residuals in 02.
+- **L2** KeePass parse errors after a correct key read as wrong password → `classify_open_error`:
+  key/cipher → `KdbxCredentials`; everything after authentication incl. block-HMAC → `KdbxMalformed`.
+- **L3** backup viewer followed symlinks → `vault_sync::read_package_entry_capped`; symlinked
+  conflict packages not listed; messages carry no path.
+
+Specs: 02 (trash membership, KeePass mapping, 1PUX bounds), 03 (write cap, viewer no-follow),
+05 (field cap). Open owner decision: hunt's spec-gap note — a blob can be removed at the save
+after a strip while a peer recovers the item in the same 24 h window (attachments show as
+Missing). Accepted by owner 2026-11-07; documented in 03 (orphan cleanup paragraph).
+
+## CHECKPOINT — Bug-hunt fixes complete (2026-11-07)
+
+fmt and clippy clean. `cargo test --workspace`: 1107 passed, 0 failed, 14 ignored. QA ledger
+205/205 (28 binaries). CLI 96/96. Uncommitted: 39 modified + 7 untracked files (hunt report,
+three new QA check files, one QA bin, legacy fixture, agent memory), ≈ +2100/−205.
+
+Owner eye checks: paste a huge note → "Field limited to 1 MiB" under the row, Save works;
+delete a title-only item → it appears in Recently Deleted and recovers with its tag; import a
+large 1PUX → app stays responsive, "Unlocking…"-style busy state; backup viewer on a
+symlinked backup → readable refusal, no path.
+
+Bug hunt: run for this wave (2026-11-06); the fixes themselves are review-covered, not re-hunted.

@@ -24,6 +24,17 @@ cargo fmt --all -- --check                     # formatting is part of the manua
   stamps at `u64::MAX`), `sync_nfc` (03 §3 NFC path comparisons, §6 case/normalisation-insensitive
   conflict names, §8 `delete_backup` paths, `WaitingForBlobs` semantics), `cli_bridge` b10-b11
   (`VAULT_DEVICE_ID`, `edit`), and `cli/run_all.sh` sections for `edit`, `sync` and concurrent editors.
+- 2026-11-06 additions: `trash` (Recently Deleted: delete/recover/delete_permanently/expire_deleted,
+  strip rules incl. extras from the v1-forward fixture, both-tombstone LWW and ties, recover-vs-strip
+  race, backups not scrubbed, trashed attachments, two handles, a corruption sweep, CLI `rm`),
+  `review_fixes` (03 §2 D-1 symlinks and FIFOs for `.lock`/`vault.bin`/conflict sources/blobs/dirs,
+  64 MiB caps vs the write path, 70 MB attachments end to end, D-6 blob publication, D-11 watcher
+  bounds and `vault sync` drain with 300 copies and 10 waiting packages, D-9 header tie-break,
+  D-2 same-bytes inode renumbering and a tight two-handle save loop), `kdbx_hostile` (deep group
+  nesting via the `open_kdbx_stack` harness, a 70 MiB KDBX within the 100 MiB limit, a 70 MiB 1PUX
+  in core, KdbxCredentials vs malformed content), and a `run_all.sh` section for `sanitize_line`,
+  the sync drain, a 70 MB attachment, a symlinked `.lock` and `rm`. `run_child` picks
+  `target/release` when built with `--release`.
 - Temp files go under `tmp/` (git-ignored) and are removed by each test.
 
 A passing check shows the behaviour on those inputs only. It is not a proof.

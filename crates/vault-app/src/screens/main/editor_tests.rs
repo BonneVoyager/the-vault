@@ -1300,3 +1300,76 @@ fn section_values_never_surface(cx: &mut TestAppContext) {
     assert_eq!(texts.len(), 4, "two names, one name, one name + value");
     assert!(texts.iter().all(|t| !t.contains(SECRET)), "{texts:?}");
 }
+
+/// Pasting 1 MiB + 1 byte into Notes keeps exactly 1 MiB, says so next to the field, and
+/// Save still works and stores the kept text.
+#[gpui::test]
+fn pasted_note_over_the_field_limit_is_cut_and_saves(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    state.update(&mut vcx, |s, cx| {
+        s.begin_new(crate::templates::Template::Note, "Big".into(), cx)
+    });
+    vcx.run_until_parked();
+    let key = state.read_with(&vcx, |s, _| {
+        let b = s.edit_buffer().unwrap();
+        let ix = b
+            .item
+            .fields
+            .iter()
+            .position(|f| f.kind == FieldKind::Notes)
+            .expect("note template has a Notes field");
+        b.keys[ix]
+    });
+    let area = main.read_with(&vcx, |m, cx| {
+        match &m
+            .editor
+            .read(cx)
+            .rows
+            .iter()
+            .find(|r| r.key == key)
+            .unwrap()
+            .value
+        {
+            ValueInput::Area(a) => a.clone(),
+            _ => panic!("notes edit in a text area"),
+        }
+    });
+    let limit = EditBuffer::FIELD_LIMIT_BYTES;
+    let selector = format!("field-limit {key}");
+    let selector: &'static str = Box::leak(selector.into_boxed_str());
+    assert!(
+        vcx.debug_bounds(selector).is_none(),
+        "no note before the paste"
+    );
+    vcx.update(|window, cx| {
+        area.update(cx, |a, cx| a.focus(window, cx));
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("n".repeat(limit + 1)));
+    });
+    vcx.simulate_keystrokes("cmd-v");
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.debug_bounds(selector).is_some(),
+        "inline limit note shown"
+    );
+    let shown = area.read_with(&vcx, |a, _| a.text().len());
+    assert_eq!(shown, limit, "the text area holds only the kept text");
+    // Save is never disabled by the limit: ⌘S saves the kept text.
+    vcx.simulate_keystrokes("cmd-s");
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| {
+        assert!(!s.is_editing(), "saved");
+        let item = s.selected_item().unwrap();
+        let notes = item
+            .fields
+            .iter()
+            .find(|f| f.kind == FieldKind::Notes)
+            .unwrap();
+        assert_eq!(
+            notes.value.expose_secret().len(),
+            limit,
+            "stored exactly 1 MiB"
+        );
+    });
+}

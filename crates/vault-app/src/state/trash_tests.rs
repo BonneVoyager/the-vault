@@ -192,3 +192,69 @@ fn expiry_text_saturates_a_far_future_deleted_at() {
     }
     assert_eq!(days_left(u64::MAX, 0), 30);
 }
+
+/// A title-only item (title and a tag, no fields) deleted in the app lands in Recently
+/// Deleted, recovers with its title and tag, and a stripped tombstone is not listed.
+#[gpui::test]
+fn title_only_item_is_trashed_and_recovers_but_a_tombstone_is_not_listed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.vault");
+    let mut vault = SyncedVault::create(
+        &path,
+        &SecretString::new("pw".into()),
+        KdfParams::for_tests(),
+        Uuid::new_v4(),
+        Arc::new(NoopHooks),
+    )
+    .unwrap();
+    let [bare, gone] = vault
+        .edit(|v| {
+            let device = v.device_id();
+            ["Bare", "Gone"].map(|t| {
+                let mut item = Item::new(t, device, 1);
+                item.tags.push("work".into());
+                v.insert(item, 1)
+            })
+        })
+        .unwrap();
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    state.update(cx, |s, _| s.install_unlocked_for_tests(vault));
+
+    // Delete both from the app; the second is then purged to a stripped tombstone.
+    for id in [bare, gone] {
+        state.update(cx, |s, cx| {
+            s.select(id, cx);
+            s.request_delete(cx);
+            s.confirm_delete(cx);
+        });
+    }
+    state.update(cx, |s, cx| {
+        s.set_filter(Filter::RecentlyDeleted, cx);
+        s.select(gone, cx);
+        s.request_delete(cx);
+        s.confirm_delete(cx);
+    });
+    state.read_with(cx, |s, _| {
+        assert_eq!(
+            s.listing.items,
+            [bare],
+            "title-only item listed, tombstone not"
+        );
+        assert_eq!(s.counts.deleted, 1);
+        let v = s.unlocked_vault().unwrap();
+        assert!(v.get(bare).unwrap().is_trashed());
+        assert!(!v.get(gone).unwrap().is_trashed());
+    });
+    state.update(cx, |s, cx| {
+        s.select(bare, cx);
+        assert_eq!(s.trashed_item().map(|i| i.id), Some(bare));
+        s.recover_selected(cx);
+    });
+    state.read_with(cx, |s, _| {
+        let item = s.unlocked_vault().unwrap().get(bare).unwrap();
+        assert!(!item.is_deleted());
+        assert_eq!(item.title, "Bare");
+        assert_eq!(item.tags, ["work"]);
+        assert_eq!(s.counts.deleted, 0);
+    });
+}

@@ -97,6 +97,17 @@ pub enum SyncError {
     /// near that size.
     #[error("{} is too large to be a vault file", .0.display())]
     PrimaryTooLarge(PathBuf),
+    /// The serialised vault is larger than `cap` ([`crate::MAX_VAULT_FILE_SIZE`]), so a read
+    /// would refuse it (03 §2). Refused before any temp file is written: the file on disk and
+    /// the backups are unchanged, and the in-memory vault stays dirty and intact. Not
+    /// transient: retrying fails the same way until the vault shrinks (remove large notes or
+    /// fields, or empty Recently Deleted).
+    #[error(
+        "the vault is too large to save ({} MiB, limit {} MiB)",
+        .bytes.div_ceil(1024 * 1024),
+        .cap / (1024 * 1024)
+    )]
+    VaultTooLarge { bytes: u64, cap: u64 },
     /// The attachment blob is evicted to the cloud and did not download within
     /// `DOWNLOAD_TIMEOUT` (03 §1.1 `NotDownloaded`). Retry later.
     #[error("attachment {0} is not downloaded yet")]

@@ -14,10 +14,10 @@ use gpui::Context;
 use vault_core::import::import_1pux;
 use vault_core::{CsvMapping, ExposeSecret as _, SecretVec, export_csv, import_csv};
 
-use super::AppState;
 use super::edit::edit_result;
 use super::sync::TRANSFER_TAB;
-use crate::bounded_read::{MAX_IMPORT_FILE_SIZE, read_capped};
+use super::{AppState, Busy, Outcome};
+use crate::bounded_read::{MAX_1PUX_FILE_SIZE, MAX_IMPORT_FILE_SIZE, read_capped};
 use crate::{text, ui};
 
 /// Publishes `bytes` at `path` owner-read/write only, atomically.
@@ -210,26 +210,47 @@ impl AppState {
         .detach();
     }
 
-    /// Reads the 1PUX at `path` (refused over [`MAX_IMPORT_FILE_SIZE`] before anything is
-    /// allocated), then [`Self::import_1pux_bytes`]. Returns how many items were inserted.
-    pub fn import_1pux_from(&mut self, path: &Path, cx: &mut Context<Self>) -> usize {
+    /// Reads the 1PUX at `path` (refused over [`MAX_1PUX_FILE_SIZE`] before anything is
+    /// allocated; vault-core bounds the `export.data` entry it extracts) and parses it on the
+    /// background executor (`Busy::Importing`), like the KeePass import: a 1 GiB read must
+    /// not stall the UI. The items are inserted only if the session is still the one that
+    /// started (not locked or closed meanwhile); a read or parse failure toasts.
+    pub fn import_1pux_from(&mut self, path: &Path, cx: &mut Context<Self>) {
         if !self.main_active() {
-            self.show_toast("Unlock the vault to import into it", cx);
-            return 0;
+            return self.show_toast("Unlock the vault to import into it", cx);
         }
-        match read_capped(path, MAX_IMPORT_FILE_SIZE) {
-            Ok(mut bytes) => {
-                self.import_1pux_bytes(&SecretVec::new(std::mem::take(&mut *bytes)), cx)
-            }
-            Err(e) => {
-                self.show_toast(format!("Could not read {}: {e}", text::file_name(path)), cx);
-                0
-            }
+        if self.busy.is_some() {
+            return;
         }
+        let path = path.to_owned();
+        let (device, now) = (self.device_id, text::now_millis());
+        self.run_bg_cx(
+            Busy::Importing,
+            cx,
+            move || {
+                // Wiped on drop, on every path out of here.
+                let bytes = read_capped(&path, MAX_1PUX_FILE_SIZE)
+                    .map_err(|e| format!("Could not read {}: {e}", text::file_name(&path)))?;
+                import_1pux(&bytes, device, now).map_err(|e| format!("Import failed: {e}"))
+            },
+            move |s, result, outcome, cx| {
+                if outcome != Outcome::Fresh || !s.main_active() {
+                    return;
+                }
+                match result {
+                    Ok(items) => {
+                        s.insert_imported(items, now, cx);
+                    }
+                    Err(message) => s.show_toast(message, cx),
+                }
+            },
+        );
     }
 
-    /// Inserts every item of a 1Password export (`.1pux`). Returns how many. Errors are
-    /// `ImportError::Malformed` texts, which never contain values.
+    /// Inserts every item of a 1Password export (`.1pux`) already in memory. Returns how
+    /// many. Errors are `ImportError::Malformed` texts, which never contain values. Tests
+    /// only: the app path is [`Self::import_1pux_from`], which parses in the background.
+    #[cfg(test)]
     pub fn import_1pux_bytes(&mut self, bytes: &SecretVec<u8>, cx: &mut Context<Self>) -> usize {
         if !self.main_active() {
             self.show_toast("Unlock the vault to import into it", cx);
@@ -412,30 +433,46 @@ mod tests {
         });
     }
 
-    /// A CSV or 1PUX over 64 MiB is refused before it is read (a sparse file, so the test
-    /// allocates nothing); a small 1PUX on disk still imports through the same path.
+    /// A CSV over 64 MiB and a 1PUX over 1 GiB are refused before they are read (sparse
+    /// files, so the test allocates nothing); a 1PUX over 64 MiB is read and handed to the
+    /// importer (here it is not a zip); a small 1PUX on disk still imports through the same
+    /// path.
     #[gpui::test]
-    fn imports_refuse_files_over_64_mib(cx: &mut TestAppContext) {
+    fn imports_refuse_files_over_their_caps(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let state = unlocked_state(&dir.path().join("t.vault"), &["Existing"], cx);
-        for name in ["big.csv", "big.1pux"] {
+        for (name, len, expected) in [
+            (
+                "big.csv",
+                MAX_IMPORT_FILE_SIZE + 1,
+                "larger than the 64 MiB limit",
+            ),
+            (
+                "big.1pux",
+                MAX_1PUX_FILE_SIZE + 1,
+                "larger than the 1 GiB limit",
+            ),
+            (
+                "over64.1pux",
+                MAX_IMPORT_FILE_SIZE + 1,
+                "not a valid zip archive",
+            ),
+        ] {
             let path = dir.path().join(name);
-            std::fs::File::create(&path)
-                .unwrap()
-                .set_len(MAX_IMPORT_FILE_SIZE + 1)
-                .unwrap();
+            std::fs::File::create(&path).unwrap().set_len(len).unwrap();
             state.update(cx, |s, cx| {
-                let n = if name.ends_with(".csv") {
-                    s.import_csv_from(&path, cx)
+                if name.ends_with(".csv") {
+                    assert_eq!(s.import_csv_from(&path, cx), 0);
                 } else {
-                    s.import_1pux_from(&path, cx)
-                };
-                assert_eq!(n, 0);
+                    s.import_1pux_from(&path, cx);
+                    assert_eq!(s.busy, Some(Busy::Importing), "read in the background");
+                }
+            });
+            cx.run_until_parked();
+            state.update(cx, |s, _| {
+                assert_eq!(s.busy, None);
                 let message = s.toast.as_ref().unwrap().message.to_string();
-                assert!(
-                    message.contains("larger than the 64 MiB limit"),
-                    "{message}"
-                );
+                assert!(message.contains(expected), "{name}: {message}");
                 assert_eq!(s.item_count(), 1);
             });
         }
@@ -448,7 +485,30 @@ mod tests {
             ])),
         )
         .unwrap();
-        assert_eq!(state.update(cx, |s, cx| s.import_1pux_from(&small, cx)), 1);
+        state.update(cx, |s, cx| s.import_1pux_from(&small, cx));
+        cx.run_until_parked();
+        state.read_with(cx, |s, _| {
+            assert_eq!(s.item_count(), 2);
+            let message = s.toast.as_ref().unwrap().message.to_string();
+            assert_eq!(message, "1 item imported");
+        });
+        // A lock while the read runs drops the result: nothing is inserted afterwards.
+        state.update(cx, |s, cx| {
+            s.import_1pux_from(&small, cx);
+            s.lock(cx);
+        });
+        cx.run_until_parked();
+        state.update(cx, |s, _| {
+            assert_eq!(s.busy, None);
+            assert!(s.locked);
+            // A stale result that reached `insert_imported` would toast "imported" or
+            // "Import failed" (the vault is locked).
+            let toast = s.toast.as_ref().map(|t| t.message.to_string());
+            assert!(
+                !toast.as_deref().unwrap_or("").contains("mport"),
+                "{toast:?}"
+            );
+        });
     }
 
     #[gpui::test]

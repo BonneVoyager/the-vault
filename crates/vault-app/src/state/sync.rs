@@ -123,6 +123,14 @@ impl AppState {
                 self.sync_status = SyncStatus::Idle;
                 None
             }
+            // Not transient (03 §2 read cap): the status line keeps the reason until a save
+            // succeeds, and the tick does not retry (`save_failing`).
+            Err(SyncError::VaultTooLarge { bytes, cap }) => {
+                self.sync.save_failing = true;
+                let message = vault_too_large_message(bytes, cap);
+                self.sync_status = SyncStatus::Error(message.clone().into());
+                Some(message)
+            }
             Err(e) => {
                 self.sync.save_failing = true;
                 Some(e.to_string())
@@ -158,7 +166,11 @@ impl AppState {
     ) {
         let busy = matches!(result, Err(SyncError::SaveLockTimeout(_)));
         let changed = matches!(result, Err(SyncError::PrimaryChangedDuringSave(_)));
+        let too_large = matches!(result, Err(SyncError::VaultTooLarge { .. }));
+        // Only a busy lock or a racing writer is worth one retry; a too-large vault is
+        // refused the same way until it shrinks.
         let retry = (busy || changed) && !self.sync.busy_retried && !self.locked;
+        let was_failing = self.sync.save_failing;
         if let Some(e) = self.record_save(result) {
             if busy {
                 self.show_toast(SAVE_BUSY, cx);
@@ -169,6 +181,12 @@ impl AppState {
                     SAVE_CHANGED
                 };
                 self.show_toast(message, cx);
+            } else if too_large {
+                // The longer-lived danger toast, once on entering the failing state; later
+                // refusals (one per edit) leave the reason to the status line.
+                if !was_failing {
+                    self.set_toast(Toast::danger(e));
+                }
             } else {
                 self.show_toast(format!("Could not save: {e}"), cx);
             }
@@ -616,6 +634,20 @@ fn save_blocked_message(blocked: &SaveBlocked) -> &'static str {
             "Not saving: the vault file on disk now holds a different vault."
         }
     }
+}
+
+/// Status line and toast for [`SyncError::VaultTooLarge`]: the serialised vault is over the
+/// vault-file read cap (03 §2), so vault-sync refused to write it. Attachments are separate
+/// blobs and do not count; notes, other field values and their history do, including items in
+/// Recently Deleted.
+pub fn vault_too_large_message(bytes: u64, cap: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    format!(
+        "The vault is too large to save ({} MiB, limit {} MiB). Remove large notes or field \
+         values (also from Recently Deleted); until then, changes are not saved.",
+        bytes.div_ceil(MIB),
+        cap / MIB
+    )
 }
 
 /// Why `delete_backup` failed, without the backup's path (05 §2.5).
@@ -1080,6 +1112,74 @@ mod tests {
             assert!(!s.autosave_pending, "no second retry");
             assert_eq!(s.toast.as_ref().unwrap().message.as_ref(), SAVE_CHANGED);
         });
+    }
+
+    /// A save refused because the vault outgrew the read cap (bug hunt 2026-11-06 M1): a
+    /// clear danger toast and a status line that stays until a save works, no retry by the
+    /// autosave or the tick, and the vault stays dirty.
+    #[gpui::test]
+    fn too_large_save_shows_a_persistent_message_and_is_not_retried(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        let cap = vault_sync::MAX_VAULT_FILE_SIZE;
+        let too_large = || {
+            Err(SyncError::VaultTooLarge {
+                bytes: cap + 5 * 1024 * 1024 + 1,
+                cap,
+            })
+        };
+        state.update(cx, |s, cx| {
+            s.toggle_favorite(cx);
+            s.autosave = None;
+            s.autosave_pending = false;
+            s.autosave_finished(too_large(), cx);
+            let toast = s.toast.as_ref().unwrap();
+            assert!(toast.danger);
+            let expected = "The vault is too large to save (70 MiB, limit 64 MiB). Remove large \
+                            notes or field values (also from Recently Deleted); until then, \
+                            changes are not saved.";
+            assert_eq!(toast.message.as_ref(), expected);
+            assert_eq!(s.sync_status, SyncStatus::Error(expected.into()));
+            assert!(s.sync.save_failing);
+            assert!(!s.autosave_pending && !s.sync.busy_retried, "not retried");
+            assert!(s.vault.as_ref().unwrap().is_dirty());
+            // The next edit's refusal does not toast again; the status line carries it.
+            s.toast = None;
+            s.autosave_finished(too_large(), cx);
+            assert!(s.toast.is_none(), "no repeated danger toast");
+            assert_eq!(s.sync_status, SyncStatus::Error(expected.into()));
+            // The tick does not retry it either, and the status line stays.
+            s.poll_sync(cx);
+            assert!(!s.autosave_pending);
+            assert_eq!(s.sync_status, SyncStatus::Error(expected.into()));
+            // Once a save works (the user shrank the vault), the message clears.
+            s.save_now(cx);
+            assert_eq!(s.sync_status, SyncStatus::Idle);
+            assert!(!s.sync.save_failing);
+        });
+    }
+
+    /// A lock whose unsaved state is over the read cap: no Unsaved copy can be written, and
+    /// the danger toast says why instead of the generic text.
+    #[test]
+    fn lock_toast_names_a_too_large_vault() {
+        let cap = vault_sync::MAX_VAULT_FILE_SIZE;
+        let bytes = cap + 5 * 1024 * 1024 + 1;
+        let outcome = vault_sync::LockOutcome::Unpreserved(SyncError::VaultTooLarge { bytes, cap });
+        let save_error = vault_too_large_message(bytes, cap);
+        let toast = super::super::lock_toast(Some(&save_error), &outcome).unwrap();
+        assert!(toast.danger);
+        assert_eq!(
+            toast.message.as_ref(),
+            format!(
+                "{} Unsaved changes were not kept.",
+                vault_too_large_message(bytes, cap)
+            )
+        );
+        // Any other unpreserved lock keeps the generic text.
+        let other = vault_sync::LockOutcome::Unpreserved(SyncError::Locked);
+        let toast = super::super::lock_toast(None, &other).unwrap();
+        assert_eq!(toast.message.as_ref(), super::super::LOCK_LOST);
     }
 
     #[gpui::test]

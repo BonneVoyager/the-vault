@@ -136,10 +136,19 @@ fn imports_kdbx3_fixture_and_rejects_bad_inputs_without_leaking_values() {
     assert!(matches!(error, ImportError::KdbxCredentials));
     assert!(!error.to_string().contains("do-not-print-this"));
     assert!(import_kdbx(b"junk", &password(PASSWORD), None, Uuid::nil(), NOW).is_err());
+    // A flipped payload byte fails the HMAC block stream *after* the key passed: damaged, not
+    // wrong credentials (owner decision 2026-11-06). The password still decides the rest.
     let mut damaged = include_bytes!("fixtures/keepass-v4.kdbx").to_vec();
     let last = damaged.len() - 1;
     damaged[last] ^= 1;
-    assert!(import_kdbx(&damaged, &password(PASSWORD), None, Uuid::nil(), NOW).is_err());
+    assert!(matches!(
+        import_kdbx(&damaged, &password(PASSWORD), None, Uuid::nil(), NOW),
+        Err(ImportError::KdbxMalformed)
+    ));
+    assert!(matches!(
+        import_kdbx(&damaged, &password("wrong"), None, Uuid::nil(), NOW),
+        Err(ImportError::KdbxCredentials)
+    ));
 }
 
 #[test]
@@ -663,6 +672,67 @@ fn crafted_kdbx4_inner_header_panic_is_caught_not_propagated() {
         "expected KdbxMalformed, got {:?}",
         import(&out, PASSWORD).err()
     );
+}
+
+/// A valid database the importer cannot read must not be reported as a wrong password (bug
+/// hunt 2026-11-06, L2; 05 §2.5 keeps the prompt open on `KdbxCredentials`). keepass-rs's XML
+/// layer refuses more than 128 nested elements, so a 150-deep group tree authenticates with the
+/// right password and then fails in the parser: that is `KdbxMalformed`. The same bytes with a
+/// wrong password are still `KdbxCredentials`, and a 100-deep tree imports. Saving and parsing
+/// the tree recurse, so the work runs on dedicated threads (8 MiB for the import, as the hunt
+/// did: the default test stack overflows in debug builds around depth 200).
+#[test]
+fn rejected_content_after_a_correct_password_is_malformed_not_credentials() {
+    fn nested(depth: usize) -> Vec<u8> {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let mut db = small_db();
+                let mut id = db.root_mut().id();
+                for _ in 0..depth {
+                    let mut group = db.group_mut(id).unwrap();
+                    let mut child = group.add_group();
+                    child.name = "g".into();
+                    id = child.id();
+                }
+                let mut group = db.group_mut(id).unwrap();
+                let mut entry = group.add_entry();
+                entry.set_unprotected("Title", "deep");
+                entry.set_protected("Password", "deep-secret");
+                encoded(&db, Some(PASSWORD), None)
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+    fn run(bytes: &[u8], pw: &'static str) -> Result<Vec<vault_core::Item>, ImportError> {
+        let bytes = bytes.to_vec();
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(move || import(&bytes, pw))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    let deep = nested(150);
+    let right = run(&deep, PASSWORD);
+    assert!(
+        matches!(right, Err(ImportError::KdbxMalformed)),
+        "correct password, parser-rejected content: {:?}",
+        right.err()
+    );
+    let wrong = run(&deep, "not-the-password");
+    assert!(
+        matches!(wrong, Err(ImportError::KdbxCredentials)),
+        "wrong password on the same bytes: {:?}",
+        wrong.err()
+    );
+    assert!(!wrong.unwrap_err().to_string().contains("deep-secret"));
+
+    let shallow = run(&nested(100), PASSWORD).unwrap();
+    assert_eq!(shallow.len(), 1);
+    assert!(shallow[0].tags.contains(&vec!["g"; 100].join("/")));
 }
 
 #[test]

@@ -49,9 +49,7 @@ impl AppState {
             return None;
         }
         let id = self.selection?;
-        self.unlocked_vault()?
-            .get(id)
-            .filter(|i| i.is_deleted() && i.has_content())
+        self.unlocked_vault()?.get(id).filter(|i| i.is_trashed())
     }
 
     /// The item the detail column reads from: the selected live item, else the selected

@@ -152,14 +152,10 @@ impl AppState {
                         Mode::Edit(b) | Mode::New(_, b)
                             if same_session && Some(b.item.id) == target.item =>
                         {
-                            match b.index(target.key) {
-                                Some(i) if b.item.fields[i].kind == FieldKind::Totp => {
-                                    b.item.fields[i].value = uri;
-                                    b.pushed.push(target.key);
-                                    true
-                                }
-                                _ => false,
-                            }
+                            // Capped like typed input (§2.3).
+                            b.field(target.key)
+                                .is_some_and(|f| f.kind == FieldKind::Totp)
+                                && b.fill_value(target.key, uri)
                         }
                         _ => false,
                     };
@@ -335,6 +331,28 @@ mod tests {
         let toast = toast(&state, cx);
         assert_eq!(toast, "One-time code added from the image");
         assert!(!toast.contains("JBSW"), "the secret never reaches a toast");
+    }
+
+    /// A scanned URI goes through the edit buffer's cap (§2.3).
+    #[gpui::test]
+    fn image_scan_is_capped(cx: &mut TestAppContext) {
+        let limit = EditBuffer::FIELD_LIMIT_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, key) = editing(dir.path(), cx);
+        // Unknown query parameters are ignored, so this still parses.
+        let long = format!("{VALID}&x={}", "a".repeat(limit));
+        state.update(cx, |st, cx| {
+            st.set_qr_scanner(FakeScanner::returning(Ok(vec![s(&long)])));
+            st.scan_totp_qr_image(key, PathBuf::from("/tmp/qr.png"), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(field_value(&state, cx), long[..limit]);
+        state.read_with(cx, |st, _| {
+            let b = st.edit_buffer().unwrap();
+            assert!(b.row_limited(key));
+            assert_eq!(b.pushed, vec![key]);
+        });
+        assert_eq!(toast(&state, cx), "One-time code added from the image");
     }
 
     #[gpui::test]

@@ -240,7 +240,7 @@ fn recover_errors() {
     v.delete(id, 2_000).unwrap();
     v.delete_permanently(id, 2_100).unwrap();
     let e = v.recover(id, 2_200).unwrap_err();
-    assert!(is_malformed(&e, "has no content"), "{e}");
+    assert!(is_malformed(&e, "is not in the trash"), "{e}");
     let item = v.get(id).unwrap();
     assert!(item.is_deleted(), "still a tombstone");
     assert_eq!(item.modified_at, 2_100, "untouched");
@@ -651,10 +651,17 @@ fn strip_and_expire_saturate_at_u64_max() {
     assert_eq!(v.get(id).unwrap().modified_at, u64::MAX);
     v.delete(id, u64::MAX).unwrap();
     assert_eq!(v.get(id).unwrap().modified_at, u64::MAX);
-    assert_eq!(
-        v.recover(id, u64::MAX).unwrap_err(),
-        VaultError::Malformed(format!("item {id} has no content"))
-    );
+    // Saturation residual (documented on `Item::is_trashed`): the strip could not restamp
+    // past deleted_at, so the shell still reads as trashed and can be recovered as a live
+    // title-only item. Below the top (see `other`) a stripped shell is not recoverable.
+    assert!(v.get(id).unwrap().is_trashed());
+    v.recover(id, u64::MAX).unwrap();
+    let shell = v.get(id).unwrap();
+    assert!(!shell.is_deleted());
+    assert!(!shell.has_content());
+    assert_eq!(shell.modified_at, u64::MAX);
+    v.delete(id, u64::MAX).unwrap();
+    assert_eq!(v.get(id).unwrap().deleted_at, Some(u64::MAX));
 
     // Content tombstone just below the top, swept with cutoff and now at the top.
     let other = v.insert(sample_item(2, 1_000), 1_000);
@@ -664,12 +671,380 @@ fn strip_and_expire_saturate_at_u64_max() {
     assert_stripped(item);
     assert_eq!(item.deleted_at, Some(u64::MAX - 1));
     assert_eq!(item.modified_at, u64::MAX);
+    assert!(
+        !item.is_trashed(),
+        "restamped past deleted_at: out of the trash"
+    );
     assert_eq!(
         v.expire_deleted(u64::MAX, u64::MAX),
         0,
         "idempotent at saturation"
     );
+    assert_eq!(
+        v.recover(other, u64::MAX).unwrap_err(),
+        VaultError::Malformed(format!("item {other} is not in the trash"))
+    );
     // Still a valid file.
     let u = unlock(&v.serialize()).unwrap();
     assert_vaults_eq(&v, &u);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Title-only items (bug hunt 2026-11-06, L1): "in the trash" is `Item::is_trashed`, read off
+// the stamps (`deleted_at` set and `modified_at <= deleted_at`, or content present), so an
+// item that never had fields, history, attachments or markers lands in Recently Deleted too.
+// ---------------------------------------------------------------------------------------------
+
+/// `Item::new` plus tags and a favorite: what `vault add --title` with a field-less template
+/// or a title-only CSV / KeePass row produces.
+fn title_only(title: &str, now: u64) -> Item {
+    let mut item = Item::new(title, dev_a(), now);
+    item.tags = vec!["keep".into(), "work".into()];
+    item.favorite = true;
+    item
+}
+
+#[test]
+fn title_only_item_round_trips_through_the_trash() {
+    let mut v = new_vault();
+    v.set_device_id(dev_a());
+    let id = v.insert(title_only("Only a title", 100), 100);
+    let live = v.get(id).unwrap();
+    assert!(!live.has_content(), "nothing but metadata");
+    assert!(!live.is_trashed(), "a live item is never in the trash");
+
+    v.delete(id, 200).unwrap();
+    let t = v.get(id).unwrap();
+    assert_eq!(t.deleted_at, Some(200));
+    assert_eq!(
+        t.modified_at, 200,
+        "delete leaves deleted_at == modified_at"
+    );
+    assert!(t.is_trashed());
+    assert!(
+        !t.has_content(),
+        "still no content: the trash is not inferred from it"
+    );
+    assert_eq!(v.deleted_items().map(|i| i.id).collect::<Vec<_>>(), [id]);
+    assert_eq!(v.items().count(), 0, "not live");
+
+    // The tombstone keeps its place in the trash across a save/unlock round trip.
+    let u = unlock(&v.serialize()).unwrap();
+    assert!(u.get(id).unwrap().is_trashed());
+    assert_eq!(u.deleted_items().count(), 1);
+
+    v.recover(id, 300).unwrap();
+    let r = v.get(id).unwrap();
+    assert!(!r.is_deleted());
+    assert!(!r.is_trashed());
+    assert_eq!(r.modified_at, 300, "restamped past the tombstone");
+    assert_eq!(r.device_id, dev_a());
+    assert_eq!(r.title, "Only a title");
+    assert_eq!(r.tags, ["keep", "work"]);
+    assert!(r.favorite);
+    assert!(r.fields.is_empty() && r.history.is_empty() && r.attachments.is_empty());
+    assert_eq!(v.items().map(|i| i.id).collect::<Vec<_>>(), [id]);
+    assert_eq!(v.deleted_items().count(), 0);
+}
+
+#[test]
+fn cli_style_title_only_item_is_recoverable() {
+    // `vault add --title Card --template card --tag bank`: `Item::new(title, device, now)`,
+    // the user's tags, then the template tag; the card template adds no fields.
+    let mut v = new_vault();
+    v.set_device_id(dev_a());
+    let now = 1_700_000_000_000;
+    let mut item = Item::new("Card", v.device_id(), now);
+    item.tags = vec!["bank".into()];
+    if !item.tags.iter().any(|t| t.eq_ignore_ascii_case("card")) {
+        item.tags.push("card".into());
+    }
+    let id = v.insert(item, now);
+    assert!(!v.get(id).unwrap().has_content());
+
+    v.delete(id, now + 1_000).unwrap();
+    assert!(v.deleted_items().any(|i| i.id == id), "in Recently Deleted");
+    v.recover(id, now + 2_000).unwrap();
+    let r = v.get(id).unwrap();
+    assert!(!r.is_deleted());
+    assert_eq!(r.title, "Card");
+    assert_eq!(r.tags, ["bank", "card"]);
+    assert_eq!(r.modified_at, now + 2_000);
+}
+
+#[test]
+fn title_only_tombstone_leaves_the_trash_only_when_stripped() {
+    let mut v = new_vault();
+    v.set_device_id(dev_a());
+    let id = v.insert(title_only("t", 1_000), 1_000);
+    v.delete(id, 2_000).unwrap();
+    // Re-deleting a trashed tombstone moves deleted_at forward, like a content tombstone.
+    v.delete(id, 2_100).unwrap();
+    let t = v.get(id).unwrap();
+    assert_eq!((t.deleted_at, t.modified_at), (Some(2_100), 2_100));
+    assert!(t.is_trashed());
+
+    // Inside the window: untouched.
+    assert_eq!(v.expire_deleted(2_100, 5_000), 0, "strict cutoff");
+    assert!(v.get(id).unwrap().is_trashed());
+    // Past the window: the strip is a pure restamp here, and the restamp is what takes the
+    // tombstone out of the trash.
+    assert_eq!(v.expire_deleted(2_101, 5_000), 1);
+    let s = v.get(id).unwrap();
+    assert_eq!(s.deleted_at, Some(2_100), "strip never moves deleted_at");
+    assert_eq!(s.modified_at, 5_000, "restamped");
+    assert_eq!(s.device_id, dev_a());
+    assert!(!s.is_trashed());
+    assert_stripped(s);
+    assert_eq!(s.title, "t");
+    assert_eq!(s.tags, ["keep", "work"]);
+    assert_eq!(v.deleted_items().count(), 0);
+    assert_eq!(v.expire_deleted(u64::MAX, 6_000), 0, "idempotent");
+    assert_eq!(v.get(id).unwrap().modified_at, 5_000, "no second restamp");
+    // Nothing to recover; deleting the shell again is a no-op.
+    let e = v.recover(id, 6_000).unwrap_err();
+    assert!(is_malformed(&e, "is not in the trash"), "{e}");
+    v.delete(id, 9_000).unwrap();
+    let s = v.get(id).unwrap();
+    assert_eq!((s.deleted_at, s.modified_at), (Some(2_100), 5_000), "no-op");
+
+    // delete_permanently on a title-only tombstone, with the clock behind: the restamp is
+    // still strictly past the tombstone (`stamp(now, previous)`), so the rule is exact.
+    let id2 = v.insert(title_only("u", 1_000), 1_000);
+    v.delete(id2, 2_000).unwrap();
+    assert!(v.get(id2).unwrap().is_trashed());
+    v.delete_permanently(id2, 10).unwrap();
+    let s = v.get(id2).unwrap();
+    assert_eq!((s.deleted_at, s.modified_at), (Some(2_000), 2_001));
+    assert!(!s.is_trashed());
+    assert!(v.recover(id2, 3_000).is_err());
+    assert_eq!(v.items_including_deleted().count(), 2, "no record dropped");
+}
+
+#[test]
+fn is_trashed_keeps_a_content_tombstone_whose_stamp_moved() {
+    // The second half of the rule only matters for content-less tombstones: a tombstone with
+    // content stays in the trash however its stamps move (here an attachment reference added
+    // to the tombstone restamps it past deleted_at).
+    let (mut v, id) = loaded_vault();
+    v.delete(id, 2_000).unwrap();
+    v.add_attachment_ref(id, new_ref("late.txt", 3, 2_500).unwrap(), 2_500)
+        .unwrap();
+    let t = v.get(id).unwrap();
+    assert!(t.modified_at > t.deleted_at.unwrap());
+    assert!(t.has_content());
+    assert!(t.is_trashed());
+    assert_eq!(v.deleted_items().count(), 1);
+    v.recover(id, 3_000).unwrap();
+    assert_eq!(v.get(id).unwrap().attachments.len(), 2);
+}
+
+#[test]
+fn title_only_trash_propagates_like_a_content_tombstone() {
+    // Delete on A reaches B's trash; B's recovery reaches A live with title and tags.
+    let mut a = new_vault();
+    a.set_device_id(dev_a());
+    let id = a.insert(title_only("shared", 1_000), 1_000);
+    let mut b = peer(&a);
+    a.delete(id, 2_000).unwrap();
+    let report = b.merge_from(&unlock(&a.serialize()).unwrap()).unwrap();
+    assert_eq!(report.deleted, 1);
+    let t = b.get(id).unwrap();
+    assert_eq!((t.deleted_at, t.modified_at), (Some(2_000), 2_000));
+    assert!(t.is_trashed(), "in B's trash after the merge");
+    assert_eq!(b.deleted_items().count(), 1);
+
+    b.recover(id, 2_500).unwrap();
+    let report = a.merge_from(&unlock(&b.serialize()).unwrap()).unwrap();
+    assert_eq!(report.updated, 1);
+    let r = a.get(id).unwrap();
+    assert!(!r.is_deleted());
+    assert_eq!(r.title, "shared");
+    assert_eq!(r.tags, ["keep", "work"]);
+    converge(&mut a, &mut b);
+    assert!(!a.get(id).unwrap().is_deleted() && !b.get(id).unwrap().is_deleted());
+
+    // A strip propagates: the stripped copy is restamped past the trashed one.
+    a.delete(id, 3_000).unwrap();
+    b.merge_from(&unlock(&a.serialize()).unwrap()).unwrap();
+    assert!(b.get(id).unwrap().is_trashed());
+    a.delete_permanently(id, 3_500).unwrap();
+    b.merge_from(&unlock(&a.serialize()).unwrap()).unwrap();
+    let s = b.get(id).unwrap();
+    assert!(s.is_deleted() && !s.is_trashed(), "stripped on B too");
+    assert_eq!((s.deleted_at, s.modified_at), (Some(3_000), 3_500));
+    assert_eq!(b.deleted_items().count(), 0);
+    converge(&mut a, &mut b);
+    assert!(!a.get(id).unwrap().is_trashed() && !b.get(id).unwrap().is_trashed());
+
+    // Recovery beats a later strip (03 §5): the one-tombstone rule compares deleted_at, which
+    // the strip does not move, so the title-only item survives on both devices.
+    let mut a = new_vault();
+    a.set_device_id(dev_a());
+    let id = a.insert(title_only("raced", 1_000), 1_000);
+    a.delete(id, 2_000).unwrap();
+    let mut b = peer(&a);
+    assert!(b.get(id).unwrap().is_trashed());
+    a.recover(id, 2_500).unwrap();
+    b.delete_permanently(id, 2_600).unwrap();
+    converge(&mut a, &mut b);
+    for v in [&a, &b] {
+        let item = v.get(id).unwrap();
+        assert!(!item.is_deleted(), "recovery survives the later strip");
+        assert_eq!(item.title, "raced");
+        assert_eq!(item.tags, ["keep", "work"]);
+    }
+    // Only a fresh delete after the recovery removes it again.
+    b.delete(id, 2_700).unwrap();
+    converge(&mut a, &mut b);
+    assert!(a.get(id).unwrap().is_trashed() && b.get(id).unwrap().is_trashed());
+}
+
+#[test]
+fn equal_stamp_tombstone_tie_is_the_documented_residual() {
+    // An equal-stamp tie: both devices delete the same item at the same stamp (a delete
+    // against an edit at the same stamp behaves alike). The both-tombstone rule picks B
+    // (greater device id); on A the merge takes B's tombstone at an equal `modified_at` and
+    // bumps it by one (03 §5), so A's copy reads `modified_at = deleted_at + 1`. For a
+    // content tombstone that changes nothing (content keeps it in the trash); for a
+    // title-only tombstone it is the one path that leaves the trash without a strip, and the
+    // devices still converge. Documented in `Item::is_trashed`; this pins the behaviour.
+    let mut a = new_vault();
+    a.set_device_id(dev_a());
+    let plain = a.insert(title_only("plain", 1_000), 1_000);
+    let rich = a.insert(sample_item(7, 1_000), 1_000);
+    let mut b = peer(&a);
+    for v in [&mut a, &mut b] {
+        v.delete(plain, 2_000).unwrap();
+        v.delete(rich, 2_000).unwrap();
+    }
+    a.merge_from(&unlock(&b.serialize()).unwrap()).unwrap();
+    let p = a.get(plain).unwrap();
+    assert_eq!(
+        (p.deleted_at, p.modified_at, p.device_id),
+        (Some(2_000), 2_001, dev_b())
+    );
+    assert!(
+        !p.is_trashed(),
+        "the equal-stamp bump reads as a strip on a content-less tombstone"
+    );
+    assert!(
+        a.get(rich).unwrap().is_trashed(),
+        "content keeps the rich one in the trash"
+    );
+    assert!(
+        b.get(plain).unwrap().is_trashed(),
+        "B's own copy is untouched"
+    );
+    converge(&mut a, &mut b);
+    for v in [&a, &b] {
+        assert!(!v.get(plain).unwrap().is_trashed());
+        assert!(v.get(rich).unwrap().is_trashed());
+        assert_eq!(
+            v.get(plain).unwrap().title,
+            "plain",
+            "the shell still carries the title"
+        );
+    }
+    assert_vaults_eq(&a, &b);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Legacy tombstones. `v2-trash-legacy.vault` holds what every tombstone was before
+// 2026-11-03: the lists emptied at delete time and `deleted_at == modified_at` (the old
+// `delete` stamped both at once). Under `is_trashed` such a shell is in the trash until the
+// first sweep restamps it. The fixture was written by `regenerate_trash_legacy_fixture`, which
+// reproduces that shape through `insert` (a tombstone inserted at its own stamp is not moved).
+// ---------------------------------------------------------------------------------------------
+
+const TRASH_LEGACY: &[u8] = include_bytes!("fixtures/v2-trash-legacy.vault");
+const TL_AT: u64 = 1_698_000_000_000;
+const TL_SHELL_A: u128 = 0x7A5A_0000_0000_0000_0000_0000_0000_0001;
+const TL_SHELL_B: u128 = 0x7A5A_0000_0000_0000_0000_0000_0000_0002;
+const TL_LIVE: u128 = 0x7A5A_0000_0000_0000_0000_0000_0000_0003;
+
+#[test]
+#[ignore = "regenerate the legacy-tombstone fixture (bytes change: fresh nonces)"]
+fn regenerate_trash_legacy_fixture() {
+    let mut v = new_vault();
+    for (id, title, at) in [
+        (TL_SHELL_A, "Old shell A", TL_AT),
+        (TL_SHELL_B, "Old shell B", TL_AT + 1_000),
+    ] {
+        let mut shell = Item::new(title, device(), at);
+        shell.id = Uuid::from_u128(id);
+        shell.tags = vec!["legacy".into()];
+        shell.deleted_at = Some(at);
+        v.insert(shell, at);
+        let s = v.get(Uuid::from_u128(id)).unwrap();
+        assert_eq!((s.deleted_at, s.modified_at), (Some(at), at));
+        assert!(!s.has_content());
+    }
+    let mut live = sample_item(1, TL_AT + 2_000);
+    live.id = Uuid::from_u128(TL_LIVE);
+    v.insert(live, TL_AT + 2_000);
+    std::fs::write(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/v2-trash-legacy.vault"
+        ),
+        v.serialize(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn legacy_stripped_tombstones_are_in_the_trash_until_swept_once() {
+    let a = Uuid::from_u128(TL_SHELL_A);
+    let b = Uuid::from_u128(TL_SHELL_B);
+    let mut v = unlock(TRASH_LEGACY).unwrap();
+    v.set_device_id(dev_a());
+    assert_eq!(v.items().count(), 1, "the live item");
+    assert_eq!(v.items_including_deleted().count(), 3);
+    let trash: Vec<Uuid> = v.deleted_items().map(|i| i.id).collect();
+    assert_eq!(trash, [a, b], "both legacy shells, id order");
+    for (id, title, at) in [(a, "Old shell A", TL_AT), (b, "Old shell B", TL_AT + 1_000)] {
+        let s = v.get(id).unwrap();
+        assert!(s.is_trashed() && !s.has_content());
+        assert_eq!((s.deleted_at, s.modified_at), (Some(at), at));
+        assert_eq!(s.title, title);
+        assert_eq!(s.tags, ["legacy"]);
+    }
+
+    // One sweep restamps them once, and they are gone from the list.
+    let now = TL_AT + 10_000;
+    assert_eq!(v.expire_deleted(TL_AT + 5_000, now), 2);
+    for (id, at) in [(a, TL_AT), (b, TL_AT + 1_000)] {
+        let s = v.get(id).unwrap();
+        assert!(!s.is_trashed());
+        assert_eq!((s.deleted_at, s.modified_at), (Some(at), now));
+        assert_eq!(s.device_id, dev_a());
+        assert_eq!(
+            s.title,
+            if id == a {
+                "Old shell A"
+            } else {
+                "Old shell B"
+            }
+        );
+    }
+    assert_eq!(v.deleted_items().count(), 0);
+    assert_eq!(v.expire_deleted(TL_AT + 5_000, now + 1), 0, "idempotent");
+    assert_eq!(v.get(a).unwrap().modified_at, now, "not restamped again");
+    assert!(v.recover(a, now + 2).is_err());
+    assert_eq!(v.items_including_deleted().count(), 3, "records kept");
+    // The swept file still opens and keeps the shape.
+    let again = unlock(&v.serialize()).unwrap();
+    assert_eq!(again.deleted_items().count(), 0);
+    assert_eq!(again.get(a).unwrap().modified_at, now);
+
+    // Until swept, a legacy shell can be recovered as a live title-only item.
+    let mut v = unlock(TRASH_LEGACY).unwrap();
+    v.recover(a, TL_AT + 3_000).unwrap();
+    let r = v.get(a).unwrap();
+    assert!(!r.is_deleted());
+    assert_eq!(r.title, "Old shell A");
+    assert_eq!(r.tags, ["legacy"]);
+    assert_eq!(r.modified_at, TL_AT + 3_000);
+    assert_eq!(v.items().count(), 2);
 }
