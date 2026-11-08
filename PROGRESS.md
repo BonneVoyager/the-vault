@@ -1136,6 +1136,11 @@ fmt and workspace clippy clean; `cargo test -p vault-app` 489 passed, 0 failed. 
 the earlier unstaged Dock/status-item wave: `scripts/Info.plist`, `main.rs`, `state/prefs.rs`,
 spec 04, PROGRESS. Owner eye check (packaged .app only): toggle off, reopen from Applications,
 Spotlight and a .vault file: no Dock icon, padlock only; quit and relaunch with the toggle off:
-no icon flash; toggle on: Dock icon and menu bar back.
+no icon flash; toggle on: Dock icon and menu bar back. Owner eye check passed 2026-11-08.
 
-Bug hunt: not yet run for this wave.
+Bug hunt: run for this wave (2026-11-08; docs/qa/bug-hunt-2026-11-08.md: no bugs; two owner decisions noted).
+
+### 2026-11-08 — Bug-hunt decisions: field order and concurrent CLI edits
+- Owner decisions on the two notes from `docs/qa/bug-hunt-2026-11-08.md`: (a) concurrent CLI edits of one item stay last-writer-wins per attribute; callers serialise (03 §5, 00 overview). (b) field order travels with the item winner and has no stamp; a reorder alone propagates, a later edit of the same item on another device wins the order (03 §5 "Field order", 05 §2.5). Both already matched the code; spec only.
+- vault-core tests pinning (b): `reorder_loses_to_a_later_edit_on_another_device`, `reorder_alone_propagates` in `tests/merge.rs` (+70 lines, no production change). `cargo test -p vault-core --test merge` 18 passed; fmt and clippy clean.
+- Checkpoint: spec and test only, no UI. Nothing to eye-check. Bug hunt: run for this wave (2026-11-08; these decisions close its two open notes).

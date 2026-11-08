@@ -691,3 +691,73 @@ fn merge_that_changes_content_advances_modified_at_and_defeats_rollback() {
     assert!(!a.merge_from(&b).unwrap().changed());
     assert_eq!(a.get(ids[0]).unwrap().modified_at, 5_000);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Field order (03-sync.md §5 "Field order"): no per-position stamp; the item winner's order wins.
+// ---------------------------------------------------------------------------------------------
+
+fn field_names(v: &UnlockedVault, id: Uuid) -> Vec<String> {
+    v.get(id)
+        .unwrap()
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect()
+}
+
+/// Moves `url` to the front, no other change.
+fn move_url_first(i: &mut Item) {
+    let pos = i.fields.iter().position(|f| f.name == "url").unwrap();
+    let url = i.fields.remove(pos);
+    i.fields.insert(0, url);
+}
+
+#[test]
+fn reorder_loses_to_a_later_edit_on_another_device() {
+    let (mut a, mut b, ids) = two_devices(1);
+    let id = ids[0];
+    let original = field_names(&b, id);
+    assert_eq!(original, ["username", "password", "totp", "url", "notes"]);
+
+    let before = a.get(id).unwrap().modified_at;
+    a.update(id, 2_000, move_url_first).unwrap();
+    assert!(
+        a.get(id).unwrap().modified_at > before,
+        "a reorder alone restamps the item"
+    );
+    assert_eq!(
+        field_names(&a, id),
+        ["url", "username", "password", "totp", "notes"]
+    );
+
+    // B has not seen the reorder and edits the password later.
+    b.update(id, 3_000, |i| {
+        i.fields
+            .iter_mut()
+            .find(|f| f.name == "password")
+            .unwrap()
+            .value = secret("bob-later-pw");
+    })
+    .unwrap();
+
+    converge(&mut a, &mut b);
+    for v in [&a, &b] {
+        assert_eq!(field_names(v, id), original, "B's order wins; reorder lost");
+        assert_eq!(value(v, id, "password"), "bob-later-pw");
+    }
+    assert_eq!(field_names(&a, id), field_names(&b, id));
+}
+
+#[test]
+fn reorder_alone_propagates() {
+    let (mut a, mut b, ids) = two_devices(1);
+    let id = ids[0];
+    a.update(id, 2_000, move_url_first).unwrap();
+    converge(&mut a, &mut b);
+    for v in [&a, &b] {
+        assert_eq!(
+            field_names(v, id),
+            ["url", "username", "password", "totp", "notes"]
+        );
+    }
+}

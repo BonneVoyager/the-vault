@@ -262,7 +262,7 @@ if [ $rc -ne 0 ] && [ $rc -ne 101 ] && cmp -s "$T/ed-before.bin" "$VAULT_FILE/va
 pids=()
 for i in $(seq 1 10); do v edit "Site 2" --add "text:c$i=v$i" >"$T/ce$i.log" 2>&1 & pids+=($!); done
 fails=0; for p in "${pids[@]}"; do wait "$p" || fails=$((fails+1)); done
-n=$(v get "Site 2" --reveal 2>/dev/null | grep -cE "c([0-9]|10)\b")
+n=$(v get "Site 2" --reveal 2>/dev/null | grep -cE "^c([0-9]|10):")
 [ "$n" = "10" ] && [ "$fails" = "0" ] && ok "10 concurrent edit --add on one item: none lost" || bad "concurrent edits" "fields=$n failed=$fails $(cat "$T"/ce*.log | sort | uniq -c | head -3)"
 
 # mixed concurrent writers: add + edit + sync
@@ -377,6 +377,35 @@ v add --title TrashMe >/dev/null 2>&1
 v rm TrashMe >"$T/o" 2>&1 && ok "rm into trash" || bad "rm" "$(cat "$T/o")"
 v list >"$T/o" 2>&1
 grep -q TrashMe "$T/o" && bad "rm: item still listed" || ok "rm: item hidden from list"
+
+# ---- 2026-11-08: field icons (01 §4 Field.icon; 05 §2.3 "no CLI flag", not exported) ---------
+FI="$ROOT/qa/spec-checks/target/debug/field_icons"
+FPW="correct horse battery staple"
+if [ ! -x "$FI" ]; then (cd "$ROOT/qa/spec-checks" && cargo build -q --bin field_icons) ; fi
+mkdir -p "$T/fi.vault"; cp "$ROOT/crates/vault-core/tests/fixtures/v2-field-icon.vault" "$T/fi.vault/vault.bin"
+fv() { FPW="$FPW" "$V" --vault "$T/fi.vault" --password-env FPW "$@"; }
+"$FI" "$T/fi.vault/vault.bin" "$FPW" | cut -f2- | sort >"$T/fi-before"
+grep -q "	key$" "$T/fi-before" && ok "fixture v2-field-icon carries icon key" || bad "fixture icon" "$(cat "$T/fi-before")"
+FT=$(fv list 2>/dev/null | head -1 | sed -E 's/^[[:space:]]*//; s/[[:space:]]{2,}.*$//')
+fv get "$FT" >"$T/o" 2>&1 && ok "get on field-icon item" || bad "get field-icon item" "$(cat "$T/o")"
+fv get "$FT" --reveal --ids >"$T/o" 2>&1 && ok "get --reveal --ids on field-icon item" || bad "get --reveal field-icon" "$(cat "$T/o")"
+fv edit "$FT" --tag qa-fi >"$T/o" 2>&1 && ok "edit --tag on field-icon item" || bad "edit field-icon item" "$(cat "$T/o")"
+"$FI" "$T/fi.vault/vault.bin" "$FPW" | cut -f2- | sort >"$T/fi-after"
+cmp -s "$T/fi-before" "$T/fi-after" && ok "CLI edit keeps every field icon" || bad "CLI edit lost icons" "$(diff "$T/fi-before" "$T/fi-after")"
+fv export --out "$T/fi.csv" --yes >"$T/o" 2>&1
+# (the fixture's notes text itself contains the word "icon"; look for the icon value "key" as a cell)
+if [ -f "$T/fi.csv" ] && ! grep -qE '(^|,)key(,|$)' "$T/fi.csv"; then ok "export CSV carries no field icon"; else bad "export field icon" "$(head -3 "$T/fi.csv" 2>/dev/null) $(cat "$T/o")"; fi
+rm -f "$T/fi.csv"
+# concurrent CLI writers on a vault with field icons (03 §2 V-02 lock; 03 §5 fields merge by id):
+# 6 processes add new fields to other items and 6 add new fields to the icon item itself.
+# (Concurrent `edit --tag` on one item keeps one tag: tags are one LWW list per 03 §5; see report Notes.)
+for i in 1 2 3 4 5 6; do fv add --title "fic$i" >/dev/null 2>&1; done
+pids=(); for i in 1 2 3 4 5 6; do fv edit "fic$i" --set "note$i=v$i" >"$T/fic$i.log" 2>&1 & pids+=($!); fv edit "$FT" --set "same$i=w$i" >"$T/fit$i.log" 2>&1 & pids+=($!); done
+fails=0; for p in "${pids[@]}"; do wait "$p" || fails=$((fails+1)); done
+"$FI" "$T/fi.vault/vault.bin" "$FPW" | cut -f2- | sort >"$T/fi-cc"
+got=$(grep -c "^note[1-6]	-$" "$T/fi-cc")
+same=$(grep -c "^same[1-6]	-$" "$T/fi-cc")
+if [ "$fails" = 0 ] && [ "$got" = 6 ] && [ "$same" = 6 ] && grep -q "	key$" "$T/fi-cc"; then ok "12 concurrent CLI field adds on a field-icon vault: nothing lost, icons intact"; else bad "concurrent edits field-icon" "fails=$fails other-items=$got same-item=$same" "$(cat "$T"/fic*.log "$T"/fit*.log | sort | uniq -c | head -4)"; fi
 
 echo
 echo "CLI checks: $PASS passed, $FAIL failed"

@@ -35,6 +35,16 @@ cargo fmt --all -- --check                     # formatting is part of the manua
   in core, KdbxCredentials vs malformed content), and a `run_all.sh` section for `sanitize_line`,
   the sync drain, a 70 MB attachment, a symlinked `.lock` and `rm`. `run_child` picks
   `target/release` when built with `--release`.
+- 2026-11-08 additions: `field_icon` (01 §4/§9 `Field.icon`: fixture shape, writer omits none,
+  `""`/`Some("")` = none, hostile types Malformed, unknown names kept through edits, merge, key
+  operations and trash, icon-only restamp, whole-field merge with 2 and 3 devices, cloned-device
+  tie, `Some("")` settling, version 1 + `upgrade_format`, no carry through CSV/1PUX/KDBX, cut and
+  bit-flip sweeps, both conflict-copy shapes, CLI get/edit/export/rm/upgrade/sync, field reorder
+  propagation), `before_write` (03 §2 hook: dirty vs clean saves, lock before the Unsaved backup,
+  never while locked or on `restore_from`, after the pre-write merge, merge write-backs and
+  absorption, expired trash from a peer never reaching disk, before the 64 MiB size check, pre-hook
+  `Merged` reports, survives lock/unlock), `src/bin/field_icons` and a `run_all.sh` field-icon
+  section (fixture vault through the CLI, 12 concurrent field adds).
 - Temp files go under `tmp/` (git-ignored) and are removed by each test.
 
 A passing check shows the behaviour on those inputs only. It is not a proof.
