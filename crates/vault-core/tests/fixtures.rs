@@ -67,6 +67,12 @@
 //! whose title, favorite, tags and icon were each edited at a distinct stamp (all four
 //! `*_modified_at` keys present) and one item without any of the keys (the pre-stamp
 //! shape). Same password and KDF. Built by `regenerate_v2_meta_fixture`.
+//!
+//! `v2-field-icon.vault` (01 §4 `Field.icon`, 2026-11-07, optional key, no version bump)
+//! holds one item with three fields: one whose `icon` is `"key"`, one without the key, and
+//! one with `"icon": null` (written through `Field.extras`, the only way this build emits a
+//! null; the reader folds it into `None`). Same password and KDF. Built by
+//! `regenerate_v2_field_icon_fixture`.
 
 use std::io::Cursor;
 
@@ -143,6 +149,14 @@ const V2_AT: u64 = T0 + 80;
 const V2M_STAMPED_ID: [u8; 16] = [0x11; 16];
 const V2M_LEGACY_ID: [u8; 16] = [0x12; 16];
 const V2M_AT: u64 = T0 + 90;
+
+/// `v2-field-icon.vault`: one item; its three fields in field order: `"icon": "key"`,
+/// no `icon` key, `"icon": null`.
+const V2I_ITEM_ID: [u8; 16] = [0x14; 16];
+const V2I_KEYED: [u8; 16] = [0x2A; 16];
+const V2I_ABSENT: [u8; 16] = [0x2B; 16];
+const V2I_NULL: [u8; 16] = [0x2C; 16];
+const V2I_AT: u64 = T0 + 100;
 
 /// Every `v1-*.vault` is frozen (see the module docs): `new_vault()` creates a version 2
 /// vault now, so a v1 regenerator must never run again. Each one calls this first.
@@ -903,6 +917,94 @@ fn v2_meta_opens_with_and_without_attribute_stamps() {
     assert_eq!(l2.tags_modified_at, None);
 }
 
+/// Builds `v2-field-icon.vault` (01 §4 `Field.icon`, 2026-11-07): one item whose three
+/// fields show every on-disk shape of the key: `"icon": "key"`, absent, and `"icon": null`.
+/// The null goes through `Field.extras`: the writer reserves `icon` only when the field has
+/// a non-empty one (`format::field_to_value`), so an `icon` extra is emitted verbatim.
+#[test]
+#[ignore]
+fn regenerate_v2_field_icon_fixture() {
+    let mut vault = new_vault();
+    let mut item = Item::new("Field icons", device(), V2I_AT);
+    item.id = Uuid::from_bytes(V2I_ITEM_ID);
+    item.tags = vec!["login".into()];
+    let mut keyed = field("username", FieldKind::Text, "someone@example.com", V2I_AT);
+    keyed.id = Uuid::from_bytes(V2I_KEYED);
+    keyed.icon = Some("key".into());
+    let mut absent = field("password", FieldKind::Password, "hunter2", V2I_AT);
+    absent.id = Uuid::from_bytes(V2I_ABSENT);
+    let mut null = field("notes", FieldKind::Notes, "icon written as null", V2I_AT);
+    null.id = Uuid::from_bytes(V2I_NULL);
+    null.extras = vec![(t("icon"), Value::Null)];
+    item.fields = vec![keyed, absent, null];
+    vault.insert(item, V2I_AT);
+    std::fs::write(
+        format!("{FIXTURE_DIR}/v2-field-icon.vault"),
+        vault.serialize(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn v2_field_icon_opens_with_all_three_shapes() {
+    let bytes = std::fs::read(format!("{FIXTURE_DIR}/v2-field-icon.vault")).unwrap();
+    assert_eq!(&bytes[4..6], &[0, 2]);
+    let locked = LockedVault::parse(&bytes).unwrap();
+    check_kdf(&locked);
+    let vault = locked.unlock(&pw()).unwrap();
+    assert_eq!(vault.items().count(), 1);
+    let item = vault.get(Uuid::from_bytes(V2I_ITEM_ID)).unwrap();
+    assert_eq!(item.title, "Field icons");
+    assert_eq!(item.modified_at, V2I_AT);
+    assert_eq!(item.fields.len(), 3);
+
+    let keyed = item.field_by_id(Uuid::from_bytes(V2I_KEYED)).unwrap();
+    assert_eq!(keyed.name, "username");
+    assert_eq!(keyed.icon.as_deref(), Some("key"), "\"icon\": \"key\"");
+    assert_eq!(keyed.icon_name(), Some("key"));
+
+    let absent = item.field_by_id(Uuid::from_bytes(V2I_ABSENT)).unwrap();
+    assert_eq!(absent.name, "password");
+    assert_eq!(absent.icon, None, "no icon key reads as none");
+
+    let null = item.field_by_id(Uuid::from_bytes(V2I_NULL)).unwrap();
+    assert_eq!(null.name, "notes");
+    assert_eq!(null.icon, None, "\"icon\": null reads as none");
+
+    for f in &item.fields {
+        assert!(
+            f.extras.is_empty(),
+            "{}: the icon key never lands in extras",
+            f.name
+        );
+        assert_eq!(
+            f.modified_at, V2I_AT,
+            "{}: reading restamps nothing",
+            f.name
+        );
+    }
+
+    // A save keeps the "key" icon; the null is folded into "absent" (reads back None).
+    let again = LockedVault::parse(&vault.serialize())
+        .unwrap()
+        .unlock(&pw())
+        .unwrap();
+    let item2 = again.get(Uuid::from_bytes(V2I_ITEM_ID)).unwrap();
+    assert_eq!(
+        item2
+            .field_by_id(Uuid::from_bytes(V2I_KEYED))
+            .unwrap()
+            .icon
+            .as_deref(),
+        Some("key")
+    );
+    assert_eq!(
+        item2.field_by_id(Uuid::from_bytes(V2I_NULL)).unwrap().icon,
+        None
+    );
+    assert!(item2.fields.iter().all(|f| f.extras.is_empty()));
+}
+
 fn check_kdf(locked: &LockedVault) {
     let k = locked.kdf_params();
     assert_eq!((k.m_cost_kib, k.t_cost, k.p_cost), (8192, 1, 1));
@@ -1159,8 +1261,8 @@ fn every_fixture_in_the_directory_opens() {
         .collect();
     names.sort();
     assert!(
-        names.len() >= 10,
-        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-icon, v1-meta, v1-stamped, v2-basic, v2-meta, v2-trash-legacy; found {names:?}"
+        names.len() >= 11,
+        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-icon, v1-meta, v1-stamped, v2-basic, v2-meta, v2-trash-legacy, v2-field-icon; found {names:?}"
     );
     assert!(names.iter().any(|n| n.starts_with("v1-")));
     assert!(names.iter().any(|n| n.starts_with("v2-")));
@@ -1175,6 +1277,7 @@ fn every_fixture_in_the_directory_opens() {
                 | "v2-basic.vault"
                 | "v2-meta.vault"
                 | "v2-trash-legacy.vault"
+                | "v2-field-icon.vault"
         )
     };
     for name in &names {

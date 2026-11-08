@@ -42,6 +42,8 @@ struct Row {
     key: u64,
     name: Entity<InputState>,
     value: ValueInput,
+    /// Focus of this row's field icon picker (05 "Field icons").
+    icon_focus: super::icon_view::FieldIconFocus,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -357,6 +359,11 @@ impl Editor {
             key,
             name,
             value,
+            icon_focus: super::icon_view::FieldIconFocus {
+                panel: cx.focus_handle(),
+                // A Tab stop: the row's `tab_index` does not apply to a tracked handle.
+                none: cx.focus_handle().tab_stop(true),
+            },
             _subscriptions: subs,
         }
     }
@@ -499,6 +506,16 @@ impl Editor {
                 ui::h_flex()
                     .gap(px(6.))
                     .child(grip)
+                    // Sections carry no icon (05 "Field icons").
+                    .when(field.kind != FieldKind::Section, |r| {
+                        r.child(super::icon_view::field_icon_button(
+                            &self.state,
+                            key,
+                            &row.icon_focus,
+                            &gpui::Focusable::focus_handle(&row.name, cx),
+                            cx,
+                        ))
+                    })
                     .child(div().w(px(180.)).child(ui::input(&row.name).small()))
                     .child(Tag::secondary().small().child(kind_name(field.kind)))
                     .when(buffer.remote_fields.contains(&key), |row| {

@@ -53,6 +53,7 @@ pub struct Field {
     pub value: SecretString,     // secrecy; Display is redacted
     pub modified_at: Millis,
     pub section: Option<String>,
+    pub icon: Option<String>,    // 2026-11-07; app-interpreted symbol name (01 §4; app uses the `icon::SYMBOLS` identifiers, e.g. "KeyRound"); nothing secret; None when absent; Field::new sets None
 }
 
 pub type Millis = u64;

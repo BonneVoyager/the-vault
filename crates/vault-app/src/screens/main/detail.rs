@@ -155,17 +155,25 @@ pub(crate) fn field_row_colors(cx: &App) -> (gpui::Hsla, gpui::Hsla) {
     (theme.foreground, theme.muted_foreground)
 }
 
+/// Gap between a field's icon and its label (05 "Field icons").
+pub(crate) const FIELD_ICON_GAP: f32 = 8.;
+
 /// One field row, shared by the detail column, item windows and the backup viewer: the
-/// label column, then the value (filling the width) and its buttons.
+/// label column, then the value (filling the width) and its buttons. `icon` is the
+/// field's stored icon name: a known symbol is drawn left of the label (05 "Field
+/// icons"); none or an unknown name leaves the row as it is without one.
 pub(crate) fn field_row(
     ix: usize,
     label: SharedString,
+    icon: Option<&str>,
     value: impl IntoElement,
     buttons: Vec<AnyElement>,
     cx: &App,
 ) -> gpui::Div {
     let theme = cx.theme();
     let (label_color, value_color) = field_row_colors(cx);
+    let symbol = icon.and_then(crate::icon::symbol);
+    let icon_color = theme.muted_foreground;
     ui::h_flex()
         .debug_selector(move || format!("field-row {ix}"))
         .w_full()
@@ -184,12 +192,26 @@ pub(crate) fn field_row(
                 .pt(px(3.))
                 .whitespace_normal()
                 .text_color(label_color)
+                .when_some(symbol, |col, symbol| {
+                    // A one-line-tall box (zero-width text sets its height) centres the
+                    // icon on the label's first line.
+                    col.flex().items_start().gap(px(FIELD_ICON_GAP)).child(
+                        ui::h_flex()
+                            .flex_none()
+                            .debug_selector(move || format!("field-row-icon {ix} {symbol:?}"))
+                            .child(Icon::new(symbol).size_4().text_color(icon_color))
+                            .child(div().w_0().overflow_hidden().child("\u{200b}")),
+                    )
+                })
                 // Display only: the stored name keeps its spelling ("username" shows
                 // "Username"; the editor's name inputs show it as stored).
                 .child({
                     let shown = text::capitalize_first(&label);
                     let selector = format!("field-label-text {ix} {shown}");
-                    div().debug_selector(move || selector.clone()).child(shown)
+                    div()
+                        .debug_selector(move || selector.clone())
+                        .when(symbol.is_some(), |d| d.flex_1().min_w_0())
+                        .child(shown)
                 }),
         )
         .child(
@@ -842,7 +864,15 @@ impl ReadDetail<'_> {
         } else {
             copy_on_click(ix, field.id, &field.name, shown, &self.actions, cx).into_any_element()
         };
-        field_row(ix, field.name.clone().into(), value, buttons, cx).into_any_element()
+        field_row(
+            ix,
+            field.name.clone().into(),
+            field.icon_name(),
+            value,
+            buttons,
+            cx,
+        )
+        .into_any_element()
     }
 
     fn render_totp(&self, ix: usize, field: &Field, now_ms: u64, cx: &App) -> AnyElement {

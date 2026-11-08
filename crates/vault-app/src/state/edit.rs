@@ -160,6 +160,13 @@ impl EditBuffer {
         }
     }
 
+    /// Sets row `key`'s icon (`None`: "No icon"). Section rows carry none (05 "Field icons").
+    pub fn set_field_icon(&mut self, key: u64, icon: Option<String>) {
+        if let Some(f) = self.field_mut(key).filter(|f| f.kind != FieldKind::Section) {
+            f.icon = icon;
+        }
+    }
+
     /// True when row `key`'s name or value was cut: the row shows the limit note.
     pub fn row_limited(&self, key: u64) -> bool {
         self.limited_names.contains(&key) || self.limited_values.contains(&key)
@@ -480,7 +487,10 @@ fn percent_encode(s: &str) -> String {
 }
 
 pub(super) fn same_field(a: &Field, b: &Field) -> bool {
-    a.name == b.name && a.kind == b.kind && a.value.expose_secret() == b.value.expose_secret()
+    a.name == b.name
+        && a.kind == b.kind
+        && a.icon_name() == b.icon_name()
+        && a.value.expose_secret() == b.value.expose_secret()
 }
 
 /// User-facing label of a field kind ("Add field" menu and the chip next to a field).
@@ -604,6 +614,7 @@ fn apply_edit(
                     name: bf.name,
                     kind: bf.kind,
                     value: bf.value,
+                    icon: bf.icon,
                     ..s
                 },
                 // Removed remotely but edited here: back, stamped past the marker.
@@ -712,6 +723,8 @@ impl AppState {
         if let Some(b) = self.edit_buffer_mut() {
             f(b);
             b.error = None;
+            // Removing a row (Delete, ⌫ on selected rows) closes its open icon picker.
+            self.field_icon_picker = self.field_icon_picker();
             cx.notify();
         }
     }
@@ -800,6 +813,60 @@ impl AppState {
                 *cursor = PickerCursor::at(cell);
             }
         });
+    }
+
+    /// The open field icon picker: its row key and keyboard cursor. `None` when its row
+    /// left the buffer (removed, or replaced by a merge rebuild) since it opened.
+    pub fn field_icon_picker(&self) -> Option<(u64, PickerCursor)> {
+        self.field_icon_picker
+            .filter(|(k, _)| self.edit_buffer().is_some_and(|b| b.index(*k).is_some()))
+    }
+
+    /// Opens (on the field's current symbol) or closes row `key`'s icon picker. Not an
+    /// edit by itself; section rows have no picker.
+    pub fn set_field_icon_picker(&mut self, key: u64, open: bool, cx: &mut Context<Self>) {
+        if open {
+            let Some(f) = self.edit_buffer().and_then(|b| b.field(key)) else {
+                return;
+            };
+            if f.kind == FieldKind::Section {
+                return;
+            }
+            self.field_icon_picker = Some((key, PickerCursor::for_field_icon(f.icon_name())));
+        } else if self.field_icon_picker.is_some_and(|(k, _)| k == key) {
+            self.field_icon_picker = None;
+        }
+        cx.notify();
+    }
+
+    /// Arrow key in the open field icon picker.
+    pub fn field_icon_picker_move(&mut self, m: Move, cx: &mut Context<Self>) {
+        if let Some((key, cursor)) = self.field_icon_picker() {
+            self.field_icon_picker = Some((key, cursor.step_symbols(m)));
+            cx.notify();
+        }
+    }
+
+    /// Enter in the open field icon picker: choose the cell under the cursor.
+    pub fn field_icon_picker_choose(&mut self, cx: &mut Context<Self>) {
+        if let Some((key, cursor)) = self.field_icon_picker() {
+            self.choose_field_icon(key, cursor.cell(), cx);
+        }
+    }
+
+    /// "No icon" (`PickerCell::Automatic`) or a symbol for row `key`, then the picker
+    /// closes. Part of the edit: saved or discarded with it.
+    pub fn choose_field_icon(&mut self, key: u64, cell: PickerCell, cx: &mut Context<Self>) {
+        let icon = match cell {
+            PickerCell::Automatic => None,
+            PickerCell::Symbol(i) => match icon::SYMBOLS.get(i) {
+                Some((name, ..)) => Some((*name).to_owned()),
+                None => return,
+            },
+            PickerCell::Color(_) | PickerCell::Image => return,
+        };
+        self.field_icon_picker = None;
+        self.edit(cx, |b| b.set_field_icon(key, icon));
     }
 
     /// The guard (§2.3): returns true if `nav` may proceed now. Leaving an edit with no
@@ -928,6 +995,7 @@ impl AppState {
         self.mode = mode;
         self.edit_session = self.edit_session.wrapping_add(1);
         self.add_field_menu_open = false;
+        self.field_icon_picker = None;
         self.delete_confirm = None;
         self.discard_prompt = None;
         self.generator_target = None;
@@ -966,6 +1034,7 @@ impl AppState {
     pub(super) fn leave_edit_mode(&mut self) {
         self.mode = Mode::View;
         self.add_field_menu_open = false;
+        self.field_icon_picker = None;
     }
 
     /// Removes the references of image icons the edit in progress added (Cancel, lock).

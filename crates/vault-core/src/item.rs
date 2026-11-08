@@ -133,6 +133,14 @@ pub struct Field {
     pub modified_at: Millis,
     /// Optional grouping label.
     pub section: Option<String>,
+    /// App-interpreted symbol name, e.g. `key`; none when `None`. Nothing secret.
+    ///
+    /// On disk (01 §4, 2026-11-07, no version bump) the `icon` key is written only when the
+    /// name is non-empty; missing, `null` and `""` all read back as `None`, so `Some("")`
+    /// is treated as "no icon" everywhere (it is never written and does not count as a
+    /// change). Part of the field: it travels with the field in a merge (03 §5) and a change
+    /// to it alone restamps the field.
+    pub icon: Option<String>,
     /// Unknown keys preserved from the file (01 §9).
     pub extras: Extras,
 }
@@ -148,8 +156,16 @@ impl Field {
             value,
             modified_at: now,
             section: None,
+            icon: None,
             extras: Vec::new(),
         }
+    }
+
+    /// The icon as stored on disk: `Some` only for a non-empty name (01 §4 reads `""` as
+    /// none and never writes it). The writer, the merge tie-break and change detection all
+    /// go through this so `Some("")` and `None` are indistinguishable.
+    pub fn icon_name(&self) -> Option<&str> {
+        self.icon.as_deref().filter(|s| !s.is_empty())
     }
 
     /// The on-disk kind string the writer emits: the preserved `kind_raw` for an unknown kind
@@ -193,6 +209,7 @@ impl fmt::Debug for Field {
             .field("value", &"[REDACTED]")
             .field("modified_at", &self.modified_at)
             .field("section", &self.section)
+            .field("icon", &self.icon)
             .field(
                 "extras",
                 &format_args!("[{} extras redacted]", self.extras.len()),

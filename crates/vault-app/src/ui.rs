@@ -824,6 +824,15 @@ impl MenuRow {
         self
     }
 
+    /// The row on its own, outside a `menu_popover` (the field icon picker's "No icon"
+    /// row): `cursor` draws a picker's keyboard-cursor ring on it.
+    pub fn render_alone(self, focus: &FocusHandle, cursor: bool, cx: &App) -> Stateful<Div> {
+        let (icons, checkable, ring) =
+            (self.icon.is_some(), self.checked.is_some(), cx.theme().ring);
+        self.render(focus, icons, checkable, cx)
+            .when(cursor, |row| row.border_color(ring))
+    }
+
     /// `icons` / `checkable`: some row of the menu has an icon / is checkable.
     fn render(self, focus: &FocusHandle, icons: bool, checkable: bool, cx: &App) -> Stateful<Div> {
         let theme = cx.theme();

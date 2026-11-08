@@ -681,12 +681,15 @@ fn history_entry_eq(a: &HistoryEntry, b: &HistoryEntry) -> bool {
 
 /// Everything about a field except its id and timestamp. Used by `update` to detect edits
 /// that forgot to bump `modified_at` (fields are matched by id first, so the id itself is
-/// not part of the content).
+/// not part of the content). `icon` is compared as written (`Field::icon_name`), so
+/// `None` -> `Some("")` is not a change (01 §4: an empty name reads as none and is never
+/// written) while any other icon-only change is one.
 pub(crate) fn field_content_eq(a: &Field, b: &Field) -> bool {
     a.name == b.name
         && a.kind == b.kind
         && a.kind_raw == b.kind_raw
         && a.section == b.section
+        && a.icon_name() == b.icon_name()
         && a.extras == b.extras
         && a.value.expose_secret() == b.value.expose_secret()
 }

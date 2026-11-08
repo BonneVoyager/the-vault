@@ -477,6 +477,35 @@ fn picker_cursor_moves_through_the_grid() {
     }
 }
 
+/// The field icon picker has "No icon" and the symbol rows only: ↓ on the last symbol
+/// row stays put (no colour or image row), ↑ from the first reaches "No icon".
+#[test]
+fn field_picker_cursor_stays_in_the_symbol_grid() {
+    let last_row_start = (SYMBOLS.len() - 1) / GRID_COLS * GRID_COLS;
+    for i in last_row_start..SYMBOLS.len() {
+        let at = PickerCursor::at(PickerCell::Symbol(i));
+        assert_eq!(at.step_symbols(Move::Down), at, "symbol {i} stays");
+        assert!(matches!(at.step(Move::Down).cell(), PickerCell::Color(_)));
+    }
+    // A column the last row lacks: ↓ from the row above clamps into the last row.
+    let above = PickerCursor::at(PickerCell::Symbol(last_row_start - 1));
+    assert!(matches!(
+        above.step_symbols(Move::Down).cell(),
+        PickerCell::Symbol(i) if i >= last_row_start
+    ));
+    for i in 0..GRID_COLS {
+        let up = PickerCursor::at(PickerCell::Symbol(i)).step_symbols(Move::Up);
+        assert_eq!(up.cell(), PickerCell::Automatic, "symbol {i}");
+        assert_eq!(up.step_symbols(Move::Up), up);
+        assert_eq!(up.step_symbols(Move::Down).cell(), PickerCell::Symbol(0));
+    }
+    // Sideways moves are the item picker's.
+    let mid = PickerCursor::at(PickerCell::Symbol(GRID_COLS + 3));
+    for m in [Move::Left, Move::Right, Move::Up] {
+        assert_eq!(mid.step_symbols(m), mid.step(m));
+    }
+}
+
 #[test]
 fn picker_cursor_starts_on_the_current_choice() {
     assert_eq!(PickerCursor::for_icon(None).cell(), PickerCell::Automatic);

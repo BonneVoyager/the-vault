@@ -20,6 +20,8 @@ gpui_kit_assets::icon_assets!(
         FingerprintPattern,
         ScanQrCode,
         Trash,
+        // Placeholder of a field's icon button in edit mode.
+        CircleDashed,
         // Item icon symbols (icon::SYMBOLS) not in gpui-kit's default set.
         Landmark,
         Wallet,

@@ -64,6 +64,12 @@ fn issue_badge(ix: usize, issues: &[Issue], cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// Tab index of the list column's buttons (Sort, generator, New). Everything else in
+/// the window keeps index 0 in document order (sidebar rows, toggle, search, list,
+/// detail); these come after the detail column so search → list → detail is direct
+/// (05 §6).
+const TOOLBAR_TAB_INDEX: isize = 1;
+
 fn render_row(
     rows: &[Row],
     ix: usize,
@@ -376,6 +382,7 @@ impl MainScreen {
                     .icon(Icon::new(IconName::Plus))
                     .label("New")
                     .tooltip("New item  ⌘N")
+                    .tab_index(TOOLBAR_TAB_INDEX)
                     .clickable(),
                 Anchor::BottomLeft,
                 picker_open,
@@ -400,7 +407,9 @@ impl MainScreen {
             ui::menu_popover(
                 "sort-menu",
                 ui::icon_button("sort", IconName::SortAscending, "Sort items")
-                    .debug_selector(|| "sort".into()),
+                    .debug_selector(|| "sort".into())
+                    .track_focus(&self.sort_focus)
+                    .tab_index(TOOLBAR_TAB_INDEX),
                 Anchor::TopLeft,
                 sort_open,
                 move |open, _, cx| {
@@ -479,7 +488,8 @@ impl MainScreen {
                         "generator",
                         IconName::WandSparkles,
                         "Password generator  ⌘G",
-                    ),
+                    )
+                    .tab_index(TOOLBAR_TAB_INDEX),
                     Anchor::TopRight,
                     generator_open,
                     move |open, _, cx| {
@@ -790,8 +800,7 @@ mod tests {
         vcx.run_until_parked();
         let before = state.read_with(&vcx, |s, _| s.selection);
         vcx.simulate_keystrokes("cmd-f");
-        // The list and its rows are not Tab stops; Enter in the search field is the
-        // keyboard way into the list.
+        // Enter in the search field is one keyboard way into the list (Tab is another).
         vcx.simulate_keystrokes("enter");
         vcx.simulate_keystrokes("down");
         vcx.update(|window, _| window.refresh());

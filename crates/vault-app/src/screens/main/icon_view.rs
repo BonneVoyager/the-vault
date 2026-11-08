@@ -1,6 +1,8 @@
-//! Item icon tile and the edit-mode icon picker (specs/05-ui.md §2.3). What to show is
-//! decided by `crate::icon`; this module only draws it.
+//! Item icon tile, the edit-mode icon picker (specs/05-ui.md §2.3) and the field icon
+//! picker (05 "Field icons"), which share the symbol grid. What to show is decided by
+//! `crate::icon`; this module only draws it.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
@@ -318,40 +320,19 @@ fn picker(
             )
         });
 
-    let symbols = SYMBOLS.chunks(GRID_COLS).enumerate().map(|(r, row)| {
-        ui::h_flex()
-            .gap(px(CELL_GAP))
-            .children(row.iter().enumerate().map(|(c, (_, name, label))| {
-                let ix = r * GRID_COLS + c;
-                let cell = PickerCell::Symbol(ix);
-                let chosen = chosen_symbol == Some(*name);
-                div()
-                    .id(("icon-symbol", ix))
-                    .debug_selector(move || format!("icon-symbol {ix}"))
-                    .aria_label(SharedString::from(*label))
-                    .tooltip(move |window, cx| {
-                        gpui_component::tooltip::Tooltip::new(*label).build(window, cx)
-                    })
-                    .size(px(CELL))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(theme.radius)
-                    .clickable()
-                    .hover(|d| d.bg(theme.accent))
-                    .when(chosen, |d| {
-                        d.bg(theme.primary.opacity(0.18))
-                            .debug_selector(move || format!("icon-symbol-chosen {ix}"))
-                    })
-                    .map(|d| cursor_ring(d, cell))
-                    .on_click(choose(cell))
-                    .child(Icon::new(*name).size_4().text_color(if chosen {
-                        theme.primary
-                    } else {
-                        theme.foreground
-                    }))
-            }))
-    });
+    let symbols = symbol_grid(
+        "icon-symbol",
+        chosen_symbol,
+        match cursor {
+            Some(PickerCell::Symbol(ix)) => Some(ix),
+            _ => None,
+        },
+        {
+            let state = state.clone();
+            move |ix, _, cx| state.update(cx, |s, cx| s.choose_icon(PickerCell::Symbol(ix), cx))
+        },
+        cx,
+    );
 
     let enabled = color_disabled.is_none();
     let swatches = ui::h_flex()
@@ -404,10 +385,10 @@ fn picker(
         .track_focus(focus)
         .key_context(PICKER_CONTEXT)
         .debug_selector(|| "icon-picker".into())
-        .on_action(move_handler(state, Move::Up, PickerUp))
-        .on_action(move_handler(state, Move::Down, PickerDown))
-        .on_action(move_handler(state, Move::Left, PickerLeft))
-        .on_action(move_handler(state, Move::Right, PickerRight))
+        .on_action(move_handler(state, Move::Up, PickerUp, ITEM_MOVE))
+        .on_action(move_handler(state, Move::Down, PickerDown, ITEM_MOVE))
+        .on_action(move_handler(state, Move::Left, PickerLeft, ITEM_MOVE))
+        .on_action(move_handler(state, Move::Right, PickerRight, ITEM_MOVE))
         .on_action({
             let state = state.clone();
             move |_: &PickerChoose, _, cx| state.update(cx, |s, cx| s.icon_picker_choose(cx))
@@ -423,7 +404,7 @@ fn picker(
         .gap(px(8.))
         .child(automatic)
         .child(ui::muted("Symbol", cx).text_xs())
-        .child(ui::v_flex().gap(px(CELL_GAP)).children(symbols))
+        .child(symbols)
         .child(ui::muted("Colour", cx).text_xs())
         .child(swatches)
         .children(color_hint)
@@ -513,12 +494,209 @@ where
         .into_any_element()
 }
 
-/// Arrow-key handler moving the picker cursor.
+type MoveFn = fn(&mut AppState, Move, &mut gpui::Context<AppState>);
+const ITEM_MOVE: MoveFn = AppState::icon_picker_move;
+const FIELD_MOVE: MoveFn = AppState::field_icon_picker_move;
+
+/// Arrow-key handler moving a picker's cursor with `f`.
 fn move_handler<A: gpui::Action>(
     state: &Entity<AppState>,
     m: Move,
     _: A,
+    f: MoveFn,
 ) -> impl Fn(&A, &mut gpui::Window, &mut App) + 'static {
     let state = state.clone();
-    move |_, _, cx| state.update(cx, |s, cx| s.icon_picker_move(m, cx))
+    move |_, _, cx| state.update(cx, |s, cx| f(s, m, cx))
+}
+
+/// The symbol grid of both pickers (`icon::SYMBOLS`, `GRID_COLS` per row). Cells are
+/// `(<prefix>, ix)` elements, found in tests as `<prefix> <ix>` and the selected one as
+/// `<prefix>-chosen <ix>`; `cursor` (a cell index) draws the keyboard cursor's ring and
+/// `on_pick` runs with the clicked cell's index.
+pub fn symbol_grid(
+    prefix: &'static str,
+    chosen: Option<IconName>,
+    cursor: Option<usize>,
+    on_pick: impl Fn(usize, &mut gpui::Window, &mut App) + 'static,
+    cx: &App,
+) -> gpui::Div {
+    let theme = cx.theme();
+    let on_pick = Rc::new(on_pick);
+    let rows = SYMBOLS.chunks(GRID_COLS).enumerate().map(|(r, row)| {
+        ui::h_flex()
+            .gap(px(CELL_GAP))
+            .children(row.iter().enumerate().map(|(c, (_, name, label))| {
+                let ix = r * GRID_COLS + c;
+                let is_chosen = chosen == Some(*name);
+                let on_pick = on_pick.clone();
+                div()
+                    .id((prefix, ix))
+                    .debug_selector(move || format!("{prefix} {ix}"))
+                    .aria_label(SharedString::from(*label))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(*label).build(window, cx)
+                    })
+                    .size(px(CELL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(theme.radius)
+                    .clickable()
+                    .hover(|d| d.bg(theme.accent))
+                    .when(is_chosen, |d| {
+                        d.bg(theme.primary.opacity(0.18))
+                            .debug_selector(move || format!("{prefix}-chosen {ix}"))
+                    })
+                    // Keyboard cursor: an accent ring; the current choice: a tinted fill.
+                    .border_2()
+                    .border_color(if cursor == Some(ix) {
+                        theme.ring
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .on_click(move |_, window, cx| on_pick(ix, window, cx))
+                    .child(Icon::new(*name).size_4().text_color(if is_chosen {
+                        theme.primary
+                    } else {
+                        theme.foreground
+                    }))
+            }))
+    });
+    ui::v_flex().gap(px(CELL_GAP)).children(rows)
+}
+
+/// Focus handles of one field row's icon picker: the open panel and its "No icon" row.
+pub struct FieldIconFocus {
+    pub panel: FocusHandle,
+    pub none: FocusHandle,
+}
+
+/// Edit mode: the ghost button left of field `key`'s name input, showing its symbol or
+/// a faint placeholder, and the picker it opens: "No icon", then the symbol grid. A
+/// pick, Enter and Esc close it and give the focus back to `name` (the name input).
+pub fn field_icon_button(
+    state: &Entity<AppState>,
+    key: u64,
+    focus: &FieldIconFocus,
+    name: &FocusHandle,
+    cx: &App,
+) -> AnyElement {
+    let s = state.read(cx);
+    let current = s
+        .edit_buffer()
+        .and_then(|b| b.field(key))
+        .and_then(|f| f.icon_name());
+    let symbol = current.and_then(icon::symbol);
+    let open = s.field_icon_picker().is_some_and(|(k, _)| k == key);
+    let muted = cx.theme().muted_foreground;
+    let glyph = match symbol {
+        Some(symbol) => Icon::new(symbol).text_color(muted),
+        None => Icon::new(IconName::CircleDashed).text_color(muted.opacity(0.5)),
+    };
+    let shown = symbol.map_or("none".to_owned(), |s| format!("{s:?}"));
+    let trigger = Button::new(("field-icon", key))
+        .debug_selector(move || format!("field-icon-button {key} {shown}"))
+        .ghost()
+        .small()
+        .icon(glyph)
+        .tooltip("Field icon")
+        .accessibility_label("Field icon")
+        .clickable();
+    let toggle = state.clone();
+    let (state, panel, none, name) = (
+        state.clone(),
+        focus.panel.clone(),
+        focus.none.clone(),
+        name.clone(),
+    );
+    ui::popover(
+        ("field-icon-picker", key),
+        trigger,
+        Anchor::TopLeft,
+        open,
+        move |open, _, cx| toggle.update(cx, |s, cx| s.set_field_icon_picker(key, open, cx)),
+        move |_, cx| field_picker(&state, key, &panel, &none, &name, cx),
+    )
+    .track_focus(&focus.panel)
+    .into_any_element()
+}
+
+/// The field icon picker's body. Uses the item picker's key context and actions.
+fn field_picker(
+    state: &Entity<AppState>,
+    key: u64,
+    panel: &FocusHandle,
+    none: &FocusHandle,
+    name: &FocusHandle,
+    cx: &App,
+) -> AnyElement {
+    let s = state.read(cx);
+    let Some((_, cursor)) = s.field_icon_picker().filter(|(k, _)| *k == key) else {
+        return div().into_any_element();
+    };
+    let current = s
+        .edit_buffer()
+        .and_then(|b| b.field(key))
+        .and_then(|f| f.icon_name());
+    let cell = cursor.cell();
+    // Picks and closes, then the name input has the focus again.
+    let pick = {
+        let (state, name) = (state.clone(), name.clone());
+        move |cell: PickerCell, window: &mut gpui::Window, cx: &mut App| {
+            state.update(cx, |s, cx| s.choose_field_icon(key, cell, cx));
+            window.focus(&name, cx);
+        }
+    };
+    let none_row = {
+        let pick = pick.clone();
+        ui::menu_row(format!("field-icon-none {key}"), "No icon")
+            .checked(current.is_none())
+            .on_click(move |_, window, cx| pick(PickerCell::Automatic, window, cx))
+            .render_alone(none, cell == PickerCell::Automatic, cx)
+    };
+    let grid = symbol_grid(
+        "field-icon-symbol",
+        current.and_then(icon::symbol),
+        match cell {
+            PickerCell::Symbol(ix) => Some(ix),
+            _ => None,
+        },
+        move |ix, window, cx| pick(PickerCell::Symbol(ix), window, cx),
+        cx,
+    );
+    ui::v_flex()
+        .track_focus(panel)
+        .key_context(PICKER_CONTEXT)
+        .debug_selector(move || format!("field-icon-picker {key}"))
+        .on_action(move_handler(state, Move::Up, PickerUp, FIELD_MOVE))
+        .on_action(move_handler(state, Move::Down, PickerDown, FIELD_MOVE))
+        .on_action(move_handler(state, Move::Left, PickerLeft, FIELD_MOVE))
+        .on_action(move_handler(state, Move::Right, PickerRight, FIELD_MOVE))
+        .on_action({
+            // Enter/Space reach this binding before a focused row's own key-up click, so
+            // a Tab-focused "No icon" row clears here; otherwise the cursor's cell wins.
+            let (state, name, none) = (state.clone(), name.clone(), none.clone());
+            move |_: &PickerChoose, window, cx| {
+                if none.is_focused(window) {
+                    state.update(cx, |s, cx| {
+                        s.choose_field_icon(key, PickerCell::Automatic, cx)
+                    });
+                } else {
+                    state.update(cx, |s, cx| s.field_icon_picker_choose(cx));
+                }
+                window.focus(&name, cx);
+            }
+        })
+        .on_action({
+            let (state, name) = (state.clone(), name.clone());
+            move |_: &PickerClose, window, cx| {
+                state.update(cx, |s, cx| s.set_field_icon_picker(key, false, cx));
+                window.focus(&name, cx);
+            }
+        })
+        .w(px(GRID_COLS as f32 * (CELL + CELL_GAP)))
+        .gap(px(8.))
+        .child(none_row)
+        .child(grid)
+        .into_any_element()
 }

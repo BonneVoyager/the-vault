@@ -951,3 +951,66 @@ Owner eye checks passed 2026-11-07 (all items incl. the ⌘C / ⇧⌘Z menu conf
 into the list declined for now (spec §4).
 
 Bug hunt: not yet run for this wave.
+
+## Field icons (2026-11-07)
+
+Owner feature: an optional symbol per field, left of the name, from the item icon picker's 40
+symbols only (no colour, image or automatic letter); no reserved space when absent.
+- **Core** (crypto-implementer, security review SHIP): `Field.icon: Option<String>`,
+  `Field::icon_name()` (non-empty filter); `icon` key written only when set, read missing/null/""
+  as none, wrong type Malformed; travels with the field in the field-level merge (no own stamp,
+  03 §5 wording closed); `merge::field_content_eq` includes it so `update` restamps an icon-only
+  change; canonical order id, icon, kind, …; fixture `v2-field-icon.vault` ("key"/absent/null;
+  "key" deliberately unknown to the app); 17 tests. No FORMAT_VERSION bump (01 §9 optional key).
+- **App** (gpui-implementer ×2 after an accidental stop, code review SHIP): shared
+  `detail::field_row` takes `icon: Option<&str>` (detail, item window, backup viewer); 16 px
+  muted symbol on the label's first line, 8 px gap; unknown names render none and are preserved
+  on save. Editor: ghost button `field-icon <row>` (`CircleDashed` placeholder) opens a popover
+  with a focusable "No icon" row and `icon_view::symbol_grid` shared with the item picker; state
+  `AppState::field_icon_picker()` (accessor ignores rows no longer in the buffer; cleared by
+  `leave_edit_mode`, edit start, lock, any buffer edit). `same_field` compares `icon_name()`.
+  Stored names are `icon::SYMBOLS` identifiers (e.g. "KeyRound"). Review fixes: Enter/Space on the
+  focused "No icon" row clears, picker closes when its row is removed, three test gaps.
+- Specs 01, 02, 03, 05 and README updated. Out of scope (owner): CLI flag, CSV/1PUX/KDBX, sections.
+
+## CHECKPOINT — Field icons (2026-11-07)
+
+fmt and workspace clippy clean. `cargo test -p vault-core -p vault-cli -p vault-sync` green
+(core 346); `cargo test -p vault-app` 473 passed, 0 failed. Uncommitted: vault-core (6 files +
+fixture + test file), vault-app (15 files), 4 specs, README, PROGRESS.
+
+Owner eye checks: open an item, Edit, click the dashed circle left of a field name, pick a symbol,
+Save: symbol sits left of the name, other rows unchanged; the same item in an item window and the
+backup viewer; "No icon" clears; Esc in the picker returns to the name input without cancelling
+the edit; section rows have no button; largest text size with a long field name wraps with the
+icon on the first line. Owner eye check passed 2026-11-08.
+
+Bug hunt: not yet run for this wave.
+
+## Item list as a Tab stop (2026-11-08)
+
+Owner decisions: Settings ▸ General dropdowns stay on `ui::menu_item`, separate from the
+main-window menus (spec 05 §4). The item list is one Tab stop (option A, spec 05 §6): `list_focus`
+is created with `.tab_stop(true)`; Sort, generator and New carry tab index 1 so gpui sorts them
+after the detail column (gpui orders stops by tab index, then draw order; the sidebar is drawn
+first, so without this the toolbar split search from the list). Full order: sidebar rows, sidebar
+toggle, search, list, detail, toolbar. A focus-in listener on the list selects the first row when
+rows are shown and nothing is selected, skipped while an edit is open (interpretation: the spec
+only said the selected row takes the focused colour). Rows are never Tab stops. Item windows and
+the backup viewer are untouched. Code review (Opus): SHIP; two tests and a comment added on
+request. New tests in `screens/main/tab_order_tests.rs`.
+
+## CHECKPOINT — Item list as a Tab stop (2026-11-08)
+
+fmt and workspace clippy clean; `cargo test -p vault-app` 479 passed, 0 failed (6 new in
+`tab_order_tests.rs`). Unstaged: `screens/main.rs`, `screens/main/list.rs`,
+`screens/main/editor_tests.rs`, new `screens/main/tab_order_tests.rs`, `specs/05-ui.md`, PROGRESS
+(on top of the staged field-icon wave).
+
+Owner eye checks: click the search field, press Tab: the list ring lights and the selected row
+turns to the focused colour; Tab again lands in the detail column; Shift-Tab from the list goes
+back to search; Tab past the detail column reaches Sort, the generator and New in that order; with
+no selection (delete the selected item from a pinned window, then Tab into the list) the first row
+is selected; start a New item, Tab into the list: no discard prompt. Owner eye check passed 2026-11-08.
+
+Bug hunt: not yet run for this wave.

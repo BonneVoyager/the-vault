@@ -1100,19 +1100,23 @@ fn icon_from_value(value: Value) -> Result<ItemIcon, VaultError> {
 }
 
 /// `Field` map (01 §4). `id` is always written (format version 2 shape, also into a version
-/// 1 file, where an older reader keeps it as an unknown key).
+/// 1 file, where an older reader keeps it as an unknown key). `icon` is written only when
+/// the field has a non-empty one ([`Field::icon_name`]); without it the key is not reserved,
+/// so an `icon` entry in `extras` is emitted verbatim (the same rule as `removed_history`:
+/// the reader never produces such an extra, it is how tests write a `null` or a wrong type).
 fn field_to_value(f: &Field) -> Value {
-    build_map(
-        vec![
-            ("id", bytes(f.id.as_bytes())),
-            ("name", text(&f.name)),
-            ("kind", text(f.kind_str())),
-            ("value", text(f.value.expose_secret())),
-            ("modified_at", Value::from(f.modified_at)),
-            ("section", f.section.as_deref().map_or(Value::Null, text)),
-        ],
-        &f.extras,
-    )
+    let mut known = vec![
+        ("id", bytes(f.id.as_bytes())),
+        ("name", text(&f.name)),
+        ("kind", text(f.kind_str())),
+        ("value", text(f.value.expose_secret())),
+        ("modified_at", Value::from(f.modified_at)),
+        ("section", f.section.as_deref().map_or(Value::Null, text)),
+    ];
+    if let Some(icon) = f.icon_name() {
+        known.push(("icon", text(icon)));
+    }
+    build_map(known, &f.extras)
 }
 
 /// Canonical CBOR bytes of one field map (the exact bytes the writer emits for it inside
@@ -1149,6 +1153,8 @@ fn field_from_value(value: Value, format_version: u16) -> Result<(Field, bool), 
     let value = SecretString::new(as_text(m.required("value")?, "field.value")?);
     let modified_at = as_u64(m.required("modified_at")?, "field.modified_at")?;
     let section = opt_text(m.take("section"), "field.section")?;
+    // Missing, null and "" are all "no icon" (01 §4); any other non-text is structural.
+    let icon = opt_text(m.take("icon"), "field.icon")?.filter(|s| !s.is_empty());
     Ok((
         Field {
             id: id.unwrap_or(Uuid::nil()),
@@ -1158,6 +1164,7 @@ fn field_from_value(value: Value, format_version: u16) -> Result<(Field, bool), 
             value,
             modified_at,
             section,
+            icon,
             extras: m.finish(),
         },
         id.is_some(),

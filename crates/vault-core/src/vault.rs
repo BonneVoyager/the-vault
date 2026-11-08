@@ -583,8 +583,9 @@ impl UnlockedVault {
     /// Edit an item in place through `f`, then restamp it (02 "update"). Fields are diffed
     /// **by id** against the pre-call copy:
     ///
-    /// - A field whose `name`, `kind`, `value`, `section` (or extras) changed while `f` left
-    ///   its `modified_at` untouched is bumped to `stamp(now, previous field modified_at)`.
+    /// - A field whose `name`, `kind`, `value`, `section`, `icon` (or extras) changed while
+    ///   `f` left its `modified_at` untouched is bumped to `stamp(now, previous field
+    ///   modified_at)`.
     ///   A rename is therefore an edit of the same field, not a delete plus an add.
     /// - A field whose id is not in the pre-call copy counts as new: it gets
     ///   `stamp(carried if non-zero else now, previous item modified_at)`.

@@ -1407,12 +1407,20 @@ fn sort_menu_opens_by_click_and_closes_on_esc(cx: &mut TestAppContext) {
 #[gpui::test]
 fn sort_menu_by_keyboard_switches_order(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
-    let (state, _main, mut vcx) = open(dir.path(), cx);
-    // A click opens the menu, so Tab from the search field (the next stop is Sort).
-    let search = vcx.debug_bounds("list-search").unwrap();
-    vcx.simulate_click(search.center(), gpui::Modifiers::none());
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    // A click opens the menu, so reach Sort by key. The list column's buttons follow
+    // the detail column in Tab order (05 §6): back from the first sidebar row, the
+    // ring wraps through New and the generator to Sort.
+    let all = vcx.debug_bounds("nav All Items icon=LayoutList").unwrap();
+    vcx.simulate_click(all.center(), gpui::Modifiers::none());
     vcx.run_until_parked();
-    press(&mut vcx, "tab");
+    for _ in 0..3 {
+        press(&mut vcx, "shift-tab");
+    }
+    assert!(
+        vcx.update(|w, cx| main.read(cx).sort_focus.is_focused(w)),
+        "three Shift-Tabs reach the Sort button (a new toolbar button moves it)"
+    );
     press(&mut vcx, "space");
     assert!(state.read_with(&vcx, |s, _| s.sort_menu_open));
     press(&mut vcx, "down");
@@ -1504,4 +1512,341 @@ fn deleting_while_editing_closes_the_add_field_menu(cx: &mut TestAppContext) {
         assert!(!s.is_editing(), "the delete ended the edit");
         assert!(!s.add_field_menu_open, "and closed the menu");
     });
+}
+
+/// An item with a text field, a section and a password, inserted at stamp 10 and in
+/// edit mode; returns the item id and the three row keys.
+fn editing_with_section(state: &Entity<AppState>, vcx: &mut VisualTestContext) -> (Uuid, [u64; 3]) {
+    let device = state.read_with(vcx, |s, _| s.device_id());
+    let mut item = vault_core::Item::new("Bank", device, 10);
+    let field =
+        |name: &str, kind| vault_core::Field::new(name, kind, SecretString::new("v".into()), 10);
+    item.fields = vec![
+        field("user", FieldKind::Text),
+        field("Extras", FieldKind::Section),
+        field("password", FieldKind::Password),
+    ];
+    let id = insert_and_select(state, item, vcx);
+    state.update(vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let keys = state.read_with(vcx, |s, _| s.edit_buffer().unwrap().keys.clone());
+    (id, [keys[0], keys[1], keys[2]])
+}
+
+fn name_focused(main: &Entity<MainScreen>, key: u64, vcx: &mut VisualTestContext) -> bool {
+    let name = name_input(main, key, vcx);
+    vcx.update(|window, cx| gpui::Focusable::focus_handle(&name, cx).is_focused(window))
+}
+
+fn field_icon(state: &Entity<AppState>, key: u64, vcx: &VisualTestContext) -> Option<String> {
+    state.read_with(vcx, |s, _| {
+        s.edit_buffer().unwrap().field(key).unwrap().icon.clone()
+    })
+}
+
+/// 05 "Field icons": the button opens "No icon" + the shared grid; a pick is part of
+/// the edit (dirty, guarded), closes the picker, and Save writes and restamps the field.
+#[gpui::test]
+fn field_icon_pick_saves_and_restamps(cx: &mut TestAppContext) {
+    use crate::icon::SYMBOLS;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let (id, [user, section, password]) = editing_with_section(&state, &mut vcx);
+    let other = state.update(&mut vcx, |s, _| {
+        let device = s.device_id();
+        let id = s
+            .vault
+            .as_mut()
+            .unwrap()
+            .edit(|v| v.insert(vault_core::Item::new("Other", device, 1), 1))
+            .unwrap();
+        s.vault_changed();
+        id
+    });
+    vcx.run_until_parked();
+    // Buttons on field rows only, showing the placeholder.
+    assert!(
+        vcx.debug_bounds(leak(format!("field-icon-button {user} none")))
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds(leak(format!("field-icon-button {password} none")))
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds(leak(format!("field-icon-button {section} none")))
+            .is_none(),
+        "no icon control on a section row"
+    );
+    state.update(&mut vcx, |s, cx| s.set_field_icon_picker(section, true, cx));
+    assert_eq!(state.read_with(&vcx, |s, _| s.field_icon_picker()), None);
+
+    click(&mut vcx, format!("field-icon-button {user} none"));
+    assert!(
+        vcx.debug_bounds(leak(format!("field-icon-picker {user}")))
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds(leak(format!("field-icon-none {user}-checked")))
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("field-icon-symbol 39").is_some(),
+        "40 symbols"
+    );
+    let key_ix = SYMBOLS.iter().position(|(n, ..)| *n == "KeyRound").unwrap();
+    click(&mut vcx, format!("field-icon-symbol {key_ix}"));
+    assert_eq!(field_icon(&state, user, &vcx).as_deref(), Some("KeyRound"));
+    assert!(
+        state.read_with(&vcx, |s, _| s.field_icon_picker().is_none()),
+        "a pick closes"
+    );
+    assert!(
+        name_focused(&main, user, &mut vcx),
+        "focus back on the name"
+    );
+    assert!(
+        vcx.debug_bounds(leak(format!("field-icon-button {user} KeyRound")))
+            .is_some()
+    );
+
+    // Icon-only change: dirty, so leaving asks first.
+    assert!(state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().has_changes()));
+    state.update(&mut vcx, |s, cx| s.select(other, cx));
+    assert!(
+        state.read_with(&vcx, |s, _| s.discard_prompt.is_some()),
+        "guarded"
+    );
+    state.update(&mut vcx, |s, cx| s.cancel_edit(cx));
+    assert!(state.read_with(&vcx, |s, _| s.is_editing()));
+
+    vcx.simulate_keystrokes("cmd-s");
+    vcx.run_until_parked();
+    let item = state.read_with(&vcx, |s, _| {
+        s.unlocked_vault().unwrap().get(id).unwrap().clone()
+    });
+    assert_eq!(item.fields[0].icon.as_deref(), Some("KeyRound"));
+    assert!(item.fields[0].modified_at > 10, "restamped");
+    assert_eq!(
+        item.fields[2].modified_at, 10,
+        "untouched field keeps its stamp"
+    );
+    assert_eq!(item.fields[2].icon, None);
+    assert!(
+        vcx.debug_bounds("field-row-icon 0 KeyRound").is_some(),
+        "read mode shows it"
+    );
+}
+
+/// Keyboard: ↓ leaves "No icon" for the grid, → moves, Enter picks; Esc closes and
+/// focuses the name input; "No icon" clears; Cancel drops the choice; ending the edit
+/// closes the picker.
+#[gpui::test]
+fn field_icon_picker_by_keyboard_no_icon_and_cancel(cx: &mut TestAppContext) {
+    use crate::icon::SYMBOLS;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let (id, [user, _, password]) = editing_with_section(&state, &mut vcx);
+    click(&mut vcx, format!("field-icon-button {password} none"));
+    vcx.simulate_keystrokes("down right enter");
+    vcx.run_until_parked();
+    assert_eq!(
+        field_icon(&state, password, &vcx).as_deref(),
+        Some(SYMBOLS[1].0)
+    );
+    assert!(name_focused(&main, password, &mut vcx));
+
+    // Reopened on the choice; Esc from elsewhere returns focus to this row's name.
+    let user_name = name_input(&main, user, &mut vcx);
+    vcx.update(|window, cx| ui::focus_input(&user_name, window, cx));
+    click(
+        &mut vcx,
+        format!("field-icon-button {password} {:?}", SYMBOLS[1].1),
+    );
+    assert!(vcx.debug_bounds("field-icon-symbol-chosen 1").is_some());
+    assert!(
+        vcx.debug_bounds(leak(format!("field-icon-none {password}-checked")))
+            .is_none()
+    );
+    vcx.simulate_keystrokes("down escape");
+    vcx.run_until_parked();
+    assert!(
+        state.read_with(&vcx, |s, _| s.field_icon_picker().is_none()),
+        "Esc closes"
+    );
+    assert!(
+        state.read_with(&vcx, |s, _| s.is_editing()),
+        "and keeps editing"
+    );
+    assert!(
+        name_focused(&main, password, &mut vcx),
+        "focus on that row's name"
+    );
+    assert_eq!(
+        field_icon(&state, password, &vcx).as_deref(),
+        Some(SYMBOLS[1].0)
+    );
+
+    // "No icon" clears it again.
+    click(
+        &mut vcx,
+        format!("field-icon-button {password} {:?}", SYMBOLS[1].1),
+    );
+    click(&mut vcx, format!("field-icon-none {password}"));
+    assert_eq!(field_icon(&state, password, &vcx), None);
+    assert!(!state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().has_changes()));
+
+    // Cancel drops a choice; the stored field never had one.
+    click(&mut vcx, format!("field-icon-button {user} none"));
+    click(&mut vcx, "field-icon-symbol 0".into());
+    state.update(&mut vcx, |s, cx| s.set_field_icon_picker(user, true, cx));
+    state.update(&mut vcx, |s, cx| s.cancel_edit(cx));
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| {
+        assert!(
+            s.field_icon_picker().is_none(),
+            "ending the edit closes the picker"
+        );
+        let item = s.unlocked_vault().unwrap().get(id).unwrap();
+        assert!(
+            item.fields.iter().all(|f| f.icon.is_none()),
+            "Cancel discards"
+        );
+        assert!(item.fields.iter().all(|f| f.modified_at == 10));
+    });
+    // Lock closes it too.
+    state.update(&mut vcx, |s, cx| {
+        s.begin_edit(cx);
+        let key = s.edit_buffer().unwrap().keys[0];
+        s.set_field_icon_picker(key, true, cx);
+        assert!(s.field_icon_picker().is_some());
+        s.lock(cx);
+    });
+    assert!(
+        state.read_with(&vcx, |s, _| s.field_icon_picker().is_none()),
+        "lock"
+    );
+}
+
+/// Tab from the open picker reaches "No icon"; Enter or Space there clears the icon
+/// like its click, not the keyboard cursor's cell (which sits on the chosen symbol).
+#[gpui::test]
+fn tab_to_no_icon_then_enter_or_space_clears(cx: &mut TestAppContext) {
+    use crate::icon::SYMBOLS;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let (_, [_, _, password]) = editing_with_section(&state, &mut vcx);
+    for key in ["enter", "space"] {
+        click(&mut vcx, format!("field-icon-button {password} none"));
+        click(&mut vcx, "field-icon-symbol 1".into());
+        assert_eq!(
+            field_icon(&state, password, &vcx).as_deref(),
+            Some(SYMBOLS[1].0)
+        );
+        click(
+            &mut vcx,
+            format!("field-icon-button {password} {:?}", SYMBOLS[1].1),
+        );
+        assert!(vcx.debug_bounds("field-icon-symbol-chosen 1").is_some());
+        let (panel, none) = main.read_with(&vcx, |m, cx| {
+            let r = m.editor.read(cx).rows.iter().find(|r| r.key == password);
+            let f = &r.unwrap().icon_focus;
+            (f.panel.clone(), f.none.clone())
+        });
+        assert!(
+            vcx.update(|w, _| panel.is_focused(w)),
+            "the panel has the focus"
+        );
+        press(&mut vcx, "tab");
+        assert!(
+            vcx.update(|w, _| none.is_focused(w)),
+            "Tab reaches \"No icon\""
+        );
+        press(&mut vcx, key);
+        assert_eq!(field_icon(&state, password, &vcx), None, "{key} clears");
+        assert!(
+            state.read_with(&vcx, |s, _| s.field_icon_picker().is_none()),
+            "{key} closes"
+        );
+        assert!(
+            name_focused(&main, password, &mut vcx),
+            "{key}: focus on the name"
+        );
+    }
+}
+
+/// Removing the row whose picker is open closes it; a row's picker survives another
+/// row's removal; a row gone from the buffer by any other path reads as closed.
+#[gpui::test]
+fn removing_a_row_closes_its_icon_picker(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, mut vcx) = open(dir.path(), cx);
+    let (_, [user, _, password]) = editing_with_section(&state, &mut vcx);
+    click(&mut vcx, format!("field-icon-button {password} none"));
+    assert!(
+        vcx.debug_bounds(leak(format!("field-icon-picker {password}")))
+            .is_some()
+    );
+    state.update(&mut vcx, |s, cx| s.edit(cx, |b| b.remove_field(password)));
+    vcx.run_until_parked();
+    assert_eq!(state.read_with(&vcx, |s, _| s.field_icon_picker()), None);
+    assert!(
+        vcx.debug_bounds(leak(format!("field-icon-picker {password}")))
+            .is_none()
+    );
+
+    click(&mut vcx, format!("field-icon-button {user} none"));
+    let section = state.update(&mut vcx, |s, cx| {
+        let section = s.edit_buffer().unwrap().keys[1];
+        s.edit(cx, |b| b.remove_field(section));
+        section
+    });
+    assert_eq!(
+        state.read_with(&vcx, |s, _| s.field_icon_picker().map(|(k, _)| k)),
+        Some(user),
+        "removing row {section} leaves row {user}'s picker open"
+    );
+    // Rows replaced without `edit` (a rebuild): the stale key is not an open picker.
+    state.update(&mut vcx, |s, cx| {
+        let b = s.edit_buffer_mut().unwrap();
+        b.keys = b.keys.iter().map(|k| k + 100).collect();
+        s.field_icon_picker_move(crate::icon::Move::Down, cx);
+        s.field_icon_picker_choose(cx);
+    });
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| {
+        assert_eq!(s.field_icon_picker(), None);
+        let b = s.edit_buffer().unwrap();
+        assert!(b.item.fields.iter().all(|f| f.icon.is_none()), "no pick");
+    });
+}
+
+/// A stored icon name this build does not know is kept through a rename and Save.
+#[gpui::test]
+fn unknown_field_icon_survives_rename_and_save(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    let mut item = vault_core::Item::new("Bank", device, 10);
+    let mut pin = vault_core::Field::new("pin", FieldKind::Text, SecretString::new("1".into()), 10);
+    pin.icon = Some("x-future-symbol".into());
+    item.fields = vec![pin];
+    let id = insert_and_select(&state, item, &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let key = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().keys[0]);
+    assert!(
+        vcx.debug_bounds(leak(format!("field-icon-button {key} none")))
+            .is_some(),
+        "unknown name shows the placeholder"
+    );
+    retype(&name_input(&main, key, &mut vcx), "PIN code", &mut vcx);
+    vcx.simulate_keystrokes("cmd-s");
+    vcx.run_until_parked();
+    let field = state.read_with(&vcx, |s, _| {
+        s.unlocked_vault().unwrap().get(id).unwrap().fields[0].clone()
+    });
+    assert_eq!(field.name, "PIN code");
+    assert!(field.modified_at > 10, "renamed and saved");
+    assert_eq!(field.icon.as_deref(), Some("x-future-symbol"));
 }

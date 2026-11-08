@@ -465,7 +465,14 @@ impl BackupWindow {
                     .into_any_element(),
             );
             // The same row as the main detail and item windows.
-            super::main::detail::field_row(ix, field.name.clone().into(), value, buttons, cx)
+            super::main::detail::field_row(
+                ix,
+                field.name.clone().into(),
+                field.icon_name(),
+                value,
+                buttons,
+                cx,
+            )
         });
         let live = self.state.read(cx).main_active();
         ui::v_flex()
@@ -697,8 +704,11 @@ mod tests {
                 let mut pin =
                     Field::new("pin", FieldKind::Other, SecretString::new("4711".into()), 1);
                 pin.kind_raw = Some("x-future-pin".into());
+                let mut user =
+                    Field::new("user", FieldKind::Text, SecretString::new("al".into()), 1);
+                user.icon = Some("KeyRound".into());
                 item.fields = vec![
-                    Field::new("user", FieldKind::Text, SecretString::new("al".into()), 1),
+                    user,
                     pin,
                     // A crafted value on a heading: never shown or copied.
                     Field::new(
@@ -749,6 +759,8 @@ mod tests {
         // Stored "user" and "pin": shown with a capital, like the main detail.
         assert!(vcx.debug_bounds("field-label-text 0 User").is_some());
         assert!(vcx.debug_bounds("field-label-text 1 Pin").is_some());
+        // The field icon comes with the shared row (05 "Field icons").
+        assert!(vcx.debug_bounds("field-row-icon 0 KeyRound").is_some());
         // A section heading renders through the shared heading row, without actions.
         assert!(vcx.debug_bounds("section-row 2 EXTRAS").is_some());
         assert!(vcx.debug_bounds("backup-value 2 shown").is_none());

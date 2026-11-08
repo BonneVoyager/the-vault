@@ -394,6 +394,10 @@ pub struct AppState {
     pub sort_menu_open: bool,
     /// Open Add field menu in the editor; closed when the edit ends.
     pub add_field_menu_open: bool,
+    /// Open field icon picker in the editor: the field's row key and the keyboard
+    /// cursor. Closed when the edit ends or its row goes; read via
+    /// [`AppState::field_icon_picker`].
+    field_icon_picker: Option<(u64, crate::icon::PickerCursor)>,
     pub generator: Generator,
     /// Open generator popover, if any.
     pub generator_target: Option<GeneratorTarget>,
@@ -509,6 +513,7 @@ impl AppState {
             template_picker: None,
             sort_menu_open: false,
             add_field_menu_open: false,
+            field_icon_picker: None,
             generator: Generator::default(),
             generator_target: None,
             settings_open: false,

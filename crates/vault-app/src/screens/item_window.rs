@@ -440,6 +440,26 @@ mod tests {
         })
     }
 
+    /// The shared field row draws a field's icon here too (05 "Field icons").
+    #[gpui::test]
+    fn field_icon_shows_in_the_item_window(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, _) = setup(dir.path(), cx);
+        state.update(cx, |s, _| {
+            s.vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| v.update(plain, 11, |it| it.fields[0].icon = Some("Lock".into())))
+                .unwrap()
+                .unwrap();
+            s.vault_changed();
+        });
+        let handle = open(&state, plain, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(handle, cx);
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("field-row-icon 0 Lock").is_some());
+    }
+
     /// The read-only attachment rows leave out the item's icon image.
     #[gpui::test]
     fn icon_blob_is_not_listed(cx: &mut TestAppContext) {

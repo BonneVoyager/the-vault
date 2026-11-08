@@ -683,6 +683,21 @@ impl PickerCursor {
         }
     }
 
+    /// Arrows in a field's icon picker (05 "Field icons"): only "No icon" (the
+    /// Automatic row) and the symbol rows exist there, so ↓ stops at the last symbol row.
+    pub fn step_symbols(self, m: Move) -> Self {
+        let next = self.step(m);
+        if next.row > SYMBOL_ROWS { self } else { next }
+    }
+
+    /// Where a field's icon picker opens: on the field's symbol, else on "No icon".
+    pub fn for_field_icon(name: Option<&str>) -> Self {
+        name.and_then(|n| SYMBOLS.iter().position(|(s, ..)| *s == n))
+            .map_or(Self::at(PickerCell::Automatic), |i| {
+                Self::at(PickerCell::Symbol(i))
+            })
+    }
+
     /// Where the cursor starts when the picker opens: on the current shape (the colour
     /// row always shows its selection, so the cursor starts on the shape).
     pub fn for_icon(icon: Option<&ItemIcon>) -> Self {

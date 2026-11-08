@@ -20,6 +20,7 @@ Pre-release and not yet signed or notarized. It is built and reviewed by an agen
 - Tags, search, and weak or reused password warnings (local audit)
 - File attachments, encrypted per file, up to 100 MB each
 - Item icons: automatic brand logos from a bundled, offline icon pack, or a symbol, colour, or custom image chosen per item
+- Field icons: an optional symbol next to any field name, chosen from the same symbol set
 - Sync through any folder (iCloud Drive, Dropbox, NAS) with field-level merge and conflict-copy absorption
 - Rotating encrypted backups
 - Recently Deleted: deleted items can be recovered for 30 days, then they are permanently removed

@@ -126,7 +126,7 @@ Field-level merge, keyed by `field.id` (2026-10-31; never by name):
 |---|---|---|
 | absent | present | take theirs, unless our `removed_fields` carries a marker for that id with `removed_at ≥ modified_at` |
 | present | absent | keep ours, unless their `removed_fields` carries a marker for that id with `removed_at ≥ modified_at` |
-| both | — | greater `modified_at` wins whole (name, kind, value, section travel together, so a rename is an edit); tie → greater `device_id` of the owning item; tie → greater canonical CBOR bytes of the field (symmetric, so both devices converge in one round; bug hunt 2026-10-31) |
+| both | — | greater `modified_at` wins whole (name, kind, value, section and, since 2026-11-07, the field `icon` travel together with no per-attribute stamp, so a rename or an icon change is an edit and a newer edit by a peer that never saw the icon drops it); tie → greater `device_id` of the owning item; tie → greater canonical CBOR bytes of the field (symmetric, so both devices converge in one round; bug hunt 2026-10-31) |
 
 `removed_fields` markers are unioned (greatest `removed_at` per id); a field edited strictly after its marker survives and the marker is dropped on both sides. Markers are never dropped by a local removal; a merge caps them at 64 by dropping, oldest first, only markers whose field neither side still holds. Accepted limit: a third device that was offline since before such a dropped marker can still bring that field back. The former "field deletion is not tracked" limit is closed. Metadata and both-tombstone ties (equal stamp and device id) are also broken by the greater canonical CBOR bytes of the item payload, so no "tie → ours" remains.
 

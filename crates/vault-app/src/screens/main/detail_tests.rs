@@ -1094,3 +1094,112 @@ fn detail_header_stays_pinned_while_fields_scroll(cx: &mut TestAppContext) {
     assert_eq!(bounds("detail-header", &mut vcx), header, "header pinned");
     assert_eq!(bounds("detail-fields-rule", &mut vcx), rule, "rule pinned");
 }
+
+/// 05 "Field icons": a known symbol sits 8 px left of its label (shifting only that
+/// label); a row without one, or with a name this build does not know, is unchanged.
+#[gpui::test]
+fn field_icon_sits_left_of_the_label_only_on_its_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open_items(
+        dir.path(),
+        |device| {
+            let mut item = login("Alpha", STRONG, device);
+            item.fields[0].icon = Some("KeyRound".into());
+            let mut future = Field::new("pin", FieldKind::Text, SecretString::new("1".into()), 1);
+            future.icon = Some("x-future-symbol".into());
+            item.fields.push(future);
+            // A crafted icon on a heading: sections never show one.
+            let mut heading = Field::new(
+                "Extras",
+                FieldKind::Section,
+                SecretString::new(String::new()),
+                1,
+            );
+            heading.icon = Some("Lock".into());
+            item.fields.push(heading);
+            vec![item]
+        },
+        cx,
+    );
+    select(&state, ids[0], &mut vcx);
+    let icon = vcx
+        .debug_bounds("field-row-icon 0 KeyRound")
+        .expect("icon on row 0");
+    let label = vcx.debug_bounds("field-label 0").unwrap();
+    let text = vcx.debug_bounds("field-label-text 0 Username").unwrap();
+    assert_eq!(icon.size.width, px(16.), "16 px glyph box");
+    assert_eq!(icon.left(), label.left(), "icon leads the label column");
+    assert_eq!(text.left() - label.left(), px(16. + FIELD_ICON_GAP));
+    // The glyph box is one label line tall, so the glyph is centred on that line.
+    assert_eq!(icon.top(), text.top(), "on the label's first line");
+    assert_eq!(icon.size.height, text.size.height, "one line tall");
+    // No icon and an unknown name: the label starts at the column's edge, as before.
+    for (ix, shown) in [(1, "Password"), (2, "Pin")] {
+        let label = vcx.debug_bounds(leak(format!("field-label {ix}"))).unwrap();
+        let text = vcx
+            .debug_bounds(leak(format!("field-label-text {ix} {shown}")))
+            .unwrap();
+        assert_eq!(text.left(), label.left(), "row {ix} unshifted");
+        for (_, symbol, _) in crate::icon::SYMBOLS {
+            let sel = leak(format!("field-row-icon {ix} {symbol:?}"));
+            assert!(vcx.debug_bounds(sel).is_none(), "row {ix} has no icon");
+        }
+    }
+    assert!(vcx.debug_bounds("section-row 3 EXTRAS").is_some());
+    assert!(
+        vcx.debug_bounds("field-row-icon 3 Lock").is_none(),
+        "no icon on a section"
+    );
+    // The value column does not move for the icon.
+    let c0 = vcx.debug_bounds("field-content 0").unwrap();
+    let c1 = vcx.debug_bounds("field-content 1").unwrap();
+    assert_eq!(c0.left(), c1.left());
+}
+
+/// 05 "Field icons" at the largest text size: a long label wraps beside its icon; the
+/// icon sits on the label's first line, not centred on the wrapped block.
+#[gpui::test]
+fn field_icon_tops_a_wrapping_label_at_the_largest_text_size(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open_items(
+        dir.path(),
+        |device| {
+            let mut item = login("Alpha", STRONG, device);
+            let mut long = Field::new(
+                "recovery passphrase for the offline backup drive kept in the safe",
+                FieldKind::Text,
+                SecretString::new("1".into()),
+                1,
+            );
+            long.icon = Some("KeyRound".into());
+            item.fields.push(long);
+            vec![item]
+        },
+        cx,
+    );
+    select(&state, ids[0], &mut vcx);
+    state.update(&mut vcx, |s, cx| {
+        s.update_settings(cx, |st| st.text_size = crate::state::TextSize::Larger)
+    });
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let icon = vcx
+        .debug_bounds("field-row-icon 2 KeyRound")
+        .expect("icon on row 2");
+    let text = vcx
+        .debug_bounds(
+            "field-label-text 2 Recovery passphrase for the offline backup drive kept in the safe",
+        )
+        .unwrap();
+    assert!(
+        text.size.height > icon.size.height * 1.5,
+        "the label wraps: {:?} vs icon {:?}",
+        text.size,
+        icon.size
+    );
+    assert_eq!(icon.top(), text.top(), "icon on the first line");
+    assert!(
+        icon.size.height > px(16.),
+        "one Larger line tall, not the glyph"
+    );
+}

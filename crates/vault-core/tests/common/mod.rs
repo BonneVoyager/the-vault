@@ -119,6 +119,7 @@ pub fn assert_field_eq(a: &Field, b: &Field) {
     );
     assert_eq!(a.modified_at, b.modified_at);
     assert_eq!(a.section, b.section);
+    assert_eq!(a.icon, b.icon, "field {}", a.name);
     assert_eq!(a.extras, b.extras);
 }
 

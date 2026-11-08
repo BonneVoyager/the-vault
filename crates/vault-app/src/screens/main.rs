@@ -25,6 +25,9 @@ mod save_blocked_tests;
 mod sidebar;
 mod sync_banners;
 #[cfg(test)]
+#[path = "main/tab_order_tests.rs"]
+mod tab_order_tests;
+#[cfg(test)]
 #[path = "main/trash_tests.rs"]
 mod trash_tests;
 
@@ -188,6 +191,8 @@ pub struct MainScreen {
     editor: Entity<Editor>,
     generator: Entity<GeneratorView>,
     list_focus: FocusHandle,
+    /// The Sort button's handle, so tests can tell it has the focus.
+    sort_focus: FocusHandle,
     /// Tracks focus inside the sidebar, so collapsing it can move that focus on.
     sidebar_focus: FocusHandle,
     detail_focus: FocusHandle,
@@ -226,7 +231,10 @@ impl MainScreen {
         let key_input = ui::password_input("Master password", window, cx);
         let generator = cx.new(|cx| GeneratorView::new(state.clone(), window, cx));
         let editor = cx.new(|cx| Editor::new(state.clone(), generator.clone(), window, cx));
-        let list_focus = cx.focus_handle();
+        // One Tab stop for the whole list (05 §6); rows are never Tab stops.
+        let list_focus = cx.focus_handle().tab_stop(true);
+        // The Button applies its own `tab_index` / `tab_stop` to the handle it tracks.
+        let sort_focus = cx.focus_handle();
         let sidebar_focus = cx.focus_handle();
         let detail_focus = cx.focus_handle();
         let search_focus = gpui::Focusable::focus_handle(search.read(cx), cx);
@@ -274,6 +282,15 @@ impl MainScreen {
             ),
         ];
         subscriptions.extend(focus_outs);
+        // Focus into a list with rows but no selection (Tab, ⌘F ⏎, a click) picks the
+        // first row, as ↓ does; never while editing, where it would raise the guard.
+        subscriptions.push(cx.on_focus(&list_focus, window, |this, _, cx| {
+            this.state.update(cx, |s, cx| {
+                if s.selection.is_none() && !s.is_editing() {
+                    s.select_offset(1, cx);
+                }
+            });
+        }));
         // A (re)opened window installs the menu bar for the current state: a lock while
         // no main window was open left it as it was.
         let menu_state = state.clone();
@@ -298,6 +315,7 @@ impl MainScreen {
             editor,
             generator,
             list_focus,
+            sort_focus,
             sidebar_focus,
             detail_focus,
             list_state: ListState::new(0, ListAlignment::Top, px(200.)),
