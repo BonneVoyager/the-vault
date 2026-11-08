@@ -119,6 +119,32 @@ pub fn boot_time() -> SystemTime;                                            // 
 
 `Subscription` is a `#[must_use]` guard that removes the observer on drop; drop it on the main thread. Callbacks run on the main thread.
 
+### 5b. Dock visibility (2026-11-08)
+
+```rust
+pub fn set_dock_icon_visible(visible: bool) -> bool;   // NSApp.setActivationPolicy(.regular | .accessory); returns the AppKit result
+pub fn dock_icon_visible() -> bool;                     // NSApp.activationPolicy() == .regular
+```
+
+Main thread only. Switching to `.accessory` hides the Dock icon and the menu bar; switching back to `.regular` restores both. After switching to `.regular` the caller re-activates the app so the menu bar is drawn. Non-macOS stubs return `false`.
+
+Launch Services puts the Dock icon back whenever a bundle without `LSUIElement` is opened again from Finder or Spotlight while running (owner report 2026-11-08: the padlock stayed, the Dock icon returned). Therefore `scripts/Info.plist` sets `LSUIElement = true` and the app sets `.regular` itself at startup when "Show Vault in Dock" is on (so the Dock icon still appears for the default). The app also goes through gpui `App::set_activation_policy` (not AppKit directly) so gpui's own cached policy agrees and is never re-applied as Regular, and re-applies the stored preference in the reopen handler as a belt-and-braces step.
+
+### 5c. Menu bar status item (2026-11-08)
+
+Shown only while Settings ▸ General "Show Vault in Dock" is off (05 §2.5), so the app is never running with neither a Dock icon nor a menu bar icon.
+
+```rust
+pub struct StatusItemCallbacks { pub open: Box<dyn Fn()>, pub lock_or_unlock: Box<dyn Fn()>, pub quit: Box<dyn Fn()> }
+pub struct StatusItem;                                     // NSStatusBar.systemStatusBar item, square length; removed on drop
+impl StatusItem {
+    pub fn install(locked: bool, cb: StatusItemCallbacks) -> Result<StatusItem, MacError>;
+    pub fn set_locked(&self, locked: bool);                // swaps the glyph and the menu title
+}
+```
+
+Main thread only; callbacks run on the main thread. Button image: a template (monochrome, follows the menu bar colour) padlock glyph, closed when locked and open when unlocked, 18 pt, SF Symbols `lock.fill` / `lock.open.fill` via `NSImage::imageWithSystemSymbolName`, with a padlock drawn in code (18 × 18, template) as the fallback when the symbol is unavailable; the accessibility description "Vault, locked" / "Vault, unlocked" is set on the image. Left click runs `open`. Right click or Control-click pops a native `NSMenu`: "Open Vault", then "Lock" (unlocked) or "Unlock…" (locked), a separator, "Quit Vault"; the menu is attached only for the duration of the click so the left click keeps its action. Non-macOS stubs: `install` returns `Err(MacError::NotAvailable)`, `set_locked` is a no-op.
+
 ## 6. Security-scoped bookmarks
 
 Only needed if the app is sandboxed. v1 ships outside the App Store, unsandboxed, Developer ID signed. Leave a `bookmark` module stub with a TODO; do not implement now.

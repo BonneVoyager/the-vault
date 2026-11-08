@@ -16,6 +16,7 @@ mod persist;
 mod root;
 mod screens;
 mod state;
+mod status_item;
 mod templates;
 mod text;
 mod theme;
@@ -38,6 +39,12 @@ fn reopen_main_window(cx: &mut App) {
     else {
         return;
     };
+    // Dock icon off: re-assert Accessory before activating (04 §5b). The bundle is
+    // LSUIElement, so this is belt and braces against Launch Services re-registering
+    // the app as foreground when it is opened again from Finder; idempotent.
+    if !state.read(cx).settings.show_in_dock {
+        state::set_dock_icon(false, cx);
+    }
     if let Some(main) = cx.try_global::<actions::MainWindow>().map(|main| main.0)
         && let Some(handle) = cx.windows().into_iter().find(|w| w.window_id() == main)
     {
@@ -97,6 +104,9 @@ fn main() {
         let settings = persist::load_settings();
         actions::set_menus(Sort::default(), !settings.sidebar_hidden, cx);
         theme::set_prefs(&settings, cx);
+        // Before the first window: the bundle is LSUIElement, so the Dock icon only
+        // appears because this sets Regular (04 §5b). Activation follows the window.
+        state::set_dock_icon(settings.show_in_dock, cx);
         let state = cx.new(|_| {
             AppState::new(vault_macos::device_id(), persist::load_recent(), true)
                 .with_settings(settings)
@@ -122,6 +132,13 @@ fn main() {
                 s.open_vault(path, cx);
             }
         });
+        // Dock icon off: the menu bar item is the way back (05 §2.5, 04 §5c).
+        status_item::install(
+            &state,
+            status_item::macos_installer(),
+            reopen_main_window,
+            cx,
+        );
         cx.activate(true);
         // The window opened with this minimum already; re-applied through the one
         // hook (best effort: the window may not be key yet).

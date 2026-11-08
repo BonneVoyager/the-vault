@@ -1,7 +1,8 @@
 - [vault-sync structure](vault-sync-structure.md) — layout, before-write hook (trash sweep), lock.rs, state model, scan fixes, review [1][2][6][11] (blob verify, bounded watcher queue, ReplaceIf hash), read_capped, VaultTooLarge write cap, read_package_entry_capped; tests/cloud.rs Provider double
-- [objc2 patterns](objc2-patterns.md) — objc2 0.6/0.3.2 API shapes, observers, NSPasteboard, NSURL, Security/LAContext, SMAppService, CG capture, NSBitmapImageRep lazy decode, rqrr, NSColor accent
-- [vault-macos layout](vault-macos-layout.md) — modules incl. appearance.rs, biometric.rs, login_item.rs, qr.rs (screen + image file), panel.rs (choose_file), cfg split, no vault-sync dep, device_id fallback, entitlement need
+- [objc2 patterns](objc2-patterns.md) — objc2 0.6/0.3.2 API shapes, observers, NSPasteboard, NSURL, Security/LAContext, SMAppService, NSStatusItem/NSMenu, CG capture, NSBitmapImageRep lazy decode, rqrr, NSColor accent
+- [vault-macos layout](vault-macos-layout.md) — modules incl. appearance.rs, biometric.rs, login_item.rs, dock.rs, status_item.rs, qr.rs (screen + image file), panel.rs (choose_file), cfg split, no vault-sync dep, device_id fallback, entitlement need
 - [notify watcher](notify-watcher.md) — poll() design, single recursive parent watch + NoCache, FSEvents quirks, NFC matching (APFS masks it in tests), WaitingForBlobs
 - [workspace fmt/concurrency](feedback-workspace-fmt.md) — never cargo fmt --all in write mode; for vault-app use rustfmt --edition 2024 on just your files when others edit the crate; other agents edit other crates concurrently
+- [gpui activation policy](gpui-activation-policy.md) — Dock policy via gpui set_activation_policy, LSUIElement bundle, gpui caches+reapplies policy, test recorder
 - [vault-app session guards](vault-app-session-guards.md) — session_gen/lock_gen for secondary windows, clipboard lock guard, gpui double-lease panic, bounded_read.rs, CLI sanitize_line, slow app tests
 - [build profiles](build-profiles.md) — dist profile choice + numbers, brand-icons.tsv now compressed via build.rs (sizes, decode cost), rustfmt blocked -> use cargo fmt --check, noisy-bench protocol, panic=abort banned

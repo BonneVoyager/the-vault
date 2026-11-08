@@ -182,6 +182,7 @@ mod tests {
             text_size: crate::state::TextSize::Larger,
             onboarding_dismissed: true,
             sidebar_hidden: true,
+            show_in_dock: false,
         };
         save_settings_to(dir.path(), &settings);
         assert_eq!(load_settings_from(dir.path()), settings);
@@ -246,5 +247,23 @@ mod tests {
         assert!(sidebar.onboarding_dismissed);
         fs::write(dir.path().join(SETTINGS_FILE), "not json").unwrap();
         assert_eq!(load_settings_from(dir.path()), Settings::default());
+    }
+
+    /// `show_in_dock` (05 §2.5): missing = true, `false` = false, garbage = true alone.
+    #[test]
+    fn show_in_dock_settings_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |json: &str| {
+            fs::write(dir.path().join(SETTINGS_FILE), json).unwrap();
+            load_settings_from(dir.path())
+        };
+        assert!(load(r#"{"lock_on_sleep": false}"#).show_in_dock);
+        assert!(!load(r#"{"show_in_dock": false}"#).show_in_dock);
+        let garbage =
+            load(r#"{"show_in_dock": "no", "lock_on_sleep": false, "text_size": "large"}"#);
+        assert!(garbage.show_in_dock);
+        assert!(!garbage.lock_on_sleep);
+        assert_eq!(garbage.text_size, crate::state::TextSize::Large);
+        assert!(Settings::default().show_in_dock);
     }
 }

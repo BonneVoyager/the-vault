@@ -48,7 +48,7 @@ pub use generator::{
 };
 pub use icon_images::IconImages;
 pub use kdbx::KdbxImportUi;
-pub use prefs::LoginRow;
+pub use prefs::{LoginRow, set_dock_icon};
 pub use qr::QrScanner;
 pub use security::{SECURITY_TAB, SecurityForm, SecurityUi};
 pub use session::{CopyTarget, FocusTarget, parse_totp};
@@ -237,6 +237,19 @@ pub struct Settings {
     /// default (missing key) is expanded. An unknown value falls back to the default alone.
     #[serde(deserialize_with = "lenient")]
     pub sidebar_hidden: bool,
+    /// Settings ▸ General ▸ "Show Vault in Dock" (05 §2.5, 04 §5b). Missing or
+    /// unparsable = shown.
+    #[serde(default = "shown", deserialize_with = "lenient_shown")]
+    pub show_in_dock: bool,
+}
+
+fn shown() -> bool {
+    true
+}
+
+/// [`lenient`] for a bool whose default is `true`.
+fn lenient_shown<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?.as_bool().unwrap_or(true))
 }
 
 /// Deserializes `T`, or its default if the value does not parse: one bad key in a
@@ -339,6 +352,7 @@ impl Default for Settings {
             text_size: TextSize::Default,
             onboarding_dismissed: false,
             sidebar_hidden: false,
+            show_in_dock: true,
         }
     }
 }
@@ -598,6 +612,10 @@ impl AppState {
             {
                 crate::theme::set_prefs(&self.settings, cx);
                 crate::theme::reapply(cx);
+            }
+            // `persist_recent` is off in tests: they never touch the activation policy.
+            if self.persist_recent && self.settings.show_in_dock != before.show_in_dock {
+                prefs::apply_dock_icon(self.settings.show_in_dock, cx);
             }
             if self.persist_recent {
                 persist::save_settings(&self.settings);

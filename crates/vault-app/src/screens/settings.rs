@@ -98,6 +98,8 @@ impl SettingsView {
     }
 }
 
+const DOCK_HINT: &str = "Also hides the menu bar. A padlock in the menu bar opens Vault instead.";
+
 /// Toast for the "Move…" stub in Sync & Backup.
 const MOVE_PACKAGE_LATER: &str = "Moving the vault package is coming later. To move it now, quit Vault and drag the \u{201c}.vault\u{201d} package in Finder.";
 
@@ -293,10 +295,45 @@ impl SettingsView {
         ];
         let rows = rows
             .into_iter()
+            .chain([self.dock_row(cx)])
             .chain(self.login_item_row(cx))
             .map(|r| (r, None))
             .collect();
         section("general", rows, cx)
+    }
+
+    /// "Show Vault in Dock" (04 §5b), always shown, with its hint under the label.
+    fn dock_row(&self, cx: &App) -> gpui::Div {
+        let state = self.state.clone();
+        let switch = Switch::new("show-in-dock")
+            .checked(self.state.read(cx).settings.show_in_dock)
+            .accessibility_label("Show Vault in Dock")
+            .clickable()
+            .on_click(move |on, _, cx| {
+                let on = *on;
+                state.update(cx, |s, cx| s.update_settings(cx, |st| st.show_in_dock = on));
+            });
+        ui::h_flex()
+            .py(px(10.))
+            .gap(px(12.))
+            .child(
+                ui::v_flex()
+                    .flex_1()
+                    .gap(px(2.))
+                    .child(div().text_sm().child("Show Vault in Dock"))
+                    .child(
+                        // gpui exposes no painted text to tests: the selector carries
+                        // the string this element renders.
+                        ui::muted(DOCK_HINT, cx)
+                            .text_xs()
+                            .debug_selector(|| format!("settings-dock-hint: {DOCK_HINT}")),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "settings-dock-switch".into())
+                    .child(switch),
+            )
     }
 
     /// "Launch at login" (hidden outside an .app bundle).
@@ -881,5 +918,65 @@ mod tests {
         });
         vcx.run_until_parked();
         assert!(!state.read_with(&vcx, |s, _| s.settings_open));
+    }
+
+    /// "Show Vault in Dock" sits directly above "Launch at login", carries its hint, and
+    /// toggling it flips and persists `show_in_dock`.
+    #[gpui::test]
+    fn settings_dock_row_above_login_and_toggles(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = SyncedVault::create(
+            &dir.path().join("t.vault"),
+            &SecretString::new("pw".into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        cx.update(gpui_component::init);
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        let window = cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let view = cx.new(|cx| SettingsView::new(state.clone(), window, cx));
+            Root::new(view, window, cx)
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        state.update(&mut vcx, |s, cx| {
+            s.install_unlocked_for_tests(vault);
+            s.open_settings(true, cx);
+            // Pretend to run from an .app bundle so the login row shows.
+            s.login_item = Some(vault_macos::LoginItemStatus::Disabled);
+        });
+        show_tab(0, &state, &mut vcx);
+
+        let rows: Vec<_> = (0..)
+            .map_while(|ix| row_bounds("general", ix, &mut vcx))
+            .collect();
+        let hint = vcx
+            .debug_bounds(
+                "settings-dock-hint: Also hides the menu bar. \
+                 A padlock in the menu bar opens Vault instead.",
+            )
+            .expect("General tab renders the hint text");
+        let dock = rows
+            .iter()
+            .position(|r| r.contains(&hint.center()))
+            .unwrap();
+        assert_eq!(
+            dock,
+            rows.len() - 2,
+            "Dock row directly above the login row"
+        );
+        assert!(rows[dock].bottom() <= rows[dock + 1].top());
+
+        assert!(state.read_with(&vcx, |s, _| s.settings.show_in_dock));
+        let switch = vcx.debug_bounds("settings-dock-switch").unwrap();
+        vcx.simulate_click(switch.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        let settings = state.read_with(&vcx, |s, _| s.settings.clone());
+        assert!(!settings.show_in_dock);
+        // Tests never write the real support dir; persist through the same functions.
+        crate::persist::save_settings_to(dir.path(), &settings);
+        assert!(!crate::persist::load_settings_from(dir.path()).show_in_dock);
     }
 }

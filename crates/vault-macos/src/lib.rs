@@ -47,3 +47,9 @@ pub use appearance::{Rgba, on_system_colors_changed, system_accent_color};
 
 mod panel;
 pub use panel::{choose_file, normalize_extensions};
+
+mod dock;
+pub use dock::{dock_icon_visible, set_dock_icon_visible};
+
+mod status_item;
+pub use status_item::{StatusItem, StatusItemCallbacks, test_fallback_glyph_size};

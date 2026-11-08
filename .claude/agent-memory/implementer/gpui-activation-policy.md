@@ -1,0 +1,14 @@
+---
+name: gpui-activation-policy
+description: Dock/activation policy in vault-app goes through gpui App::set_activation_policy; gpui-pre-macos caches the policy and re-applies it in did_finish_launching; test platform ignores it (thread_local recorder in state/prefs.rs tests)
+metadata:
+  type: project
+---
+- Bundle is `LSUIElement = true` (scripts/Info.plist, 04 §5b). Without it Launch Services re-registers the app as foreground (Dock icon back) when reopened from Finder while accessory.
+- `state::set_dock_icon(show, cx)` (state/prefs.rs) -> `cx.set_activation_policy(dock_policy(show))`; never call `vault_macos::set_dock_icon_visible` from the app: gpui-pre-macos caches `activation_policy` and re-applies it in `did_finish_launching` (sets cached policy, THEN calls our run callback) and in `request_windowing`. App never calls request_windowing/with_windowing.
+- gpui `with_windowing(Headless)` would apply Accessory before the run loop (no Regular step at launch) but marks the app "headless" for `graphical_environment()`; not used.
+- gpui TestPlatform's `set_activation_policy` is a no-op with no getter, so prefs.rs tests use a `#[cfg(test)]` thread_local recorder (`tests::take_applied_policies`). `reopen_main_window` re-asserts Accessory when show_in_dock is off.
+- Crate-root private items in main.rs (`RunningVault`, `reopen_main_window`) are reachable from any module's tests.
+
+**Why:** owner bug 2026-11-08, Dock icon returned on reopen from Finder.
+**How to apply:** any Dock/menu-bar visibility work in vault-app; LSUIElement only applies to a packaged .app, not `cargo run`.

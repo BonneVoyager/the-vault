@@ -1014,3 +1014,128 @@ no selection (delete the selected item from a pinned window, then Tab into the l
 is selected; start a New item, Tab into the list: no discard prompt. Owner eye check passed 2026-11-08.
 
 Bug hunt: not yet run for this wave.
+
+## Field drag-to-reorder, option A (2026-11-08)
+
+Owner screen recording showed the drop line painted as the hovered row's border (read as a box),
+above/below chosen by drag start direction, a 280 px "Untitled field" ghost next to a 40 % copy of
+the row. Option A chosen (B live reordering and C arrows-only declined for now). `editor.rs` only:
+per-row `on_drag_move` records hovered row + pointer half into one drag-state struct; one container
+`on_drop` computes the destination with the pure `drop_index(from, target, lower)` against
+remove-then-insert, looking the current index up by key; one 2 px primary line at a single -1.5 px
+offset in the gap; the dragged row collapses to its header line at 40 %; the ghost mirrors the row
+header (grip, field icon, name or placeholder, kind tag) at the measured row width; pressing the
+grip focuses the row's name input so Esc reaches the editor and cancels the drag, not the edit (the
+old code cancelled the whole edit on Esc during every drag); drag state cleared on any window
+mouse-up (deferred past the drop), Esc, edit start and edit end; collapse and line require both an
+active gpui drag and our state, so the column-resize drag cannot trigger them. ↑/↓ buttons kept.
+Code review (Opus): FIX FIRST (stale state, start-index drop, Esc focus) → fixed → SHIP; three
+non-blocking hardening notes applied. Tests `drop_index_matches_remove_then_insert` (exhaustive
+n = 1..=5) and `field_drag_line_esc_and_drop` (real drag through the main screen). Spec 05 §2.5
+"Edit mode" updated. gpui facts learned: no pointer position in `on_drop`, no bounds in
+`drag_over`; `on_drag_move` gives both per element; no public query for the active drag's type.
+
+## CHECKPOINT — Field drag-to-reorder (2026-11-08)
+
+fmt and clippy clean; `cargo test -p vault-app` 480 passed, 0 failed (full run before the three
+hardening tweaks; `screens::main::editor::` 31 passed after). Unstaged: `editor.rs` (+313/−62,
+~130 of it tests; over the ~400-line guideline is not reached but the single-file size is noted),
+`specs/05-ui.md`, PROGRESS, on top of the Tab-stop wave and the staged field-icon wave.
+
+Owner eye checks: Edit an item, drag a field's grip slowly over the rows: one blue line between
+rows, switching halfway through each row; no line over the dragged row or its own slot; the
+dragged row shows only its header line, dimmed; the ghost is as wide as the row with grip, icon,
+name (or "Name" muted) and kind tag. Release in a gap: the field lands where the line was. Press
+Esc mid-drag: the drag ends, edit mode stays, order unchanged. Click the grip without dragging:
+focus goes to that row's name input. Resize the list/detail column while editing: no row collapses
+and no stray line. ↑/↓ buttons still work. Owner eye check passed 2026-11-08.
+
+Bug hunt: not yet run for this wave.
+
+## Show Vault in Dock (2026-11-08)
+
+Owner request: Settings ▸ General "Show Vault in Dock", above "Launch at login", on by default.
+Option A chosen (plain toggle; closing the window keeps the app running as today). vault-macos
+`dock.rs`: `set_dock_icon_visible(bool) -> bool` / `dock_icon_visible() -> bool`, safe objc2 calls
+(no `unsafe`), `MainThreadMarker` guard, objc2-app-kit feature `NSRunningApplication` added
+(where `NSApplicationActivationPolicy` lives). App: `Settings.show_in_dock` (missing or bad value →
+true, other keys intact), `state::set_dock_icon` at startup before the window opens,
+`prefs::apply_dock_icon` on toggle (`cx.activate(true)` in both directions so the sheet does not
+slip behind other apps), gated by the persistence flag so headless tests never touch AppKit. Code
+review (Opus): FIX FIRST → fixed → SHIP. Correction recorded: accessory apps are NOT in the ⌘Tab
+switcher; the way back is launching Vault again (on_reopen) — superseded the same day by the menu
+bar status item (next entry). Tests: `persist::tests::show_in_dock_settings_json`,
+`screens::settings::tests::settings_dock_row_above_login_and_toggles`.
+
+## CHECKPOINT — Show Vault in Dock (2026-11-08)
+
+fmt and workspace clippy clean; vault-macos 25 passed; `cargo test -p vault-app` 482 passed,
+0 failed. Not eye-checked yet: the owner asked for the menu bar status item before trying it, so
+the eye check is folded into that wave.
+
+Bug hunt: not yet run for this wave.
+
+## Menu bar status item while the Dock icon is off (2026-11-08)
+
+Owner request after the Dock toggle: "otherwise it's running in background like a ghost". Owner
+decision: the status item exists only while "Show Vault in Dock" is off (no separate setting).
+vault-macos `status_item.rs` (04 §5c): `StatusItem::install(locked, StatusItemCallbacks{open,
+lock_or_unlock, quit})`, `set_locked`, removed on drop; SF Symbols `lock.fill`/`lock.open.fill`
+template images (code-drawn padlock fallback); left click → open; right/Control-click attaches a
+native NSMenu "Open Vault" / "Lock" or "Unlock…" / separator / "Quit Vault" for the duration of the
+click; callbacks held by a main-thread ObjC target with weak links from button and menu items,
+`catch_unwind` with the payload printed, menu index bounds-checked, `popping` re-entrancy guard;
+main-thread integration test `tests/status_item.rs` (harness = false) incl. drop-from-callback and
+panicking callback. Security review (Fable): SHIP, three warnings fixed. App `status_item.rs`: a
+main-thread global owns the item behind a `Handle` trait + `Installer` closure (fake in tests); one
+app-level observer installs on show_in_dock → false, drops on → true, `set_locked` on changes of
+(locked || no vault open); callbacks go through a channel drained by a spawned task (autolock
+pattern): open → `reopen_main_window`, lock_or_unlock → Lock action or open, quit → Quit action
+(global on_action → cx.quit → on_app_quit hook). Install failure reverts the setting through
+`update_settings` and toasts "Could not add Vault to the menu bar. The Dock icon stays on." Hint:
+"Also hides the menu bar. A padlock in the menu bar opens Vault instead." Code review (Opus): SHIP,
+one warning fixed. Spec 05 §2.5 and the non-goals line, 04 §5c updated. Not testable headless: a
+real right-click opening the menu.
+
+## CHECKPOINT — Dock toggle + menu bar status item (2026-11-08)
+
+fmt and workspace clippy clean; vault-macos 67 passed; `cargo test -p vault-app` 487 passed,
+0 failed. Unstaged: vault-macos (`dock.rs`, `status_item.rs`, `tests/status_item.rs`, lib.rs,
+Cargo.toml features + [[test]]), vault-app (`status_item.rs`, main.rs, persist.rs, settings.rs,
+state.rs, state/prefs.rs), specs 04/05, PROGRESS; on top of the staged editor.rs drag wave.
+
+Owner eye checks: Settings ▸ General shows "Show Vault in Dock" above "Launch at login" with the
+hint; turn it off: Dock icon and menu bar disappear, a padlock appears in the menu bar at once,
+the Settings sheet stays in front; left-click the padlock: the main window comes forward; close
+the window, left-click again: it reopens; right-click or Control-click: menu "Open Vault",
+"Lock"/"Unlock…", "Quit Vault"; ⌘L: padlock closes immediately; unlock: it opens; ⌘O to the choose
+screen: closed; "Quit Vault" quits (the vault file saved, no stale lock); turn the toggle back on:
+padlock gone, Dock icon and menu bar back; quit and relaunch with the toggle off: no Dock icon,
+padlock present from startup, closed on the unlock screen.
+
+Bug hunt: not yet run for this wave.
+
+## Fix: Dock icon returned on relaunch from Finder (2026-11-08)
+
+Owner eye check of the Dock toggle: with the icon off, opening Vault again from Applications
+brought the Dock icon back while the padlock stayed. Cause: Launch Services re-registers a bundle
+without `LSUIElement` as a foreground app when it is opened again while running; a runtime
+`setActivationPolicy(.accessory)` does not survive it. Fix: `scripts/Info.plist` gains
+`LSUIElement = true` (the app sets `.regular` itself at startup when the toggle is on, so the
+default still shows the Dock icon); the Dock policy now goes through gpui `App::set_activation_policy`
+(`prefs::dock_policy(show)` pure mapping) so gpui's cached policy agrees and is never re-applied as
+Regular; `reopen_main_window` re-applies Accessory when the toggle is off before activating.
+`vault_macos::set_dock_icon_visible` stays in the crate, unused by the app. Tests
+`dock_policy_mapping`, `reopen_reapplies_accessory_when_dock_off` (test-only recorder, since the
+gpui test platform ignores the policy). Only the packaged .app exercises LSUIElement; `cargo run`
+cannot reproduce the Finder-reopen case. Spec 04 §5b updated.
+
+## CHECKPOINT — Dock relaunch fix (2026-11-08)
+
+fmt and workspace clippy clean; `cargo test -p vault-app` 489 passed, 0 failed. Unstaged on top of
+the earlier unstaged Dock/status-item wave: `scripts/Info.plist`, `main.rs`, `state/prefs.rs`,
+spec 04, PROGRESS. Owner eye check (packaged .app only): toggle off, reopen from Applications,
+Spotlight and a .vault file: no Dock icon, padlock only; quit and relaunch with the toggle off:
+no icon flash; toggle on: Dock icon and menu bar back.
+
+Bug hunt: not yet run for this wave.
