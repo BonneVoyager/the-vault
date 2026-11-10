@@ -62,6 +62,12 @@ struct MenuBarItem {
 
 impl gpui::Global for MenuBarItem {}
 
+/// Startup without a window or activation: a login-item launch (04 §5d) while the Dock
+/// icon is off, so Vault starts as just the padlock (05 §2.5). Otherwise unchanged.
+pub fn start_in_background(login_launch: bool, show_in_dock: bool) -> bool {
+    login_launch && !show_in_dock
+}
+
 /// Shows the item now if the Dock icon is off and keeps it in step with `state`. `open`
 /// is the Dock-reopen path (activates the app, raises or reopens the main window).
 pub fn install(state: &Entity<AppState>, installer: Installer, open: fn(&mut App), cx: &mut App) {
@@ -197,6 +203,14 @@ mod tests {
         state: &Entity<AppState>,
         cx: &mut TestAppContext,
     ) -> (Log, Rc<RefCell<Option<StatusItemCallbacks>>>) {
+        fake_opening(state, record_open, cx)
+    }
+
+    fn fake_opening(
+        state: &Entity<AppState>,
+        open: fn(&mut App),
+        cx: &mut TestAppContext,
+    ) -> (Log, Rc<RefCell<Option<StatusItemCallbacks>>>) {
         let (log, callbacks) = (Log::default(), Rc::new(RefCell::new(None)));
         let (l, c) = (log.clone(), callbacks.clone());
         let installer: Installer = Rc::new(move |locked, cb| {
@@ -204,7 +218,7 @@ mod tests {
             *c.borrow_mut() = Some(cb);
             Some(Box::new(Fake(l.clone())))
         });
-        cx.update(|cx| install(state, installer, record_open, cx));
+        cx.update(|cx| install(state, installer, open, cx));
         (log, callbacks)
     }
 
@@ -318,6 +332,64 @@ mod tests {
         state.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
         assert_eq!(*log.borrow(), [Call::Install(true)]);
+    }
+
+    /// Only a login launch with the Dock icon off starts without a window.
+    #[test]
+    fn start_in_background_only_for_login_launch_with_dock_off() {
+        assert!(start_in_background(true, false));
+        assert!(!start_in_background(true, true));
+        assert!(!start_in_background(false, false));
+        assert!(!start_in_background(false, true));
+    }
+
+    /// Background startup (no window was ever opened, no `MainWindow` global): the
+    /// padlock's Open runs the reopen path, which opens the main window on the unlock
+    /// screen of the remembered vault.
+    #[gpui::test]
+    fn background_start_opens_the_window_from_the_padlock(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = unlocked(dir.path(), cx);
+        state.update(cx, |s, cx| {
+            s.lock(cx);
+            s.settings.show_in_dock = false;
+        });
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::actions::bind_keys(cx);
+            crate::actions::register(&state, cx);
+            cx.set_global(crate::RunningVault(state.clone()));
+        });
+        let (log, callbacks) = fake_opening(&state, crate::reopen_main_window, cx);
+        assert_eq!(*log.borrow(), [Call::Install(true)], "locked padlock");
+        assert!(cx.update(|cx| cx.windows().is_empty()));
+
+        (callbacks.borrow().as_ref().unwrap().open)();
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+        state.read_with(cx, |s, _| {
+            assert!(s.locked);
+            assert_eq!(s.screen, crate::state::Screen::Unlock);
+        });
+    }
+
+    /// Background start (no window) whose item fails: the setting reverts and still no
+    /// window is opened. The activation guard itself is tested on `apply_dock_icon` in
+    /// state/prefs.rs: test states run with `persist_recent` off, which skips the policy
+    /// call in `update_settings`.
+    #[gpui::test]
+    fn status_item_failure_without_a_window_reverts_only(cx: &mut TestAppContext) {
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        state.update(cx, |s, _| s.settings.show_in_dock = false);
+        let installer: Installer = Rc::new(|_, _| None);
+        cx.update(|cx| install(&state, installer, record_open, cx));
+        cx.run_until_parked();
+        state.read_with(cx, |s, _| {
+            assert!(s.settings.show_in_dock, "setting back on");
+            assert_eq!(s.toast.as_ref().unwrap().message.as_ref(), NO_ITEM_TOAST);
+        });
+        assert!(cx.update(|cx| cx.windows().is_empty()), "no window opened");
+        assert_eq!(OPENS.with(Cell::get), 0, "reopen path not taken");
     }
 
     /// An installer that fails (e.g. `NotAvailable`) turns the Dock icon back on, says

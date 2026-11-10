@@ -19,3 +19,5 @@ metadata:
 
 **Why:** these came out of the daybreak-03-10-2026 review fixes [4], [7] and [10] (2026-11-06).
 **How to apply:** reuse these patterns for any new secondary window or async result, and for any new file-import path.
+
+- Test states (`AppState::new(.., false)`, persist_recent off) skip `prefs::apply_dock_icon` inside `update_settings`, so the status-item fallback never reaches it in tests; test the activation guard on `apply_dock_icon` directly (thread_local `take_activations` / `take_applied_policies` in state/prefs.rs tests; gpui TestPlatform `activate` is a no-op). Don't wrap two calls in a tuple to discard them: clippy `unnecessary_operation`.

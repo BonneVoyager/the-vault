@@ -36,6 +36,9 @@ pub use login_item::{
     set_launch_at_login,
 };
 
+mod login_launch;
+pub use login_launch::launched_as_login_item;
+
 mod qr;
 pub use qr::{
     MAX_IMAGE_FILE_BYTES, MAX_IMAGE_PIXELS, decode_qr_from_gray, scan_qr_from_image_file,

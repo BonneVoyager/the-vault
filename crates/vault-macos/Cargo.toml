@@ -29,8 +29,10 @@ rqrr = { version = "=0.11.0", default-features = false }
 # Objective-C runtime bindings: message sending, retained pointers.
 objc2 = "=0.6.5"
 # NSString, NSNotification, NSNotificationCenter, NSDistributedNotificationCenter; NSData
-# (image file bytes for qr.rs).
-objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString", "NSNotification", "NSDistributedNotificationCenter", "NSObject", "NSArray", "NSDictionary", "NSError", "NSURL", "NSFileManager", "NSValue", "NSBundle", "NSData"] }
+# (image file bytes for qr.rs). NSAppleEventManager/NSAppleEventDescriptor + objc2-core-services
+# (gates eventClass/eventID/paramDescriptorForKeyword; crate already in the lockfile):
+# login-item launch detection in login_launch.rs (spec 04 §5d).
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString", "NSNotification", "NSDistributedNotificationCenter", "NSObject", "NSArray", "NSDictionary", "NSError", "NSURL", "NSFileManager", "NSValue", "NSBundle", "NSData", "NSAppleEventManager", "NSAppleEventDescriptor", "objc2-core-services"] }
 # NSWorkspace + NSWorkspaceWillSleepNotification; NSPasteboard (§3); NSAccessibility (reduce motion);
 # NSBitmapImageRep (+ its CGImage bridge) decodes PNG/JPEG/HEIC/TIFF files for qr.rs.
 # bitflags: NSPasteboardContentsOptions (currentHostOnly). NSWindow/NSResponder/NSApplication:
@@ -89,6 +91,11 @@ harness = false
 # Installs an NSStatusItem (main thread only): install -> set_locked -> drop.
 [[test]]
 name = "status_item"
+harness = false
+
+# Reads NSAppleEventManager.currentAppleEvent on the main thread (no event -> false).
+[[test]]
+name = "login_launch"
 harness = false
 
 # Opens an NSOpenPanel (main thread only) when run with `-- --ignored`; manual check.

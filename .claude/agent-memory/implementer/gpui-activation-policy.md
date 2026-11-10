@@ -12,3 +12,5 @@ metadata:
 
 **Why:** owner bug 2026-11-08, Dock icon returned on reopen from Finder.
 **How to apply:** any Dock/menu-bar visibility work in vault-app; LSUIElement only applies to a packaged .app, not `cargo run`.
+
+- Login launch (2026-11-10, 05 §2.5): main.rs skips open_main_window/activate/apply_main_min_size when `status_item::start_in_background(launched_as_login_item(), show_in_dock)`; no AppState field. autolock::install lives in VaultRoot::new, so it only runs once a window exists (fine: vault is locked). Test `background_start_opens_the_window_from_the_padlock` covers reopen with no MainWindow global.

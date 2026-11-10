@@ -99,6 +99,7 @@ impl SettingsView {
 }
 
 const DOCK_HINT: &str = "Also hides the menu bar. A padlock in the menu bar opens Vault instead.";
+const LOGIN_HINT: &str = "Starts in the menu bar when the Dock icon is off.";
 
 /// Toast for the "Move…" stub in Sync & Backup.
 const MOVE_PACKAGE_LATER: &str = "Moving the vault package is coming later. To move it now, quit Vault and drag the \u{201c}.vault\u{201d} package in Finder.";
@@ -126,6 +127,33 @@ fn row(label: &'static str, control: impl IntoElement) -> gpui::Div {
         .py(px(10.))
         .gap(px(12.))
         .child(div().flex_1().text_sm().child(label))
+        .child(control)
+}
+
+/// A [`row`] whose label carries a one-line muted hint under it. `tag` names the hint's
+/// test selector `settings-{tag}-hint: {hint}` (gpui exposes no painted text to tests:
+/// the selector carries the string this element renders).
+fn hinted_row(
+    label: &'static str,
+    hint: &'static str,
+    tag: &'static str,
+    control: impl IntoElement,
+    cx: &App,
+) -> gpui::Div {
+    ui::h_flex()
+        .py(px(10.))
+        .gap(px(12.))
+        .child(
+            ui::v_flex()
+                .flex_1()
+                .gap(px(2.))
+                .child(div().text_sm().child(label))
+                .child(
+                    ui::muted(hint, cx)
+                        .text_xs()
+                        .debug_selector(move || format!("settings-{tag}-hint: {hint}")),
+                ),
+        )
         .child(control)
 }
 
@@ -313,30 +341,13 @@ impl SettingsView {
                 let on = *on;
                 state.update(cx, |s, cx| s.update_settings(cx, |st| st.show_in_dock = on));
             });
-        ui::h_flex()
-            .py(px(10.))
-            .gap(px(12.))
-            .child(
-                ui::v_flex()
-                    .flex_1()
-                    .gap(px(2.))
-                    .child(div().text_sm().child("Show Vault in Dock"))
-                    .child(
-                        // gpui exposes no painted text to tests: the selector carries
-                        // the string this element renders.
-                        ui::muted(DOCK_HINT, cx)
-                            .text_xs()
-                            .debug_selector(|| format!("settings-dock-hint: {DOCK_HINT}")),
-                    ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "settings-dock-switch".into())
-                    .child(switch),
-            )
+        let control = div()
+            .debug_selector(|| "settings-dock-switch".into())
+            .child(switch);
+        hinted_row("Show Vault in Dock", DOCK_HINT, "dock", control, cx)
     }
 
-    /// "Launch at login" (hidden outside an .app bundle).
+    /// "Launch at login" (hidden outside an .app bundle), with its hint under the label.
     fn login_item_row(&self, cx: &App) -> Option<gpui::Div> {
         let control = match self.state.read(cx).login_row() {
             LoginRow::Hidden => return None,
@@ -359,7 +370,13 @@ impl SettingsView {
                 .on_click(|_, _, _| vault_macos::open_login_items_settings())
                 .into_any_element(),
         };
-        Some(row("Launch at login", control))
+        Some(hinted_row(
+            "Launch at login",
+            LOGIN_HINT,
+            "login",
+            control,
+            cx,
+        ))
     }
 
     /// Sync & Backup (§2.5, 03 §4). The path shown and revealed is the `.vault` package.
@@ -968,6 +985,13 @@ mod tests {
             "Dock row directly above the login row"
         );
         assert!(rows[dock].bottom() <= rows[dock + 1].top());
+        let login_hint = vcx
+            .debug_bounds("settings-login-hint: Starts in the menu bar when the Dock icon is off.")
+            .expect("login row renders its hint");
+        assert!(
+            rows[dock + 1].contains(&login_hint.center()),
+            "hint sits in the login row"
+        );
 
         assert!(state.read_with(&vcx, |s, _| s.settings.show_in_dock));
         let switch = vcx.debug_bounds("settings-dock-switch").unwrap();
@@ -978,5 +1002,22 @@ mod tests {
         // Tests never write the real support dir; persist through the same functions.
         crate::persist::save_settings_to(dir.path(), &settings);
         assert!(!crate::persist::load_settings_from(dir.path()).show_in_dock);
+
+        // The hint follows the row: still there as "Allow in System Settings…", gone
+        // with the row outside an .app bundle.
+        let login_hint = "settings-login-hint: Starts in the menu bar when the Dock icon is off.";
+        let set_login = |status, vcx: &mut VisualTestContext| {
+            state.update(vcx, |s, cx| {
+                s.login_item = status;
+                cx.notify();
+            });
+            vcx.run_until_parked();
+            vcx.debug_bounds(login_hint).is_some()
+        };
+        assert!(set_login(
+            Some(vault_macos::LoginItemStatus::RequiresApproval),
+            &mut vcx
+        ));
+        assert!(!set_login(None, &mut vcx), "no row, no hint");
     }
 }

@@ -50,10 +50,16 @@ pub fn set_dock_icon(show: bool, cx: &mut App) {
 
 /// [`set_dock_icon`] on toggling, then re-activates the app either way: back on, AppKit
 /// needs it to draw the menu bar; off, a frontmost app switching to accessory can lose
-/// its active state and let the Settings sheet slip behind other windows.
+/// its active state and let the Settings sheet slip behind other windows. With no
+/// window (a background login start whose status item failed, 05 §2.5) it does not
+/// activate: a windowless Vault is never brought to the front.
 pub fn apply_dock_icon(show: bool, cx: &mut App) {
     set_dock_icon(show, cx);
-    cx.activate(true);
+    if !cx.windows().is_empty() {
+        #[cfg(test)]
+        tests::record_activation();
+        cx.activate(true);
+    }
 }
 
 impl AppState {
@@ -106,6 +112,20 @@ pub(crate) mod tests {
         APPLIED.with(|a| a.borrow_mut().push(policy));
     }
 
+    thread_local! {
+        /// `cx.activate(true)` calls from [`apply_dock_icon`] (a no-op on the test platform).
+        static ACTIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(crate) fn record_activation() {
+        ACTIVATIONS.with(|n| n.set(n.get() + 1));
+    }
+
+    /// Drains the activation count recorded on this thread.
+    pub(crate) fn take_activations() -> usize {
+        ACTIVATIONS.with(|n| n.replace(0))
+    }
+
     /// Drains the policies recorded on this thread.
     pub(crate) fn take_applied_policies() -> Vec<ActivationPolicy> {
         APPLIED.with(|a| std::mem::take(&mut *a.borrow_mut()))
@@ -143,6 +163,22 @@ pub(crate) mod tests {
         cx.update(crate::reopen_main_window);
         cx.run_until_parked();
         assert!(take_applied_policies().is_empty());
+    }
+
+    /// Toggling the Dock icon activates only when a window exists: with none (background
+    /// login start, 05 §2.5) the policy changes but Vault is not brought to the front.
+    #[gpui::test]
+    fn apply_dock_icon_activates_only_with_a_window(cx: &mut gpui::TestAppContext) {
+        take_activations();
+        take_applied_policies();
+        cx.update(|cx| apply_dock_icon(true, cx));
+        assert_eq!(take_applied_policies(), vec![ActivationPolicy::Regular]);
+        assert_eq!(take_activations(), 0, "no window: no activation");
+
+        cx.add_empty_window();
+        cx.update(|cx| apply_dock_icon(false, cx));
+        assert_eq!(take_applied_policies(), vec![ActivationPolicy::Accessory]);
+        assert_eq!(take_activations(), 1, "window open: activates as before");
     }
 
     #[test]

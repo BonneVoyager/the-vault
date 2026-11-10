@@ -145,6 +145,10 @@ impl StatusItem {
 
 Main thread only; callbacks run on the main thread. Button image: a template (monochrome, follows the menu bar colour) padlock glyph, closed when locked and open when unlocked, 18 pt, SF Symbols `lock.fill` / `lock.open.fill` via `NSImage::imageWithSystemSymbolName`, with a padlock drawn in code (18 × 18, template) as the fallback when the symbol is unavailable; the accessibility description "Vault, locked" / "Vault, unlocked" is set on the image. Left click runs `open`. Right click or Control-click pops a native `NSMenu`: "Open Vault", then "Lock" (unlocked) or "Unlock…" (locked), a separator, "Quit Vault"; the menu is attached only for the duration of the click so the left click keeps its action. Non-macOS stubs: `install` returns `Err(MacError::NotAvailable)`, `set_locked` is a no-op.
 
+### 5d. Login-item launch detection (2026-11-10)
+
+`vault_macos::launched_as_login_item() -> bool`. True when the current Apple Event is the `kAEOpenApplication` event whose `keyAEPropData` parameter is `keyAELaunchedAsLogInItem`, which `loginwindow` sets when it starts a login item registered through `SMAppService.mainAppService` (the documented check, also valid for the legacy login-items list). Safe objc2 over `NSAppleEventManager.sharedAppleEventManager().currentAppleEvent`, main thread only (`MainThreadMarker`; off-main → false), no `unsafe` beyond what the bindings need. The value is only meaningful while `applicationDidFinishLaunching` is on the stack, which is where gpui runs the `app.run` closure, so the app reads it once there, before any window code, and does not keep it (nothing after startup needs it). False on non-macOS, when there is no current event, when the event has no such parameter (Finder, Spotlight, `open`, a `cargo run` binary), and on any error. Not spec'd as a stable guarantee of macOS: if it ever returns false on a real login launch, the fallback is the ordinary startup with a window (05 §2.5).
+
 ## 6. Security-scoped bookmarks
 
 Only needed if the app is sandboxed. v1 ships outside the App Store, unsandboxed, Developer ID signed. Leave a `bookmark` module stub with a TODO; do not implement now.

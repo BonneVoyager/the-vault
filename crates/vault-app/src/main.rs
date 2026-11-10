@@ -102,6 +102,12 @@ fn main() {
         gpui_component::init(cx);
         actions::bind_keys(cx);
         let settings = persist::load_settings();
+        // Read while gpui runs this closure inside applicationDidFinishLaunching, the
+        // only time the current Apple Event is the launch event (04 §5d).
+        let background = status_item::start_in_background(
+            vault_macos::launched_as_login_item(),
+            settings.show_in_dock,
+        );
         actions::set_menus(Sort::default(), !settings.sidebar_hidden, cx);
         theme::set_prefs(&settings, cx);
         // Before the first window: the bundle is LSUIElement, so the Dock icon only
@@ -114,16 +120,20 @@ fn main() {
         cx.set_global(RunningVault(state.clone()));
         register_actions(&state, cx);
 
-        let restore = persist::load_window_state();
+        // Login launch with the Dock icon off: no window and no activation; the padlock,
+        // Finder or Spotlight opens it through `reopen_main_window` (05 §2.5).
         let sidebar_visible = state.read(cx).sidebar_visible();
-        let opened = ui::open_main_window(restore, sidebar_visible, cx, |window, cx| {
-            theme::apply(window, cx);
-            cx.new(|cx| VaultRoot::new(state.clone(), restore, window, cx))
-        });
-        if let Err(err) = opened {
-            eprintln!("vault: failed to open main window: {err:#}");
-            cx.quit();
-            return;
+        if !background {
+            let restore = persist::load_window_state();
+            let opened = ui::open_main_window(restore, sidebar_visible, cx, |window, cx| {
+                theme::apply(window, cx);
+                cx.new(|cx| VaultRoot::new(state.clone(), restore, window, cx))
+            });
+            if let Err(err) = opened {
+                eprintln!("vault: failed to open main window: {err:#}");
+                cx.quit();
+                return;
+            }
         }
 
         // A remembered vault skips the choose screen (05 §2.1).
@@ -139,6 +149,9 @@ fn main() {
             reopen_main_window,
             cx,
         );
+        if background {
+            return;
+        }
         cx.activate(true);
         // The window opened with this minimum already; re-applied through the one
         // hook (best effort: the window may not be key yet).
