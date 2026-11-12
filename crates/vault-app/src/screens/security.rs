@@ -6,9 +6,12 @@
 //! `AppState::security`; this view owns only the password inputs and clears them whenever
 //! their form closes.
 
+use std::time::SystemTime;
+
 use gpui::{
-    AnyElement, App, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
-    Subscription, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, Styled as _, Subscription, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{InputEvent, InputState};
@@ -19,6 +22,7 @@ use gpui_kit_assets::IconName;
 use vault_core::SecretString;
 
 use super::settings::{SectionRow, section};
+use crate::state::diagnostics::{DIAGNOSTICS_COPIED, Host, diagnostics_text};
 use crate::state::{AppState, Busy, SECURITY_TAB, SecurityForm};
 use crate::ui::{self, Clickable as _};
 
@@ -218,6 +222,17 @@ impl SecurityView {
             self.state.update(cx, |s, cx| submit(s, password, cx));
         }
     }
+}
+
+/// "Copy diagnostics": an ordinary pasteboard write (not the concealed secret path, no
+/// clear timer), then the window toast.
+fn copy_diagnostics(state: &Entity<AppState>, cx: &mut App) {
+    let text = {
+        let s = state.read(cx);
+        diagnostics_text(s, SystemTime::now(), &Host::probe(s))
+    };
+    cx.write_to_clipboard(ClipboardItem::new_string(text));
+    state.update(cx, |s, cx| s.show_toast(DIAGNOSTICS_COPIED, cx));
 }
 
 fn clear(input: &Entity<InputState>, window: &mut Window, cx: &mut App) {
@@ -649,7 +664,15 @@ impl Render for SecurityView {
                 cx,
             ));
         }
-        body.into_any_element()
+        let state = self.state.clone();
+        let diagnostics = Button::new("copy-diagnostics")
+            .small()
+            .label("Copy diagnostics")
+            .clickable()
+            .debug_selector(|| "copy-diagnostics".into())
+            .on_click(move |_, _, cx| copy_diagnostics(&state, cx));
+        body.child(div().pt(px(12.)).child(diagnostics))
+            .into_any_element()
     }
 }
 
@@ -811,5 +834,32 @@ mod tests {
             assert!(ui::input_is_masked(&new, cx));
         });
         state.read_with(&vcx, |s, _| assert!(s.security.form.is_none()));
+    }
+
+    /// "Copy diagnostics" sits below Encryption strength at the bottom of the tab; a
+    /// click writes the block to the ordinary clipboard and toasts.
+    #[gpui::test]
+    fn copy_diagnostics_button_copies_and_toasts(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _view, mut vcx) = window(dir.path(), cx);
+        let button = vcx.debug_bounds("copy-diagnostics").expect("button shown");
+        let strength = vcx
+            .debug_bounds("settings-row security 2")
+            .expect("Encryption strength row");
+        assert!(button.top() >= strength.bottom());
+
+        click("copy-diagnostics", &mut vcx);
+        let copied = vcx
+            .update(|_, cx| cx.read_from_clipboard())
+            .and_then(|item| item.text())
+            .expect("clipboard text");
+        assert!(copied.starts_with("app version: "), "{copied}");
+        assert!(copied.contains("format version: 2\n"), "{copied}");
+        state.read_with(&vcx, |s, _| {
+            assert_eq!(
+                s.toast.as_ref().unwrap().message.as_ref(),
+                DIAGNOSTICS_COPIED
+            );
+        });
     }
 }

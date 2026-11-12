@@ -827,3 +827,144 @@ fn item_shortcuts_are_scoped_to_the_main_window(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(favorite(cx), "from the main window it works");
 }
+
+/// The first `# ` heading of `docs/help.md`, read from disk at test time, so a broken
+/// `include_str!` (wrong file, empty page) fails [`help_sheet_opens_while_locked_and_esc_closes_it`].
+fn help_heading_on_disk() -> String {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/help.md");
+    let page = std::fs::read_to_string(path).unwrap();
+    let line = page.lines().find(|l| l.starts_with("# ")).unwrap();
+    line[2..].trim().to_owned()
+}
+
+/// ⌘? on the unlock screen (locked) opens the Help sheet titled with the page's first
+/// heading; Esc closes it and the state follows.
+#[gpui::test]
+fn help_sheet_opens_while_locked_and_esc_closes_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _root, mut vcx) = root_with_vault(dir.path(), cx);
+    assert_eq!(state.read_with(&vcx, |s, _| s.screen), Screen::Unlock);
+
+    vcx.simulate_keystrokes(actions::HELP_KEYS);
+    vcx.run_until_parked();
+    assert!(state.read_with(&vcx, |s, _| s.help_open));
+    assert!(vcx.update(|window, cx| window.has_active_dialog(cx)));
+    // `debug_bounds` takes a static selector.
+    let title: &'static str = format!("sheet-title {}", help_heading_on_disk()).leak();
+    assert!(vcx.debug_bounds(title).is_some(), "{title} drawn");
+
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(!vcx.update(|window, cx| window.has_active_dialog(cx)));
+    assert!(!state.read_with(&vcx, |s, _| s.help_open));
+
+    // The menu item's action takes the same path.
+    vcx.dispatch_action(actions::ShowHelp);
+    vcx.run_until_parked();
+    assert!(vcx.update(|window, cx| window.has_active_dialog(cx)));
+}
+
+/// Help over an item being edited: Esc closes the sheet only, the edit stays. Help
+/// then replaces an open Settings sheet, and ⌘, replaces Help again.
+#[gpui::test]
+fn help_esc_keeps_the_edit_and_replaces_settings(cx: &mut TestAppContext) {
+    use std::sync::Arc;
+    use vault_core::{Item, KdfParams, SecretString};
+    use vault_sync::{NoopHooks, SyncedVault};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut vault = SyncedVault::create(
+        &dir.path().join("t.vault"),
+        &SecretString::new("pw".into()),
+        KdfParams::for_tests(),
+        Uuid::new_v4(),
+        Arc::new(NoopHooks),
+    )
+    .unwrap();
+    let item = Item::new("GitHub", vault.device_id(), 1);
+    let id = item.id;
+    vault.edit(|v| v.insert(item, 1)).unwrap();
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        actions::bind_keys(cx);
+        actions::register(&state, cx);
+    });
+    let window = cx.add_window(|window, cx| {
+        theme::apply(window, cx);
+        let view = cx.new(|cx| VaultRoot::new(state.clone(), None, window, cx));
+        Root::new(view, window, cx)
+    });
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    vcx.update(|window, _| window.activate_window());
+    state.update(&mut vcx, |s, _| s.install_unlocked_for_tests(vault));
+    vcx.run_until_parked();
+    let edit = |vcx: &mut VisualTestContext| {
+        state.update(vcx, |s, cx| {
+            s.select(id, cx);
+            s.begin_edit(cx);
+        });
+        vcx.run_until_parked();
+        vcx.dispatch_action(actions::FocusDetail);
+        vcx.run_until_parked();
+        assert!(state.read_with(vcx, |s, _| s.is_editing()));
+    };
+    // Without a sheet, Esc reaches the editor and cancels: the check below means something.
+    edit(&mut vcx);
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(!state.read_with(&vcx, |s, _| s.is_editing()));
+    edit(&mut vcx);
+
+    vcx.simulate_keystrokes(actions::HELP_KEYS);
+    vcx.run_until_parked();
+    assert!(vcx.update(|window, cx| window.has_active_dialog(cx)));
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(!vcx.update(|window, cx| window.has_active_dialog(cx)));
+    assert!(!state.read_with(&vcx, |s, _| s.help_open));
+    assert!(
+        state.read_with(&vcx, |s, _| s.is_editing()),
+        "Esc closed the sheet, not the edit"
+    );
+
+    vcx.simulate_keystrokes("cmd-,");
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes(actions::HELP_KEYS);
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| assert!(s.help_open && !s.settings_open));
+    // `debug_bounds` takes a static selector.
+    let help: &'static str = format!("sheet-title {}", help_heading_on_disk()).leak();
+    assert!(vcx.debug_bounds(help).is_some(), "Help replaced Settings");
+    assert!(vcx.debug_bounds("sheet-title Settings").is_none());
+
+    vcx.simulate_keystrokes("cmd-,");
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| assert!(!s.help_open && s.settings_open));
+    assert!(vcx.debug_bounds("sheet-title Settings").is_some());
+    assert!(vcx.debug_bounds(help).is_none());
+}
+
+/// The placeholder toast is gone from every source file of the crate.
+#[test]
+fn help_placeholder_toast_is_gone() {
+    let needle = concat!("Help is not ", "available yet");
+    let mut dirs = vec![std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src"
+    ))];
+    let mut files = 0;
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files += 1;
+                let text = std::fs::read_to_string(&path).unwrap();
+                assert!(!text.contains(needle), "{}", path.display());
+            }
+        }
+    }
+    assert!(files > 10);
+}

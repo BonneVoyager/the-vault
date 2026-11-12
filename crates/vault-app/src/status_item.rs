@@ -390,6 +390,34 @@ mod tests {
         });
         assert!(cx.update(|cx| cx.windows().is_empty()), "no window opened");
         assert_eq!(OPENS.with(Cell::get), 0, "reopen path not taken");
+
+        // No window: the toast waits past its TTL (05 §3 "Toasts without a window") and
+        // shows for its full time once the window opens.
+        let ttl = crate::state::TOAST_TTL;
+        cx.executor().advance_clock(ttl * 2);
+        cx.run_until_parked();
+        state.read_with(cx, |s, _| {
+            assert_eq!(s.toast.as_ref().unwrap().message.as_ref(), NO_ITEM_TOAST);
+        });
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::actions::bind_keys(cx);
+            crate::actions::register(&state, cx);
+            cx.set_global(crate::RunningVault(state.clone()));
+            crate::reopen_main_window(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+        cx.executor()
+            .advance_clock(ttl - std::time::Duration::from_millis(1));
+        cx.run_until_parked();
+        state.read_with(cx, |s, _| {
+            assert_eq!(s.toast.as_ref().unwrap().message.as_ref(), NO_ITEM_TOAST);
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(1));
+        cx.run_until_parked();
+        assert!(state.read_with(cx, |s, _| s.toast.is_none()), "expired");
     }
 
     /// An installer that fails (e.g. `NotAvailable`) turns the Dock icon back on, says

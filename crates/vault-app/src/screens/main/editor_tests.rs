@@ -1491,6 +1491,99 @@ fn add_field_menu_adds_the_first_kind_and_closes(cx: &mut TestAppContext) {
     assert!(!state.read_with(&vcx, |s, _| s.add_field_menu_open), "lock");
 }
 
+/// Picks `kind` from the real "Add field" menu with the pointer; returns the new row's key.
+fn add_field_by_click(state: &Entity<AppState>, vcx: &mut VisualTestContext, kind: &str) -> u64 {
+    click(vcx, "add-field".into());
+    click(vcx, format!("add-field-{kind}"));
+    state.read_with(vcx, |s, _| {
+        let b = s.edit_buffer().unwrap();
+        assert_eq!(b.focus_row, None, "pending focus consumed");
+        *b.keys.last().unwrap()
+    })
+}
+
+fn focused(input: &Entity<InputState>, vcx: &mut VisualTestContext) -> bool {
+    vcx.update(|window, cx| gpui::Focusable::focus_handle(input, cx).is_focused(window))
+}
+
+/// 05 §2.5 (owner 2026-11-12): an added field is scrolled into view and its Value input
+/// takes focus; its default name is kept.
+#[gpui::test]
+fn added_field_is_revealed_and_its_value_focused(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    let mut item = vault_core::Item::new("Long", device, 1);
+    item.fields = (0..40)
+        .map(|i| {
+            let v = SecretString::new("v".into());
+            vault_core::Field::new(format!("f{i}"), FieldKind::Text, v, 1)
+        })
+        .collect();
+    insert_and_select(&state, item, &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let viewport = vcx.update(|window, _| window.viewport_size());
+    let last = state.read_with(&vcx, |s, _| *s.edit_buffer().unwrap().keys.last().unwrap());
+    let off = |vcx: &mut VisualTestContext, key: u64| {
+        let b = vcx.debug_bounds(leak(format!("edit-row {key}")));
+        b.is_none_or(|b| b.bottom() > viewport.height)
+    };
+    assert!(off(&mut vcx, last), "the last row starts below the fold");
+
+    // "Add field" is below the fold too: open the menu by keyboard, Enter picks Text.
+    vcx.simulate_keystrokes("shift");
+    state.update(&mut vcx, |s, cx| s.open_add_field_menu(cx));
+    vcx.run_until_parked();
+    press(&mut vcx, "enter");
+    let key = state.read_with(&vcx, |s, _| *s.edit_buffer().unwrap().keys.last().unwrap());
+    let value = value_input(&main, key, &mut vcx);
+    assert!(focused(&value, &mut vcx), "value input focused");
+    assert!(!off(&mut vcx, key), "new row scrolled into view");
+    let name = state.read_with(&vcx, |s, _| {
+        s.edit_buffer()
+            .unwrap()
+            .item
+            .fields
+            .last()
+            .unwrap()
+            .name
+            .clone()
+    });
+    assert_eq!(name, "Text", "default name unchanged");
+}
+
+#[gpui::test]
+fn added_section_focuses_its_title(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    insert_and_select(&state, vault_core::Item::new("Bank", device, 1), &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let key = add_field_by_click(&state, &mut vcx, "section");
+    let name = name_input(&main, key, &mut vcx);
+    assert!(focused(&name, &mut vcx), "section title focused");
+}
+
+#[gpui::test]
+fn adding_fields_in_a_run_focuses_the_latest(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    insert_and_select(&state, vault_core::Item::new("Bank", device, 1), &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let first = add_field_by_click(&state, &mut vcx, "text");
+    let second = add_field_by_click(&state, &mut vcx, "url");
+    let (first, second) = (
+        value_input(&main, first, &mut vcx),
+        value_input(&main, second, &mut vcx),
+    );
+    assert!(focused(&second, &mut vcx), "second value focused");
+    assert!(!focused(&first, &mut vcx));
+}
+
 #[gpui::test]
 fn deleting_while_editing_closes_the_add_field_menu(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();

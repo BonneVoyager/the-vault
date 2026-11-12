@@ -7,6 +7,7 @@
 pub mod bookmark;
 mod device;
 mod error;
+mod host;
 mod icloud;
 mod idle;
 mod pasteboard;
@@ -14,6 +15,7 @@ mod window;
 
 pub use device::{BUNDLE_ID, DEVICE_ID_ENV, device_id, device_id_in, try_device_id};
 pub use error::MacError;
+pub use host::{model_identifier, os_version};
 pub use icloud::{CloudError, ICloudHooks, PIN_INTERVAL, POLL_INTERVAL, is_in_icloud};
 pub use idle::{
     Subscription, boot_time, on_distributed_notification, on_screen_locked, on_user_switched,

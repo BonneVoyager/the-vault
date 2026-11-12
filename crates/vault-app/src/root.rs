@@ -6,8 +6,8 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, AppContext as _, Context, Entity,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Subscription,
-    Task, Window, div, ease_out_quint, prelude::FluentBuilder as _, px,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
+    Subscription, Task, Window, div, ease_out_quint, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{ActiveTheme as _, WindowExt as _};
 use gpui_kit_assets::IconName;
@@ -15,6 +15,7 @@ use gpui_kit_assets::IconName;
 use crate::actions;
 use crate::autolock::{self, LockTriggers};
 use crate::persist::{self, WindowState};
+use crate::screens::help;
 use crate::screens::{ChooseScreen, ColumnsResized, MainScreen, SettingsView, UnlockScreen};
 use crate::state::{AppState, Screen, ToastPlace};
 use crate::{theme, ui};
@@ -114,12 +115,56 @@ const CROSSFADE: Duration = crate::state::UNLOCK_CROSSFADE;
 /// Window geometry is written this long after the last resize/move.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// The sheets over the main window; one at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sheet {
+    Settings,
+    Help,
+}
+
+/// The sheet chrome Settings and Help share: our own close button in the title (the
+/// built-in one keeps the arrow cursor and takes no style), 560 px wide, a body the
+/// dialog scrolls. `close` runs for the button, Esc and a backdrop click.
+fn open_sheet(
+    window: &mut Window,
+    cx: &mut gpui::App,
+    (title, close_id): (SharedString, &'static str),
+    body: impl Fn(&mut gpui::App) -> AnyElement + 'static,
+    close: impl Fn(&mut gpui::App) + 'static,
+) {
+    let close = std::rc::Rc::new(close);
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let (on_click, on_close) = (close.clone(), close.clone());
+        let selector = format!("sheet-title {title}");
+        let header = ui::h_flex()
+            .w_full()
+            .justify_between()
+            .child(
+                div()
+                    .debug_selector(move || selector.clone())
+                    .child(title.clone()),
+            )
+            .child(
+                ui::icon_button(close_id, IconName::Close, "Close  Esc")
+                    .on_click(move |_, _, cx| on_click(cx)),
+            );
+        dialog
+            .title(header)
+            .close_button(false)
+            .w(px(560.))
+            .child(body(cx))
+            .on_close(move |_, _, cx| on_close(cx))
+    });
+}
+
 pub struct VaultRoot {
     state: Entity<AppState>,
     choose: Entity<ChooseScreen>,
     unlock: Entity<UnlockScreen>,
     main: Entity<MainScreen>,
     settings: Entity<SettingsView>,
+    /// The sheet this root last opened, if still wanted.
+    sheet: Option<Sheet>,
     screen: Screen,
     geometry: WindowState,
     save_geometry: Option<Task<()>>,
@@ -171,7 +216,7 @@ impl VaultRoot {
                 } else if screen == Screen::Choose && request {
                     this.appear(window, cx);
                 }
-                this.sync_settings(window, cx);
+                this.sync_sheet(window, cx);
                 cx.notify();
             }),
             cx.observe_window_bounds(window, |this, window, cx| {
@@ -206,6 +251,8 @@ impl VaultRoot {
         let screen = state.read(cx).screen;
         cx.defer_in(window, |this, window, cx| {
             exclude_windows_from_capture(cx);
+            // Registered now: a toast held while no main window was up starts its clock.
+            this.state.update(cx, |s, cx| s.release_held_toast(cx));
             this.appear(window, cx);
         });
         let triggers = autolock::install(&state, cx);
@@ -217,6 +264,7 @@ impl VaultRoot {
             unlock,
             main,
             settings,
+            sheet: None,
             screen,
             save_geometry: None,
             _subscriptions: subscriptions,
@@ -233,7 +281,11 @@ impl VaultRoot {
         // Tests exercise close/reopen without writing the developer's real window.json.
         #[cfg(not(test))]
         persist::save_window_state(&self.geometry);
-        self.state.update(cx, |s, cx| s.lock(cx));
+        self.state.update(cx, |s, cx| {
+            // The sheet goes with the window; a reopened window starts without it.
+            s.open_help(false, cx);
+            s.lock(cx);
+        });
     }
 
     /// Focus the right control for the screen that just became visible.
@@ -245,35 +297,46 @@ impl VaultRoot {
         }
     }
 
-    /// Opens or closes the settings dialog to match `AppState::settings_open`.
-    fn sync_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let want = self.state.read(cx).settings_open;
+    /// Opens, swaps or closes the one sheet to match `AppState::help_open` /
+    /// `settings_open` (opening one clears the other). With no sheet wanted, any active
+    /// dialog closes.
+    fn sync_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let want = {
+            let s = self.state.read(cx);
+            (s.help_open.then_some(Sheet::Help)).or(s.settings_open.then_some(Sheet::Settings))
+        };
         let have = window.has_active_dialog(cx);
-        if want && !have {
-            let (view, state) = (self.settings.clone(), self.state.clone());
-            window.open_dialog(cx, move |dialog, _, _| {
-                let (state, close) = (state.clone(), state.clone());
-                // Our own close button: gpui-component's built-in one keeps the arrow
-                // cursor and takes no style.
-                let title = ui::h_flex()
-                    .w_full()
-                    .justify_between()
-                    .child("Settings")
-                    .child(
-                        ui::icon_button("settings-close", IconName::Close, "Close  Esc").on_click(
-                            move |_, _, cx| close.update(cx, |s, cx| s.open_settings(false, cx)),
-                        ),
-                    );
-                dialog
-                    .title(title)
-                    .close_button(false)
-                    .w(px(560.))
-                    .child(view.clone())
-                    .on_close(move |_, _, cx| state.update(cx, |s, cx| s.open_settings(false, cx)))
-            });
-        } else if !want && have {
+        if have && want != self.sheet {
             window.close_dialog(cx);
         }
+        if let Some(sheet) = want
+            && (!have || want != self.sheet)
+        {
+            let state = self.state.clone();
+            match sheet {
+                Sheet::Settings => {
+                    let view = self.settings.clone();
+                    open_sheet(
+                        window,
+                        cx,
+                        ("Settings".into(), "settings-close"),
+                        move |_| view.clone().into_any_element(),
+                        move |cx| state.update(cx, |s, cx| s.open_settings(false, cx)),
+                    );
+                }
+                Sheet::Help => {
+                    let page = state.clone();
+                    open_sheet(
+                        window,
+                        cx,
+                        (help::title().into(), "help-close"),
+                        move |_| help::help_view(&page).into_any_element(),
+                        move |cx| state.update(cx, |s, cx| s.open_help(false, cx)),
+                    );
+                }
+            }
+        }
+        self.sheet = want;
     }
 
     fn schedule_save(&mut self, cx: &mut Context<Self>) {

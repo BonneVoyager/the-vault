@@ -31,8 +31,8 @@ objc2 = "=0.6.5"
 # NSString, NSNotification, NSNotificationCenter, NSDistributedNotificationCenter; NSData
 # (image file bytes for qr.rs). NSAppleEventManager/NSAppleEventDescriptor + objc2-core-services
 # (gates eventClass/eventID/paramDescriptorForKeyword; crate already in the lockfile):
-# login-item launch detection in login_launch.rs (spec 04 §5d).
-objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString", "NSNotification", "NSDistributedNotificationCenter", "NSObject", "NSArray", "NSDictionary", "NSError", "NSURL", "NSFileManager", "NSValue", "NSBundle", "NSData", "NSAppleEventManager", "NSAppleEventDescriptor", "objc2-core-services"] }
+# login-item launch detection in login_launch.rs (spec 04 §5d). NSProcessInfo: os_version in host.rs.
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString", "NSNotification", "NSDistributedNotificationCenter", "NSObject", "NSArray", "NSDictionary", "NSError", "NSURL", "NSFileManager", "NSValue", "NSBundle", "NSData", "NSAppleEventManager", "NSAppleEventDescriptor", "objc2-core-services", "NSProcessInfo"] }
 # NSWorkspace + NSWorkspaceWillSleepNotification; NSPasteboard (§3); NSAccessibility (reduce motion);
 # NSBitmapImageRep (+ its CGImage bridge) decodes PNG/JPEG/HEIC/TIFF files for qr.rs.
 # bitflags: NSPasteboardContentsOptions (currentHostOnly). NSWindow/NSResponder/NSApplication:
@@ -48,7 +48,7 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std
 objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGEventSource", "CGEventTypes", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGImage", "CGColorSpace", "CGContext", "CGBitmapContext", "CGWindow"] }
 # Wipes the grayscale screen buffers in qr.rs (same version as vault-core's lock).
 zeroize = "=1.9.1"
-# sysctl(kern.boottime) and timeval.
+# sysctl(kern.boottime) and timeval; sysctlbyname("hw.model") in host.rs.
 libc = "=0.2.191"
 # Touch ID (§2): SecKeyCreateRandomKey, SecAccessControl, SecKeyCreate{En,De}cryptedData, SecItem*.
 # Chosen over security-framework 3.7: its GenerateKeyOptions cannot set kSecAttrApplicationTag

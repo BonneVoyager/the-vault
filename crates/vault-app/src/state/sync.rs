@@ -69,6 +69,30 @@ pub struct SyncUi {
     /// window's red strip. Read through [`AppState::save_blocked`], which also requires
     /// `save_failing`.
     pub save_blocked: Option<SaveBlockedNotice>,
+    /// The last sync event's short label ([`sync_event_label`]) and when it arrived, for
+    /// Copy diagnostics (05 §2.5).
+    pub last_event: Option<(&'static str, SystemTime)>,
+}
+
+/// A short, fixed label per event: never a path or error text (diagnostics prints it).
+pub fn sync_event_label(event: &SyncEvent) -> &'static str {
+    match event {
+        SyncEvent::Merged(_) => "merged",
+        SyncEvent::ChangedWhileLocked => "changed while locked",
+        SyncEvent::ConflictAbsorbed(_) => "conflict absorbed",
+        SyncEvent::WaitingForBlobs(_) => "waiting for attachments",
+        SyncEvent::CorruptOnDisk => "corrupt on disk",
+        SyncEvent::ForeignVault => "foreign vault ignored",
+        SyncEvent::PrimaryMissing => "vault file missing",
+        SyncEvent::CloudUnavailable => "cloud unavailable",
+        SyncEvent::AttachmentsPruned(_) => "attachments pruned",
+        SyncEvent::BackupTaken(_) => "backup taken",
+        SyncEvent::BackupDeleted(_) => "backup deleted",
+        SyncEvent::SaveBlocked(_) => "save blocked",
+        SyncEvent::KeyMismatch => "key mismatch",
+        SyncEvent::KeyRotatedOnDisk => "key rotated on disk",
+        SyncEvent::Error(_) => "error",
+    }
 }
 
 /// The persistent "edits are not being saved" strip under the main window's title band.
@@ -284,6 +308,7 @@ impl AppState {
 
     /// Applies one `SyncEvent` (05 §3). Safe in every state: locked, editing, choose screen.
     pub fn handle_sync_event(&mut self, event: SyncEvent, cx: &mut Context<Self>) {
+        self.sync.last_event = Some((sync_event_label(&event), SystemTime::now()));
         match event {
             SyncEvent::Merged(report) => {
                 self.sync.key_mismatch = false;

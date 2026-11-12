@@ -315,6 +315,13 @@ fn locked_with_failing_disk(
 fn danger_toast_outlives_later_toasts_until_its_ttl(cx: &mut TestAppContext) {
     let (state, _dir) = locked_with_failing_disk(true, cx);
     state.update(cx, |s, cx| {
+        // No window in this test: held until one opens, and later ordinary text is
+        // dropped, not appended.
+        assert!(s.toast_held);
+        s.show_toast("Copied", cx);
+        assert!(!s.toast.as_ref().unwrap().message.contains("Copied"));
+        s.release_held_toast(cx);
+
         s.show_toast("Copied", cx);
         s.handle_sync_event(SyncEvent::ForeignVault, cx);
         s.handle_sync_event(SyncEvent::Error("boom".into()), cx);
@@ -323,9 +330,12 @@ fn danger_toast_outlives_later_toasts_until_its_ttl(cx: &mut TestAppContext) {
         let toast = s.toast.as_ref().expect("still up");
         assert!(toast.danger);
         assert!(toast.message.starts_with(LOCK_LOST), "{}", toast.message);
-        assert!(toast.message.contains("Copied"), "later text is appended");
+        assert!(
+            toast.message.contains("Copied"),
+            "shown: later text is appended"
+        );
         assert_eq!(toast.ttl, Duration::from_secs(10));
-
+        s.release_held_toast(cx);
         // Its 10 s run out: the tick removes it and ordinary toasts show again.
         s.toast.as_mut().unwrap().shown_at -= Duration::from_secs(11);
         s.tick(0.0, cx);
@@ -412,4 +422,105 @@ fn sidebar_row_filter_follows_display_order() {
             "trash={deleted} open={open} n={n}"
         );
     }
+}
+
+/// Opens a main window (the `VaultRoot` every `open_main_window` caller builds).
+fn open_main_window(state: &gpui::Entity<AppState>, cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let state = state.clone();
+    cx.add_window(|window, cx| {
+        crate::theme::apply(window, cx);
+        let view = cx.new(|cx| crate::root::VaultRoot::new(state, None, window, cx));
+        gpui_component::Root::new(view, window, cx)
+    });
+    cx.run_until_parked();
+}
+
+/// 05 §3 "Toasts without a window": no main window, so the toast's clock does not run.
+#[gpui::test]
+fn toast_without_a_window_is_held(cx: &mut TestAppContext) {
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    state.update(cx, |s, cx| {
+        s.show_toast("Hello", cx);
+        assert!(
+            s.toast_dismiss.is_none(),
+            "no dismiss task for a held toast"
+        );
+    });
+    cx.executor().advance_clock(TOAST_TTL * 3);
+    cx.run_until_parked();
+    state.update(cx, |s, cx| {
+        assert!(s.toast_held);
+        s.toast.as_mut().unwrap().shown_at -= TOAST_TTL * 3;
+        s.tick(0.0, cx);
+        assert_eq!(s.toast.as_ref().unwrap().message.as_ref(), "Hello");
+        // The newest ordinary toast takes the one slot.
+        s.show_toast("Newer", cx);
+        assert_eq!(s.toast.as_ref().unwrap().message.as_ref(), "Newer");
+        assert!(s.toast_held);
+    });
+}
+
+/// The next main window shows a held toast for its full time, then it expires.
+#[gpui::test]
+fn opening_a_window_releases_the_held_toast(cx: &mut TestAppContext) {
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    state.update(cx, |s, cx| s.show_toast("Hello", cx));
+    cx.executor().advance_clock(TOAST_TTL * 2);
+    open_main_window(&state, cx);
+    state.read_with(cx, |s, _| {
+        assert!(!s.toast_held, "released");
+        assert!(s.toast.as_ref().unwrap().shown_at.elapsed() < TOAST_TTL);
+    });
+    cx.executor()
+        .advance_clock(TOAST_TTL - Duration::from_millis(1));
+    cx.run_until_parked();
+    assert!(state.read_with(cx, |s, _| s.toast.is_some()), "full TTL");
+    cx.executor().advance_clock(Duration::from_millis(1));
+    cx.run_until_parked();
+    assert!(state.read_with(cx, |s, _| s.toast.is_none()), "expired");
+    // With the window up, toasts are not held.
+    state.update(cx, |s, cx| s.show_toast("Live", cx));
+    assert!(state.read_with(cx, |s, _| !s.toast_held));
+}
+
+/// A held danger toast is never replaced by an ordinary one, however long it waits, and
+/// the ordinary text is dropped, not appended (no window has shown the warning yet).
+#[gpui::test]
+fn held_danger_toast_is_not_replaced(cx: &mut TestAppContext) {
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    state.update(cx, |s, cx| {
+        s.set_toast(Toast::danger(LOCK_LOST));
+        s.hold_toast_if_windowless(cx);
+        assert!(s.toast_held);
+        s.toast.as_mut().unwrap().shown_at -= Duration::from_secs(60);
+        s.show_toast("Copied", cx);
+        let toast = s.toast.as_ref().unwrap();
+        assert!(toast.danger);
+        assert_eq!(toast.message.as_ref(), LOCK_LOST);
+        assert!(s.toast_held);
+    });
+}
+
+/// 05 §3 "Menus without a window": a lock with no window open removes Settings… at once.
+#[gpui::test]
+fn lock_without_a_window_rebuilds_the_menus(cx: &mut TestAppContext) {
+    fn has_settings(cx: &mut TestAppContext) -> bool {
+        cx.update(|cx| cx.get_menus()).unwrap()[0].items.iter().any(
+            |item| matches!(item, gpui::OwnedMenuItem::Action { name, .. } if name == "Settings…"),
+        )
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    state.update(cx, |s, _| s.install_unlocked_for_tests(create(dir.path())));
+    // The launch menus (no Settings…) are stale for an already-unlocked state: the
+    // follower's registration alone must bring Settings… in.
+    cx.update(|cx| crate::actions::set_menus(Sort::default(), true, cx));
+    assert!(!has_settings(cx), "launch menus");
+    cx.update(|cx| crate::actions::follow_state_with_menus(&state, cx));
+    assert!(has_settings(cx), "unlocked, at registration");
+    assert!(cx.update(|cx| cx.windows().is_empty()));
+    state.update(cx, |s, cx| s.lock(cx));
+    cx.run_until_parked();
+    assert!(!has_settings(cx), "locked with no window");
 }

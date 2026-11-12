@@ -45,9 +45,7 @@ fn reopen_main_window(cx: &mut App) {
     if !state.read(cx).settings.show_in_dock {
         state::set_dock_icon(false, cx);
     }
-    if let Some(main) = cx.try_global::<actions::MainWindow>().map(|main| main.0)
-        && let Some(handle) = cx.windows().into_iter().find(|w| w.window_id() == main)
-    {
+    if let Some(handle) = actions::main_window(cx) {
         cx.activate(true);
         handle
             .update(cx, |_, window, _| window.activate_window())
@@ -149,6 +147,8 @@ fn main() {
             reopen_main_window,
             cx,
         );
+        // The menu bar follows the state, window or not (05 §3).
+        actions::follow_state_with_menus(&state, cx);
         if background {
             return;
         }

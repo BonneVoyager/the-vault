@@ -25,6 +25,7 @@ use crate::listing::{Counts, Listing};
 use crate::{cloud, persist};
 
 mod attachments;
+pub mod diagnostics;
 mod edit;
 mod generator;
 mod icon_images;
@@ -59,7 +60,7 @@ pub use trash::{DELETE_RECOVERABLE, NO_DELETED_ITEMS, PURGE_CONFIRM, TRASH_INFO,
 /// Target duration of one KDF derivation on this Mac (01 §6).
 const KDF_TARGET: Duration = Duration::from_millis(500);
 /// How long a window toast stays up.
-const TOAST_TTL: Duration = Duration::from_secs(3);
+pub(crate) const TOAST_TTL: Duration = Duration::from_secs(3);
 /// Longest the quit hook waits for in-flight background work.
 const BACKGROUND_QUIT_WAIT: Duration = Duration::from_secs(30);
 /// Shortest time "Unlocking…" stays up, from the start of a password or Touch ID unlock
@@ -417,6 +418,8 @@ pub struct AppState {
     pub generator_target: Option<GeneratorTarget>,
     /// Settings sheet requested open; the root view opens and closes the dialog.
     pub settings_open: bool,
+    /// Help sheet requested open (05 §2.5); replaces Settings, any screen.
+    pub help_open: bool,
     /// Selected settings tab; File ▸ Export… and restore jump to theirs.
     pub settings_tab: usize,
     /// Banners, key-mismatch prompt, backups list, restore and export confirms.
@@ -493,6 +496,9 @@ pub struct AppState {
     /// Completion signal of the latest `run_bg` work, for the quit hook.
     background_done: Option<Receiver<()>>,
     toast_dismiss: Option<Task<()>>,
+    /// The window toast was set while no main window was up: its clock has not started
+    /// (05 §3 "Toasts without a window"). The next main window releases it.
+    toast_held: bool,
 }
 
 impl AppState {
@@ -531,6 +537,7 @@ impl AppState {
             generator: Generator::default(),
             generator_target: None,
             settings_open: false,
+            help_open: false,
             settings_tab: 0,
             sync: SyncUi::default(),
             security: SecurityUi::default(),
@@ -590,6 +597,7 @@ impl AppState {
             autosave_pending: false,
             background_done: None,
             toast_dismiss: None,
+            toast_held: false,
         }
     }
 
@@ -632,6 +640,9 @@ impl AppState {
         if open && !self.main_active() {
             return;
         }
+        if open {
+            self.help_open = false;
+        }
         if open && !self.settings_open {
             self.refresh_backups();
             self.refresh_touch();
@@ -644,6 +655,18 @@ impl AppState {
         }
         if open || self.settings_open {
             self.settings_open = open;
+            cx.notify();
+        }
+    }
+
+    /// Help ▸ Vault Help / ⌘? (05 §2.5): opening replaces an open Settings sheet.
+    pub fn open_help(&mut self, open: bool, cx: &mut Context<Self>) {
+        if open {
+            self.open_settings(false, cx);
+        }
+        // Always notifies on open, so the root re-checks the dialog (as Settings).
+        if open || self.help_open {
+            self.help_open = open;
             cx.notify();
         }
     }
@@ -699,15 +722,17 @@ impl AppState {
     pub fn danger_toast_showing(&self) -> bool {
         self.toast
             .as_ref()
-            .is_some_and(|t| t.danger && t.shown_at.elapsed() < t.ttl)
+            .is_some_and(|t| t.danger && (self.toast_held || t.shown_at.elapsed() < t.ttl))
     }
 
     /// The one setter for `toast`. A danger toast that has not expired is never replaced
     /// by an ordinary one: the newer text is appended to it instead, so the warning stays
-    /// up for its full time. Returns whether `toast` became the toast shown.
+    /// up for its full time. A held danger toast (no window has shown it yet) drops the
+    /// ordinary one instead. Returns whether `toast` became the toast shown.
     pub(super) fn set_toast(&mut self, toast: Toast) -> bool {
         if !toast.danger && self.danger_toast_showing() {
-            if let Some(current) = self.toast.as_mut()
+            if !self.toast_held
+                && let Some(current) = self.toast.as_mut()
                 && !current.message.contains(toast.message.as_ref())
             {
                 current.message = format!("{} {}", current.message, toast.message).into();
@@ -715,7 +740,50 @@ impl AppState {
             return false;
         }
         self.toast = Some(toast);
+        self.toast_held = false;
         true
+    }
+
+    /// Stops the clock of the window toast up now if no main window exists; held, it
+    /// waits for [`Self::release_held_toast`]. A held danger toast is never replaced.
+    /// Returns whether the toast is held.
+    fn hold_toast_if_windowless(&mut self, cx: &gpui::App) -> bool {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|t| t.place == ToastPlace::Window)
+            && crate::actions::main_window(cx).is_none()
+        {
+            self.toast_held = true;
+            self.toast_dismiss = None;
+        }
+        self.toast_held
+    }
+
+    /// A main window opened: a held toast shows now for its full time.
+    pub fn release_held_toast(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.toast_held) {
+            return;
+        }
+        if let Some(toast) = self.toast.as_mut() {
+            toast.shown_at = Instant::now();
+            let (shown_at, ttl) = (toast.shown_at, toast.ttl);
+            self.dismiss_toast_after(shown_at, ttl, cx);
+            cx.notify();
+        }
+    }
+
+    fn dismiss_toast_after(&mut self, shown_at: Instant, ttl: Duration, cx: &mut Context<Self>) {
+        self.toast_dismiss = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(ttl).await;
+            this.update(cx, |this, cx| {
+                if this.toast.as_ref().is_some_and(|t| t.shown_at == shown_at) {
+                    this.toast = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     pub fn toast_at(
@@ -733,20 +801,10 @@ impl AppState {
             ttl,
             danger: false,
         });
-        if !shown {
-            cx.notify();
-            return;
+        // Held (no main window): no dismiss task until a window releases it.
+        if shown && !self.hold_toast_if_windowless(cx) {
+            self.dismiss_toast_after(shown_at, ttl, cx);
         }
-        self.toast_dismiss = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(ttl).await;
-            this.update(cx, |this, cx| {
-                if this.toast.as_ref().is_some_and(|t| t.shown_at == shown_at) {
-                    this.toast = None;
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
         cx.notify();
     }
 
@@ -1078,6 +1136,7 @@ impl AppState {
         if !self.danger_toast_showing() {
             self.toast = None;
             self.toast_dismiss = None;
+            self.toast_held = false;
         }
         self.settings_open = false;
         self.close_backup_windows(cx);
@@ -1103,6 +1162,7 @@ impl AppState {
             let outcome = vault.lock();
             self.report_lock(save_error.as_deref(), &outcome);
         }
+        self.hold_toast_if_windowless(cx);
         if !self.locked {
             self.touch.auto = TouchAuto::OnActivation;
         }
@@ -1180,7 +1240,7 @@ impl AppState {
         if self
             .toast
             .as_ref()
-            .is_some_and(|t| t.shown_at.elapsed() >= t.ttl)
+            .is_some_and(|t| !self.toast_held && t.shown_at.elapsed() >= t.ttl)
         {
             self.toast = None;
             cx.notify();

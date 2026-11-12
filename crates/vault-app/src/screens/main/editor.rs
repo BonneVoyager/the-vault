@@ -146,6 +146,8 @@ pub struct Editor {
     tags_scroll: ScrollHandle,
     /// Tag count last seen by `sync`, to notice an add.
     tag_count: usize,
+    /// The editor column's scroll; moved to the bottom to reveal an added field.
+    scroll: ScrollHandle,
     rows: Vec<Row>,
     /// The field drag in progress, if any.
     drag: Rc<FieldDrag>,
@@ -211,6 +213,7 @@ impl Editor {
             tags,
             tags_scroll: ScrollHandle::new(),
             tag_count: 0,
+            scroll: ScrollHandle::new(),
             rows: Vec::new(),
             drag: Rc::default(),
             row_width: Rc::new(Cell::new(px(280.))),
@@ -273,7 +276,28 @@ impl Editor {
                 }
             });
         }
+        if buffer.focus_row.is_some() {
+            self.focus_added(window, cx);
+        }
         cx.notify();
+    }
+
+    /// Focuses the row just added from "Add field" (its value input, or the name of a
+    /// section) and scrolls it into view (05 §2.5, owner 2026-11-12).
+    fn focus_added(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.state.update(cx, |s, _| {
+            s.edit_buffer_mut().and_then(EditBuffer::take_focus_row)
+        });
+        let Some(row) = key.and_then(|k| self.rows.iter().find(|r| r.key == k)) else {
+            return;
+        };
+        match &row.value {
+            ValueInput::Line(input) => ui::focus_input(input, window, cx),
+            ValueInput::Area(area) => area.update(cx, |a, cx| a.focus(window, cx)),
+            ValueInput::None => ui::focus_input(&row.name, window, cx),
+        }
+        // Added fields are appended: the last row, just above "Add field".
+        self.scroll.scroll_to_bottom();
     }
 
     /// Creates rows for new keys, drops rows for removed keys, and orders rows like the buffer.
@@ -937,6 +961,7 @@ impl Render for Editor {
             .on_mouse_up_out(gpui::MouseButton::Left, defer_clear(self.drag.clone()))
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .pt(px(ui::content_top(s)))
             .px(px(ui::COLUMN_PAD_X - ui::FOCUS_RING_WIDTH))
             .pb(px(64.))
@@ -989,9 +1014,7 @@ fn add_field_rows(state: &Entity<AppState>) -> Vec<ui::MenuRow> {
                 move |_, _, cx| {
                     state.update(cx, |s, cx| {
                         s.close_add_field_menu(cx);
-                        s.edit(cx, |b| {
-                            b.add_field(kind);
-                        });
+                        s.edit(cx, |b| b.focus_row = Some(b.add_field(kind)));
                     });
                 },
             )

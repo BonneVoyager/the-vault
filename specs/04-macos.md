@@ -10,6 +10,10 @@ Minimum target: macOS 15 (passkey PRF needs it; `LSMinimumSystemVersion 15.0`).
 
 `device_id() -> Uuid` — generated once, stored in `~/Library/Application Support/<bundle id>/device_id`. Used as `device_id` in items and in the Dropbox conflict pattern. Not secret.
 
+### 1b. Host facts (2026-11-12)
+
+`os_version() -> String` ("15.1.1", from `NSProcessInfo.operatingSystemVersion`) and `model_identifier() -> String` ("Mac15,6", from `libc::sysctlbyname("hw.model")`, one `unsafe` call with a `// SAFETY:` comment and a fixed 256-byte buffer since rustix has no sysctl; "unknown" on any error, bad length or non-UTF-8). Patch version omitted when 0. No network, no secrets. Used by the Copy diagnostics block (05 §2.5).
+
 ## 2. Touch ID convenience unlock
 
 Goal: after the user has unlocked with the master password once on this Mac, subsequent unlocks can use Touch ID. Security property: the vault key never leaves the process unencrypted except in memory; the wrapping key lives in the Secure Enclave and requires biometry to use.

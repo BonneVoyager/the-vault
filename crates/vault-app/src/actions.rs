@@ -83,7 +83,7 @@ actions!(
         Minimize,
         /// Window ▸ Zoom.
         Zoom,
-        /// Help ▸ Vault Help (placeholder).
+        /// Help ▸ Vault Help, ⌘? ([`HELP_KEYS`]): the help sheet (05 §2.5).
         ShowHelp,
         /// File ▸ Import CSV…: CSV via the open panel.
         Import,
@@ -101,6 +101,10 @@ actions!(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Action)]
 #[action(namespace = vault, no_json)]
 pub struct SelectSidebarRow(pub usize);
+
+/// ⌘?: macOS reports ⌘⇧/ on a US layout as key `?` with only ⌘ held (gpui-pre-macos
+/// `events.rs` drops shift for shifted punctuation), so `cmd-shift-/` would never match.
+pub const HELP_KEYS: &str = "cmd-?";
 
 /// ⌃⌘S, as in Finder and Passwords.
 pub const TOGGLE_SIDEBAR_KEYS: &str = "ctrl-cmd-s";
@@ -149,6 +153,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", PrevItem, list),
         KeyBinding::new("enter", FocusDetail, list),
         KeyBinding::new("cmd-m", Minimize, None),
+        KeyBinding::new(HELP_KEYS, ShowHelp, None),
     ]);
     // `KeyBinding::new` takes `&'static str` keystrokes, hence the table.
     const ROW_KEYS: [&str; 9] = [
@@ -172,6 +177,41 @@ pub fn refresh_menus(s: &AppState, cx: &mut App) {
         s.main_active(),
         cx,
     );
+}
+
+/// What the menu bar depends on: (locked or no vault, trash view, sort, sidebar visible,
+/// Settings… present).
+type MenuKey = (bool, bool, Sort, bool, bool);
+
+fn menu_key(s: &AppState) -> MenuKey {
+    let locked = s.locked || s.vault_path.is_none();
+    (
+        locked,
+        s.viewing_trash(),
+        s.sort,
+        s.sidebar_visible(),
+        s.main_active(),
+    )
+}
+
+/// Keeps the menu bar in step with `state` whether or not a window is open (05 §3 "Menus
+/// without a window"): builds the menus now, then rebuilds only when [`menu_key`]
+/// changed since the last build.
+pub fn follow_state_with_menus(state: &Entity<AppState>, cx: &mut App) {
+    fn build(key: MenuKey, cx: &mut App) {
+        let (_, trash, sort, sidebar_visible, main_active) = key;
+        install_menus(sort, sidebar_visible, trash, main_active, cx);
+    }
+    let key = menu_key(state.read(cx));
+    build(key, cx);
+    let last = std::rc::Rc::new(std::cell::Cell::new(key));
+    cx.observe(state, move |state, cx| {
+        let key = menu_key(state.read(cx));
+        if last.replace(key) != key {
+            build(key, cx);
+        }
+    })
+    .detach();
 }
 
 /// Installs the launch menu bar: nothing unlocked yet, so no Settings…. Later rebuilds go
@@ -293,6 +333,13 @@ pub struct MainWindow(pub gpui::WindowId, pub WeakEntity<VaultRoot>);
 
 impl gpui::Global for MainWindow {}
 
+/// The open main window, if any. The global outlives a closed window, so the id is
+/// checked against the windows that still exist.
+pub fn main_window(cx: &App) -> Option<gpui::AnyWindowHandle> {
+    let main = cx.try_global::<MainWindow>()?.0;
+    cx.windows().into_iter().find(|w| w.window_id() == main)
+}
+
 /// Whether item actions may run: the main window (or no window) is active. In the
 /// backup viewer, ⌘D, ⌘⇧C, ⌘E, ↑/↓... would otherwise act on the live vault.
 pub fn in_main_window(cx: &App) -> bool {
@@ -342,8 +389,15 @@ pub fn register(state: &Entity<AppState>, cx: &mut App) {
     on::<About>(state, cx, |s, cx| {
         s.show_toast(format!("Vault {}", env!("CARGO_PKG_VERSION")), cx);
     });
-    on::<ShowHelp>(state, cx, |s, cx| {
-        s.show_toast("Help is not available yet", cx)
+    let help_state = state.clone();
+    cx.on_action(move |_: &ShowHelp, cx| {
+        let state = help_state.clone();
+        // Deferred: the reopen path updates windows, and this handler may run inside the
+        // active window's dispatch. It brings the main window forward or opens one.
+        cx.defer(move |cx| {
+            crate::reopen_main_window(cx);
+            state.update(cx, |s, cx| s.open_help(true, cx));
+        });
     });
     on::<Import>(state, cx, |s, cx| s.choose_import_path(cx));
     on::<Import1Pux>(state, cx, |s, cx| s.choose_import_1pux(cx));

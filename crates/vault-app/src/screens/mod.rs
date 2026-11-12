@@ -2,6 +2,7 @@
 
 mod backup;
 mod choose;
+pub(crate) mod help;
 mod item_window;
 mod kdbx_import;
 mod main;

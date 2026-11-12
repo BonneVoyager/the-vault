@@ -55,6 +55,9 @@ pub struct EditBuffer {
     pub limited_values: Vec<u64>,
     /// The last tag input was cut to [`Self::FIELD_LIMIT_BYTES`].
     pub limited_tag: bool,
+    /// Row just added from "Add field": the editor focuses and reveals it once its
+    /// inputs exist (05 §2.5, owner 2026-11-12). Dropped with the buffer on Cancel.
+    pub focus_row: Option<u64>,
 }
 
 /// The first [`EditBuffer::FIELD_LIMIT_BYTES`] of `text`, ending on a character
@@ -106,7 +109,13 @@ impl EditBuffer {
             limited_names: Vec::new(),
             limited_values: Vec::new(),
             limited_tag: false,
+            focus_row: None,
         }
+    }
+
+    /// The row to focus after an add, once; see [`Self::focus_row`].
+    pub fn take_focus_row(&mut self) -> Option<u64> {
+        self.focus_row.take()
     }
 
     /// Sets the title, cut to [`Self::FIELD_LIMIT_BYTES`]. Returns the kept text when it was cut
