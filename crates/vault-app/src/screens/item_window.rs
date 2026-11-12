@@ -458,6 +458,12 @@ mod tests {
         let mut vcx = gpui::VisualTestContext::from_window(handle, cx);
         vcx.run_until_parked();
         assert!(vcx.debug_bounds("field-row-icon 0 Lock").is_some());
+        // The weak password's notice comes with the shared row too (05 §2.3).
+        let field = state.read_with(&vcx, |s, _| {
+            s.unlocked_vault().unwrap().get(plain).unwrap().fields[0].id
+        });
+        let key = format!("issue-strip {field} Weak Password");
+        assert!(vcx.debug_bounds(Box::leak(key.into_boxed_str())).is_some());
     }
 
     /// The read-only attachment rows leave out the item's icon image.

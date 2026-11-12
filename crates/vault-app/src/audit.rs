@@ -1,15 +1,16 @@
-//! Weak and reused item-password warnings, modelled on Apple's Passwords app.
+//! Weak and reused password warnings, modelled on Apple's Passwords app.
 //!
 //! Pure functions over an `UnlockedVault`. `AppState::vault_changed` audits once per
-//! content change and stores the result on the listing, where the list rows and the
-//! detail banners read it.
+//! content change and stores the result on the listing, where the list badges and the
+//! per-field strips (05 §2.3 "Password notices") read it. The editor checks the typed
+//! value live with [`strength_bits`] and [`reuse_count`].
 //! Compromised-password (data leak) checks are out of scope: the app makes no network
 //! requests (00-overview).
 
 use std::collections::HashMap;
 
-use vault_core::generator::strength_bits;
-use vault_core::{ExposeSecret, FieldKind, UnlockedVault, Uuid};
+pub use vault_core::generator::strength_bits;
+use vault_core::{ExposeSecret, FieldKind, Item, UnlockedVault, Uuid};
 
 /// A password scoring under this many bits of estimated entropy is weak. Same cut-off as
 /// the "Weak" band of the generator's strength meter (`ui::strength_label`).
@@ -17,14 +18,14 @@ pub const WEAK_BELOW_BITS: f64 = 40.;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Issue {
-    /// The item's weakest password field scores `bits`.
+    /// The password field scores `bits`.
     Weak { bits: f64 },
-    /// One of the item's passwords is used by `count` live items, this one included.
+    /// The field's password is used by `count` live items, this one included.
     Reused { count: usize },
 }
 
 impl Issue {
-    /// Bold banner title.
+    /// Bold strip title.
     pub fn title(&self) -> &'static str {
         match self {
             Issue::Weak { .. } => "Weak Password",
@@ -40,7 +41,7 @@ impl Issue {
         }
     }
 
-    /// Banner body text.
+    /// Strip body text.
     pub fn body(&self) -> String {
         match self {
             Issue::Weak { .. } => "This password is easy to guess and should be changed.".into(),
@@ -48,58 +49,112 @@ impl Issue {
                 let others = count.saturating_sub(1);
                 let noun = if others == 1 { "item" } else { "items" };
                 format!(
-                    "This password is used by {others} other {noun}. \
-                     Reuse lets one leak unlock several accounts."
+                    "Used by {others} other {noun}. Reuse lets one leak unlock several accounts."
                 )
             }
         }
     }
+
+    /// Same kind, ignoring the numbers (the list badge shows distinct kinds).
+    pub fn same_kind(&self, other: &Issue) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
 }
 
-pub type Issues = HashMap<Uuid, Vec<Issue>>;
+/// One issue of one password field.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldIssue {
+    pub field: Uuid,
+    pub issue: Issue,
+}
+
+/// Item id -> its password fields' issues.
+pub type Issues = HashMap<Uuid, Vec<FieldIssue>>;
+
+/// The issues of one password `value` held by item `item`: weak first, then reused
+/// (against the other live items of `vault`). Empty for an empty value.
+pub fn value_issues(vault: &UnlockedVault, value: &str, item: Uuid) -> Vec<Issue> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let mut issues = Vec::new();
+    let bits = strength_bits(value);
+    if bits < WEAK_BELOW_BITS {
+        issues.push(Issue::Weak { bits });
+    }
+    let others = reuse_count(vault, value, item);
+    if others > 0 {
+        issues.push(Issue::Reused { count: others + 1 });
+    }
+    issues
+}
+
+/// How many live items other than `exclude` have a Password field equal to `value`
+/// (each item counted once). Zero for an empty value.
+pub fn reuse_count(vault: &UnlockedVault, value: &str, exclude: Uuid) -> usize {
+    if value.is_empty() {
+        return 0;
+    }
+    vault
+        .items()
+        .filter(|item| item.id != exclude)
+        .filter(|item| {
+            item.fields.iter().any(|f| {
+                let v: &str = f.value.expose_secret();
+                f.kind == FieldKind::Password && v == value
+            })
+        })
+        .count()
+}
 
 /// Audits every live item's Password fields. Items without issues are absent from the
-/// map. Each item gets at most one `Weak` (its weakest password) and one `Reused` (its
-/// most shared password), in that order. Empty passwords are skipped.
+/// map. Every weak field and every reused field is listed, fields in item order, weak
+/// before reused within a field. Empty passwords are skipped; the same password twice
+/// in one item is not reuse.
 ///
 /// Grouping keys are `&str` borrowed from the vault for the duration of this call; no
 /// password is copied into an owned string.
 pub fn audit(vault: &UnlockedVault) -> Issues {
-    let mut weakest: Vec<(Uuid, f64)> = Vec::new();
+    // The item's non-empty passwords, borrowed: (field id, value).
+    fn passwords(item: &Item) -> impl Iterator<Item = (Uuid, &str)> {
+        item.fields.iter().filter_map(|f| {
+            let value: &str = f.value.expose_secret();
+            (f.kind == FieldKind::Password && !value.is_empty()).then_some((f.id, value))
+        })
+    }
     // Password value -> ids of the live items that use it (each id once).
     let mut by_value: HashMap<&str, Vec<Uuid>> = HashMap::new();
     for item in vault.items() {
-        let mut min_bits: Option<f64> = None;
-        for field in item.fields.iter().filter(|f| f.kind == FieldKind::Password) {
-            let value = field.value.expose_secret();
-            if value.is_empty() {
-                continue;
-            }
-            let bits = strength_bits(value);
-            min_bits = Some(min_bits.map_or(bits, |m: f64| m.min(bits)));
+        for (_, value) in passwords(item) {
             let ids = by_value.entry(value).or_default();
             if ids.last() != Some(&item.id) {
                 ids.push(item.id);
             }
         }
-        if let Some(bits) = min_bits.filter(|b| *b < WEAK_BELOW_BITS) {
-            weakest.push((item.id, bits));
-        }
     }
 
     let mut issues = Issues::new();
-    for (id, bits) in weakest {
-        issues.entry(id).or_default().push(Issue::Weak { bits });
-    }
-    let mut shared: HashMap<Uuid, usize> = HashMap::new();
-    for ids in by_value.values().filter(|ids| ids.len() >= 2) {
-        for id in ids {
-            let c = shared.entry(*id).or_default();
-            *c = (*c).max(ids.len());
+    for item in vault.items() {
+        let mut found = Vec::new();
+        for (field, value) in passwords(item) {
+            let bits = strength_bits(value);
+            if bits < WEAK_BELOW_BITS {
+                found.push(FieldIssue {
+                    field,
+                    issue: Issue::Weak { bits },
+                });
+            }
+            let count = by_value.get(value).map_or(0, Vec::len);
+            if count >= 2 {
+                found.push(FieldIssue {
+                    field,
+                    issue: Issue::Reused { count },
+                });
+            }
         }
-    }
-    for (id, count) in shared {
-        issues.entry(id).or_default().push(Issue::Reused { count });
+        if !found.is_empty() {
+            issues.insert(item.id, found);
+        }
     }
     issues
 }
@@ -107,7 +162,7 @@ pub fn audit(vault: &UnlockedVault) -> Issues {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vault_core::{Field, Item, KdfParams, SecretString};
+    use vault_core::{Field, KdfParams, SecretString};
 
     const STRONG: &str = "correct-Horse-battery-staple-42";
     const STRONG_2: &str = "Tr0ub4dor&3-plus-much-more-entropy";
@@ -130,12 +185,22 @@ mod tests {
         v.insert(item, 1)
     }
 
+    fn field_ids(v: &UnlockedVault, id: Uuid) -> Vec<Uuid> {
+        v.get(id).unwrap().fields.iter().map(|f| f.id).collect()
+    }
+
+    /// The issues of `id`, without field ids.
+    fn kinds(issues: &Issues, id: Uuid) -> Vec<Issue> {
+        issues[&id].iter().map(|f| f.issue).collect()
+    }
+
     #[test]
     fn weak_password_is_flagged() {
         let mut v = vault();
         let id = login(&mut v, "Bank", &["123"]);
         let issues = audit(&v);
-        match issues[&id].as_slice() {
+        assert_eq!(issues[&id][0].field, field_ids(&v, id)[0]);
+        match kinds(&issues, id).as_slice() {
             [Issue::Weak { bits }] => assert!(*bits < WEAK_BELOW_BITS),
             other => panic!("unexpected {other:?}"),
         }
@@ -157,18 +222,22 @@ mod tests {
         let b = login(&mut v, "B", &[STRONG]);
         let c = login(&mut v, "C", &[STRONG_2]);
         let issues = audit(&v);
-        assert_eq!(issues[&a], [Issue::Reused { count: 2 }]);
-        assert_eq!(issues[&b], [Issue::Reused { count: 2 }]);
+        assert_eq!(kinds(&issues, a), [Issue::Reused { count: 2 }]);
+        assert_eq!(kinds(&issues, b), [Issue::Reused { count: 2 }]);
         assert!(!issues.contains_key(&c));
 
         let d = login(&mut v, "D", &[STRONG]);
         let issues = audit(&v);
         for id in [a, b, d] {
-            assert_eq!(issues[&id], [Issue::Reused { count: 3 }]);
+            assert_eq!(kinds(&issues, id), [Issue::Reused { count: 3 }]);
         }
         assert_eq!(
             Issue::Reused { count: 3 }.body(),
-            "This password is used by 2 other items. Reuse lets one leak unlock several accounts."
+            "Used by 2 other items. Reuse lets one leak unlock several accounts."
+        );
+        assert_eq!(
+            Issue::Reused { count: 2 }.body(),
+            "Used by 1 other item. Reuse lets one leak unlock several accounts."
         );
     }
 
@@ -194,19 +263,32 @@ mod tests {
     }
 
     #[test]
-    fn weakest_of_several_password_fields_is_reported() {
+    fn every_weak_field_is_reported_in_item_order() {
         let mut v = vault();
-        let id = login(&mut v, "Multi", &[STRONG, "abcdefgh", "123"]);
+        let id = login(&mut v, "Multi", &["abcdefgh", STRONG, "123"]);
+        let fields = field_ids(&v, id);
         let issues = audit(&v);
-        let expected = strength_bits("123");
-        match issues[&id].as_slice() {
-            [Issue::Weak { bits }] => assert_eq!(*bits, expected),
-            other => panic!("unexpected {other:?}"),
-        }
+        assert_eq!(
+            issues[&id],
+            [
+                FieldIssue {
+                    field: fields[0],
+                    issue: Issue::Weak {
+                        bits: strength_bits("abcdefgh")
+                    },
+                },
+                FieldIssue {
+                    field: fields[2],
+                    issue: Issue::Weak {
+                        bits: strength_bits("123")
+                    },
+                },
+            ]
+        );
     }
 
     #[test]
-    fn reuse_count_is_the_most_shared_password() {
+    fn every_reused_field_is_reported_with_its_own_count() {
         let mut v = vault();
         // A shares STRONG with B and STRONG_2 with C and D.
         let a = login(&mut v, "A", &[STRONG, STRONG_2]);
@@ -214,10 +296,23 @@ mod tests {
         let c = login(&mut v, "C", &[STRONG_2]);
         let d = login(&mut v, "D", &[STRONG_2]);
         let issues = audit(&v);
-        assert_eq!(issues[&a], [Issue::Reused { count: 3 }]);
-        assert_eq!(issues[&b], [Issue::Reused { count: 2 }]);
-        assert_eq!(issues[&c], [Issue::Reused { count: 3 }]);
-        assert_eq!(issues[&d], [Issue::Reused { count: 3 }]);
+        let fa = field_ids(&v, a);
+        assert_eq!(
+            issues[&a],
+            [
+                FieldIssue {
+                    field: fa[0],
+                    issue: Issue::Reused { count: 2 },
+                },
+                FieldIssue {
+                    field: fa[1],
+                    issue: Issue::Reused { count: 3 },
+                },
+            ]
+        );
+        assert_eq!(kinds(&issues, b), [Issue::Reused { count: 2 }]);
+        assert_eq!(kinds(&issues, c), [Issue::Reused { count: 3 }]);
+        assert_eq!(kinds(&issues, d), [Issue::Reused { count: 3 }]);
     }
 
     #[test]
@@ -228,17 +323,43 @@ mod tests {
     }
 
     #[test]
-    fn weak_and_reused_both_reported() {
+    fn weak_and_reused_both_reported_weak_first() {
         let mut v = vault();
         let a = login(&mut v, "A", &["123"]);
         let b = login(&mut v, "B", &["123"]);
         let issues = audit(&v);
         for id in [a, b] {
+            assert!(issues[&id].iter().all(|f| f.field == field_ids(&v, id)[0]));
             assert!(matches!(
-                issues[&id].as_slice(),
+                kinds(&issues, id).as_slice(),
                 [Issue::Weak { .. }, Issue::Reused { count: 2 }]
             ));
         }
+    }
+
+    #[test]
+    fn reuse_count_excludes_the_item_and_counts_items_once() {
+        let mut v = vault();
+        let a = login(&mut v, "A", &[STRONG]);
+        let b = login(&mut v, "B", &[STRONG, STRONG]);
+        login(&mut v, "C", &[STRONG_2]);
+        assert_eq!(reuse_count(&v, STRONG, a), 1);
+        assert_eq!(reuse_count(&v, STRONG, b), 1);
+        assert_eq!(reuse_count(&v, STRONG, Uuid::new_v4()), 2);
+        assert_eq!(reuse_count(&v, "", Uuid::new_v4()), 0);
+        assert_eq!(reuse_count(&v, "unused", a), 0);
+        v.delete(b, 2).unwrap();
+        assert_eq!(reuse_count(&v, STRONG, a), 0, "tombstones do not count");
+
+        assert!(value_issues(&v, "", a).is_empty());
+        assert!(matches!(
+            value_issues(&v, STRONG_2, a).as_slice(),
+            [Issue::Reused { count: 2 }]
+        ));
+        assert!(matches!(
+            value_issues(&v, "123", a).as_slice(),
+            [Issue::Weak { .. }]
+        ));
     }
 
     #[test]

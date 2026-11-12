@@ -18,12 +18,13 @@ use gpui_component::input::{Backspace, InputEvent, InputState, Textarea, Textare
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
-use vault_core::{ExposeSecret as _, FieldKind, strength_bits};
+use vault_core::{ExposeSecret as _, FieldKind};
 
 use super::detail::history_disclosure;
 use super::generator::GeneratorView;
 use super::prompts;
 use crate::actions::{CancelEdit, SaveItem};
+use crate::audit::{self, FieldIssue, strength_bits};
 use crate::state::{ADDABLE_KINDS, AppState, EditBuffer, GeneratorTarget, Mode, kind_name};
 use crate::text;
 use crate::ui::{self, Clickable as _};
@@ -681,9 +682,43 @@ impl Editor {
                     strength_bits(field.value.expose_secret()),
                     cx,
                 )))
+                // Password notices follow the typed value; reuse is checked against the
+                // saved items other than this one (05 §2.3 "Password notices").
+                .children(issue_strips(field, buffer, s, cx))
             })
             .into_any_element()
     }
+}
+
+/// The live password notices under a password row in edit mode: the typed value's
+/// strength and its reuse among the saved items other than the edited one. Empty value,
+/// no notices. 4 px apart and 4 px under the strength meter, aligned with the inputs.
+fn issue_strips(
+    field: &vault_core::Field,
+    buffer: &EditBuffer,
+    s: &AppState,
+    cx: &App,
+) -> Option<gpui::Div> {
+    let issues = audit::value_issues(
+        s.unlocked_vault()?,
+        field.value.expose_secret(),
+        buffer.item.id,
+    );
+    (!issues.is_empty()).then(|| {
+        ui::v_flex()
+            .pl(px(22.))
+            .mt(px(super::detail::ISSUE_STRIP_GAP - 6.))
+            .gap(px(super::detail::ISSUE_STRIP_GAP))
+            .children(issues.into_iter().map(|issue| {
+                super::detail::issue_strip(
+                    &FieldIssue {
+                        field: field.id,
+                        issue,
+                    },
+                    cx,
+                )
+            }))
+    })
 }
 
 /// "Field limited to 1 MiB": muted, under a field whose input was cut to the limit. Save

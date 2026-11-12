@@ -1151,3 +1151,14 @@ Bug hunt: run for this wave (2026-11-08; docs/qa/bug-hunt-2026-11-08.md: no bugs
 - Reviews: security-reviewer SHIP (no unsafe, forgery only skips the window); code-reviewer SHIP after the activate guard. Fallback when the padlock cannot be installed in a background start: setting reverts, Dock icon returns, toast is lost (no window), Dock click opens the window; spec'd.
 - Checks: fmt, clippy clean; vault-macos 33 lib tests; vault-app full suite rerun after the follow-ups: 493 passed, 0 failed.
 - Checkpoint: eye check pending. Bug hunt: not yet run for this wave.
+
+### 2026-11-12 — Low-hanging wave: held toasts, live menus, Help sheet, Copy diagnostics, add-field focus (committed e392ae9)
+- Toasts shown with no main window are held and get a full TTL when a window opens (05 §3 "Toasts without a window"); lock clears ordinary toasts; residual: toasts set from background results without an app context are not held. Menu bar follows state through an app-level observer (`actions::follow_state_with_menus`), builds on registration; closes the "Settings… after auto-lock with window closed" corner.
+- Help ▸ Vault Help and ⌘? (`cmd-?`) open an in-app sheet rendering `docs/help.md` (include_str, notes renderer, tables supported) through a shared `open_sheet` helper with Settings; one sheet slot; locked or unlocked; reopen path when no window. Placeholder toast removed.
+- Copy diagnostics button at the bottom of Settings ▸ Security: pure `diagnostics_text(&AppState, now, &Host)`; ordinary clipboard path, no clear timer; toast "Diagnostics copied". vault-macos `host.rs`: `os_version()`, `model_identifier()` (one libc sysctl `unsafe` with SAFETY; 04 §1b). `SyncUi::last_event` records label and time. Leak test covers titles, values, tags, path parts, device and vault ids, and error states.
+- Add field focuses the new row's Value (or a Section's title) and scrolls to the bottom (`EditBuffer::focus_row`, `ScrollHandle::scroll_to_bottom`).
+- Reviews: toasts/menus FIX FIRST (menus on registration) → fixed; Help/diagnostics FIX FIRST (host facts, error-state leak test) → fixed. App suite 504 then filtered reruns green; full workspace rerun in flight at commit time.
+- Owner committed as e392ae9 before this entry was written. Eye checks 1–6 passed (2026-11-12). Owner report: edit-mode header does not stay pinned (spec 05 "Detail header is pinned" amended; fix queued after the notices wave). Bug hunt: not yet run for this wave.
+
+### 2026-11-12 — Password notices per field (owner decision, option A) — in flight
+- Spec 05 §2.3 "Password notices": compact strip under each weak or reused password field in read and edit mode (live while typing); audit per field; item-level banner removed.

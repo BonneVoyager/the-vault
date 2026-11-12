@@ -28,6 +28,7 @@ use vault_sync::SyncError;
 use zeroize::Zeroizing;
 
 use super::main::item_tile;
+use crate::audit::{self, FieldIssue};
 use crate::state::{AppState, parse_totp};
 use crate::ui::Clickable as _;
 use crate::{listing, text, theme, ui};
@@ -464,6 +465,19 @@ impl BackupWindow {
                     .on_click(cx.listener(move |this, _, _, cx| this.copy_field(ix, cx)))
                     .into_any_element(),
             );
+            // Password notices against the backup's own items (05 §2.3).
+            let issues: Vec<FieldIssue> = match (self.live_vault(cx), field.kind) {
+                (Some(vault), FieldKind::Password) => {
+                    audit::value_issues(vault, field.value.expose_secret(), item.id)
+                        .into_iter()
+                        .map(|issue| FieldIssue {
+                            field: field.id,
+                            issue,
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
             // The same row as the main detail and item windows.
             super::main::detail::field_row(
                 ix,
@@ -471,6 +485,7 @@ impl BackupWindow {
                 field.icon_name(),
                 value,
                 buttons,
+                &issues,
                 cx,
             )
         });
@@ -809,6 +824,12 @@ mod tests {
             assert!(w.status.as_ref().unwrap().contains("clears in"));
         });
         vcx.run_until_parked();
+        // "hunter2" is weak: the shared row draws its notice under the field (05 §2.3).
+        let field = view.read_with(&vcx, |w, _| {
+            w.vault.as_ref().unwrap().get(github).unwrap().fields[0].id
+        });
+        let key = format!("issue-strip {field} Weak Password");
+        assert!(vcx.debug_bounds(Box::leak(key.into_boxed_str())).is_some());
 
         // Copy to current vault: a clone under a fresh id.
         let new_id = view

@@ -17,7 +17,7 @@ use super::icon_view::item_tile;
 use crate::actions::{
     LIST_CONTEXT, SortAlphabetical, SortRecentlyModified, ToggleSidebar, sidebar_menu_title,
 };
-use crate::audit::Issue;
+use crate::audit::{FieldIssue, Issue};
 use crate::listing::{self, Row};
 use crate::state::{AppState, Filter, GeneratorTarget, NO_DELETED_ITEMS, Sort, TRASH_INFO};
 use crate::templates::Template;
@@ -45,10 +45,22 @@ pub fn alert_dot(size: f32, cx: &App) -> gpui::Div {
         .child("!")
 }
 
+/// The distinct issue kinds among an item's field issues, weak before reused.
+fn issue_kinds(issues: &[FieldIssue]) -> Vec<Issue> {
+    let mut kinds: Vec<Issue> = Vec::new();
+    for fi in issues {
+        if !kinds.iter().any(|k| k.same_kind(&fi.issue)) {
+            kinds.push(fi.issue);
+        }
+    }
+    kinds.sort_by_key(|k| matches!(k, Issue::Reused { .. }));
+    kinds
+}
+
 /// Trailing badge for a list row whose item has password `issues`. The tooltip and
-/// VoiceOver label name every issue ("Weak password, Reused password").
-fn issue_badge(ix: usize, issues: &[Issue], cx: &App) -> AnyElement {
-    let label: SharedString = issues
+/// VoiceOver label name each issue kind once ("Weak password, Reused password").
+fn issue_badge(ix: usize, issues: &[FieldIssue], cx: &App) -> AnyElement {
+    let label: SharedString = issue_kinds(issues)
         .iter()
         .map(Issue::short)
         .collect::<Vec<_>>()
@@ -723,6 +735,24 @@ mod tests {
             }
             _ => None,
         })
+    }
+
+    /// The badge names each kind once, weak before reused, whatever the field order.
+    #[test]
+    fn issue_kinds_are_distinct_weak_first() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let fi = |field, issue| FieldIssue { field, issue };
+        let weak = Issue::Weak { bits: 10. };
+        let reused = Issue::Reused { count: 2 };
+        let kinds = issue_kinds(&[
+            fi(a, reused),
+            fi(b, weak),
+            fi(b, Issue::Reused { count: 3 }),
+            fi(a, Issue::Weak { bits: 20. }),
+        ]);
+        assert_eq!(kinds, [weak, reused]);
+        assert_eq!(issue_kinds(&[fi(a, weak), fi(b, weak)]), [weak]);
+        assert!(issue_kinds(&[]).is_empty());
     }
 
     #[gpui::test]

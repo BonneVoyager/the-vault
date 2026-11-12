@@ -1943,3 +1943,77 @@ fn unknown_field_icon_survives_rename_and_save(cx: &mut TestAppContext) {
     assert!(field.modified_at > 10, "renamed and saved");
     assert_eq!(field.icon.as_deref(), Some("x-future-symbol"));
 }
+
+fn pw_login(
+    title: &str,
+    password: &str,
+    state: &Entity<AppState>,
+    vcx: &VisualTestContext,
+) -> vault_core::Item {
+    let device = state.read_with(vcx, |s, _| s.device_id());
+    let mut item = vault_core::Item::new(title, device, 10);
+    item.fields = vec![vault_core::Field::new(
+        "password",
+        FieldKind::Password,
+        SecretString::new(password.into()),
+        10,
+    )];
+    item
+}
+
+/// In edit mode the password notices follow the typed value without saving: a strong
+/// value drops the weak strip, another saved item's password shows the reused strip,
+/// and an empty value shows none (05 §2.3 "Password notices").
+#[gpui::test]
+fn password_notices_follow_the_typed_value(cx: &mut TestAppContext) {
+    const OTHER: &str = "correct-Horse-battery-staple-42";
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let other = pw_login("Other", OTHER, &state, &vcx);
+    insert_and_select(&state, other, &mut vcx);
+    let item = pw_login("Bank", "123", &state, &vcx);
+    let field = item.fields[0].id;
+    let id = insert_and_select(&state, item, &mut vcx);
+    let weak = leak(format!("issue-strip {field} Weak Password"));
+    let reused = leak(format!("issue-strip {field} Reused Password"));
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds(weak).is_some(), "weak strip in edit mode");
+    assert!(vcx.debug_bounds(reused).is_none());
+
+    let key = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().keys[0]);
+    let input = value_input(&main, key, &mut vcx);
+    retype(&input, "an-entirely-Different-passphrase-7", &mut vcx);
+    assert!(
+        vcx.debug_bounds(weak).is_none(),
+        "strong value: no weak strip"
+    );
+    assert!(vcx.debug_bounds(reused).is_none());
+
+    retype(&input, OTHER, &mut vcx);
+    let b = vcx.debug_bounds(reused).expect("reused strip");
+    assert!(vcx.debug_bounds(weak).is_none());
+    // Under the value input, inside the row.
+    let row = vcx.debug_bounds(leak(format!("edit-row {key}"))).unwrap();
+    assert!(row.top() < b.top() && b.bottom() <= row.bottom());
+
+    vcx.update(|window, cx| ui::focus_input(&input, window, cx));
+    vcx.simulate_keystrokes("cmd-a backspace");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds(weak).is_none(), "empty value: no strips");
+    assert!(vcx.debug_bounds(reused).is_none());
+
+    // Nothing was saved: the stored password and the audit are unchanged.
+    state.read_with(&vcx, |s, _| {
+        assert!(s.is_editing());
+        let stored = s.unlocked_vault().unwrap().get(id).unwrap();
+        assert_eq!(stored.fields[0].value.expose_secret(), "123");
+        assert!(matches!(
+            s.listing.issues(id),
+            [FieldIssue {
+                issue: crate::audit::Issue::Weak { .. },
+                ..
+            }]
+        ));
+    });
+}

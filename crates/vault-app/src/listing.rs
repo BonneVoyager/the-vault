@@ -10,7 +10,7 @@ use gpui::SharedString;
 use vault_core::search::{Query, search};
 use vault_core::{ExposeSecret, Field, FieldKind, Item, UnlockedVault, Uuid};
 
-use crate::audit::{Issue, Issues};
+use crate::audit::{FieldIssue, Issues};
 use crate::state::{Filter, Sort};
 use crate::text;
 
@@ -39,8 +39,8 @@ impl Listing {
         self.rows.iter().position(|r| *r == Row::Item(id))
     }
 
-    /// Password warnings for `id`; empty when it has none.
-    pub fn issues(&self, id: Uuid) -> &[Issue] {
+    /// Per-field password warnings for `id`; empty when it has none.
+    pub fn issues(&self, id: Uuid) -> &[FieldIssue] {
         self.issues.get(&id).map_or(&[], Vec::as_slice)
     }
 }
@@ -246,6 +246,7 @@ pub fn avatar_letter(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::Issue;
     use vault_core::{KdfParams, SecretString};
 
     fn vault() -> UnlockedVault {
@@ -456,7 +457,7 @@ mod tests {
         assert!(
             issues
                 .get(&twin)
-                .is_none_or(|i| !i.iter().any(|x| matches!(x, Issue::Reused { .. }))),
+                .is_none_or(|i| !i.iter().any(|x| matches!(x.issue, Issue::Reused { .. }))),
             "the live twin no longer counts as reused"
         );
     }

@@ -881,9 +881,11 @@ mod tests {
             "the item's name"
         );
         assert!(detail.debug_bounds("detail-title GitHub").is_some());
+        // "field-content 1", not the row: the weak password's notice under it wraps
+        // to more lines in the narrower window (05 §2.3 "Password notices").
         for selector in [
             "detail-header",
-            "field-row 1",
+            "field-content 1",
             "field-row 4",
             "detail-footer",
         ] {

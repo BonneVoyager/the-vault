@@ -10,6 +10,7 @@ use vault_sync::{NoopHooks, SyncedVault};
 use super::super::MainScreen;
 use super::*;
 use crate::actions;
+use crate::audit::Issue;
 use crate::clipboard::fake::FakePasteboard;
 
 const STRONG: &str = "correct-Horse-battery-staple-42";
@@ -119,18 +120,36 @@ fn change_password(state: &Entity<AppState>, password: &str, vcx: &mut VisualTes
     vcx.run_until_parked();
 }
 
+/// Bounds of the password notice `title` under field `field`, if drawn.
+fn strip(
+    field: Uuid,
+    title: &str,
+    vcx: &mut VisualTestContext,
+) -> Option<gpui::Bounds<gpui::Pixels>> {
+    let key = format!("issue-strip {field} {title}");
+    vcx.debug_bounds(Box::leak(key.into_boxed_str()))
+}
+
+/// Field id `ix` of item `id`.
+fn field_id(state: &Entity<AppState>, id: Uuid, ix: usize, vcx: &VisualTestContext) -> Uuid {
+    state.read_with(vcx, |s, _| {
+        s.unlocked_vault().unwrap().get(id).unwrap().fields[ix].id
+    })
+}
+
 #[gpui::test]
-fn weak_password_shows_badge_and_banner_until_fixed(cx: &mut TestAppContext) {
+fn weak_password_shows_badge_and_strip_until_fixed(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (state, ids, mut vcx) = open(dir.path(), &[("Bank", "123")], cx);
     select(&state, ids[0], &mut vcx);
+    let pw = field_id(&state, ids[0], 1, &vcx);
     assert!(shown("issue-badge Weak password", &mut vcx));
-    assert!(shown("issue-banner Weak Password", &mut vcx));
-    assert!(!shown("issue-banner Reused Password", &mut vcx));
+    assert!(strip(pw, "Weak Password", &mut vcx).is_some());
+    assert!(strip(pw, "Reused Password", &mut vcx).is_none());
 
     change_password(&state, STRONG, &mut vcx);
     assert!(!shown("issue-badge Weak password", &mut vcx));
-    assert!(!shown("issue-banner Weak Password", &mut vcx));
+    assert!(strip(pw, "Weak Password", &mut vcx).is_none());
 }
 
 #[gpui::test]
@@ -138,16 +157,124 @@ fn reused_password_flags_both_items(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (state, ids, mut vcx) = open(dir.path(), &[("Alpha", STRONG), ("Beta", STRONG)], cx);
     select(&state, ids[0], &mut vcx);
+    let pw = field_id(&state, ids[0], 1, &vcx);
     // One badge per row, both rows flagged.
     assert!(shown("issue-badge Reused password", &mut vcx));
     let rows = state.read_with(&vcx, |s, _| s.listing.issues.len());
     assert_eq!(rows, 2);
-    assert!(shown("issue-banner Reused Password", &mut vcx));
-    assert!(!shown("issue-banner Weak Password", &mut vcx));
+    assert!(strip(pw, "Reused Password", &mut vcx).is_some());
+    assert!(strip(pw, "Weak Password", &mut vcx).is_none());
 
     change_password(&state, "an-entirely-Different-passphrase-7", &mut vcx);
     assert!(!shown("issue-badge Reused password", &mut vcx));
-    assert!(!shown("issue-banner Reused Password", &mut vcx));
+    assert!(strip(pw, "Reused Password", &mut vcx).is_none());
+}
+
+/// An item with a weak and a strong password field: one strip, inside the weak field's
+/// row, under its value; nothing under the strong one.
+#[gpui::test]
+fn only_the_weak_field_gets_a_strip(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open_items(
+        dir.path(),
+        |device| {
+            let mut item = login("Two", "123", device);
+            item.fields.push(Field::new(
+                "recovery",
+                FieldKind::Password,
+                SecretString::new(STRONG.into()),
+                1,
+            ));
+            vec![item]
+        },
+        cx,
+    );
+    select(&state, ids[0], &mut vcx);
+    let (weak, strong) = (
+        field_id(&state, ids[0], 1, &vcx),
+        field_id(&state, ids[0], 2, &vcx),
+    );
+    let issues = state.read_with(&vcx, |s, _| s.listing.issues(ids[0]).to_vec());
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].field, weak);
+    let b = strip(weak, "Weak Password", &mut vcx).expect("strip under the weak field");
+    assert!(strip(strong, "Weak Password", &mut vcx).is_none());
+    assert!(strip(strong, "Reused Password", &mut vcx).is_none());
+    // Inside the weak field's row, below its value, from the value column's left edge.
+    let row = vcx.debug_bounds("field-row 1").unwrap();
+    let content = vcx.debug_bounds("field-content 1").unwrap();
+    assert!(
+        row.top() < b.top() && b.bottom() <= row.bottom(),
+        "{row:?} {b:?}"
+    );
+    assert!(b.top() >= content.bottom(), "{content:?} {b:?}");
+    assert_eq!(b.left(), content.left());
+    assert!(shown("issue-badge Weak password", &mut vcx));
+}
+
+/// A field both weak and reused shows two strips, weak first (above).
+#[gpui::test]
+fn weak_and_reused_field_shows_two_strips_weak_first(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open(dir.path(), &[("Alpha", "123"), ("Beta", "123")], cx);
+    select(&state, ids[0], &mut vcx);
+    let pw = field_id(&state, ids[0], 1, &vcx);
+    let weak = strip(pw, "Weak Password", &mut vcx).unwrap();
+    let reused = strip(pw, "Reused Password", &mut vcx).unwrap();
+    assert!(weak.bottom() < reused.top(), "{weak:?} {reused:?}");
+    assert!(shown(
+        "issue-badge Weak password, Reused password",
+        &mut vcx
+    ));
+}
+
+/// The list badge names each issue kind once, however many fields have it.
+#[gpui::test]
+fn badge_for_two_weak_fields_names_weak_once(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open_items(
+        dir.path(),
+        |device| {
+            let mut item = login("Two", "123", device);
+            item.fields.push(Field::new(
+                "pin",
+                FieldKind::Password,
+                SecretString::new("4567".into()),
+                1,
+            ));
+            vec![item]
+        },
+        cx,
+    );
+    select(&state, ids[0], &mut vcx);
+    let issues = state.read_with(&vcx, |s, _| s.listing.issues(ids[0]).len());
+    assert_eq!(issues, 2, "both fields audited");
+    assert!(shown("issue-badge Weak password", &mut vcx));
+    assert!(!shown("issue-badge Weak password, Weak password", &mut vcx));
+}
+
+/// The item-level banners are gone (05 §2.3 "Password notices", option A).
+#[test]
+fn item_level_issue_banner_is_gone() {
+    let needle = concat!("issue", "-banner");
+    let mut dirs = vec![std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src"
+    ))];
+    let mut files = 0;
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files += 1;
+                let text = std::fs::read_to_string(&path).unwrap();
+                assert!(!text.contains(needle), "{}", path.display());
+            }
+        }
+    }
+    assert!(files > 10);
 }
 
 #[gpui::test]
@@ -166,11 +293,13 @@ fn search_reuses_the_audit_and_edits_redo_it(cx: &mut TestAppContext) {
     let edited = state.read_with(&vcx, |s, _| s.listing.issues.clone());
     assert!(!std::rc::Rc::ptr_eq(&before, &edited));
     // Alpha now shares Beta's password.
-    assert!(
-        edited
-            .values()
-            .all(|v| matches!(v.as_slice(), [Issue::Reused { count: 2 }]))
-    );
+    assert!(edited.values().all(|v| matches!(
+        v.as_slice(),
+        [FieldIssue {
+            issue: Issue::Reused { count: 2 },
+            ..
+        }]
+    )));
 }
 
 /// Opens one login (username, password, totp) with a fake pasteboard installed.

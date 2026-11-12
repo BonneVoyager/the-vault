@@ -27,7 +27,7 @@ use super::list::alert_dot;
 use super::prompts;
 use super::sync_banners;
 use crate::actions::{DETAIL_CONTEXT, DeleteItem, EditItem, RecoverItem, ToggleFavorite};
-use crate::audit::Issue;
+use crate::audit::FieldIssue;
 use crate::state::{AppState, CopyTarget, Mode, ToastPlace, expiry_text, parse_totp};
 use crate::ui::Clickable as _;
 use crate::{text, ui};
@@ -161,13 +161,16 @@ pub(crate) const FIELD_ICON_GAP: f32 = 8.;
 /// One field row, shared by the detail column, item windows and the backup viewer: the
 /// label column, then the value (filling the width) and its buttons. `icon` is the
 /// field's stored icon name: a known symbol is drawn left of the label (05 "Field
-/// icons"); none or an unknown name leaves the row as it is without one.
+/// icons"); none or an unknown name leaves the row as it is without one. `issues` are
+/// the field's password notices, one [`issue_strip`] each under the value (05 §2.3
+/// "Password notices").
 pub(crate) fn field_row(
     ix: usize,
     label: SharedString,
     icon: Option<&str>,
     value: impl IntoElement,
     buttons: Vec<AnyElement>,
+    issues: &[FieldIssue],
     cx: &App,
 ) -> gpui::Div {
     let theme = cx.theme();
@@ -215,22 +218,66 @@ pub(crate) fn field_row(
                 }),
         )
         .child(
-            ui::h_flex()
-                .debug_selector(move || format!("field-content {ix}"))
+            ui::v_flex()
                 .flex_1()
                 .min_w_0()
-                .items_start()
-                .gap(px(4.))
-                .min_h(px(28.))
+                .gap(px(ISSUE_STRIP_GAP))
                 .child(
                     ui::h_flex()
-                        .flex_1()
+                        .debug_selector(move || format!("field-content {ix}"))
+                        .w_full()
                         .min_w_0()
-                        .text_color(value_color)
-                        .child(value),
+                        .items_start()
+                        .gap(px(4.))
+                        .min_h(px(28.))
+                        .child(
+                            ui::h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(value_color)
+                                .child(value),
+                        )
+                        .child(ui::h_flex().flex_none().gap(px(4.)).children(buttons)),
                 )
-                .child(ui::h_flex().flex_none().gap(px(4.)).children(buttons)),
+                .children(issues.iter().map(|fi| issue_strip(fi, cx))),
         )
+}
+
+/// Space above and between password notice strips.
+pub(crate) const ISSUE_STRIP_GAP: f32 = 4.;
+
+/// One password notice under a password field (05 §2.3 "Password notices"): a 12 px red
+/// "!", the bold title and the body on one line (wrapping when narrow) on a muted red
+/// background. Not clickable, not dismissable. Tests find it as
+/// "issue-strip <field id> <title>".
+pub(crate) fn issue_strip(fi: &FieldIssue, cx: &App) -> gpui::Div {
+    let theme = cx.theme();
+    let title = fi.issue.title();
+    let selector = format!("issue-strip {} {title}", fi.field);
+    ui::h_flex()
+        .debug_selector(move || selector.clone())
+        .w_full()
+        .min_w_0()
+        .items_start()
+        .gap(px(6.))
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(4.))
+        // The danger tint of the delete confirm and the other danger cards.
+        .bg(theme.danger.opacity(0.10))
+        .text_xs()
+        .text_color(theme.foreground)
+        // The dot sits on the first text line (xs line height is about 16 px).
+        .child(div().pt(px(2.)).child(alert_dot(12., cx)))
+        .child(div().flex_1().min_w_0().whitespace_normal().child(
+            gpui::StyledText::new(format!("{title} {}", fi.issue.body())).with_highlights([(
+                0..title.len(),
+                gpui::HighlightStyle {
+                    font_weight: Some(FontWeight::BOLD),
+                    ..Default::default()
+                },
+            )]),
+        ))
 }
 
 /// A section heading row (01 §4 `"section"`), shared like [`field_row`]: the name
@@ -283,38 +330,6 @@ fn mono(text: impl Into<SharedString>, cx: &App) -> gpui::Div {
     div()
         .font_family(cx.theme().mono_font_family.clone())
         .child(text.into())
-}
-
-/// Apple-style warning card for one password issue: red "!" at left, bold title, body.
-/// Not dismissable; it disappears when a save fixes the password.
-fn issue_banner(issue: &Issue, cx: &App) -> impl IntoElement {
-    let theme = cx.theme();
-    let title = issue.title();
-    ui::h_flex()
-        .items_start()
-        .gap(px(12.))
-        .p(px(12.))
-        .rounded(theme.radius_lg)
-        .bg(theme.secondary)
-        .border_1()
-        .border_color(theme.border)
-        // Tests find the banner by this key (no-op outside test builds).
-        .debug_selector(move || format!("issue-banner {title}"))
-        .child(alert_dot(20., cx))
-        .child(
-            ui::v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap(px(2.))
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .whitespace_normal()
-                        .child(issue.body()),
-                ),
-        )
 }
 
 /// Under a trashed item's title (pinned header): when it goes, and Delete (permanently) / Recover.
@@ -657,8 +672,6 @@ impl ReadDetail<'_> {
             }
         }
 
-        let issues = s.listing.issues(item.id);
-        let has_issues = !issues.is_empty();
         let pad_x = px(ui::COLUMN_PAD_X - ui::FOCUS_RING_WIDTH);
 
         // Pinned (05 §2.3 "Detail header is pinned"): the header, the trash card (if
@@ -708,8 +721,7 @@ impl ReadDetail<'_> {
 
         // The rows sit under the pinned rule exactly as each row sits under the one
         // above: only their own `FIELD_ROW_PAD_Y` top padding, so the scroll area has no
-        // top padding. Warning cards come first when present; the rows then get a rule
-        // of their own above them, as before the header was pinned. Every field row
+        // top padding. Password notices sit inside their field's row. Every field row
         // (and the history disclosure) draws its own bottom border, so the last row's
         // border already closes the group above the footer. Only the no-fields message
         // needs a closing rule of its own.
@@ -722,15 +734,8 @@ impl ReadDetail<'_> {
             .px(pad_x)
             .pb(px(64.))
             .gap(px(12.))
-            .when(has_issues, |col| col.pt(px(12.)))
-            .children(
-                issues
-                    .iter()
-                    .map(|issue| ui::no_window_drag(div()).child(issue_banner(issue, cx))),
-            )
             .child(
                 ui::v_flex()
-                    .when(has_issues, |col| col.child(ui::divider(cx)))
                     .when(item.fields.is_empty(), |col| {
                         col.child(ui::muted("This item has no fields.", cx).py(px(FIELD_ROW_PAD_Y)))
                             .child(ui::divider(cx))
@@ -864,12 +869,22 @@ impl ReadDetail<'_> {
         } else {
             copy_on_click(ix, field.id, &field.name, shown, &self.actions, cx).into_any_element()
         };
+        let issues: Vec<FieldIssue> = self
+            .state
+            .read(cx)
+            .listing
+            .issues(item.id)
+            .iter()
+            .filter(|fi| fi.field == field.id)
+            .copied()
+            .collect();
         field_row(
             ix,
             field.name.clone().into(),
             field.icon_name(),
             value,
             buttons,
+            &issues,
             cx,
         )
         .into_any_element()
