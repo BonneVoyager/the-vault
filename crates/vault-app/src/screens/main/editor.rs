@@ -953,6 +953,7 @@ impl Render for Editor {
             ))
             .child(
                 div()
+                    .debug_selector(|| "editor-title".into())
                     .flex_1()
                     .min_w_0()
                     .text_lg()
@@ -978,28 +979,14 @@ impl Render for Editor {
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(SaveItem), cx)),
             );
 
-        ui::v_flex()
-            .id("editor-scroll")
-            // Esc during a field drag cancels the drag, not the edit.
-            .capture_action({
-                let drag = self.drag.clone();
-                move |_: &CancelEdit, window, cx| {
-                    if drag.row.get().is_some() && cx.has_active_drag() {
-                        drag.clear();
-                        cx.stop_active_drag(window);
-                        cx.stop_propagation();
-                    }
-                }
-            })
-            // Any release ends a field drag; after the drop listener has run.
-            .capture_any_mouse_up(defer_clear(self.drag.clone()))
-            .on_mouse_up_out(gpui::MouseButton::Left, defer_clear(self.drag.clone()))
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
+        let pad_x = px(ui::COLUMN_PAD_X - ui::FOCUS_RING_WIDTH);
+        // Pinned (05 §2.3 "Detail header is pinned", edit mode): the header, the tags
+        // row and the rule under them stay put, with read mode's top and side padding.
+        let pinned = ui::v_flex()
+            .debug_selector(|| "editor-pinned".into())
+            .flex_none()
             .pt(px(ui::content_top(s)))
-            .px(px(ui::COLUMN_PAD_X - ui::FOCUS_RING_WIDTH))
-            .pb(px(64.))
+            .px(pad_x)
             .gap(px(10.))
             .when_some(new_kind, |col, kind| {
                 col.child(ui::muted(format!("New {}", kind.label()), cx))
@@ -1029,12 +1016,45 @@ impl Render for Editor {
             .when_some(buffer.error.clone(), |col, error| {
                 col.child(div().text_sm().text_color(theme.danger).child(error))
             })
-            .child(ui::divider(cx))
+            .child(ui::divider(cx));
+
+        // Only the field rows and "Add field" scroll; the top padding keeps the gap the
+        // rows had under the rule before it was pinned.
+        let scroll = ui::v_flex()
+            .id("editor-scroll")
+            .debug_selector(|| "editor-scroll".into())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .pt(px(10.))
+            .px(pad_x)
+            .pb(px(64.))
+            .gap(px(10.))
             .when(rows.is_empty(), |col| {
                 col.child(ui::muted("No fields. Add one below.", cx))
             })
             .child(self.rows_container(rows))
-            .child(ui::h_flex().child(add_field))
+            .child(ui::h_flex().child(add_field));
+
+        ui::v_flex()
+            // Esc during a field drag cancels the drag, not the edit.
+            .capture_action({
+                let drag = self.drag.clone();
+                move |_: &CancelEdit, window, cx| {
+                    if drag.row.get().is_some() && cx.has_active_drag() {
+                        drag.clear();
+                        cx.stop_active_drag(window);
+                        cx.stop_propagation();
+                    }
+                }
+            })
+            // Any release ends a field drag; after the drop listener has run.
+            .capture_any_mouse_up(defer_clear(self.drag.clone()))
+            .on_mouse_up_out(gpui::MouseButton::Left, defer_clear(self.drag.clone()))
+            .size_full()
+            .child(pinned)
+            .child(scroll)
             .into_any_element()
     }
 }

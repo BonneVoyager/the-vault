@@ -2017,3 +2017,75 @@ fn password_notices_follow_the_typed_value(cx: &mut TestAppContext) {
         ));
     });
 }
+
+/// 05 §2.3 "Detail header is pinned", edit mode (owner 2026-11-12): with 40 fields, scrolling
+/// the field column to the bottom (directly, or by adding a field) leaves the title, the
+/// tags row and the rule where they were, at read mode's header position.
+#[gpui::test]
+fn edit_header_and_tags_stay_pinned_while_fields_scroll(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    let mut item = vault_core::Item::new("Long", device, 1);
+    item.tags = vec!["work".into()];
+    item.fields = (0..40)
+        .map(|i| {
+            let v = SecretString::new("v".into());
+            vault_core::Field::new(format!("f{i}"), FieldKind::Text, v, 1)
+        })
+        .collect();
+    insert_and_select(&state, item, &mut vcx);
+    let read_header = vcx.debug_bounds("detail-header").expect("read header");
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+
+    let column = vcx.debug_bounds("detail-column").expect("detail column");
+    let header = vcx.debug_bounds("editor-header").expect("editor header");
+    assert_eq!(
+        header.origin, read_header.origin,
+        "edit header sits where read's did"
+    );
+    let first = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().keys[0]);
+    let measure = |vcx: &mut VisualTestContext| {
+        let title = vcx.debug_bounds("editor-title").expect("title input");
+        let tags = vcx.debug_bounds("edit-tags").expect("tags row");
+        let row = vcx.debug_bounds(leak(format!("edit-row {first}")));
+        (title, tags, row.map(|r| r.top()))
+    };
+    let (title, tags, row) = measure(&mut vcx);
+    assert!(title.top() >= column.top() && title.bottom() < column.top() + px(120.));
+    assert!(tags.top() > title.bottom());
+    let scroll = vcx.debug_bounds("editor-scroll").expect("scroll column");
+    assert!(
+        scroll.top() > tags.bottom(),
+        "tags row is outside the scroll column"
+    );
+
+    // Scroll to the bottom directly.
+    vcx.update(|window, cx| {
+        main.read(cx).editor.read(cx).scroll.scroll_to_bottom();
+        window.refresh();
+    });
+    vcx.run_until_parked();
+    let (title2, tags2, row2) = measure(&mut vcx);
+    assert_ne!(row2, row, "the field rows scrolled");
+    assert_eq!(title2, title, "title moved");
+    assert_eq!(tags2, tags, "tags row moved");
+
+    // Back to the top, then by adding a field (which scrolls to the bottom).
+    vcx.update(|window, cx| {
+        let editor = main.read(cx).editor.read(cx);
+        editor.scroll.set_offset(gpui::point(px(0.), px(0.)));
+        window.refresh();
+    });
+    vcx.run_until_parked();
+    assert_eq!(measure(&mut vcx).2, row, "back at the top");
+    state.update(&mut vcx, |s, cx| {
+        s.edit(cx, |b| b.focus_row = Some(b.add_field(FieldKind::Text)))
+    });
+    vcx.run_until_parked();
+    let (title3, tags3, row3) = measure(&mut vcx);
+    assert_ne!(row3, row, "adding a field scrolled the rows");
+    assert_eq!(title3, title, "title moved after add");
+    assert_eq!(tags3, tags, "tags row moved after add");
+}

@@ -847,6 +847,88 @@ mod tests {
         assert_eq!(std::fs::read(&backup).unwrap(), backup_bytes);
     }
 
+    /// 05 §2.3 "Password notices": the backup viewer audits against the backup's own items.
+    /// Two backup items share a password the open vault no longer holds anywhere: the
+    /// viewer still flags it as reused, and the open vault flags nothing.
+    #[gpui::test]
+    fn backup_reuse_is_judged_against_the_backups_own_items(cx: &mut TestAppContext) {
+        const SHARED: &str = "Shared-backup-passphrase-91";
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = SyncedVault::create(
+            &dir.path().join("t.vault"),
+            &SecretString::new(PW.into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let device = vault.device_id();
+        let login = |title: &str, pw: &str| {
+            let mut item = Item::new(title, device, 1);
+            item.fields = vec![Field::new(
+                "password",
+                FieldKind::Password,
+                SecretString::new(pw.into()),
+                1,
+            )];
+            item
+        };
+        let (alpha, beta) = vault
+            .edit(|v| {
+                (
+                    v.insert(login("Alpha", SHARED), 1),
+                    v.insert(login("Beta", SHARED), 1),
+                )
+            })
+            .unwrap();
+        vault.save().unwrap();
+        let backup = vault.backup_now().unwrap();
+        // The open vault moves on: distinct passwords, plus an unrelated item.
+        let unrelated = vault
+            .edit(|v| {
+                for (id, pw) in [
+                    (alpha, "Alpha-new-passphrase-38"),
+                    (beta, "Beta-new-passphrase-52"),
+                ] {
+                    v.update(id, 2, |item| {
+                        item.fields[0].value = SecretString::new(pw.into());
+                    })
+                    .unwrap();
+                }
+                v.insert(login("Unrelated", "Unrelated-passphrase-64"), 2)
+            })
+            .unwrap();
+        vault.save().unwrap();
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        state.update(cx, |s, _| s.install_unlocked_for_tests(vault));
+        state.read_with(cx, |s, _| {
+            let v = s.unlocked_vault().unwrap();
+            assert!(
+                v.items()
+                    .all(|i| i.fields.iter().all(|f| f.value.expose_secret() != SHARED))
+            );
+            assert!(
+                s.listing.issues(unrelated).is_empty(),
+                "open vault: no notices"
+            );
+            assert!(s.listing.issues(alpha).is_empty() && s.listing.issues(beta).is_empty());
+        });
+
+        let (view, mut vcx) = window(&state, &backup, cx);
+        view.update(&mut vcx, |w, cx| w.unlock(SecretString::new(PW.into()), cx));
+        vcx.run_until_parked();
+        assert!(view.read_with(&vcx, |w, _| w.is_open()));
+        view.update(&mut vcx, |w, cx| w.select(alpha, cx));
+        vcx.run_until_parked();
+        let field = view.read_with(&vcx, |w, _| {
+            w.vault.as_ref().unwrap().get(alpha).unwrap().fields[0].id
+        });
+        let key = format!("issue-strip {field} Reused Password");
+        assert!(vcx.debug_bounds(Box::leak(key.into_boxed_str())).is_some());
+        let weak = format!("issue-strip {field} Weak Password");
+        assert!(vcx.debug_bounds(Box::leak(weak.into_boxed_str())).is_none());
+    }
+
     /// Attachments are not backed up: the viewer lists them as Missing, with no actions.
     #[gpui::test]
     fn attachments_show_as_missing(cx: &mut TestAppContext) {

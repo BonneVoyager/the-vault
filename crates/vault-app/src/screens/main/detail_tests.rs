@@ -1332,3 +1332,40 @@ fn field_icon_tops_a_wrapping_label_at_the_largest_text_size(cx: &mut TestAppCon
         "one Larger line tall, not the glyph"
     );
 }
+
+/// 05 §2.3 "Password notices": trashed items show no strips. A weak login is flagged
+/// while live; once deleted, its Recently Deleted detail draws none.
+#[gpui::test]
+fn trashed_item_shows_no_password_notices(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open(dir.path(), &[("Bank", "123"), ("Keep", STRONG)], cx);
+    select(&state, ids[0], &mut vcx);
+    let pw = field_id(&state, ids[0], 1, &vcx);
+    assert!(
+        strip(pw, "Weak Password", &mut vcx).is_some(),
+        "flagged while live"
+    );
+
+    vcx.update(|_, cx| {
+        state.update(cx, |s, cx| {
+            s.request_delete(cx);
+            s.confirm_delete(cx);
+        })
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        state.update(cx, |s, cx| {
+            s.set_filter(crate::state::Filter::RecentlyDeleted, cx)
+        })
+    });
+    vcx.run_until_parked();
+    select(&state, ids[0], &mut vcx);
+    state.read_with(&vcx, |s, _| {
+        assert!(s.viewing_trash());
+        assert_eq!(s.trashed_item().map(|i| i.id), Some(ids[0]));
+    });
+    assert!(shown("detail-title Bank", &mut vcx), "trash detail drawn");
+    assert!(strip(pw, "Weak Password", &mut vcx).is_none());
+    assert!(strip(pw, "Reused Password", &mut vcx).is_none());
+    assert!(!shown("issue-badge Weak password", &mut vcx));
+}

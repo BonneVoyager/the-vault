@@ -1160,5 +1160,9 @@ Bug hunt: run for this wave (2026-11-08; docs/qa/bug-hunt-2026-11-08.md: no bugs
 - Reviews: toasts/menus FIX FIRST (menus on registration) → fixed; Help/diagnostics FIX FIRST (host facts, error-state leak test) → fixed. App suite 504 then filtered reruns green; full workspace rerun in flight at commit time.
 - Owner committed as e392ae9 before this entry was written. Eye checks 1–6 passed (2026-11-12). Owner report: edit-mode header does not stay pinned (spec 05 "Detail header is pinned" amended; fix queued after the notices wave). Bug hunt: not yet run for this wave.
 
-### 2026-11-12 — Password notices per field (owner decision, option A) — in flight
-- Spec 05 §2.3 "Password notices": compact strip under each weak or reused password field in read and edit mode (live while typing); audit per field; item-level banner removed.
+### 2026-11-12 — Password notices per field (owner decision, option A; committed 84ac4d5)
+- Spec 05 §2.3 "Password notices": compact strip inside each weak or reused password field's row, under the value, in read mode (detail, item window, backup viewer via shared `field_row`) and edit mode (live from the typed value, item excluded from reuse; backup viewer checks the backup's own items); item-level banner removed. `audit::Issues` per field (`FieldIssue`), `reuse_count`, `value_issues`; list badge dedupes kinds weak first; Reused body "Used by N other items…".
+- Review: SHIP; two test gaps (backup reuse against backup items, trash shows no strips) dispatched as tests only. App suite 514 passed; fmt, clippy clean.
+- Review test gaps closed: `backup_reuse_is_judged_against_the_backups_own_items`, `trashed_item_shows_no_password_notices`.
+- Edit-mode pinned header (spec 05 "Detail header is pinned"): editor root split into a fixed part (icon, title, Save/Cancel, tags row, rule) and the `editor-scroll` fields column (`flex_1().min_h_0()`); drag handlers on the root; test `edit_header_and_tags_stay_pinned_while_fields_scroll`. App suite 517 passed; fmt, clippy clean.
+- Checkpoint: eye check pending (notices 1–5, pinned header). Bug hunt: not yet run for this wave.
