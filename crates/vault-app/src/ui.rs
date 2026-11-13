@@ -237,11 +237,32 @@ pub fn open_main_window<V: Render>(
     cx: &mut App,
     build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
 ) -> Result<WindowHandle<Root>> {
-    let options = window_options(restore, main_min_size(sidebar_visible), cx);
+    let options = main_options(restore, sidebar_visible, cx);
     cx.open_window(options, |window, cx| {
         let view = build(window, cx);
-        cx.new(|cx| Root::new(view, window, cx))
+        cx.new(|cx| main_root(view, window, cx))
     })
+}
+
+/// The main window's options: [`window_options`], blurred in both appearances so the
+/// translucent sidebar shows the desktop behind (05 §5). Backup and item windows built
+/// from [`window_options`] stay opaque.
+fn main_options(restore: Option<WindowState>, sidebar_visible: bool, cx: &App) -> WindowOptions {
+    WindowOptions {
+        window_background: gpui::WindowBackgroundAppearance::Blurred,
+        ..window_options(restore, main_min_size(sidebar_visible), cx)
+    }
+}
+
+/// The main window's `Root`. gpui-component fills the whole root surface with the
+/// theme background; an instance style wins over that, so clear it here and let our
+/// screens paint their own fills (sidebar vibrancy, 05 §5).
+pub fn main_root(
+    view: impl Into<gpui::AnyView>,
+    window: &mut Window,
+    cx: &mut Context<Root>,
+) -> Root {
+    Root::new(view, window, cx).bg(gpui::transparent_black())
 }
 
 /// Current restore bounds of `window` (also valid while fullscreen or zoomed).
@@ -1296,3 +1317,14 @@ pub mod probe {
 #[cfg(test)]
 #[path = "ui_menu_tests.rs"]
 mod menu_tests;
+
+/// Only the main window is blurred (05 §5); the backup viewer's options stay opaque.
+#[cfg(test)]
+#[gpui::test]
+fn only_the_main_window_is_blurred(cx: &mut gpui::TestAppContext) {
+    use gpui::WindowBackgroundAppearance::{Blurred, Opaque};
+    cx.update(|cx| {
+        assert_eq!(main_options(None, true, cx).window_background, Blurred);
+        assert_eq!(main_window_options(None, cx).window_background, Opaque);
+    });
+}

@@ -1,5 +1,7 @@
 //! Window root: picks the screen from `AppState`, persists window geometry, shows toasts.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -168,6 +170,8 @@ pub struct VaultRoot {
     screen: Screen,
     geometry: WindowState,
     save_geometry: Option<Task<()>>,
+    /// The unlock crossfade this root last started and whether it has finished.
+    fade: (u32, Rc<Cell<bool>>),
     _subscriptions: Vec<Subscription>,
     _triggers: LockTriggers,
     _system_accent: SystemAccentWatch,
@@ -267,6 +271,7 @@ impl VaultRoot {
             sheet: None,
             screen,
             save_geometry: None,
+            fade: (u32::MAX, Rc::new(Cell::new(true))),
             _subscriptions: subscriptions,
             _triggers: triggers,
             _system_accent: system_accent,
@@ -360,6 +365,51 @@ impl Render for VaultRoot {
         if window.rem_size() != rem {
             window.set_rem_size(rem);
         }
+        let (unlock_count, reduce_motion) = {
+            let s = self.state.read(cx);
+            (s.unlock_count, s.reduce_motion)
+        };
+        if self.fade.0 != unlock_count {
+            self.fade = (unlock_count, Rc::new(Cell::new(false)));
+        }
+        // No crossfade under Reduce Motion: nothing to underlay, nothing to wait for.
+        if reduce_motion {
+            self.fade.1.set(true);
+        }
+        let fading = self.screen == Screen::Main && !self.fade.1.get();
+        // While the crossfade runs, an opaque underlay keeps the blur hidden; under the
+        // sidebar it fades out with the main screen fading in. Gone once finished.
+        let underlay = fading.then(|| {
+            let viewport = window.viewport_size().width.as_f32();
+            let side = self.main.read(cx).sidebar_width_for(viewport);
+            let bg = cx.theme().background;
+            let done = self.fade.1.clone();
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                this.update(cx, |_, cx| cx.notify()).ok();
+            });
+            ui::h_flex()
+                .absolute()
+                .size_full()
+                .child(
+                    div()
+                        .flex_none()
+                        .h_full()
+                        .w(px(side))
+                        .bg(bg)
+                        .with_animation(
+                            ("unlock-underlay", unlock_count),
+                            Animation::new(CROSSFADE).with_easing(ease_out_quint()),
+                            move |el, t| {
+                                if t >= 1. {
+                                    done.set(true);
+                                }
+                                el.bg(bg.opacity(1. - t))
+                            },
+                        ),
+                )
+                .child(div().flex_1().h_full().bg(bg))
+        });
         let state = self.state.read(cx);
         // On the main screen, detail toasts ("Copied") draw in the detail column.
         let toast = state
@@ -367,8 +417,6 @@ impl Render for VaultRoot {
             .as_ref()
             .filter(|t| self.screen != Screen::Main || t.place == ToastPlace::Window)
             .map(|t| (t.message.clone(), t.danger));
-        let unlock_count = state.unlock_count;
-        let reduce_motion = state.reduce_motion;
         let theme = cx.theme();
 
         let content: AnyElement = match self.screen {
@@ -377,12 +425,13 @@ impl Render for VaultRoot {
             Screen::Main if reduce_motion => self.main.clone().into_any_element(),
             Screen::Main => div()
                 .size_full()
-                .child(self.main.clone())
-                .with_animation(
+                .relative()
+                .children(underlay)
+                .child(div().size_full().child(self.main.clone()).with_animation(
                     ("unlock-fade", unlock_count),
                     Animation::new(CROSSFADE).with_easing(ease_out_quint()),
                     |el, t| el.opacity(t),
-                )
+                ))
                 .into_any_element(),
         };
 
@@ -390,7 +439,11 @@ impl Render for VaultRoot {
             .id("vault-root")
             .size_full()
             .relative()
-            .bg(theme.background)
+            // On the main screen the columns paint their own fills, so the sidebar can
+            // show the blurred window through its tint (05 §5).
+            .when(self.screen != Screen::Main, |root| {
+                root.bg(theme.background)
+            })
             .text_color(theme.foreground)
             .text_size(theme.font_size)
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.touch(cx)))

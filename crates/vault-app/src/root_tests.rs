@@ -102,7 +102,7 @@ fn root_with_vault(
         theme::apply(window, cx);
         let view = cx.new(|cx| VaultRoot::new(state.clone(), None, window, cx));
         root = Some(view.clone());
-        Root::new(view, window, cx)
+        ui::main_root(view, window, cx)
     });
     let mut vcx = VisualTestContext::from_window(window.into(), cx);
     state.update(&mut vcx, |s, cx| s.open_vault(path, cx));
@@ -967,4 +967,132 @@ fn help_placeholder_toast_is_gone() {
         }
     }
     assert!(files > 10);
+}
+
+/// Sidebar vibrancy (05 §5) render checks: a fresh frame.
+fn frame(vcx: &mut VisualTestContext) {
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+}
+
+/// Whether a solid quad in `color` is painted within 1 px of `area`.
+fn fill_at(
+    area: gpui::Bounds<gpui::Pixels>,
+    color: gpui::Hsla,
+    vcx: &mut VisualTestContext,
+) -> bool {
+    vcx.update(|window, _| {
+        let scaled = area.scale(window.scale_factor());
+        let near = |a: gpui::ScaledPixels, b: gpui::ScaledPixels| (a.0 - b.0).abs() < 1.;
+        window.painted_quads().iter().any(|q| {
+            near(q.bounds.origin.x, scaled.origin.x)
+                && near(q.bounds.origin.y, scaled.origin.y)
+                && near(q.bounds.size.width, scaled.size.width)
+                && near(q.bounds.size.height, scaled.size.height)
+                && q.background.as_solid() == Some(color)
+        })
+    })
+}
+
+fn whole_window(vcx: &mut VisualTestContext) -> gpui::Bounds<gpui::Pixels> {
+    vcx.update(|window, _| gpui::Bounds::new(gpui::Point::default(), window.viewport_size()))
+}
+
+fn background(vcx: &mut VisualTestContext) -> gpui::Hsla {
+    vcx.update(|_, cx| cx.theme().background)
+}
+
+fn unlock(state: &Entity<AppState>, vcx: &mut VisualTestContext) {
+    state.update(vcx, |s, cx| {
+        s.unlock(vault_core::SecretString::new("pw".into()), cx)
+    });
+    vcx.run_until_parked();
+    assert_eq!(state.read_with(vcx, |s, _| s.screen), Screen::Main);
+}
+
+/// Under Reduce Motion there is no crossfade, so the fade is finished at once and the
+/// root schedules no per-frame redraw for its underlay.
+#[gpui::test]
+fn reduce_motion_unlock_needs_no_fade_underlay(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, root, mut vcx) = root_with_vault(dir.path(), cx);
+    state.update(&mut vcx, |s, cx| s.set_reduce_motion(true, cx));
+    unlock(&state, &mut vcx);
+    for _ in 0..3 {
+        frame(&mut vcx);
+    }
+    let count = state.read_with(&vcx, |s, _| s.unlock_count);
+    root.read_with(&vcx, |r, _| {
+        assert_eq!(r.fade.0, count);
+        assert!(r.fade.1.get(), "fade marked finished under Reduce Motion");
+    });
+}
+
+/// The root leaves the window unfilled on the main screen (the crossfade underlay is
+/// gone once the fade ends) and fills it again on the unlock screen after a lock.
+#[gpui::test]
+fn root_fill_is_skipped_on_main_and_back_after_lock(cx: &mut TestAppContext) {
+    root_fill_check(cx);
+}
+
+/// [`root_fill_is_skipped_on_main_and_back_after_lock`] in dark mode.
+#[gpui::test]
+fn dark_root_fill_is_skipped_on_main_and_back_after_lock(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        cx.set_global(theme::ThemePrefs {
+            appearance: crate::state::Appearance::Dark,
+            scale: 1.0,
+        })
+    });
+    root_fill_check(cx);
+    cx.update(|cx| assert!(cx.theme().is_dark()));
+}
+
+fn root_fill_check(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, root, mut vcx) = root_with_vault(dir.path(), cx);
+    frame(&mut vcx);
+    let (window, bg) = (whole_window(&mut vcx), background(&mut vcx));
+    assert!(fill_at(window, bg, &mut vcx), "unlock screen is filled");
+
+    unlock(&state, &mut vcx);
+    // The crossfade runs on real time.
+    std::thread::sleep(CROSSFADE + Duration::from_millis(50));
+    for _ in 0..3 {
+        frame(&mut vcx);
+    }
+    assert!(root.read_with(&vcx, |r, _| r.fade.1.get()), "fade finished");
+    assert!(
+        !fill_at(window, bg, &mut vcx),
+        "main screen has no window fill"
+    );
+
+    state.update(&mut vcx, |s, cx| s.lock(cx));
+    vcx.run_until_parked();
+    frame(&mut vcx);
+    assert_eq!(state.read_with(&vcx, |s, _| s.screen), Screen::Unlock);
+    assert!(
+        fill_at(window, bg, &mut vcx),
+        "unlock screen is filled again"
+    );
+}
+
+/// In light mode the list and detail columns paint the opaque background themselves.
+#[gpui::test]
+fn light_list_and_detail_columns_paint_opaque_background(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, mut vcx) = root_with_vault(dir.path(), cx);
+    state.update(&mut vcx, |s, cx| s.set_reduce_motion(true, cx));
+    unlock(&state, &mut vcx);
+    frame(&mut vcx);
+    assert!(!vcx.update(|_, cx| cx.theme().is_dark()), "light mode");
+    let bg = background(&mut vcx);
+    assert_eq!(bg.a, 1.);
+    for column in ["list-slot", "detail-slot"] {
+        let area = vcx.debug_bounds(column).expect(column);
+        assert!(
+            fill_at(area, bg, &mut vcx),
+            "{column} paints the background"
+        );
+    }
 }

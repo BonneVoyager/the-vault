@@ -80,6 +80,8 @@ impl MainScreen {
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let s = self.state.read(cx);
         let theme = cx.theme();
+        // Light mode: a translucent tint over the blurred window (05 §5).
+        let fill = crate::theme::sidebar_fill(theme.is_dark());
         let filter = s.filter.clone();
         let counts = s.counts.clone();
         let tags_open = s.tags_open;
@@ -113,7 +115,7 @@ impl MainScreen {
             .debug_selector(|| "sidebar-column".into())
             // Lets the main screen see focus inside (a Tab-focused row) when collapsing.
             .track_focus(&self.sidebar_focus)
-            .bg(theme.sidebar)
+            .bg(fill)
             .border_r_1()
             .border_color(theme.sidebar_border)
             // The sidebar extends under the transparent titlebar; keep clear of the lights.

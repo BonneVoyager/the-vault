@@ -82,11 +82,9 @@ pub struct VaultTheme {
     /// Text on an accent fill (primary buttons).
     pub accent_text: Hsla,
     pub bg: Hsla,
-    /// Opaque stand-in for the sidebar. See `sidebar_vibrancy`.
+    /// The sidebar tint, painted translucent over the blurred main window
+    /// (see [`sidebar_fill`]).
     pub bg_sidebar: Hsla,
-    /// The spec asks for vibrancy behind the sidebar in light mode. Not wired yet:
-    /// it needs a blurred window background plus a translucent sidebar.
-    pub sidebar_vibrancy: bool,
     pub bg_elevated: Hsla,
     pub border: Hsla,
     pub text: Hsla,
@@ -185,31 +183,29 @@ fn current_accent(cx: &App) -> Option<Hsla> {
 
 impl VaultTheme {
     pub fn for_appearance(dark: bool) -> Self {
-        let shared =
-            |accent, bg, bg_sidebar, sidebar_vibrancy, bg_elevated, border, text, muted| Self {
-                accent: hex(accent),
-                accent_text: hex(LIGHT_ACCENT_TEXT),
-                bg: hex(bg),
-                bg_sidebar: hex(bg_sidebar),
-                sidebar_vibrancy,
-                bg_elevated: hex(bg_elevated),
-                border: hex(border),
-                text: hex(text),
-                text_muted: hex(muted),
-                danger: hex(0xE5484D),
-                warning: hex(0xF5A524),
-                success: hex(0x30A46C),
-                radius_panel: px(8.),
-                radius_control: px(6.),
-                font_size: px(13.),
-            };
+        let shared = |accent, bg, bg_sidebar, bg_elevated, border, text, muted| Self {
+            accent: hex(accent),
+            accent_text: hex(LIGHT_ACCENT_TEXT),
+            bg: hex(bg),
+            bg_sidebar: hex(bg_sidebar),
+            bg_elevated: hex(bg_elevated),
+            border: hex(border),
+            text: hex(text),
+            text_muted: hex(muted),
+            danger: hex(0xE5484D),
+            warning: hex(0xF5A524),
+            success: hex(0x30A46C),
+            radius_panel: px(8.),
+            radius_control: px(6.),
+            font_size: px(13.),
+        };
         if dark {
             shared(
-                0x5B8CFF, 0x1C1C1E, 0x232326, false, 0x2A2A2D, 0x38383B, 0xF2F2F7, 0x98989D,
+                0x5B8CFF, 0x1C1C1E, 0x232326, 0x2A2A2D, 0x38383B, 0xF2F2F7, 0x98989D,
             )
         } else {
             shared(
-                0x3B6CF0, 0xFFFFFF, 0xF5F5F7, true, 0xF7F7F8, 0xE5E5EA, 0x1D1D1F, 0x6E6E73,
+                0x3B6CF0, 0xFFFFFF, 0xF5F5F7, 0xF7F7F8, 0xE5E5EA, 0x1D1D1F, 0x6E6E73,
             )
         }
     }
@@ -266,6 +262,18 @@ impl VaultTheme {
         theme.font_size = self.font_size;
         theme.mono_font_family = mono;
     }
+}
+
+/// Opacity of the sidebar tint over the blurred window (05 §5; tuned by eye check).
+pub const SIDEBAR_VIBRANCY_ALPHA: f32 = 0.88;
+
+/// The sidebar column's fill over the blurred main window: the appearance's tint at
+/// [`SIDEBAR_VIBRANCY_ALPHA`]. Window activation changes nothing (05 §5: it read as a
+/// flash).
+pub fn sidebar_fill(dark: bool) -> Hsla {
+    VaultTheme::for_appearance(dark)
+        .bg_sidebar
+        .opacity(SIDEBAR_VIBRANCY_ALPHA)
 }
 
 /// Picks "SF Mono" if the system exposes it by name, else Menlo.
@@ -480,6 +488,14 @@ mod tests {
                 .accent_text,
             white
         );
+    }
+
+    #[test]
+    fn sidebar_fill_is_translucent_in_both_modes() {
+        assert_eq!(sidebar_fill(false), hex(0xF5F5F7).opacity(0.88));
+        assert_eq!(sidebar_fill(true), hex(0x232326).opacity(0.88));
+        assert!((sidebar_fill(false).a - 0.88).abs() < 1e-6);
+        assert!((sidebar_fill(true).a - 0.88).abs() < 1e-6);
     }
 
     #[test]

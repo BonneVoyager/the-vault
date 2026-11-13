@@ -650,10 +650,14 @@ impl Render for MainScreen {
         });
         let list_column = gpui::div()
             .id("list-slot")
+            .debug_selector(|| "list-slot".into())
             .flex_none()
             .h_full()
             .w(px(self.fitted[1]))
             .relative()
+            // The root leaves the window unfilled on this screen (sidebar vibrancy, 05 §5):
+            // the list and detail columns paint their own opaque background.
+            .bg(cx.theme().background)
             .child(list)
             .children(ui::test_probe("list-probe"))
             // No divider to drag while the sidebar moves.
@@ -664,10 +668,12 @@ impl Render for MainScreen {
         // stays empty (as with the sync banners).
         let detail_column = ui::v_flex()
             .id("detail-slot")
+            .debug_selector(|| "detail-slot".into())
             .flex_1()
             .min_w_0()
             .h_full()
             .relative()
+            .bg(cx.theme().background)
             .when(blocked, |el| {
                 el.child(gpui::div().flex_none().h(header_height(cx)))
             })
@@ -712,6 +718,20 @@ impl Render for MainScreen {
 }
 
 impl MainScreen {
+    /// The sidebar's width in a `viewport`-wide window, mid-slide included (0 collapsed).
+    pub(crate) fn sidebar_width_for(&self, viewport: f32) -> f32 {
+        let sliding = !self.slide.is_done();
+        if !self.seen_sidebar && !sliding {
+            return 0.;
+        }
+        let full = fit_widths(self.widths, viewport, true)[0];
+        if sliding {
+            full * self.slide.current_at(self.slide_clock())
+        } else {
+            full
+        }
+    }
+
     /// Wraps the list's search row so its left inset follows the sidebar slide.
     pub(super) fn slide_header(&self, header: gpui::Div) -> gpui::AnyElement {
         use gpui::AnimationExt as _;

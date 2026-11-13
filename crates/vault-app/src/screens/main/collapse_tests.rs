@@ -1287,3 +1287,73 @@ fn item_window_ring_and_its_entry_on_close(cx: &mut TestAppContext) {
         "entry left behind"
     );
 }
+
+/// The fill of the quad painted at the sidebar column's bounds, as of a fresh frame.
+fn sidebar_column_fill(vcx: &mut VisualTestContext) -> gpui::Hsla {
+    frame(vcx);
+    let area = bounds("sidebar-column", vcx);
+    vcx.update(|window, _| {
+        let scaled = area.scale(window.scale_factor());
+        let near = |a: gpui::ScaledPixels, b: gpui::ScaledPixels| (a.0 - b.0).abs() < 1.;
+        window
+            .painted_quads()
+            .iter()
+            .find(|q| {
+                near(q.bounds.origin.x, scaled.origin.x)
+                    && near(q.bounds.origin.y, scaled.origin.y)
+                    && near(q.bounds.size.width, scaled.size.width)
+                    && near(q.bounds.size.height, scaled.size.height)
+            })
+            .and_then(|q| q.background.as_solid())
+            .expect("sidebar column paints a solid fill")
+    })
+}
+
+/// Sidebar vibrancy (05 §5): a translucent tint in light mode that does not change
+/// when the window loses key status (a switch read as a flash).
+#[gpui::test]
+fn light_sidebar_fill_ignores_window_activation(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, mut vcx) = open(true, dir.path(), cx);
+    vcx.update(|window, _| window.activate_window());
+    vcx.run_until_parked();
+    let active = sidebar_column_fill(&mut vcx);
+    assert!(active.a < 1., "light sidebar is translucent: {active:?}");
+    assert_eq!(active, crate::theme::sidebar_fill(false));
+
+    vcx.deactivate_window();
+    vcx.run_until_parked();
+    assert!(vcx.update(|window, _| !window.is_window_active()));
+    assert_eq!(
+        sidebar_column_fill(&mut vcx),
+        active,
+        "same fill when inactive"
+    );
+}
+
+/// Dark mode: the same translucent tint, also unchanged by window activation.
+#[gpui::test]
+fn dark_sidebar_fill_is_translucent_and_ignores_activation(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        cx.set_global(crate::theme::ThemePrefs {
+            appearance: crate::state::Appearance::Dark,
+            scale: 1.0,
+        })
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, mut vcx) = open(true, dir.path(), cx);
+    vcx.update(|window, _| window.activate_window());
+    vcx.run_until_parked();
+    let active = sidebar_column_fill(&mut vcx);
+    assert!(active.a < 1., "dark sidebar is translucent: {active:?}");
+    assert_eq!(active, crate::theme::sidebar_fill(true));
+
+    vcx.deactivate_window();
+    vcx.run_until_parked();
+    assert!(vcx.update(|window, _| !window.is_window_active()));
+    assert_eq!(
+        sidebar_column_fill(&mut vcx),
+        active,
+        "same fill when inactive"
+    );
+}
