@@ -13,6 +13,8 @@ gpui_kit_assets::icon_assets!(
         StickyNote,
         CreditCard,
         IdCard,
+        // License template (Server is registered below with the item symbols).
+        FileBadge,
         Tag,
         LayoutList,
         GripVertical,
@@ -138,6 +140,14 @@ mod tests {
             AppAssets.load("icons/lock.svg").unwrap().is_some(),
             "icons still load"
         );
+        // The Server and License template icons (05 §2.3) are bundled.
+        for icon in [
+            gpui_kit_assets::IconName::Server,
+            gpui_kit_assets::IconName::FileBadge,
+        ] {
+            let path = icon.path();
+            assert!(AppAssets.load(&path).unwrap().is_some(), "{path}");
+        }
         let strip = AppAssets
             .load(APP_ICON_WHEEL_STRIP)
             .unwrap()

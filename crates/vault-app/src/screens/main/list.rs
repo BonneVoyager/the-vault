@@ -766,6 +766,40 @@ mod tests {
         assert_eq!(pick(1, "space", cx), Some(Template::Note));
     }
 
+    /// ⌘N lists the six templates in spec order (05 §2.3): Login, Note, Card, Identity,
+    /// Server, License, each row with its template icon.
+    #[gpui::test]
+    fn template_menu_lists_six_rows_in_order(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut vcx) = open(dir.path(), cx);
+        vcx.simulate_keystrokes("cmd-n");
+        vcx.run_until_parked();
+        assert!(state.read_with(&vcx, |s, _| s.template_picker.is_some()));
+        let tops: Vec<_> = ["login", "note", "card", "identity", "server", "license"]
+            .into_iter()
+            .map(|tag| {
+                let sel: &'static str = Box::leak(format!("new-{tag}").into());
+                vcx.debug_bounds(sel)
+                    .unwrap_or_else(|| panic!("{sel} row"))
+                    .top()
+            })
+            .collect();
+        assert!(tops.windows(2).all(|w| w[0] < w[1]), "{tops:?}");
+        assert!(vcx.debug_bounds("new-other").is_none());
+        assert_eq!(Template::ALL.len(), 6);
+    }
+
+    /// Server and License are picked like any template: their preset fields and tag.
+    #[gpui::test]
+    fn template_picker_offers_server(cx: &mut TestAppContext) {
+        assert_eq!(pick(4, "enter", cx), Some(Template::Server));
+    }
+
+    #[gpui::test]
+    fn template_picker_offers_license(cx: &mut TestAppContext) {
+        assert_eq!(pick(5, "enter", cx), Some(Template::License));
+    }
+
     /// "No results" offers "Create '<query>'": it opens the Templates menu, and the
     /// picked template starts a new item titled with the query.
     #[gpui::test]

@@ -462,6 +462,26 @@ mod tests {
         );
     }
 
+    /// A Server shows its Username as the subtitle like a Login (05 §2.3); a License has
+    /// no rule of its own, so its masked key never shows.
+    #[test]
+    fn server_subtitle_is_its_username_and_license_has_none() {
+        use crate::templates::Template;
+        let mut server = Template::Server.new_item("db1", Uuid::new_v4(), 1);
+        server.fields[0].value = SecretString::new("ssh://db1.example.com".into());
+        server.fields[1].value = SecretString::new("root".into());
+        server.fields[2].value = SecretString::new("hunter2".into());
+        assert_eq!(subtitle(&server), "root");
+        assert_eq!(
+            username_field(&server).map(|f| f.name.as_str()),
+            Some("Username")
+        );
+        let mut license = Template::License.new_item("App", Uuid::new_v4(), 1);
+        license.fields[0].value = SecretString::new("2.1".into());
+        license.fields[1].value = SecretString::new("ABCD-EFGH".into());
+        assert!(!subtitle(&license).contains("ABCD"));
+    }
+
     #[test]
     fn subtitles() {
         let mut card =

@@ -279,8 +279,10 @@ mod tests {
         for (tag, icon) in [
             ("card", "CreditCard"),
             ("identity", "IdCard"),
+            ("license", "FileBadge"),
             ("login", "KeyRound"),
             ("note", "StickyNote"),
+            ("server", "Server"),
             ("work", "Tag"),
         ] {
             let sel: &'static str = Box::leak(format!("nav #{tag} icon={icon}").into());
@@ -291,8 +293,8 @@ mod tests {
             last = row.top();
         }
         state.read_with(&vcx, |s, _| {
-            assert_eq!(s.counts.all, 5);
-            assert_eq!(s.counts.tags.len(), 5);
+            assert_eq!(s.counts.all, 7);
+            assert_eq!(s.counts.tags.len(), 7);
         });
     }
 

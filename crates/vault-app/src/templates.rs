@@ -11,14 +11,18 @@ pub enum Template {
     Note,
     Card,
     Identity,
+    Server,
+    License,
 }
 
 impl Template {
-    pub const ALL: [Template; 4] = [
+    pub const ALL: [Template; 6] = [
         Template::Login,
         Template::Note,
         Template::Card,
         Template::Identity,
+        Template::Server,
+        Template::License,
     ];
 
     /// Menu label.
@@ -28,6 +32,8 @@ impl Template {
             Template::Note => "Note",
             Template::Card => "Card",
             Template::Identity => "Identity",
+            Template::Server => "Server",
+            Template::License => "License",
         }
     }
 
@@ -38,6 +44,8 @@ impl Template {
             Template::Note => "note",
             Template::Card => "card",
             Template::Identity => "identity",
+            Template::Server => "server",
+            Template::License => "license",
         }
     }
 
@@ -47,6 +55,8 @@ impl Template {
             Template::Note => IconName::StickyNote,
             Template::Card => IconName::CreditCard,
             Template::Identity => IconName::IdCard,
+            Template::Server => IconName::Server,
+            Template::License => IconName::FileBadge,
         }
     }
 
@@ -75,6 +85,17 @@ impl Template {
                 ("Email", FieldKind::Email),
                 ("Phone", FieldKind::Text),
                 ("Address", FieldKind::Notes),
+            ],
+            Template::Server => &[
+                ("URL", FieldKind::Url),
+                ("Username", FieldKind::Text),
+                ("Password", FieldKind::Password),
+                ("Notes", FieldKind::Notes),
+            ],
+            Template::License => &[
+                ("Version", FieldKind::Text),
+                ("License key", FieldKind::Password),
+                ("Website", FieldKind::Url),
             ],
         }
     }
@@ -116,7 +137,7 @@ pub fn has_tag(tags: &[String], tag: &str) -> bool {
     tags.iter().any(|t| tag_matches(t, tag))
 }
 
-/// Sidebar glyph for a tag: the template icon for the four template tags, else the
+/// Sidebar glyph for a tag: the template icon for the six template tags, else the
 /// generic tag glyph.
 pub fn tag_icon(tag: &str) -> IconName {
     Template::ALL
@@ -187,6 +208,37 @@ mod tests {
             names(Template::Identity),
             ["First name", "Last name", "Email", "Phone", "Address"]
         );
+        // Server and License (05 §2.3, owner decision 2026-11-15), appended after Identity.
+        assert_eq!(
+            Template::ALL.map(Template::label),
+            ["Login", "Note", "Card", "Identity", "Server", "License"]
+        );
+        assert_eq!(
+            Template::Server.fields(),
+            [
+                ("URL", FieldKind::Url),
+                ("Username", FieldKind::Text),
+                ("Password", FieldKind::Password),
+                ("Notes", FieldKind::Notes),
+            ]
+        );
+        assert_eq!(
+            Template::License.fields(),
+            [
+                ("Version", FieldKind::Text),
+                ("License key", FieldKind::Password),
+                ("Website", FieldKind::Url),
+            ]
+        );
+        assert_eq!(Template::Server.tag(), "server");
+        assert_eq!(Template::License.tag(), "license");
+        // A server or license is not a card: nothing is masked beyond its field kinds.
+        assert!(!is_card(&Template::Server.new_item("s", Uuid::new_v4(), 1)));
+        assert!(!is_card(&Template::License.new_item(
+            "l",
+            Uuid::new_v4(),
+            1
+        )));
         for t in Template::ALL {
             for (name, _) in t.fields() {
                 assert_eq!(*name, crate::text::capitalize_first(name), "{name}");
@@ -255,6 +307,9 @@ mod tests {
         assert_eq!(tag_icon("Note"), IconName::StickyNote);
         assert_eq!(tag_icon("CARD"), IconName::CreditCard);
         assert_eq!(tag_icon("identity"), IconName::IdCard);
+        assert_eq!(tag_icon("server"), IconName::Server);
+        assert_eq!(tag_icon(" License "), IconName::FileBadge);
+        assert_eq!(tag_icon("servers"), IconName::Tag);
         assert_eq!(tag_icon("logins"), IconName::Tag);
         assert_eq!(tag_icon("work"), IconName::Tag);
     }
