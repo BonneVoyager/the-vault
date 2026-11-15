@@ -232,13 +232,17 @@ impl ItemWindow {
                 cx.notify();
             }
             DetailAction::Copy(target) => self.copy(target, cx),
-            DetailAction::CopyHistory(stamp) => {
+            DetailAction::CopyHistory(stamp, field) => {
                 let ix = self
                     .state
                     .read(cx)
                     .unlocked_vault()
                     .and_then(|v| v.get(self.id))
-                    .and_then(|item| item.history.iter().position(|h| h.replaced_at == stamp));
+                    .and_then(|item| {
+                        item.history
+                            .iter()
+                            .position(|h| h.replaced_at == stamp && h.field_id == field)
+                    });
                 if let Some(ix) = ix {
                     self.copy(CopyTarget::History(ix), cx);
                 }

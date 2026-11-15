@@ -48,7 +48,7 @@ pub struct ItemIcon { pub kind: String, pub value: String, pub color: Option<Str
 pub struct Field {
     pub id: Uuid,                // stable identity (2026-10-31); random v4 from Field::new; derived for version 1 files (01 §9)
     pub name: String,            // a label: not unique within an item, may be empty
-    pub kind: FieldKind,         // Copy; `Other` for unknown; `is_sensitive()` = Password | Totp | Other (Section is never sensitive); ALL has 9 entries incl. Section
+    pub kind: FieldKind,         // Copy; `Other` for unknown; `is_sensitive()` = Password | Pin | Totp | Other (Section is never sensitive); ALL has 10 entries incl. Pin (2026-11-15) and Section
     pub kind_raw: Option<String>,// as on Item
     pub value: SecretString,     // secrecy; Display is redacted
     pub modified_at: Millis,
@@ -129,7 +129,7 @@ pub struct MergeReport { pub added: usize, pub updated: usize, pub deleted: usiz
 
 `now` is always passed in — the core never calls the clock. Tests pass fixed values.
 
-`set_field` on a `password`-kind field pushes the previous value onto `history` (cap 10).
+`set_field` on a `password`- or `pin`-kind field (pin since 2026-11-15, owner decision: PINs keep the history disclosure) pushes the previous value onto `history` (cap 10).
 
 `update` recomputes `item.modified_at = max(all field.modified_at, deleted_at, now)` after `f` runs. It diffs fields by id against the pre-call copy: a field whose name, kind, value or section changed without a bumped `modified_at` is bumped to `now` (a rename is an edit, not a delete + add); an id that vanished gets a `removed_fields` marker stamped `now`; a re-added id is stamped past its marker and the marker dropped; a duplicate id within an item is rejected and the item restored. `Item::field(name)` returns the first non-Section field whose name matches ASCII case-insensitively (an empty name never matches); `Item::field_by_id(id)` is the identity lookup.
 

@@ -459,6 +459,12 @@ fn history_trash_buttons_only_in_edit_mode(cx: &mut TestAppContext) {
     });
     assert!(vcx.debug_bounds("history-remove 0").is_none());
     assert!(vcx.debug_bounds("history-clear").is_none());
+    // The disclosure stays, reading "(0) · 2 removed on save".
+    assert!(vcx.debug_bounds("history-toggle").is_some(), "toggle kept");
+    assert!(
+        vcx.debug_bounds("history-removed 2").is_some(),
+        "removed note"
+    );
 }
 
 #[gpui::test]
@@ -2088,4 +2094,228 @@ fn edit_header_and_tags_stay_pinned_while_fields_scroll(cx: &mut TestAppContext)
     assert_ne!(row3, row, "adding a field scrolled the rows");
     assert_eq!(title3, title, "title moved after add");
     assert_eq!(tags3, tags, "tags row moved after add");
+}
+
+/// 05 §2.3 `pin` (owner 2026-11-15): in edit mode a PIN row has the masked input with
+/// the reveal eye like a password, but no Generate button, no strength meter and no
+/// password notices, even when short and reused; "Add field" lists "PIN" right after
+/// Password, and a new PIN row is named "PIN".
+#[gpui::test]
+fn pin_row_has_no_generate_meter_or_notices(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let pin = |item: &mut vault_core::Item| {
+        item.fields.push(vault_core::Field::new(
+            "CVV",
+            FieldKind::Pin,
+            SecretString::new("12".into()),
+            10,
+        ));
+    };
+    let mut other = pw_login("Other", "123", &state, &vcx);
+    pin(&mut other);
+    insert_and_select(&state, other, &mut vcx);
+    let mut item = pw_login("Bank", "123", &state, &vcx);
+    pin(&mut item);
+    let pin_field = item.fields[1].id;
+    insert_and_select(&state, item, &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let (pw_key, pin_key) = state.read_with(&vcx, |s, _| {
+        let b = s.edit_buffer().unwrap();
+        (b.keys[0], b.keys[1])
+    });
+
+    // The password row keeps both controls; the PIN row has neither.
+    assert!(
+        vcx.debug_bounds(leak(format!("generate-btn {pw_key}")))
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds(leak(format!("strength-meter {pw_key}")))
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds(leak(format!("generate-btn {pin_key}")))
+            .is_none()
+    );
+    assert!(
+        vcx.debug_bounds(leak(format!("strength-meter {pin_key}")))
+            .is_none()
+    );
+    for title in ["Weak Password", "Reused Password"] {
+        let key = leak(format!("issue-strip {pin_field} {title}"));
+        assert!(vcx.debug_bounds(key).is_none(), "{title}");
+    }
+    let input = value_input(&main, pin_key, &mut vcx);
+    vcx.update(|_, cx| assert!(ui::input_is_masked(&input, cx), "PIN is masked"));
+    // Any characters, not only digits.
+    retype(&input, "AB-12 x", &mut vcx);
+    state.read_with(&vcx, |s, _| {
+        let b = s.edit_buffer().unwrap();
+        assert_eq!(b.field(pin_key).unwrap().value.expose_secret(), "AB-12 x");
+    });
+    // The generator refuses a PIN row as its target.
+    state.update(&mut vcx, |s, cx| {
+        s.open_generator(GeneratorTarget::Field(pin_key), cx)
+    });
+    assert!(state.read_with(&vcx, |s, _| s.generator_target.is_none()));
+
+    // "Add field": PIN directly under Password, labelled "PIN"; the new row is "PIN".
+    click(&mut vcx, "add-field".into());
+    let top = |vcx: &mut VisualTestContext, k: &str| {
+        vcx.debug_bounds(leak(format!("add-field-{k}")))
+            .expect(k)
+            .top()
+    };
+    let (pw, pn, totp) = (
+        top(&mut vcx, "password"),
+        top(&mut vcx, "pin"),
+        top(&mut vcx, "totp"),
+    );
+    assert!(pw < pn && pn < totp, "{pw:?} {pn:?} {totp:?}");
+    click(&mut vcx, "add-field-pin".into());
+    state.read_with(&vcx, |s, _| {
+        let b = s.edit_buffer().unwrap();
+        let f = b.item.fields.last().unwrap();
+        assert_eq!((f.kind, f.name.as_str()), (FieldKind::Pin, "PIN"));
+    });
+}
+
+/// 05 §2.3 `pin` history (2026-11-15): editing a PIN and a password in one save records
+/// one entry each; read mode shows the PIN's under the PIN row (own toggle, field name,
+/// copy) and the password's under the password row. ⌘⇧R reveals the password, never the
+/// PIN.
+#[gpui::test]
+fn pin_and_password_edits_keep_separate_history_rows(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let mut item = pw_login("Card", "pw-old", &state, &vcx);
+    item.fields.push(vault_core::Field::new(
+        "CVV",
+        FieldKind::Pin,
+        SecretString::new("111".into()),
+        10,
+    ));
+    let (pw_id, pin_id) = (item.fields[0].id, item.fields[1].id);
+    let id = insert_and_select(&state, item, &mut vcx);
+    let board = crate::clipboard::fake::FakePasteboard::default();
+    state.update(&mut vcx, |s, _| s.set_pasteboard(Box::new(board.clone())));
+
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let keys = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().keys.clone());
+    retype(&value_input(&main, keys[0], &mut vcx), "pw-new", &mut vcx);
+    retype(&value_input(&main, keys[1], &mut vcx), "222", &mut vcx);
+    vcx.simulate_keystrokes("cmd-s");
+    vcx.run_until_parked();
+
+    state.update(&mut vcx, |s, cx| {
+        let item = s.unlocked_vault().unwrap().get(id).unwrap();
+        let old = |field| {
+            let h = item.history.iter().find(|h| h.field_id == Some(field));
+            h.map(|h| (h.value.expose_secret().to_owned(), h.replaced_at))
+        };
+        let pin_modified = item.field_by_id(pin_id).unwrap().modified_at;
+        assert_eq!(old(pin_id), Some(("111".to_owned(), pin_modified)));
+        assert_eq!(old(pw_id).map(|o| o.0).as_deref(), Some("pw-old"));
+        assert_eq!(item.history.len(), 2);
+        s.toggle_history(cx);
+    });
+    vcx.run_until_parked();
+
+    // One disclosure per row, each directly under its own row.
+    let at = |vcx: &mut VisualTestContext, k: &str| vcx.debug_bounds(leak(k.into())).expect(k);
+    let (pw_row, pin_row) = (at(&mut vcx, "field-value 0"), at(&mut vcx, "field-value 1"));
+    let pw_toggle = at(&mut vcx, "history-toggle");
+    let pin_toggle = at(&mut vcx, "history-toggle pin1");
+    assert!(pw_row.bottom() <= pw_toggle.top() && pw_toggle.bottom() <= pin_row.top());
+    assert!(pin_row.bottom() <= pin_toggle.top());
+    at(&mut vcx, "history-entry 0 Password");
+    at(&mut vcx, "history-entry 0 CVV pin1");
+    assert!(
+        vcx.debug_bounds("history-entry 1 Password").is_none(),
+        "one each"
+    );
+    assert!(vcx.debug_bounds("history-entry 1 CVV pin1").is_none());
+
+    // Both entries carry the same stamp today (one save); copy is keyed by stamp and
+    // field id, so this still holds once core gives each entry a unique stamp.
+    click(&mut vcx, "history-copy 0 pin1".into());
+    assert_eq!(board.contents().as_deref(), Some("111"));
+    click(&mut vcx, "history-copy 0".into());
+    assert_eq!(board.contents().as_deref(), Some("pw-old"));
+
+    vcx.simulate_keystrokes("cmd-shift-r");
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| {
+        assert!(s.revealed.contains(&pw_id));
+        assert!(!s.revealed.contains(&pin_id), "⌘⇧R is password-only");
+    });
+}
+
+/// "Clear history" under a PIN's disclosure marks only that PIN's entries: the password's
+/// history is untouched and each disclosure counts its own pending removals. Stamps differ
+/// per field here (separate saves) so the per-stamp removal cannot cross fields.
+#[gpui::test]
+fn clearing_pin_history_leaves_the_password_history(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    let mut item = pw_login("Card", "pw-a", &state, &vcx);
+    item.fields.push(vault_core::Field::new(
+        "CVV",
+        FieldKind::Pin,
+        SecretString::new("111".into()),
+        10,
+    ));
+    let (pw_id, pin_id) = (item.fields[0].id, item.fields[1].id);
+    let id = insert_and_select(&state, item, &mut vcx);
+    state.update(&mut vcx, |s, cx| {
+        s.vault
+            .as_mut()
+            .unwrap()
+            .edit(|v| {
+                v.set_field(id, pw_id, SecretString::new("pw-b".into()), 20)?;
+                v.set_field(id, pin_id, SecretString::new("222".into()), 30)?;
+                v.set_field(id, pin_id, SecretString::new("333".into()), 40)
+            })
+            .unwrap()
+            .unwrap();
+        s.vault_changed();
+        s.select(id, cx);
+        s.toggle_history(cx);
+        s.begin_edit(cx);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("history-remove 1 pin1").is_some());
+    click(&mut vcx, "history-clear pin1".into());
+
+    state.read_with(&vcx, |s, _| {
+        let b = s.edit_buffer().unwrap();
+        let left: Vec<_> = b.history().map(|h| h.field_id).collect();
+        assert_eq!(left, [Some(pw_id)], "only the password's entry remains");
+        assert_eq!(b.removed_history.len(), 2);
+    });
+    assert!(
+        vcx.debug_bounds("history-removed 2 pin1").is_some(),
+        "PIN count"
+    );
+    assert!(
+        vcx.debug_bounds("history-toggle pin1").is_some(),
+        "PIN toggle kept"
+    );
+    assert!(vcx.debug_bounds("history-removed 2").is_none());
+    assert!(
+        vcx.debug_bounds("history-remove 0").is_some(),
+        "password entry kept"
+    );
+    assert!(vcx.debug_bounds("history-clear").is_some());
+
+    vcx.simulate_keystrokes("cmd-s");
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| {
+        let item = s.unlocked_vault().unwrap().get(id).unwrap();
+        let ids: Vec<_> = item.history.iter().map(|h| h.field_id).collect();
+        assert_eq!(ids, [Some(pw_id)]);
+    });
 }

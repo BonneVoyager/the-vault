@@ -189,6 +189,57 @@ fn set_field_password_pushes_history_newest_first_capped() {
 }
 
 #[test]
+fn set_field_pin_pushes_history_with_field_id_and_skips_removed_stamps() {
+    // 02 "write" (2026-11-15): a `pin` field keeps history exactly like `password`.
+    let (mut v, id) = vault_with_item(1_000);
+    let pin = Field::new("pin", FieldKind::Pin, secret("1234"), 1_000);
+    let pin_id = pin.id;
+    v.update(id, 1_000, |item| item.fields.push(pin)).unwrap();
+    assert!(v.get(id).unwrap().history.is_empty());
+
+    v.set_field(id, pin_id, secret("5678"), 2_000).unwrap();
+    let item = v.get(id).unwrap();
+    let f = item.field_by_id(pin_id).unwrap();
+    assert_eq!(f.kind, FieldKind::Pin);
+    assert_eq!(f.value.expose_secret(), "5678");
+    assert_eq!(f.modified_at, 2_000);
+    assert_eq!(item.modified_at, 2_000);
+    assert_eq!(item.history.len(), 1);
+    assert_eq!(item.history[0].value.expose_secret(), "1234");
+    assert_eq!(item.history[0].replaced_at, 2_000);
+    assert_eq!(item.history[0].field_id, Some(pin_id));
+
+    // Removed-stamp guard, crafted as for `password` in history.rs: delete the entry, move
+    // the field's stamp back by hand, set again; the new stamp skips the removed 2_000.
+    v.remove_history_entry(id, 2_000, 3_000).unwrap();
+    assert_eq!(v.get(id).unwrap().removed_history, vec![2_000]);
+    assert!(v.get(id).unwrap().history.is_empty());
+    v.update(id, 3_001, |item| {
+        item.fields
+            .iter_mut()
+            .find(|f| f.id == pin_id)
+            .unwrap()
+            .modified_at = 1_999;
+    })
+    .unwrap();
+    v.set_field(id, pin_id, secret("9999"), 100).unwrap();
+    let item = v.get(id).unwrap();
+    assert_eq!(item.history.len(), 1);
+    assert_eq!(item.history[0].replaced_at, 2_001, "2_000 skipped");
+    assert_eq!(item.history[0].value.expose_secret(), "5678");
+    assert_eq!(item.history[0].field_id, Some(pin_id));
+    assert_eq!(item.field_by_id(pin_id).unwrap().modified_at, 2_001);
+    assert_eq!(item.removed_history, vec![2_000]);
+
+    // A text field on the same item still writes no history.
+    v.set_field_named(id, "username", secret("u2"), 4_000)
+        .unwrap();
+    let item = v.get(id).unwrap();
+    assert_eq!(item.history.len(), 1);
+    assert_eq!(item.field("username").unwrap().modified_at, 4_000);
+}
+
+#[test]
 fn delete_tombstones_and_purge() {
     let mut v = new_vault();
     let a = v.insert(sample_item(1, 1_000), 1_000);

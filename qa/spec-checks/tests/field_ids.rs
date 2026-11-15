@@ -547,10 +547,23 @@ fn fi07_remove_field_markers_cap_and_order() {
 
 /// 01 §4 Field kind "section": "a visual heading; name is the heading text, value is empty and
 /// ignored (core stores it as given); never sensitive; skipped by CSV export and search; set_field
-/// on it writes no history". 02 FieldKind ALL has 9 entries incl. Section; Other is sensitive.
+/// on it writes no history". 02 FieldKind ALL has 10 entries incl. Section and Pin (Pin right
+/// after Password, on-disk "pin", sensitive); Other is sensitive.
 #[test]
 fn fi08_section_kind() {
-    assert_eq!(FieldKind::ALL.len(), 9);
+    assert_eq!(FieldKind::ALL.len(), 10);
+    assert_eq!(FieldKind::parse("pin"), Some(FieldKind::Pin));
+    assert_eq!(FieldKind::Pin.as_str(), "pin");
+    assert!(FieldKind::Pin.is_sensitive());
+    let pi = FieldKind::ALL
+        .iter()
+        .position(|k| *k == FieldKind::Password)
+        .unwrap();
+    assert_eq!(
+        FieldKind::ALL[pi + 1],
+        FieldKind::Pin,
+        "Pin sits right after Password"
+    );
     assert!(FieldKind::ALL.contains(&FieldKind::Section));
     assert!(!FieldKind::Section.is_sensitive());
     assert!(FieldKind::Password.is_sensitive() && FieldKind::Totp.is_sensitive());

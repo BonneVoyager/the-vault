@@ -43,7 +43,9 @@ const TAGS_MAX_H: f32 = 64.;
 #[derive(Clone)]
 pub(crate) enum DetailAction {
     Copy(CopyTarget),
-    CopyHistory(u64),
+    /// A history entry by `(replaced_at, field_id)`: entries of two fields saved in one
+    /// edit share a stamp.
+    CopyHistory(u64, Option<Uuid>),
     Reveal(Uuid),
     OpenUrl(usize),
     ToggleHistory,
@@ -59,11 +61,12 @@ impl DetailActions {
         Self(Rc::new(move |action, cx| {
             state.update(cx, |s, cx| match action {
                 DetailAction::Copy(target) => s.copy(target, cx),
-                DetailAction::CopyHistory(stamp) => {
-                    if let Some(ix) = s
-                        .viewed_item()
-                        .and_then(|item| item.history.iter().position(|h| h.replaced_at == stamp))
-                    {
+                DetailAction::CopyHistory(stamp, field) => {
+                    if let Some(ix) = s.viewed_item().and_then(|item| {
+                        item.history
+                            .iter()
+                            .position(|h| h.replaced_at == stamp && h.field_id == field)
+                    }) {
                         s.copy(CopyTarget::History(ix), cx);
                     }
                 }
@@ -598,10 +601,6 @@ impl ReadDetail<'_> {
         } else {
             text::short_id(item.device_id)
         };
-        let first_password = item
-            .fields
-            .iter()
-            .position(|f| f.kind == FieldKind::Password);
         // Recently Deleted: read-only, no header buttons; Recover / Delete in a card under the title.
         let trashed = item.is_deleted();
 
@@ -667,8 +666,8 @@ impl ReadDetail<'_> {
         let mut fields: Vec<AnyElement> = Vec::with_capacity(item.fields.len() + 1);
         for (ix, field) in item.fields.iter().enumerate() {
             fields.push(self.render_field(ix, field, item, now, cx));
-            if Some(ix) == first_password && !item.history.is_empty() {
-                fields.push(self.render_history(item, now, cx));
+            if let Some(history) = self.render_history(item, ix, now, cx) {
+                fields.push(history);
             }
         }
 
@@ -804,11 +803,12 @@ impl ReadDetail<'_> {
             }
             // A field kind from a newer app version may hold a secret: keep it concealed
             // behind the same reveal toggle as a password.
-            FieldKind::Password | FieldKind::Other => {
-                let what = if field.kind == FieldKind::Password {
-                    "password  ⌘⇧R"
-                } else {
-                    "value"
+            // A PIN renders like a password (05 §2.3 `pin`); ⌘⇧R stays password-only.
+            FieldKind::Password | FieldKind::Pin | FieldKind::Other => {
+                let what = match field.kind {
+                    FieldKind::Password => "password  ⌘⇧R",
+                    FieldKind::Pin => "PIN",
+                    _ => "value",
                 };
                 buttons.push(
                     reveal_button(ix, field.id, revealed, what, &self.actions).into_any_element(),
@@ -953,12 +953,21 @@ impl ReadDetail<'_> {
             .into_any_element()
     }
 
-    fn render_history(&self, item: &Item, now: u64, cx: &App) -> AnyElement {
-        let entries: Vec<&HistoryEntry> = item.history.iter().collect();
-        history_view(
+    /// The history disclosure under row `row`, when it owns any entries.
+    fn render_history(&self, item: &Item, row: usize, now: u64, cx: &App) -> Option<AnyElement> {
+        let entries: Vec<&HistoryEntry> = item
+            .history
+            .iter()
+            .filter(|h| history_row(&item.fields, h) == Some(row))
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        Some(history_view(
             History {
                 entries: &entries,
                 fields: &item.fields,
+                row,
             },
             None,
             self.state,
@@ -966,8 +975,22 @@ impl ReadDetail<'_> {
             self.actions.clone(),
             now,
             cx,
-        )
+        ))
     }
+}
+
+/// The row whose disclosure shows history entry `h` (05 §2.3): a PIN's entries sit under
+/// that PIN row; every other entry under the first password row, as before PINs, or the
+/// first PIN row when there is no password (a removed PIN's entries on a Card).
+pub(super) fn history_row(fields: &[Field], h: &HistoryEntry) -> Option<usize> {
+    h.field_id
+        .and_then(|id| {
+            fields
+                .iter()
+                .position(|f| f.id == id && f.kind == FieldKind::Pin)
+        })
+        .or_else(|| fields.iter().position(|f| f.kind == FieldKind::Password))
+        .or_else(|| fields.iter().position(|f| f.kind == FieldKind::Pin))
 }
 
 /// Password history disclosure (§2.3): a toggle and, when open, the previous values
@@ -993,16 +1016,18 @@ pub(super) fn history_disclosure(
     )
 }
 
-/// Password history entries and the item's fields (to name the field each belonged to).
+/// History entries of row `row` and the item's fields (to name the field each belonged to).
 pub(super) struct History<'a> {
     pub entries: &'a [&'a HistoryEntry],
     pub fields: &'a [Field],
+    pub row: usize,
 }
 
 fn history_view(
     History {
         entries: history,
         fields,
+        row,
     }: History<'_>,
     removed: Option<usize>,
     state: &Entity<AppState>,
@@ -1015,11 +1040,21 @@ fn history_view(
     let editing = removed.is_some();
     let count = history.len().min(HISTORY_SHOWN);
     let pending = removed.unwrap_or(0);
+    // A PIN row's disclosure: its own label and selectors (" pin<row>" suffix); one shared
+    // open flag for the item.
+    let pin = fields.get(row).is_some_and(|f| f.kind == FieldKind::Pin);
+    let (what, sfx, id_sfx) = if pin {
+        ("PIN", format!(" pin{row}"), format!("-pin{row}"))
+    } else {
+        ("Password", String::new(), String::new())
+    };
+    let id = |name: &str| SharedString::from(format!("{name}{id_sfx}"));
     let toggle = {
         let actions = actions.clone();
+        let (sfx, note_sfx) = (sfx.clone(), sfx.clone());
         ui::h_flex()
-            .id("history-toggle")
-            .debug_selector(|| "history-toggle".into())
+            .id(id("history-toggle"))
+            .debug_selector(move || format!("history-toggle{sfx}"))
             .tab_index(0)
             .gap(px(4.))
             .py(px(6.))
@@ -1036,9 +1071,14 @@ fn history_view(
                 })
                 .size_3(),
             )
-            .child(format!("Password history ({count})"))
+            .child(format!("{what} history ({count})"))
             .when(pending > 0, |row| {
-                row.child(format!("\u{b7} {pending} removed on save"))
+                // Tests read the count from the selector (no painted-text API).
+                row.child(
+                    div()
+                        .debug_selector(move || format!("history-removed {pending}{note_sfx}"))
+                        .child(format!("\u{b7} {pending} removed on save")),
+                )
             })
             .on_click(move |_, _, cx| (actions.0)(DetailAction::ToggleHistory, cx))
     };
@@ -1048,7 +1088,7 @@ fn history_view(
         .take(HISTORY_SHOWN)
         .enumerate()
         .map(|(j, h)| {
-            let stamp = h.replaced_at;
+            let (stamp, field_id) = (h.replaced_at, h.field_id);
             // Version 2 entries know their field: say which one (its name now, or that it
             // was removed). Entries without a field id read as before.
             let field = h.field_id.map(|id| {
@@ -1059,23 +1099,31 @@ fn history_view(
             });
             let copy = {
                 let actions = actions.clone();
+                let sfx = sfx.clone();
                 // By stamp in the stored item: in edit mode the shown list skips removals.
                 ui::icon_button(
-                    ("history-copy", j),
+                    (id("history-copy"), j),
                     IconName::Copy,
-                    "Copy previous password",
+                    if pin {
+                        "Copy previous PIN"
+                    } else {
+                        "Copy previous password"
+                    },
                 )
-                .debug_selector(move || format!("history-copy {j}"))
-                .on_click(move |_, _, cx| (actions.0)(DetailAction::CopyHistory(stamp), cx))
+                .debug_selector(move || format!("history-copy {j}{sfx}"))
+                .on_click(move |_, _, cx| {
+                    (actions.0)(DetailAction::CopyHistory(stamp, field_id), cx)
+                })
             };
             let remove = editing.then(|| {
                 let state = state.clone();
+                let sfx = sfx.clone();
                 ui::icon_button(
-                    ("history-remove", j),
+                    (id("history-remove"), j),
                     IconName::Trash,
                     "Remove from history",
                 )
-                .debug_selector(move || format!("history-remove {j}"))
+                .debug_selector(move || format!("history-remove {j}{sfx}"))
                 .on_click(move |_, _, cx| {
                     state.update(cx, |s, cx| s.edit(cx, |b| b.remove_history(stamp)))
                 })
@@ -1100,7 +1148,7 @@ fn history_view(
                     };
                     // Tests read which field the entry names ("-" when it names none).
                     let selector = format!(
-                        "history-entry {j} {}",
+                        "history-entry {j} {}{sfx}",
                         field.as_deref().filter(|n| !n.is_empty()).unwrap_or("-")
                     );
                     // The line gives way (truncated) before the buttons do.
@@ -1113,17 +1161,22 @@ fn history_view(
                 .children(remove.map(|r| div().flex_none().child(r)))
         });
 
+    // Marks only this disclosure's entries.
+    let stamps: Vec<_> = history.iter().map(|h| h.replaced_at).collect();
+    let clear_sfx = sfx.clone();
     let clear = (editing && count > 0).then(|| {
         let state = state.clone();
         ui::h_flex().pl(px(18.)).pt(px(2.)).child(
-            Button::new("history-clear")
-                .debug_selector(|| "history-clear".into())
+            Button::new(id("history-clear"))
+                .debug_selector(move || format!("history-clear{clear_sfx}"))
                 .link()
                 .xsmall()
                 .label("Clear history")
                 .clickable()
                 .on_click(move |_, _, cx| {
-                    state.update(cx, |s, cx| s.edit(cx, |b| b.clear_history()))
+                    state.update(cx, |s, cx| {
+                        s.edit(cx, |b| b.clear_history(|h| stamps.contains(&h.replaced_at)))
+                    })
                 }),
         )
     });

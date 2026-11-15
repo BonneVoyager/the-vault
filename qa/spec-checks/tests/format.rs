@@ -132,6 +132,7 @@ fn f02_independent_crypto_opens_file() {
                 [
                     "text",
                     "password",
+                    "pin",
                     "totp",
                     "url",
                     "notes",

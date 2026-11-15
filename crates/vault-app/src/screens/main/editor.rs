@@ -540,7 +540,10 @@ impl Editor {
 
         let value: Option<AnyElement> = match &row.value {
             ValueInput::Line(input) => {
-                let masked = matches!(field.kind, FieldKind::Password | FieldKind::Totp);
+                let masked = matches!(
+                    field.kind,
+                    FieldKind::Password | FieldKind::Pin | FieldKind::Totp
+                );
                 Some(
                     ui::input(input)
                         .small()
@@ -574,7 +577,8 @@ impl Editor {
                     ("generate-btn", key),
                     IconName::WandSparkles,
                     "Generate password  ⌘G",
-                ),
+                )
+                .debug_selector(move || format!("generate-btn {key}")),
                 Anchor::TopRight,
                 open,
                 move |open, _, cx| {
@@ -678,10 +682,15 @@ impl Editor {
             })
             .children(totp_hint(key, buffer, cx).filter(|_| !is_ghost))
             .when(!is_ghost && field.kind == FieldKind::Password, |col| {
-                col.child(div().pl(px(22.)).child(ui::strength_meter(
-                    strength_bits(field.value.expose_secret()),
-                    cx,
-                )))
+                col.child(
+                    div()
+                        .debug_selector(move || format!("strength-meter {key}"))
+                        .pl(px(22.))
+                        .child(ui::strength_meter(
+                            strength_bits(field.value.expose_secret()),
+                            cx,
+                        )),
+                )
                 // Password notices follow the typed value; reuse is checked against the
                 // saved items other than this one (05 §2.3 "Password notices").
                 .children(issue_strips(field, buffer, s, cx))
@@ -856,6 +865,7 @@ fn remote_badge(id: impl Into<gpui::ElementId>) -> impl IntoElement {
 fn value_placeholder(kind: FieldKind) -> &'static str {
     match kind {
         FieldKind::Password => "Password",
+        FieldKind::Pin => "PIN",
         FieldKind::Totp => "otpauth:// URI or secret",
         FieldKind::Url => "https://",
         FieldKind::Email => "name@example.com",
@@ -910,35 +920,44 @@ impl Render for Editor {
             Mode::New(kind, _) => Some(kind),
             _ => None,
         };
-        // Password history sits under the first password row, as in read mode, with
-        // per-entry remove buttons (edit mode only; a new item has no history).
-        let history_after = (new_kind.is_none() && !buffer.item.history.is_empty())
-            .then(|| {
-                buffer
-                    .item
-                    .fields
-                    .iter()
-                    .position(|f| f.kind == FieldKind::Password)
-            })
-            .flatten()
-            .and_then(|i| buffer.keys.get(i).copied());
+        // History sits under its row as in read mode (a PIN's under that PIN, the rest
+        // under the first password), with per-entry remove buttons (edit mode only; a new
+        // item has no history).
         let mut rows: Vec<AnyElement> = Vec::with_capacity(self.rows.len() + 1);
+        let fields = &buffer.item.fields;
         for (ix, row) in self.rows.iter().enumerate() {
             rows.push(self.render_row(ix, row, buffer, s, cx));
-            if history_after == Some(row.key) {
-                let history: Vec<_> = buffer.history().collect();
-                rows.push(history_disclosure(
-                    super::detail::History {
-                        entries: &history,
-                        fields: &buffer.item.fields,
-                    },
-                    Some(buffer.removed_history.len()),
-                    s,
-                    &self.state,
-                    text::now_millis(),
-                    cx,
-                ));
+            // The row's field index, by key (not by assuming row order).
+            let Some(at) = buffer.keys.iter().position(|k| *k == row.key) else {
+                continue;
+            };
+            let mine =
+                |h: &&vault_core::HistoryEntry| super::detail::history_row(fields, h) == Some(at);
+            // Shown while the row owns any stored entry, so "(0) · N removed on save" stays
+            // after the last one is trashed or cleared.
+            let owned: Vec<_> = buffer.item.history.iter().filter(mine).collect();
+            if new_kind.is_some() || owned.is_empty() {
+                continue;
             }
+            let history: Vec<_> = buffer.history().filter(mine).collect();
+            // Pending removals of this row's entries.
+            let removed = buffer
+                .removed_history
+                .iter()
+                .filter(|t| owned.iter().any(|h| h.replaced_at == **t))
+                .count();
+            rows.push(history_disclosure(
+                super::detail::History {
+                    entries: &history,
+                    fields,
+                    row: at,
+                },
+                Some(removed),
+                s,
+                &self.state,
+                text::now_millis(),
+                cx,
+            ));
         }
 
         let header = ui::h_flex()

@@ -230,6 +230,7 @@ fn new_item_inserts_template_and_selects_it(cx: &mut TestAppContext) {
         let names: Vec<_> = b.item.fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["Number", "Expiry", "CVV", "Name"]);
         assert_eq!(b.item.fields[1].kind, FieldKind::MonthYear);
+        assert_eq!(b.item.fields[2].kind, FieldKind::Pin);
         s.save_edit(cx);
         assert!(!s.is_editing());
         let item = s.selected_item().expect("new item selected");
@@ -548,6 +549,7 @@ fn kind_labels_are_capitalised_and_number_is_not_offered() {
         [
             "Text",
             "Password",
+            "PIN",
             "One-time code",
             "URL",
             "Notes",
@@ -569,6 +571,9 @@ fn kind_labels_are_capitalised_and_number_is_not_offered() {
     assert_eq!(b.field(k1).unwrap().name, "One-time code");
     assert_eq!(b.field(k2).unwrap().name, "One-time code 2");
     assert_eq!(b.field(k3).unwrap().name, "URL");
+    // 05 §2.3 `pin` (2026-11-15): a new PIN row is named "PIN".
+    let k4 = b.add_field(FieldKind::Pin);
+    assert_eq!(b.field(k4).unwrap().name, "PIN");
     // A lower-case name already in the item (template spelling) counts as taken, and
     // keeps its own spelling.
     let mut item = Item::new("x", Uuid::new_v4(), 1);
@@ -637,7 +642,7 @@ fn cancel_discards_history_removals(cx: &mut TestAppContext) {
     state.update(cx, |s, cx| {
         let before = stamps(&stored(s, gh));
         s.begin_edit(cx);
-        s.edit(cx, |b| b.clear_history());
+        s.edit(cx, |b| b.clear_history(|_| true));
         s.cancel_edit(cx);
         assert!(!s.is_editing());
         let after = stored(s, gh);
@@ -659,7 +664,7 @@ fn clear_history_empties_it_on_save(cx: &mut TestAppContext) {
     state.update(cx, |s, cx| {
         let before = stamps(&stored(s, gh));
         s.begin_edit(cx);
-        s.edit(cx, |b| b.clear_history());
+        s.edit(cx, |b| b.clear_history(|_| true));
         assert_eq!(s.edit_buffer().unwrap().history().count(), 0);
         s.save_edit(cx);
         let after = stored(s, gh);

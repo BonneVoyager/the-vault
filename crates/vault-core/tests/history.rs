@@ -399,3 +399,119 @@ fn set_field_never_reuses_a_removed_stamp() {
     assert!(!v.merge_from(&u).unwrap().changed());
     assert_eq!(stamps(&v, id), vec![2_003, 2_001]);
 }
+
+#[test]
+fn set_field_on_two_history_fields_with_one_now_gives_distinct_stamps() {
+    use vault_core::{Field, FieldKind};
+
+    let (mut v, id) = vault_with_history(0);
+    let pin = Field::new("pin", FieldKind::Pin, secret("0000"), 1_000);
+    let pin_id = pin.id;
+    v.update(id, 1_000, |item| item.fields.push(pin)).unwrap();
+    assert!(v.get(id).unwrap().history.is_empty());
+
+    // One save, same `now` for both fields: the second entry is bumped past the first.
+    v.set_field_named(id, "password", secret("pw-new"), 2_000)
+        .unwrap();
+    v.set_field(id, pin_id, secret("1111"), 2_000).unwrap();
+    let item = v.get(id).unwrap();
+    assert_eq!(stamps(&v, id), vec![2_001, 2_000]);
+    assert_eq!(item.field("password").unwrap().modified_at, 2_000);
+    assert_eq!(item.field_by_id(pin_id).unwrap().modified_at, 2_001);
+    assert_eq!(item.history[0].value.expose_secret(), "0000");
+    assert_eq!(item.history[0].field_id, Some(pin_id));
+    assert_eq!(item.history[1].value.expose_secret(), "p\u{e4}ss-1-hunter2");
+    assert_eq!(item.modified_at, 2_001);
+    // Two passwords in one save behave the same way.
+    let pw2 = Field::new("pw2", FieldKind::Password, secret("a"), 1_000);
+    let pw2_id = pw2.id;
+    v.update(id, 2_001, |item| item.fields.push(pw2)).unwrap();
+    v.set_field_named(id, "password", secret("pw-3"), 2_001)
+        .unwrap();
+    v.set_field(id, pw2_id, secret("b"), 2_001).unwrap();
+    assert_eq!(stamps(&v, id), vec![2_003, 2_002, 2_001, 2_000]);
+    assert_eq!(
+        v.get(id).unwrap().field_by_id(pw2_id).unwrap().modified_at,
+        2_003
+    );
+
+    // Removing one entry leaves its same-`now` sibling in place, through normalisation, a
+    // round trip and a two-way merge.
+    v.remove_history_entry(id, 2_001, 5_000).unwrap();
+    assert_eq!(stamps(&v, id), vec![2_003, 2_002, 2_000]);
+    assert_eq!(v.get(id).unwrap().removed_history, vec![2_001]);
+    let u = unlock(&v.serialize()).unwrap();
+    assert_eq!(stamps(&u, id), vec![2_003, 2_002, 2_000]);
+    let (mut a, mut b) = two_copies(&v);
+    b.remove_history_entry(id, 2_003, 6_000).unwrap();
+    a.merge_from(&b).unwrap();
+    b.merge_from(&a).unwrap();
+    assert_eq!(stamps(&a, id), vec![2_002, 2_000]);
+    assert!(item_eq(a.get(id).unwrap(), b.get(id).unwrap()));
+    assert_eq!(
+        a.get(id).unwrap().history[1].value.expose_secret(),
+        "p\u{e4}ss-1-hunter2"
+    );
+}
+
+#[test]
+fn set_field_fails_instead_of_hanging_when_stamps_reach_u64_max() {
+    // A peer file may carry u64::MAX stamps (item_meta.rs accepts the whole range). With
+    // the field one below and the top stamp taken, the walk has nowhere to go.
+    for via_removed in [false, true] {
+        let (mut v, id) = vault_with_history(0);
+        v.update(id, 1_000, |item| {
+            let f = item
+                .fields
+                .iter_mut()
+                .find(|f| f.name == "password")
+                .unwrap();
+            f.modified_at = u64::MAX - 1;
+            if via_removed {
+                item.removed_history = vec![u64::MAX];
+            } else {
+                item.history.push(HistoryEntry {
+                    value: secret("top"),
+                    replaced_at: u64::MAX,
+                    field_id: Some(f.id),
+                });
+            }
+        })
+        .unwrap();
+        let before = v.get(id).unwrap().clone();
+
+        let err = v
+            .set_field_named(id, "password", secret("new"), 100)
+            .unwrap_err();
+        assert!(
+            matches!(&err, VaultError::Malformed(m) if m.contains("u64::MAX")),
+            "{via_removed}: {err:?}"
+        );
+        // Nothing changed: value, stamps, history and removed list are as before.
+        let after = v.get(id).unwrap();
+        assert!(
+            item_eq(&before, after),
+            "{via_removed}: item mutated on error"
+        );
+        assert_eq!(
+            after.field("password").unwrap().value.expose_secret(),
+            "p\u{e4}ss-1-hunter2"
+        );
+        assert_eq!(after.field("password").unwrap().modified_at, u64::MAX - 1);
+        assert_eq!(after.modified_at, before.modified_at);
+    }
+
+    // The stamp u64::MAX itself is still usable when free.
+    let (mut v, id) = vault_with_history(0);
+    v.update(id, 1_000, |item| {
+        item.fields
+            .iter_mut()
+            .find(|f| f.name == "password")
+            .unwrap()
+            .modified_at = u64::MAX - 1;
+    })
+    .unwrap();
+    v.set_field_named(id, "password", secret("new"), 100)
+        .unwrap();
+    assert_eq!(stamps(&v, id), vec![u64::MAX]);
+}

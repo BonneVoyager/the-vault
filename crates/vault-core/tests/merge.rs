@@ -634,6 +634,63 @@ fn password_conflict_loser_lands_in_history_on_both_sides() {
 }
 
 #[test]
+fn pin_conflict_loser_lands_in_history_on_both_sides() {
+    // 03 §5 (2026-11-15): a `pin` true-conflict loser is kept like a `password` one.
+    let (mut a, mut b, ids) = two_devices(1);
+    let id = ids[0];
+    let pin = Field::new("pin", FieldKind::Pin, secret("0000"), 1_000);
+    let pin_id = pin.id;
+    a.update(id, 1_000, |item| item.fields.push(pin)).unwrap();
+    b.merge_from(&unlock(&a.serialize()).unwrap()).unwrap();
+    assert!(b.get(id).unwrap().field_by_id(pin_id).is_some());
+
+    a.set_field(id, pin_id, secret("1111"), 5_000).unwrap();
+    b.set_field(id, pin_id, secret("2222"), 6_000).unwrap();
+    converge(&mut a, &mut b);
+    for v in [&a, &b] {
+        let item = v.get(id).unwrap();
+        let f = item.field_by_id(pin_id).unwrap();
+        assert_eq!(f.kind, FieldKind::Pin);
+        assert_eq!(f.value.expose_secret(), "2222");
+        assert_eq!(f.modified_at, 6_000);
+        let entries: Vec<(&str, u64, Option<Uuid>)> = item
+            .history
+            .iter()
+            .map(|h| (h.value.expose_secret().as_str(), h.replaced_at, h.field_id))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("0000", 6_000, Some(pin_id)),
+                // Equal stamps: normalize_history orders by value, so "0000" precedes "1111".
+                ("0000", 5_000, Some(pin_id)),
+                ("1111", 5_000, Some(pin_id)),
+                ("old-0", 900, None),
+            ],
+            "losing pin recorded at its own modified_at with its field id"
+        );
+    }
+
+    // Equal values on both sides are not a conflict and leave no history entry.
+    let (mut a, mut b, ids) = two_devices(1);
+    let id = ids[0];
+    let pin = Field::new("pin", FieldKind::Pin, secret("0000"), 1_000);
+    let pin_id = pin.id;
+    a.update(id, 1_000, |item| item.fields.push(pin)).unwrap();
+    b.merge_from(&unlock(&a.serialize()).unwrap()).unwrap();
+    a.set_field(id, pin_id, secret("same"), 5_000).unwrap();
+    b.set_field(id, pin_id, secret("same"), 6_000).unwrap();
+    converge(&mut a, &mut b);
+    assert!(
+        !a.get(id)
+            .unwrap()
+            .history
+            .iter()
+            .any(|h| h.value.expose_secret() == "same")
+    );
+}
+
+#[test]
 fn merge_that_changes_content_advances_modified_at_and_defeats_rollback() {
     use vault_core::format::VaultFile;
     use vault_core::{TamperKind, VaultError};

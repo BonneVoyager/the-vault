@@ -714,21 +714,29 @@ impl UnlockedVault {
 
     /// Replace the value of the field with id `field_id` and stamp it `stamp(now,
     /// field.modified_at)` (strictly advancing, see [`stamp`]). For a [`FieldKind::Password`]
-    /// field the previous value is pushed onto `history` as `(value, replaced_at = that
-    /// stamp, field_id)`; history is kept newest-first and capped at [`HISTORY_CAP`]. Every
+    /// or [`FieldKind::Pin`] field (pin since 2026-11-15; one rule, `merge::keeps_history`)
+    /// the previous value is pushed onto `history` as `(value, replaced_at = that stamp,
+    /// field_id)`; history is kept newest-first and capped at [`HISTORY_CAP`]. Every
     /// other kind, including a [`FieldKind::Section`] heading (allowed, though its value is
-    /// ignored), writes nothing to history. If that stamp is in the item's `removed_history`
-    /// (a deleted entry's stamp, 03 §5) the stamp is advanced past it so the new entry is
-    /// not dropped by the next merge; under the monotone stamp rule this never triggers
-    /// (every removed stamp is an earlier password stamp of this item and the field already
-    /// sits at or past it), it only guards a field whose timestamp was moved back by hand
-    /// through `update`. The item is restamped as in [`UnlockedVault::update`].
+    /// ignored), writes nothing to history. The stamp is advanced past any stamp in the
+    /// item's `removed_history` (a deleted entry's stamp, 03 §5: the new entry would be
+    /// dropped by the next merge) and past any `replaced_at` already in the item's
+    /// `history`, so every entry on an item carries a unique stamp and removing one never
+    /// removes another (two history-keeping fields saved with the same `now` would
+    /// otherwise share one). Only the latter is reachable under the monotone stamp rule;
+    /// the former needs a field timestamp moved back by hand through `update`. A merge
+    /// conflict loser is the one entry that may share a stamp (03 §5 fixes it to the
+    /// losing field's `modified_at`, and the value it replaced carries the same one); a
+    /// bump there would depend on merge order and diverge between devices, so it is left
+    /// as is and the two are removed together. The item is restamped as in [`UnlockedVault::update`].
     ///
     /// # Errors
     ///
     /// `Malformed("unknown item ..")` if `id` is not in the vault; [`VaultError::FieldNotFound`]
     /// if the item has no field with `field_id`. A missing field is not created
-    /// (interpretation: callers add fields through `update`).
+    /// (interpretation: callers add fields through `update`). `Malformed("history stamps
+    /// .. exhausted ..")` if a history-keeping field's stamp walk would pass `u64::MAX`
+    /// (a peer file may carry such stamps); nothing is changed on error.
     pub fn set_field(
         &mut self,
         id: Uuid,
@@ -744,15 +752,27 @@ impl UnlockedVault {
             .iter_mut()
             .find(|f| f.id == field_id)
             .ok_or(VaultError::FieldNotFound)?;
-        let previous = std::mem::replace(&mut field.value, value);
         let mut at = stamp(now, field.modified_at);
-        if field.kind == FieldKind::Password {
-            while item.removed_history.contains(&at) {
-                at = at.saturating_add(1);
+        if merge::keeps_history(field.kind) {
+            // Every history entry on an item gets a stamp of its own: `removed_history` is
+            // keyed by stamp alone (03 §5), so two entries sharing one would be removed
+            // together. Skip removed stamps and stamps already used by this item's history
+            // (two history-keeping fields saved with one `now`). A peer file may carry
+            // u64::MAX stamps, so the walk is checked: running out of range is an error,
+            // not a hang, and nothing has been changed yet at this point.
+            while item.removed_history.contains(&at)
+                || item.history.iter().any(|h| h.replaced_at == at)
+            {
+                at = at.checked_add(1).ok_or_else(|| {
+                    VaultError::Malformed(format!(
+                        "history stamps of item {id} exhausted at u64::MAX"
+                    ))
+                })?;
             }
         }
+        let previous = std::mem::replace(&mut field.value, value);
         field.modified_at = at;
-        if field.kind == FieldKind::Password {
+        if merge::keeps_history(field.kind) {
             item.history.push(HistoryEntry {
                 value: previous,
                 replaced_at: at,

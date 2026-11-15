@@ -49,6 +49,15 @@ use crate::item::{
     Millis,
 };
 
+/// Whether a field of this kind keeps its previous values in the item's `history`:
+/// [`UnlockedVault::set_field`] pushes the replaced value and [`merge_live`] records a true
+/// conflict loser (02 "write", 03 §5). `password` always has; `pin` since 2026-11-15 (owner
+/// decision: a PIN keeps the history disclosure like a password). Every other kind, known
+/// or [`FieldKind::Other`], writes nothing. One site for both callers so they cannot drift.
+pub(crate) fn keeps_history(kind: FieldKind) -> bool {
+    matches!(kind, FieldKind::Password | FieldKind::Pin)
+}
+
 /// What `merge_from` did, per item id in `ours ∪ theirs`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MergeReport {
@@ -311,8 +320,8 @@ fn ours_wins_metadata(ours: &Item, theirs: &Item) -> bool {
 /// side beats the other side's untouched copy), while a field stamped strictly after its
 /// marker (edited after the removal) survives and the marker is dropped, so both sides
 /// converge on the resurrected field. History is the union on `(value, replaced_at)` plus,
-/// for every surviving [`FieldKind::Password`] field that lost a true conflict (both sides
-/// present, different values), the losing value as `(value, replaced_at = loser field
+/// for every surviving history-keeping field (`keeps_history`: `password` or `pin`) that
+/// lost a true conflict (both sides present, different values), the losing value as `(value, replaced_at = loser field
 /// modified_at, field_id)` so nothing is lost (03 §5). A losing value already present in the
 /// union by value (the common "only one side edited" case, where the winner recorded it when
 /// replacing it) is not pushed again, so merging an untouched copy never changes history.
@@ -369,7 +378,7 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
                 let (o, t) = if ours_wins { (w, l) } else { (l, w) };
                 let (kept, dropped) = pick(o, t);
                 fields.push(kept.clone());
-                if dropped.kind == FieldKind::Password
+                if keeps_history(dropped.kind)
                     && dropped.value.expose_secret() != kept.value.expose_secret()
                 {
                     conflict_losers.push(dropped);

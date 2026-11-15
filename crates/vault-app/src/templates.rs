@@ -76,7 +76,7 @@ impl Template {
             Template::Card => &[
                 ("Number", FieldKind::Text),
                 ("Expiry", FieldKind::MonthYear),
-                ("CVV", FieldKind::Password),
+                ("CVV", FieldKind::Pin),
                 ("Name", FieldKind::Text),
             ],
             Template::Identity => &[
@@ -94,7 +94,7 @@ impl Template {
             ],
             Template::License => &[
                 ("Version", FieldKind::Text),
-                ("License key", FieldKind::Password),
+                ("License key", FieldKind::Pin),
                 ("Website", FieldKind::Url),
             ],
         }
@@ -226,7 +226,7 @@ mod tests {
             Template::License.fields(),
             [
                 ("Version", FieldKind::Text),
-                ("License key", FieldKind::Password),
+                ("License key", FieldKind::Pin),
                 ("Website", FieldKind::Url),
             ]
         );
@@ -252,6 +252,8 @@ mod tests {
             crate::icon::IconSpec::Logo { slug: "github", .. }
         ));
         assert_eq!(card.fields[1].kind, FieldKind::MonthYear);
+        // 05 §2.3 (2026-11-15): CVV and License key are PINs, outside the password audit.
+        assert_eq!(card.field("CVV").map(|f| f.kind), Some(FieldKind::Pin));
         let id = Template::Identity.new_item("Me", Uuid::new_v4(), 1);
         assert_eq!(id.field("Phone").map(|f| f.kind), Some(FieldKind::Text));
         assert!(

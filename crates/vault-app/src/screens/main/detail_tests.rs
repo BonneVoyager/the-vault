@@ -1369,3 +1369,92 @@ fn trashed_item_shows_no_password_notices(cx: &mut TestAppContext) {
     assert!(strip(pw, "Reused Password", &mut vcx).is_none());
     assert!(!shown("issue-badge Weak password", &mut vcx));
 }
+
+/// An item holding one PIN field "CVV" with `pin`.
+fn pin_item(title: &str, pin: &str, device: Uuid) -> Item {
+    let mut item = Item::new(title, device, 1);
+    item.fields.push(Field::new(
+        "CVV",
+        FieldKind::Pin,
+        SecretString::new(pin.into()),
+        1,
+    ));
+    item
+}
+
+/// 05 §2.3 `pin` (owner 2026-11-15): read mode masks a PIN like a password, reveals it
+/// on the toggle, and a click copies it through the secret pasteboard with the clear
+/// timer without revealing it.
+#[gpui::test]
+fn pin_is_masked_revealed_and_copied_like_a_password(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open_items(dir.path(), |d| vec![pin_item("Visa", "0042", d)], cx);
+    let board = FakePasteboard::default();
+    vcx.update(|_, cx| {
+        state.update(cx, |s, _| {
+            s.set_pasteboard(Box::new(board.clone()));
+            s.settings.clipboard_clear_secs = 30;
+        });
+    });
+    select(&state, ids[0], &mut vcx);
+    assert!(shown("field-masked 0", &mut vcx));
+    assert!(!shown("field-plain 0", &mut vcx));
+
+    click("field-value 0", &mut vcx);
+    assert_eq!(board.contents().as_deref(), Some("0042"));
+    state.read_with(&vcx, |s, _| {
+        let toast = s.toast.as_ref().expect("copied pill");
+        assert_eq!(toast.message.as_ref(), "Copied — clears in 30 s");
+        assert!(s.revealed.is_empty(), "the click revealed the PIN");
+    });
+    vcx.executor().advance_clock(Duration::from_secs(31));
+    vcx.run_until_parked();
+    assert_eq!(board.contents(), None);
+
+    // ⌘⇧C copies passwords only: a PIN-only item has none.
+    state.update(&mut vcx, |s, cx| s.copy(CopyTarget::Password, cx));
+    assert_eq!(board.contents(), None);
+
+    let field = field_id(&state, ids[0], 0, &vcx);
+    state.update(&mut vcx, |s, cx| s.toggle_reveal(field, cx));
+    vcx.run_until_parked();
+    assert!(shown("field-plain 0", &mut vcx));
+    assert!(!shown("field-masked 0", &mut vcx));
+}
+
+/// A short PIN shared by two items is outside the audit: no issue, no list badge, no
+/// notice strips (05 §2.3 `pin`).
+#[gpui::test]
+fn short_reused_pin_has_no_issue_badge_or_strip(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open_items(
+        dir.path(),
+        |d| vec![pin_item("Alpha", "12", d), pin_item("Beta", "12", d)],
+        cx,
+    );
+    select(&state, ids[0], &mut vcx);
+    state.read_with(&vcx, |s, _| assert!(s.listing.issues.is_empty()));
+    assert!(!shown("issue-badge Weak password", &mut vcx));
+    assert!(!shown("issue-badge Reused password", &mut vcx));
+    let pin = field_id(&state, ids[0], 0, &vcx);
+    assert!(strip(pin, "Weak Password", &mut vcx).is_none());
+    assert!(strip(pin, "Reused Password", &mut vcx).is_none());
+}
+
+/// History of a removed field falls to the first password row, else the first PIN row
+/// (a Card with only a CVV), never nowhere.
+#[test]
+fn removed_field_history_falls_back_to_a_password_or_pin_row() {
+    let d = Uuid::new_v4();
+    let entry = HistoryEntry {
+        value: SecretString::new("old".into()),
+        replaced_at: 5,
+        field_id: Some(Uuid::new_v4()),
+    };
+    let card = pin_item("Visa", "1", d);
+    assert_eq!(history_row(&card.fields, &entry), Some(0));
+    let mut both = card.clone();
+    both.fields.push(login("x", "p", d).fields.remove(1));
+    assert_eq!(history_row(&both.fields, &entry), Some(1), "password first");
+    assert_eq!(history_row(&Item::new("n", d, 1).fields, &entry), None);
+}

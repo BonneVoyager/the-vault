@@ -249,6 +249,7 @@ mod tests {
             FieldKind::Text,
             FieldKind::Date,
             FieldKind::Notes,
+            FieldKind::Pin,
             FieldKind::Other,
         ] {
             item.fields
@@ -258,8 +259,10 @@ mod tests {
         // Same weak, shared values in a second item: still not passwords.
         let mut twin = item;
         twin.id = Uuid::new_v4();
-        v.insert(twin, 1);
+        let twin_id = v.insert(twin, 1);
         assert!(audit(&v).is_empty());
+        // A short PIN shared by both items is no reuse and no weakness (05 §2.3 `pin`).
+        assert_eq!(reuse_count(&v, "123", twin_id), 0);
     }
 
     #[test]

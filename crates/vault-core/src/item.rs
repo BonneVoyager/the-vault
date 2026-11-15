@@ -40,6 +40,12 @@ pub type Extras = Vec<(Value, Value)>;
 pub enum FieldKind {
     Text,
     Password,
+    /// A masked secret expected to be short: license keys, CVVs, device PINs. Any characters
+    /// are allowed (on-disk `"pin"`, added 2026-11-15 as a new enum string, no version bump).
+    /// Sensitive like [`FieldKind::Password`]. App rule (not enforced here): no strength or
+    /// reuse audit in the UI. A build older than the variant reads it as `Other` with
+    /// `kind_raw = "pin"`, which is also masked.
+    Pin,
     Totp,
     Url,
     Notes,
@@ -56,9 +62,10 @@ pub enum FieldKind {
 
 impl FieldKind {
     /// Every *known* variant, in declaration order. [`FieldKind::Other`] is not listed.
-    pub const ALL: [FieldKind; 9] = [
+    pub const ALL: [FieldKind; 10] = [
         FieldKind::Text,
         FieldKind::Password,
+        FieldKind::Pin,
         FieldKind::Totp,
         FieldKind::Url,
         FieldKind::Notes,
@@ -74,6 +81,7 @@ impl FieldKind {
         match self {
             FieldKind::Text => "text",
             FieldKind::Password => "password",
+            FieldKind::Pin => "pin",
             FieldKind::Totp => "totp",
             FieldKind::Url => "url",
             FieldKind::Notes => "notes",
@@ -97,14 +105,14 @@ impl FieldKind {
         self == FieldKind::Other
     }
 
-    /// Whether a UI must mask this field's value by default: `password`, `totp`, and every
+    /// Whether a UI must mask this field's value by default: `password`, `pin`, `totp`, and every
     /// unknown kind (a newer version may have added a secret kind; masking is the safe
     /// default). Card numbers are an item-level rule, not a field kind, and are not covered.
     /// A [`FieldKind::Section`] heading is never sensitive.
     pub fn is_sensitive(self) -> bool {
         matches!(
             self,
-            FieldKind::Password | FieldKind::Totp | FieldKind::Other
+            FieldKind::Password | FieldKind::Pin | FieldKind::Totp | FieldKind::Other
         )
     }
 }
@@ -620,6 +628,38 @@ mod tests {
         assert!(
             !FieldKind::Section.is_sensitive(),
             "a heading is never masked"
+        );
+    }
+
+    #[test]
+    fn pin_kind_round_trips_through_parse_and_as_str() {
+        assert_eq!(FieldKind::parse("pin"), Some(FieldKind::Pin));
+        assert_eq!(FieldKind::Pin.as_str(), "pin");
+        assert_eq!(
+            Value::serialized(&FieldKind::Pin).unwrap(),
+            Value::Text("pin".to_owned())
+        );
+        assert!(!FieldKind::Pin.is_other());
+    }
+
+    #[test]
+    fn pin_kind_is_sensitive() {
+        assert!(FieldKind::Pin.is_sensitive());
+    }
+
+    #[test]
+    fn all_lists_pin_right_after_password() {
+        let pw = FieldKind::ALL
+            .iter()
+            .position(|k| *k == FieldKind::Password)
+            .unwrap();
+        assert_eq!(FieldKind::ALL.get(pw + 1), Some(&FieldKind::Pin));
+        assert_eq!(
+            FieldKind::ALL
+                .iter()
+                .filter(|k| **k == FieldKind::Pin)
+                .count(),
+            1
         );
     }
 

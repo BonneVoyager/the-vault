@@ -214,10 +214,15 @@ impl EditBuffer {
         }
     }
 
-    /// "Clear history": marks every entry shown when editing began for removal. Entries
-    /// another device adds meanwhile are not touched.
-    pub fn clear_history(&mut self) {
-        let mut stamps: Vec<Millis> = self.history().map(|h| h.replaced_at).collect();
+    /// "Clear history": marks every entry shown when editing began that `only` selects
+    /// (one disclosure's entries) for removal. Entries another device adds meanwhile are
+    /// not touched.
+    pub fn clear_history(&mut self, only: impl Fn(&HistoryEntry) -> bool) {
+        let mut stamps: Vec<Millis> = self
+            .history()
+            .filter(|h| only(h))
+            .map(|h| h.replaced_at)
+            .collect();
         // Two merged entries can share a stamp; core removes them together.
         stamps.sort_unstable();
         stamps.dedup();
@@ -507,6 +512,7 @@ pub fn kind_name(kind: FieldKind) -> &'static str {
     match kind {
         FieldKind::Text => "Text",
         FieldKind::Password => "Password",
+        FieldKind::Pin => "PIN",
         FieldKind::Totp => "One-time code",
         FieldKind::Url => "URL",
         FieldKind::Notes => "Notes",
@@ -519,9 +525,10 @@ pub fn kind_name(kind: FieldKind) -> &'static str {
 }
 
 /// The kinds the "Add field" menu offers, in menu order. Unknown kinds are never offered.
-pub const ADDABLE_KINDS: [FieldKind; 9] = [
+pub const ADDABLE_KINDS: [FieldKind; 10] = [
     FieldKind::Text,
     FieldKind::Password,
+    FieldKind::Pin,
     FieldKind::Totp,
     FieldKind::Url,
     FieldKind::Notes,
@@ -557,8 +564,8 @@ pub enum Navigation {
 /// delete and add. A field the user removed is left out, and `update` writes its
 /// `removed_fields` marker. Fields added to the stored item meanwhile are kept.
 ///
-/// A changed password goes through `set_field` first, by id, so the old value lands in
-/// the history (with its `field_id`) even when the field was also renamed.
+/// A changed password or PIN goes through `set_field` first, by id, so the old value lands
+/// in the history (with its `field_id`) even when the field was also renamed.
 fn apply_edit(
     v: &mut UnlockedVault,
     item: Item,
@@ -570,13 +577,16 @@ fn apply_edit(
         let Some(of) = original.field_by_id(f.id) else {
             continue;
         };
-        let changed_password = of.kind == FieldKind::Password
-            && f.kind == FieldKind::Password
+        // The kinds core keeps history for (`merge::keeps_history`, crate-private):
+        // password and, since 2026-11-15, PIN.
+        let keeps = |k: FieldKind| matches!(k, FieldKind::Password | FieldKind::Pin);
+        let changed_password = keeps(of.kind)
+            && f.kind == of.kind
             && of.value.expose_secret() != f.value.expose_secret();
         let stored_password = v
             .get(id)
             .and_then(|it| it.field_by_id(f.id))
-            .is_some_and(|s| s.kind == FieldKind::Password);
+            .is_some_and(|s| s.kind == of.kind);
         if changed_password && stored_password {
             v.set_field(id, f.id, f.value.clone(), now)?;
         }

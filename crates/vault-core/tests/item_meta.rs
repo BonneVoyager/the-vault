@@ -409,7 +409,7 @@ fn section_field_round_trips_as_the_string_section() {
     // The enum string is known: parse() recognises it and it is in ALL.
     assert_eq!(FieldKind::parse("section"), Some(FieldKind::Section));
     assert!(FieldKind::ALL.contains(&FieldKind::Section));
-    assert_eq!(FieldKind::ALL.len(), 9);
+    assert_eq!(FieldKind::ALL.len(), 10);
 }
 
 #[test]

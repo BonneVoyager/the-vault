@@ -72,9 +72,16 @@ Phases 1–5 shipped 2026-10-29 (core, CLI, app skeleton, sync, macOS, polish). 
 - Notes, not counted (owner's call): (1) License key is a password-kind field, so it gets Weak/Reused notices; (2) diagnostics prints Touch ID/passkey slot lines as yes/no while locked (unreachable: Settings opens only unlocked); (3) the CLI has no Server/License template.
 - PROGRESS.md compacted: history to 2026-11-08 archived verbatim in `docs/progress-history.md`; condensed decisions, routing, tools and open list at the top.
 
-## CHECKPOINT — Templates + bug hunt 2026-11-15
-Committed: cdd111a (templates). Uncommitted: this compaction (PROGRESS.md, docs/progress-history.md), the hunt artefacts (docs/qa/bug-hunt-2026-11-15.md, qa/spec-checks changes), gpui-implementer agent memory. Index still holds the implementer's stray `git add` of PROGRESS.md and the memory file.
-Workspace: fmt PASS, clippy PASS, tests 1240 passed / 15 ignored; QA ledger 249 + CLI 107 green.
-Awaiting owner: decision on the License-key notice exemption (note 1); the two-Mac checklist run.
-Open list: see the condensed history at the top.
-Bug hunt: run for this wave (2026-11-15).
+### 2026-11-15 — Spec tidy-up from bug-hunt note 2 (orchestrator, spec only)
+05 §2.5 Copy diagnostics now says the Touch ID and passkey slot lines print yes/no even while locked, because the slot list is plaintext header data; "locked" applies to lines that need the unlocked vault. Matches `diagnostics_text` as shipped in 9d6547a. No code change. Uncommitted.
+
+### 2026-11-15 — PIN field kind (routine-implementer, crypto-implementer, gpui-implementer)
+Owner decision 2026-11-15 (solves bug-hunt note 1): new `FieldKind::Pin` ("pin", sensitive, no bump, 01 §4). Masked like password, same reveal/copy/mono/history, any characters; no Generate, no meter, no Weak/Reused notice, outside the audit; ⌘⇧C/⌘⇧R and lookups ignore it; "Add field" offers PIN after Password; Card CVV and License key are PIN on new items. Core: `merge::keeps_history` = Password | Pin drives set_field history and the merge conflict loser (02, 03 §5 amended); set_field stamps are now unique per item across `history` and `removed_history` (fixes a pre-existing twin-stamp removal bug for two history fields saved together; merge-created twins stay paired by design). App: history disclosure per field row with per-disclosure Clear, copy keyed on stamp+field, fallback row for removed fields. Reviews: security-reviewer on core (variant SHIP; history gap found → fixed), code-reviewer on app (MEDIUM disclosure regression → fixed). Diff: core +193/−17 plus item.rs +44; app +501/−86 (over the ~400 guideline, most of it tests). Uncommitted. Second security review: stamp walk could spin at u64::MAX (pre-existing for removed stamps) → `checked_add`, `VaultError::Malformed`, test; 03 §5 records the unique-stamp rule (+20 ms bound, error never spin, merge twins unbumped). QA ledger: fi08 count 10 + pin assertions, format.rs kind list.
+
+## CHECKPOINT — PIN field kind 2026-11-15
+Committed: 9d6547a (bug hunt, compaction). Uncommitted: the PIN wave (vault-core, vault-app, specs 01/02/03/05, qa/spec-checks), the 05 §2.5 diagnostics wording, this file, crypto-/gpui-implementer agent memory.
+Workspace: fmt PASS, clippy PASS, `cargo test --workspace` 0 failed / 14 ignored (~1 200 tests, before the u64::MAX fix; vault-core re-run after it: 312 passed); QA ledger 249 + CLI 107 green.
+Eye check passed 2026-11-15 (PIN rows, per-row history, per-disclosure Clear; shared open/closed state accepted).
+Awaiting owner: commit; the two-Mac checklist run.
+Bug hunt: not yet run for this wave.
+
