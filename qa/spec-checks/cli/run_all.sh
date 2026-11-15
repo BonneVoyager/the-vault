@@ -407,6 +407,55 @@ got=$(grep -c "^note[1-6]	-$" "$T/fi-cc")
 same=$(grep -c "^same[1-6]	-$" "$T/fi-cc")
 if [ "$fails" = 0 ] && [ "$got" = 6 ] && [ "$same" = 6 ] && grep -q "	key$" "$T/fi-cc"; then ok "12 concurrent CLI field adds on a field-icon vault: nothing lost, icons intact"; else bad "concurrent edits field-icon" "fails=$fails other-items=$got same-item=$same" "$(cat "$T"/fic*.log "$T"/fit*.log | sort | uniq -c | head -4)"; fi
 
+# ---- 2026-11-15: concurrent CLI edits of one item (03 §5), Help page vs keymap (05 §2.5, §4) ----
+export VAULT_FILE="$T/ca.vault"
+v init --kdf-test-params >/dev/null 2>&1
+export CA_SECRET="ca-Secret-Value-551"
+cafail=0
+for rep in 1 2 3; do
+  CID=$(v add --title "Item$rep" --username u0 --url https://e.x --tag base 2>/dev/null | grep -oE '^[0-9a-f-]{36}$' | head -1)
+  # C2 (03 §5 "Edits to different fields or items survive"; 01 §4 per-attribute stamps): six
+  # processes edit six different attributes/fields of one item at once; all must survive.
+  pids=()
+  v edit "$CID" --title "Renamed$rep" >"$T/ca1" 2>&1 & pids+=($!)
+  v edit "$CID" --favorite >"$T/ca2" 2>&1 & pids+=($!)
+  v edit "$CID" --tag solo >"$T/ca3" 2>&1 & pids+=($!)
+  v edit "$CID" --set "username=user$rep" >"$T/ca4" 2>&1 & pids+=($!)
+  v edit "$CID" --set-env password=CA_SECRET >"$T/ca5" 2>&1 & pids+=($!)
+  v edit "$CID" --icon "symbol:Star" >"$T/ca6" 2>&1 & pids+=($!)
+  fails=0; for p in "${pids[@]}"; do wait "$p" || fails=$((fails+1)); done
+  v get "$CID" --reveal >"$T/o" 2>&1
+  miss=""
+  grep -q "^title: Renamed$rep$" "$T/o" || miss="$miss title"
+  grep -q "solo" "$T/o" || miss="$miss tag"
+  grep -q "^username: user$rep" "$T/o" || miss="$miss username"
+  grep -q "^password: $CA_SECRET" "$T/o" || miss="$miss password"
+  if [ "$fails" != 0 ] || [ -n "$miss" ]; then cafail=1; bad "C2 rep $rep: concurrent edits of different attributes" "failed=$fails lost:$miss" "$(cat "$T"/ca[1-6] | sort | uniq -c | head -3)"; fi
+  grep -q "$CA_SECRET" "$T"/ca[1-6] && { cafail=1; bad "C2: --set-env secret echoed"; }
+done
+[ $cafail = 0 ] && ok "concurrent edits of 6 different attributes on one item: none lost (3 reps)"
+# C1: same attribute in parallel: every process reports success, at least one tag survives
+CID=$(v add --title Tagged --tag base 2>/dev/null | grep -oE '^[0-9a-f-]{36}$' | head -1)
+pids=(); for i in 1 2 3 4 5 6; do v edit "$CID" --tag "t$i" >"$T/ct$i" 2>&1 & pids+=($!); done
+fails=0; for p in "${pids[@]}"; do wait "$p" || fails=$((fails+1)); done
+v get "$CID" >"$T/o" 2>&1
+n=$(grep '^tags:' "$T/o" | grep -oE '\bt[1-6]\b' | wc -l | tr -d ' ')
+if [ "$fails" = 0 ] && [ "$n" -ge 1 ] && grep -q '^tags:.*base' "$T/o"; then ok "C1 concurrent --tag: all succeed, $n of 6 tags survive (spec: greater stamp wins)"; else bad "C1 concurrent --tag" "failed=$fails survivors=$n $(grep '^tags' "$T/o")"; fi
+
+# 05 §2.5 Help: docs/help.md is the bundled page. Every shortcut in its table must be one the
+# keymap in 05 §4 lists (a stale shortcut in Help misleads users), and none of the removed
+# ⌘1/⌘2 pane-focus keys may be described as such.
+HELP="$ROOT/docs/help.md"; SPEC5="$ROOT/specs/05-ui.md"
+stale=""
+while IFS= read -r keys; do
+  for k in $(echo "$keys" | sed 's#/# #g; s#…# #g'); do
+    case "$k" in ⌘1|⌘9) continue;; esac
+    grep -qF -- "| $k" "$SPEC5" || grep -qF -- "$k " "$SPEC5" || grep -qF -- "$k |" "$SPEC5" || grep -qF -- "/ $k" "$SPEC5" || stale="$stale $k"
+  done
+done < <(awk -F'|' '/^\| / && NR>1 {print $3}' "$HELP" | grep -v -- '---' | grep -v '^ *Keys *$')
+[ -z "$stale" ] && ok "help.md shortcuts all appear in 05 §4 keymap" || bad "help.md lists shortcuts not in 05 §4" "$stale"
+grep -qiE "⌘1.*(list|item list)|⌘2.*detail" "$HELP" && bad "help.md describes removed ⌘1/⌘2 pane keys" || ok "help.md has no removed ⌘1/⌘2 pane keys"
+
 echo
 echo "CLI checks: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]

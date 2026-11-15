@@ -45,6 +45,17 @@ cargo fmt --all -- --check                     # formatting is part of the manua
   absorption, expired trash from a peer never reaching disk, before the 64 MiB size check, pre-hook
   `Merged` reports, survives lock/unlock), `src/bin/field_icons` and a `run_all.sh` field-icon
   section (fixture vault through the CLI, 12 concurrent field adds).
+- 2026-11-15 additions: `field_order` (03 §5 "Field order": winner's order then the loser's
+  extras in the loser's order, reorder restamps the item but no field, later edit elsewhere wins
+  the order, device-id and cloned-device payload ties, three devices with markers, reorder vs
+  delete, markers filtering loser extras, the merge laws on random scripts with shuffles and
+  moves, two handles on one folder, both conflict-copy shapes via `vault sync`, and the 03 §5
+  concurrent CLI edit rules: same attribute keeps one, different attributes all survive),
+  `host_facts` (04 §1b `os_version`/`model_identifier` against `sw_vers`/`sysctl`, thread safety,
+  no identity; 04 §5d `launched_as_login_item` false off the main thread). `Cargo.toml` gains a
+  macOS-only path dependency on `vault-macos` for these plain functions; the rest of vault-macos
+  stays code read only. `run_all.sh` gains concurrent attribute edits (3 reps), concurrent
+  `--tag`, and a docs/help.md shortcut table vs 05 §4 consistency check.
 - Temp files go under `tmp/` (git-ignored) and are removed by each test.
 
 A passing check shows the behaviour on those inputs only. It is not a proof.
