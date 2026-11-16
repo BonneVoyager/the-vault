@@ -429,9 +429,15 @@ fn main_empty_vault(cx: &mut TestAppContext) {
 }
 
 /// The last field row's move-down button (disabled; the first row's move-up is too).
-fn last_move_down(state: &Entity<AppState>, vcx: &VisualTestContext) -> String {
+/// Also returns a guard drawing every row's ↑/↓ (normally on the hovered or focused row
+/// only) until it is dropped at the end of the test.
+fn last_move_down(
+    state: &Entity<AppState>,
+    vcx: &VisualTestContext,
+) -> (String, crate::screens::AllArrowsForTests) {
+    let arrows = crate::screens::AllArrowsForTests::on();
     let last = state.read_with(vcx, |s, _| s.edit_buffer().unwrap().keys.len() - 1);
-    format!("move-down-{last}")
+    (format!("move-down-{last}"), arrows)
 }
 
 #[gpui::test]
@@ -442,7 +448,7 @@ fn edit_mode(cx: &mut TestAppContext) {
         s.begin_edit(cx);
         s.toggle_history(cx);
     });
-    let last_down = last_move_down(&state, &vcx);
+    let (last_down, _arrows) = last_move_down(&state, &vcx);
     audit(
         Case {
             label: "edit",
@@ -477,7 +483,7 @@ fn edit_add_field_menu(cx: &mut TestAppContext) {
     let (state, mut vcx) = main_window(dir.path(), TALL, cx);
     state.update(&mut vcx, |s, cx| s.begin_edit(cx));
     click("add-field", &mut vcx);
-    let last_down = last_move_down(&state, &vcx);
+    let (last_down, _arrows) = last_move_down(&state, &vcx);
     audit(
         Case {
             label: "add field menu",
@@ -497,7 +503,7 @@ fn edit_field_generator(cx: &mut TestAppContext) {
         let key = s.edit_buffer().unwrap().keys[1];
         s.open_generator(GeneratorTarget::Field(key), cx);
     });
-    let last_down = last_move_down(&state, &vcx);
+    let (last_down, _arrows) = last_move_down(&state, &vcx);
     audit(
         Case {
             label: "field generator",
@@ -518,7 +524,7 @@ fn edit_icon_picker(cx: &mut TestAppContext) {
         s.set_icon_picker(true, cx);
         s.choose_icon(crate::icon::PickerCell::Symbol(0), cx);
     });
-    let last_down = last_move_down(&state, &vcx);
+    let (last_down, _arrows) = last_move_down(&state, &vcx);
     audit(
         Case {
             label: "icon picker",

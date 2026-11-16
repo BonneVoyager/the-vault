@@ -74,11 +74,21 @@ pub type Issues = HashMap<Uuid, Vec<FieldIssue>>;
 /// The issues of one password `value` held by item `item`: weak first, then reused
 /// (against the other live items of `vault`). Empty for an empty value.
 pub fn value_issues(vault: &UnlockedVault, value: &str, item: Uuid) -> Vec<Issue> {
+    scored_value_issues(vault, value, strength_bits(value), item)
+}
+
+/// [`value_issues`] for a value whose [`strength_bits`] the caller already has (the
+/// editor scores each typed value once, for the meter and the notices).
+pub fn scored_value_issues(
+    vault: &UnlockedVault,
+    value: &str,
+    bits: f64,
+    item: Uuid,
+) -> Vec<Issue> {
     if value.is_empty() {
         return Vec::new();
     }
     let mut issues = Vec::new();
-    let bits = strength_bits(value);
     if bits < WEAK_BELOW_BITS {
         issues.push(Issue::Weak { bits });
     }

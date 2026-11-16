@@ -161,6 +161,21 @@ pub(crate) fn field_row_colors(cx: &App) -> (gpui::Hsla, gpui::Hsla) {
 /// Gap between a field's icon and its label (05 "Field icons").
 pub(crate) const FIELD_ICON_GAP: f32 = 8.;
 
+/// Gap between a field row's label column and its value column.
+pub(crate) const FIELD_ROW_GAP: f32 = 16.;
+
+/// Minimum height of a field row's value line (fits the row's icon buttons).
+pub(crate) const FIELD_LINE_MIN_H: f32 = 28.;
+
+/// The label column's width rule, shared by read mode and the editor's rows (05 §2.3
+/// "Edit-mode field rows": same width in both, so pressing Edit moves nothing).
+pub(crate) fn label_column<E: gpui::Styled>(el: E) -> E {
+    el.w(relative(0.26))
+        .min_w(px(80.))
+        .max_w(px(140.))
+        .flex_shrink_0()
+}
+
 /// One field row, shared by the detail column, item windows and the backup viewer: the
 /// label column, then the value (filling the width) and its buttons. `icon` is the
 /// field's stored icon name: a known symbol is drawn left of the label (05 "Field
@@ -185,16 +200,12 @@ pub(crate) fn field_row(
         .w_full()
         .items_start()
         .py(px(FIELD_ROW_PAD_Y))
-        .gap(px(16.))
+        .gap(px(FIELD_ROW_GAP))
         .border_b_1()
         .border_color(theme.border)
         .child(
-            div()
+            label_column(div())
                 .debug_selector(move || format!("field-label {ix}"))
-                .w(relative(0.26))
-                .min_w(px(80.))
-                .max_w(px(140.))
-                .flex_shrink_0()
                 .pt(px(3.))
                 .whitespace_normal()
                 .text_color(label_color)
@@ -232,7 +243,7 @@ pub(crate) fn field_row(
                         .min_w_0()
                         .items_start()
                         .gap(px(4.))
-                        .min_h(px(28.))
+                        .min_h(px(FIELD_LINE_MIN_H))
                         .child(
                             ui::h_flex()
                                 .flex_1()
@@ -705,6 +716,8 @@ impl ReadDetail<'_> {
                     ui::h_flex()
                         .id("detail-tags")
                         .debug_selector(|| "detail-tags".into())
+                        // The editor's tags row height: Edit does not move the rows.
+                        .min_h(crate::theme::scaled(super::editor::TAGS_ROW_HEIGHT, cx))
                         .max_h(px(TAGS_MAX_H))
                         .overflow_y_scroll()
                         .gap(px(6.))

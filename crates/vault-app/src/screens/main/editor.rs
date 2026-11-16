@@ -5,26 +5,27 @@
 //! adding, removing or reordering fields keeps the other inputs (and their cursors).
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
-    prelude::FluentBuilder as _, px,
+    Anchor, AnyElement, App, AppContext as _, Context, Entity, FocusHandle, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window,
+    div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Backspace, InputEvent, InputState, Textarea, TextareaState};
+use gpui_component::input::{Backspace, Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
-use vault_core::{ExposeSecret as _, FieldKind};
+use vault_core::{ExposeSecret as _, FieldKind, HistoryEntry, SecretString, Uuid};
 
-use super::detail::history_disclosure;
+use super::detail::{FIELD_LINE_MIN_H, FIELD_ROW_GAP, FIELD_ROW_PAD_Y, history_disclosure};
 use super::generator::GeneratorView;
 use super::prompts;
 use crate::actions::{CancelEdit, SaveItem};
-use crate::audit::{self, FieldIssue, strength_bits};
+use crate::audit::{self, FieldIssue, Issue, strength_bits};
 use crate::state::{ADDABLE_KINDS, AppState, EditBuffer, GeneratorTarget, Mode, kind_name};
 use crate::text;
 use crate::ui::{self, Clickable as _};
@@ -45,7 +46,35 @@ struct Row {
     value: ValueInput,
     /// Focus of this row's field icon picker (05 "Field icons").
     icon_focus: super::icon_view::FieldIconFocus,
+    /// The ↑/↓ and trash buttons' focus: owned here so a row with a focused button
+    /// keeps its arrows shown, and focus stays on the button when the row moves.
+    up: FocusHandle,
+    down: FocusHandle,
+    trash: FocusHandle,
     _subscriptions: Vec<Subscription>,
+}
+
+impl Row {
+    /// The value input's focus handle (a section has none).
+    fn value_focus(&self, cx: &App) -> Option<FocusHandle> {
+        match &self.value {
+            ValueInput::Line(i) => Some(gpui::Focusable::focus_handle(i, cx)),
+            ValueInput::Area(a) => Some(gpui::Focusable::focus_handle(a, cx)),
+            ValueInput::None => None,
+        }
+    }
+
+    /// The row's own button and icon-picker focus handles (not the inputs').
+    fn focus_handles(&self) -> impl Iterator<Item = &FocusHandle> {
+        [
+            &self.up,
+            &self.down,
+            &self.trash,
+            &self.icon_focus.panel,
+            &self.icon_focus.none,
+        ]
+        .into_iter()
+    }
 }
 
 /// What is dragged when a row's grip is pulled.
@@ -61,7 +90,9 @@ struct DraggedRow {
     width: Pixels,
 }
 
-/// The ghost under the pointer while dragging: the row's header line at the row's width.
+/// The ghost under the pointer while dragging: the row's value line at the row's width,
+/// in the row's geometry (label column with grip, icon and name; kind chip trailing).
+/// The value is not drawn (it may be a secret; the dragged row hides it too).
 struct DragPreview(DraggedRow);
 
 impl Render for DragPreview {
@@ -72,25 +103,33 @@ impl Render for DragPreview {
         let name = if row.name.is_empty() {
             div().text_color(muted).child(row.placeholder)
         } else {
-            div().child(row.name.clone())
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .child(row.name.clone())
         };
         ui::h_flex()
             .w(row.width)
-            .gap(px(6.))
-            .px(px(4.))
-            .py(px(6.))
+            .py(px(FIELD_ROW_PAD_Y))
+            .gap(px(FIELD_ROW_GAP))
             .rounded(theme.radius)
             .bg(theme.popover)
             .border_1()
             .border_color(theme.border)
             .shadow_md()
             .opacity(0.95)
-            .child(Icon::new(IconName::GripVertical).size_4().text_color(muted))
-            .when_some(row.icon, |r, icon| {
-                r.child(Icon::new(icon).size_4().text_color(muted))
-            })
-            .child(name.min_w_0().truncate().text_sm())
+            .child(
+                super::detail::label_column(ui::h_flex())
+                    .min_h(px(FIELD_LINE_MIN_H))
+                    .gap(px(4.))
+                    .child(Icon::new(IconName::GripVertical).size_4().text_color(muted))
+                    .when_some(row.icon, |r, icon| {
+                        r.child(Icon::new(icon).size_4().text_color(muted))
+                    })
+                    .child(name.min_w_0().truncate().text_sm()),
+            )
+            .child(div().flex_1())
             .child(Tag::secondary().small().child(row.kind))
+            .pr(px(4.))
     }
 }
 
@@ -132,6 +171,111 @@ fn drop_index(from: usize, target: usize, lower: bool) -> Option<usize> {
     (gap != from && gap != from + 1).then(|| if gap > from { gap - 1 } else { gap })
 }
 
+/// Strength and live notices of one password row (05 §2.3 "Password notices").
+struct ScoredValue {
+    /// The value they were computed for.
+    value: SecretString,
+    bits: f64,
+    issues: Vec<Issue>,
+}
+
+/// Per-row [`ScoredValue`]s, kept until the row's value or the saved vault changes, so a
+/// frame (a scroll, a drag move, typing in another row) scores nothing again: one
+/// `strength_bits` and one reuse scan per value change.
+#[derive(Default)]
+struct IssueCache {
+    /// The edited item: reuse is counted among the saved items other than it.
+    item: Option<Uuid>,
+    /// The listing's audit when the entries were computed. `vault_changed` replaces it,
+    /// which is when the reuse counts can change.
+    audit: Option<Rc<audit::Issues>>,
+    rows: HashMap<u64, ScoredValue>,
+}
+
+impl IssueCache {
+    /// Rescores the password rows whose value changed (all of them after a vault change)
+    /// and drops the entries of rows that are gone or no longer passwords.
+    fn update(&mut self, buffer: &EditBuffer, s: &AppState) {
+        let audit = &s.listing.issues;
+        let item = Some(buffer.item.id);
+        if self.item != item || !self.audit.as_ref().is_some_and(|a| Rc::ptr_eq(a, audit)) {
+            self.item = item;
+            self.audit = Some(audit.clone());
+            self.rows.clear();
+        }
+        let passwords = || {
+            buffer
+                .keys
+                .iter()
+                .zip(&buffer.item.fields)
+                .filter(|(_, f)| f.kind == FieldKind::Password)
+        };
+        self.rows
+            .retain(|key, _| passwords().any(|(k, _)| k == key));
+        let vault = s.unlocked_vault();
+        for (key, field) in passwords() {
+            let value = field.value.expose_secret();
+            if self
+                .rows
+                .get(key)
+                .is_some_and(|c| c.value.expose_secret() == value)
+            {
+                continue;
+            }
+            let bits = strength_bits(value);
+            let issues = vault
+                .map(|v| audit::scored_value_issues(v, value, bits, buffer.item.id))
+                .unwrap_or_default();
+            let value = field.value.clone();
+            self.rows.insert(
+                *key,
+                ScoredValue {
+                    value,
+                    bits,
+                    issues,
+                },
+            );
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ALL_ARROWS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Tests only: while alive, ↑/↓ are drawn on every row, as the cursor audit's scan moves
+/// no hover. Dropping it restores hover/focus-only arrows.
+#[cfg(test)]
+#[must_use]
+pub(crate) struct AllArrowsForTests(());
+
+#[cfg(test)]
+impl AllArrowsForTests {
+    pub(crate) fn on() -> Self {
+        ALL_ARROWS.with(|a| a.set(true));
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for AllArrowsForTests {
+    fn drop(&mut self) {
+        ALL_ARROWS.with(|a| a.set(false));
+    }
+}
+
+fn all_arrows() -> bool {
+    #[cfg(test)]
+    return ALL_ARROWS.with(Cell::get);
+    #[cfg(not(test))]
+    false
+}
+
 /// Icon tile in the edit header: the read-mode header's size, so it does not jump.
 const HEADER_TILE: f32 = 44.;
 
@@ -156,6 +300,10 @@ pub struct Editor {
     row_width: Rc<Cell<Pixels>>,
     /// Focus of the open icon picker (arrow keys and Enter move and choose).
     icon_focus: gpui::FocusHandle,
+    /// Live password notices, rescored only when a value changes.
+    scores: IssueCache,
+    /// Key of the row under the pointer: it shows its ↑/↓ buttons.
+    hovered: Option<u64>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -219,6 +367,8 @@ impl Editor {
             drag: Rc::default(),
             row_width: Rc::new(Cell::new(px(280.))),
             icon_focus: cx.focus_handle(),
+            scores: IssueCache::default(),
+            hovered: None,
             _subscriptions: subscriptions,
         }
     }
@@ -233,6 +383,8 @@ impl Editor {
                 // Drop the inputs (and the text they hold) as soon as editing ends.
                 self.rows.clear();
                 self.drag.clear();
+                self.scores.clear();
+                self.hovered = None;
                 ui::clear_input(&self.title, window, cx);
                 ui::clear_input(&self.tags, window, cx);
             }
@@ -246,6 +398,9 @@ impl Editor {
             self.session = session;
             self.rows.clear();
             self.drag.clear();
+            self.scores.clear();
+            // Row keys restart per session: a stale key would light another row.
+            self.hovered = None;
             ui::set_input(&self.title, &buffer.item.title, window, cx);
             ui::clear_input(&self.tags, window, cx);
             ui::focus_input(&self.title, window, cx);
@@ -419,6 +574,9 @@ impl Editor {
                 // A Tab stop: the row's `tab_index` does not apply to a tracked handle.
                 none: cx.focus_handle().tab_stop(true),
             },
+            up: cx.focus_handle(),
+            down: cx.focus_handle(),
+            trash: cx.focus_handle(),
             _subscriptions: subs,
         }
     }
@@ -455,12 +613,21 @@ impl Editor {
             .children(rows)
     }
 
+    /// One editable field row (05 §2.3 "Edit-mode field rows", owner 2026-11-15): read
+    /// mode's `detail::field_row` geometry (label column, value column, 7 px padding,
+    /// hairline rule) with borderless inputs in place of the text, the kind chip, ↑/↓
+    /// and trash at the trailing edge, and the row's extras under the value line.
+    /// `dragged_ix`: index of the row being dragged, if a field drag is in progress.
+    #[allow(clippy::too_many_arguments)]
     fn render_row(
         &self,
         ix: usize,
         row: &Row,
+        dragged_ix: Option<usize>,
         buffer: &EditBuffer,
         s: &AppState,
+        this: &WeakEntity<Self>,
+        window: &Window,
         cx: &App,
     ) -> AnyElement {
         let theme = cx.theme();
@@ -469,10 +636,25 @@ impl Editor {
         };
         let key = row.key;
         let count = buffer.keys.len();
+        let section = field.kind == FieldKind::Section;
+        let is_ghost = dragged_ix == Some(ix);
+        let name_focus = gpui::Focusable::focus_handle(&row.name, cx);
+        let value_focus = row.value_focus(cx);
+        let value_focused = value_focus.as_ref().is_some_and(|h| h.is_focused(window));
+        // ↑/↓ only on the hovered row and the row holding focus (perf: a Button each).
+        // No hover arrows during a field drag: only the drop line marks rows then.
+        let show_arrows = !is_ghost
+            && (all_arrows()
+                || (dragged_ix.is_none() && self.hovered == Some(key))
+                || value_focused
+                || name_focus.is_focused(window)
+                || row.focus_handles().any(|h| h.is_focused(window)));
 
-        let mover = |id: &'static str, icon: IconName, label: &str, to: Option<usize>| {
+        let mover = |id: &'static str, icon: IconName, label: &str, to: Option<usize>, focus| {
             let state = self.state.clone();
             ui::icon_button((id, key), icon, label)
+                .track_focus(focus)
+                .debug_selector(move || format!("{id} {key}"))
                 .disabled(to.is_none())
                 .clickable_when(to.is_some())
                 .on_click(move |_, _, cx| {
@@ -481,22 +663,49 @@ impl Editor {
                     }
                 })
         };
+        let arrows = if show_arrows {
+            ui::h_flex()
+                .flex_none()
+                .gap(px(4.))
+                .child(mover(
+                    "move-up",
+                    IconName::ArrowUp,
+                    "Move field up",
+                    ix.checked_sub(1),
+                    &row.up,
+                ))
+                .child(mover(
+                    "move-down",
+                    IconName::ArrowDown,
+                    "Move field down",
+                    (ix + 1 < count).then_some(ix + 1),
+                    &row.down,
+                ))
+        } else {
+            // Their space stays reserved, so the value input does not resize on hover.
+            ui::h_flex()
+                .flex_none()
+                .gap(px(4.))
+                .child(div().flex_none().size_6())
+                .child(div().flex_none().size_6())
+        };
         let remove = {
             let state = self.state.clone();
-            ui::icon_button(("remove-field", key), IconName::Trash, "Remove field").on_click(
-                move |_, _, cx| {
+            ui::icon_button(("remove-field", key), IconName::Trash, "Remove field")
+                .track_focus(&row.trash)
+                .debug_selector(move || format!("remove-field {key}"))
+                .on_click(move |_, _, cx| {
                     state.update(cx, |s, cx| s.edit(cx, |b| b.remove_field(key)));
-                },
-            )
+                })
         };
+        let trailing = ui::h_flex()
+            .flex_none()
+            .gap(px(4.))
+            .child(Tag::secondary().small().child(kind_name(field.kind)))
+            .child(arrows)
+            .child(remove);
 
         let drag = self.drag.clone();
-        let dragged_ix = cx
-            .has_active_drag()
-            .then(|| self.drag.row.get())
-            .flatten()
-            .and_then(|k| self.rows.iter().position(|r| r.key == k));
-        let is_ghost = dragged_ix == Some(ix);
         // The accent line between rows: at this row's top (insert before) or bottom.
         let line = match (dragged_ix, self.drag.target.get()) {
             (Some(from), Some((target, lower))) if target == ix => {
@@ -504,9 +713,9 @@ impl Editor {
             }
             _ => None,
         };
-        let section = field.kind == FieldKind::Section;
-        let name_input = row.name.clone();
+        let grip_focus = row.name.clone();
         let grip = div()
+            .flex_none()
             .debug_selector(move || format!("grip {key}"))
             .id(("grip", key))
             .cursor_grab()
@@ -517,7 +726,7 @@ impl Editor {
             // and Esc then reaches the editor's drag cancel (not the edit cancel).
             .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                 window.prevent_default();
-                ui::focus_input(&name_input, window, cx);
+                ui::focus_input(&grip_focus, window, cx);
             })
             .on_drag(
                 DraggedRow {
@@ -537,6 +746,87 @@ impl Editor {
                     cx.new(|_| DragPreview(dragged.clone()))
                 },
             );
+        let name = div()
+            .debug_selector(move || format!("edit-name {key}"))
+            .flex_1()
+            .min_w_0()
+            .child(
+                field_input(&row.name)
+                    .text_color(theme.foreground)
+                    .font_weight(FontWeight::MEDIUM),
+            );
+
+        let row_el = ui::h_flex()
+            .id(("edit-row", key))
+            .debug_selector(move || format!("edit-row {key}"))
+            .relative()
+            .w_full()
+            .border_color(theme.border)
+            // The row being dragged collapses to its header line at 40 % opacity.
+            .when(is_ghost, |row| row.opacity(0.4))
+            .on_hover({
+                let this = this.clone();
+                move |hovered, _, cx| {
+                    // A drag crossing rows does not hover them (and redraws nothing).
+                    let hovered = *hovered && !cx.has_active_drag();
+                    this.update(cx, |e, cx| {
+                        let now = if hovered {
+                            Some(key)
+                        } else {
+                            e.hovered.filter(|k| *k != key)
+                        };
+                        if now != e.hovered {
+                            e.hovered = now;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }
+            })
+            // Which half of this row the pointer is over (the line follows the pointer).
+            .on_drag_move::<DraggedRow>({
+                let drag = self.drag.clone();
+                move |ev, _, _| {
+                    let pos = ev.event.position;
+                    if ev.bounds.contains(&pos) {
+                        drag.target.set(Some((ix, pos.y >= ev.bounds.center().y)));
+                    }
+                }
+            })
+            // Drop indicator: one 2 px accent line over the separator, no layout shift.
+            .when_some(line, |row, lower| {
+                let bar = div()
+                    .debug_selector(|| "drop-line".into())
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .h(px(2.))
+                    .bg(theme.primary);
+                row.child(if lower {
+                    bar.bottom(px(LINE_INSET))
+                } else {
+                    bar.top(px(LINE_INSET))
+                })
+            });
+
+        // A section: read mode's heading geometry (extra space above unless first, 2 px
+        // rule), one name input spanning the row.
+        if section {
+            let top = if ix == 0 {
+                FIELD_ROW_PAD_Y
+            } else {
+                FIELD_ROW_PAD_Y + super::detail::SECTION_GAP
+            };
+            return row_el
+                .pt(px(top))
+                .pb(px(FIELD_ROW_PAD_Y))
+                .gap(px(4.))
+                .border_b_2()
+                .child(grip)
+                .child(name)
+                .child(trailing)
+                .into_any_element();
+        }
 
         let value: Option<AnyElement> = match &row.value {
             ValueInput::Line(input) => {
@@ -545,17 +835,51 @@ impl Editor {
                     FieldKind::Password | FieldKind::Pin | FieldKind::Totp
                 );
                 Some(
-                    ui::input(input)
-                        .small()
-                        .when(masked, |i| i.mask_toggle())
+                    field_input(input)
+                        // Muted like read mode's values until focused.
+                        .text_color(if value_focused {
+                            theme.foreground
+                        } else {
+                            theme.muted_foreground
+                        })
+                        .when(masked, |i| {
+                            i.font_family(theme.mono_font_family.clone()).mask_toggle()
+                        })
                         .into_any_element(),
                 )
             }
-            ValueInput::Area(area) => Some(Textarea::new(area).into_any_element()),
+            ValueInput::Area(area) => Some(
+                Textarea::new(area)
+                    .bg(gpui::transparent_black())
+                    .border_color(gpui::transparent_black())
+                    .text_color(if value_focused {
+                        theme.foreground
+                    } else {
+                        theme.muted_foreground
+                    })
+                    .into_any_element(),
+            ),
             ValueInput::None => None,
         }
         // The dragged row collapses to its header line.
         .filter(|_| !is_ghost);
+        let notes = matches!(row.value, ValueInput::Area(_));
+        let content = ui::h_flex()
+            .debug_selector(move || format!("edit-content {key}"))
+            .w_full()
+            .min_w_0()
+            .when(notes, |line| line.items_start())
+            .gap(px(4.))
+            .min_h(px(FIELD_LINE_MIN_H))
+            .child(
+                div()
+                    .debug_selector(move || format!("edit-value {key}"))
+                    .flex_1()
+                    .min_w_0()
+                    .children(value),
+            )
+            .child(trailing);
+
         let scan_file = (field.kind == FieldKind::Totp).then(|| {
             let state = self.state.clone();
             ui::icon_button(
@@ -593,141 +917,95 @@ impl Editor {
                 move |_, _| generator.clone().into_any_element(),
             )
         });
-
-        ui::v_flex()
-            .id(("edit-row", key))
-            .debug_selector(move || format!("edit-row {key}"))
-            .relative()
-            .py(px(8.))
-            .gap(px(6.))
-            .px(px(4.))
-            .rounded(theme.radius)
-            .border_b_1()
-            .border_color(theme.border)
-            // The row being dragged collapses to its header line at 40 % opacity.
-            .when(is_ghost, |row| row.opacity(0.4))
-            // Which half of this row the pointer is over (the line follows the pointer).
-            .on_drag_move::<DraggedRow>({
-                let drag = self.drag.clone();
-                move |ev, _, _| {
-                    let pos = ev.event.position;
-                    if ev.bounds.contains(&pos) {
-                        drag.target.set(Some((ix, pos.y >= ev.bounds.center().y)));
-                    }
-                }
-            })
-            // Drop indicator: one 2 px accent line over the separator, no layout shift.
-            .when_some(line, |row, lower| {
-                let bar = div()
-                    .debug_selector(|| "drop-line".into())
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .h(px(2.))
-                    .bg(theme.primary);
-                row.child(if lower {
-                    bar.bottom(px(LINE_INSET))
-                } else {
-                    bar.top(px(LINE_INSET))
-                })
-            })
-            .child(
-                ui::h_flex()
-                    .gap(px(6.))
-                    .child(grip)
-                    // Sections carry no icon (05 "Field icons").
-                    .when(field.kind != FieldKind::Section, |r| {
-                        r.child(super::icon_view::field_icon_button(
-                            &self.state,
-                            key,
-                            &row.icon_focus,
-                            &gpui::Focusable::focus_handle(&row.name, cx),
-                            cx,
-                        ))
-                    })
-                    .child(div().w(px(180.)).child(ui::input(&row.name).small()))
-                    .child(Tag::secondary().small().child(kind_name(field.kind)))
-                    .when(buffer.remote_fields.contains(&key), |row| {
-                        row.child(remote_badge(("remote", key)))
-                    })
-                    .child(div().flex_1())
-                    .child(mover(
-                        "move-up",
-                        IconName::ArrowUp,
-                        "Move field up",
-                        ix.checked_sub(1),
-                    ))
-                    .child(mover(
-                        "move-down",
-                        IconName::ArrowDown,
-                        "Move field down",
-                        (ix + 1 < count).then_some(ix + 1),
-                    ))
-                    .child(remove),
-            )
-            .when_some(value, |row, value| {
-                row.child(
-                    ui::h_flex()
-                        .gap(px(4.))
-                        .pl(px(22.))
-                        .child(div().flex_1().min_w_0().child(value))
-                        .children(generate)
-                        .children(scan_file),
-                )
-            })
-            .when(!is_ghost && buffer.row_limited(key), |col| {
-                col.child(
-                    limit_note(("field-limit", key), format!("field-limit {key}"), cx).pl(px(22.)),
-                )
-            })
-            .children(totp_hint(key, buffer, cx).filter(|_| !is_ghost))
-            .when(!is_ghost && field.kind == FieldKind::Password, |col| {
-                col.child(
+        let scored = self.scores.rows.get(&key);
+        // Under the value line, inside the value column: the strength meter with
+        // Generate, the TOTP validity line with Scan, the notices (05 §2.3).
+        let meter_line = generate.map(|generate| {
+            ui::h_flex()
+                .gap(px(8.))
+                .child(div().flex_1().min_w_0().when_some(scored, |d, scored| {
+                    d.debug_selector(move || format!("strength-meter {key}"))
+                        .child(ui::strength_meter(scored.bits, cx))
+                }))
+                .child(generate)
+        });
+        let totp_line = scan_file.map(|scan| {
+            ui::h_flex()
+                .gap(px(8.))
+                .child(
                     div()
-                        .debug_selector(move || format!("strength-meter {key}"))
-                        .pl(px(22.))
-                        .child(ui::strength_meter(
-                            strength_bits(field.value.expose_secret()),
-                            cx,
-                        )),
+                        .flex_1()
+                        .min_w_0()
+                        .children(totp_hint(key, buffer, cx)),
                 )
+                .child(scan)
+        });
+        let issues = scored.map_or(&[][..], |scored| &scored.issues[..]);
+        let column = ui::v_flex()
+            .flex_1()
+            .min_w_0()
+            .gap(px(super::detail::ISSUE_STRIP_GAP))
+            .child(content)
+            .when(!is_ghost, |col| {
+                col.when(buffer.remote_fields.contains(&key), |col| {
+                    col.child(remote_badge(("remote", key)))
+                })
+                .when(buffer.row_limited(key), |col| {
+                    col.child(limit_note(
+                        ("field-limit", key),
+                        format!("field-limit {key}"),
+                        cx,
+                    ))
+                })
+                .children(totp_line)
+                .children(meter_line)
                 // Password notices follow the typed value; reuse is checked against the
                 // saved items other than this one (05 §2.3 "Password notices").
-                .children(issue_strips(field, buffer, s, cx))
-            })
+                .children(issues.iter().map(|&issue| {
+                    super::detail::issue_strip(
+                        &FieldIssue {
+                            field: field.id,
+                            issue,
+                        },
+                        cx,
+                    )
+                }))
+            });
+
+        row_el
+            .items_start()
+            .py(px(FIELD_ROW_PAD_Y))
+            .gap(px(FIELD_ROW_GAP))
+            .border_b_1()
+            .child(
+                super::detail::label_column(ui::h_flex())
+                    .debug_selector(move || format!("edit-label {key}"))
+                    .min_h(px(FIELD_LINE_MIN_H))
+                    .gap(px(4.))
+                    .child(grip)
+                    // Sections carry no icon (05 "Field icons").
+                    .child(super::icon_view::field_icon_button(
+                        &self.state,
+                        key,
+                        &row.icon_focus,
+                        &name_focus,
+                        cx,
+                    ))
+                    .child(name),
+            )
+            .child(column)
             .into_any_element()
     }
 }
 
-/// The live password notices under a password row in edit mode: the typed value's
-/// strength and its reuse among the saved items other than the edited one. Empty value,
-/// no notices. 4 px apart and 4 px under the strength meter, aligned with the inputs.
-fn issue_strips(
-    field: &vault_core::Field,
-    buffer: &EditBuffer,
-    s: &AppState,
-    cx: &App,
-) -> Option<gpui::Div> {
-    let issues = audit::value_issues(
-        s.unlocked_vault()?,
-        field.value.expose_secret(),
-        buffer.item.id,
-    );
-    (!issues.is_empty()).then(|| {
-        ui::v_flex()
-            .pl(px(22.))
-            .mt(px(super::detail::ISSUE_STRIP_GAP - 6.))
-            .gap(px(super::detail::ISSUE_STRIP_GAP))
-            .children(issues.into_iter().map(|issue| {
-                super::detail::issue_strip(
-                    &FieldIssue {
-                        field: field.id,
-                        issue,
-                    },
-                    cx,
-                )
-            }))
-    })
+/// A borderless, transparent field input (05 §2.3 "Edit-mode field rows"): it reads
+/// like read mode's text until focused, when gpui-component's accent ring is drawn on
+/// the input itself (its border stays 1 px transparent at rest, so nothing moves).
+fn field_input(state: &Entity<InputState>) -> Input {
+    ui::input(state)
+        .small()
+        .bg(gpui::transparent_black())
+        .border_color(gpui::transparent_black())
 }
 
 /// "Field limited to 1 MiB": muted, under a field whose input was cut to the limit. Save
@@ -757,7 +1035,6 @@ fn totp_hint(key: u64, buffer: &EditBuffer, cx: &App) -> Option<AnyElement> {
         ui::h_flex()
             .id(("totp-hint", key))
             .debug_selector(move || format!("totp-hint {message}"))
-            .pl(px(22.))
             .gap(px(4.))
             .text_xs()
             .text_color(color)
@@ -769,8 +1046,9 @@ fn totp_hint(key: u64, buffer: &EditBuffer, cx: &App) -> Option<AnyElement> {
 
 /// The tag chips with their remove buttons, then the "Add tag" input (§2.3 edit mode).
 /// Height of the edit-mode tags row at the default text size: fits a removable chip
-/// and the small input.
-const TAGS_ROW_HEIGHT: f32 = 28.;
+/// and the small input. Read mode's tags row has it as its minimum, so the field rows
+/// of a tagged item sit at the same height in both modes.
+pub(super) const TAGS_ROW_HEIGHT: f32 = 28.;
 
 fn tags_row(
     tags: &[String],
@@ -915,6 +1193,7 @@ impl Render for Editor {
         let Some(buffer) = s.edit_buffer() else {
             return div().into_any_element();
         };
+        self.scores.update(buffer, s);
         let theme = cx.theme();
         let new_kind = match s.mode {
             Mode::New(kind, _) => Some(kind),
@@ -925,21 +1204,42 @@ impl Render for Editor {
         // item has no history).
         let mut rows: Vec<AnyElement> = Vec::with_capacity(self.rows.len() + 1);
         let fields = &buffer.item.fields;
+        // Each stored entry's row, in one pass: field index -> its entries, in item order.
+        let mut owned_by_row: Vec<Vec<&HistoryEntry>> = vec![Vec::new(); fields.len()];
+        if new_kind.is_none() {
+            for h in &buffer.item.history {
+                if let Some(at) = super::detail::history_row(fields, h) {
+                    owned_by_row[at].push(h);
+                }
+            }
+        }
+        let dragged_ix = cx
+            .has_active_drag()
+            .then(|| self.drag.row.get())
+            .flatten()
+            .and_then(|k| self.rows.iter().position(|r| r.key == k));
+        let this = cx.entity().downgrade();
         for (ix, row) in self.rows.iter().enumerate() {
-            rows.push(self.render_row(ix, row, buffer, s, cx));
+            rows.push(self.render_row(ix, row, dragged_ix, buffer, s, &this, window, cx));
             // The row's field index, by key (not by assuming row order).
-            let Some(at) = buffer.keys.iter().position(|k| *k == row.key) else {
-                continue;
+            let at = if buffer.keys.get(ix) == Some(&row.key) {
+                Some(ix)
+            } else {
+                buffer.keys.iter().position(|k| *k == row.key)
             };
-            let mine =
-                |h: &&vault_core::HistoryEntry| super::detail::history_row(fields, h) == Some(at);
             // Shown while the row owns any stored entry, so "(0) · N removed on save" stays
             // after the last one is trashed or cleared.
-            let owned: Vec<_> = buffer.item.history.iter().filter(mine).collect();
-            if new_kind.is_some() || owned.is_empty() {
+            let Some((at, owned)) = at.and_then(|at| Some((at, owned_by_row.get(at)?))) else {
+                continue;
+            };
+            if owned.is_empty() {
                 continue;
             }
-            let history: Vec<_> = buffer.history().filter(mine).collect();
+            let history: Vec<_> = owned
+                .iter()
+                .copied()
+                .filter(|h| !buffer.removed_history.contains(&h.replaced_at))
+                .collect();
             // Pending removals of this row's entries.
             let removed = buffer
                 .removed_history
@@ -1006,7 +1306,8 @@ impl Render for Editor {
             .flex_none()
             .pt(px(ui::content_top(s)))
             .px(pad_x)
-            .gap(px(10.))
+            // Read mode's gap: with the tags row's height, the rows stay put on Edit.
+            .gap(px(12.))
             .when_some(new_kind, |col, kind| {
                 col.child(ui::muted(format!("New {}", kind.label()), cx))
             })
@@ -1037,8 +1338,8 @@ impl Render for Editor {
             })
             .child(ui::divider(cx));
 
-        // Only the field rows and "Add field" scroll; the top padding keeps the gap the
-        // rows had under the rule before it was pinned.
+        // Only the field rows and "Add field" scroll. No top padding: as in read mode the
+        // first row sits under the rule by its own 7 px padding (05 "Edit-mode field rows").
         let scroll = ui::v_flex()
             .id("editor-scroll")
             .debug_selector(|| "editor-scroll".into())
@@ -1046,7 +1347,6 @@ impl Render for Editor {
             .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
-            .pt(px(10.))
             .px(pad_x)
             .pb(px(64.))
             .gap(px(10.))
@@ -1196,8 +1496,17 @@ mod drag_tests {
         let value = super::tests::value_input(&main, keys[0], &mut vcx);
         vcx.update(|window, cx| ui::focus_input(&value, window, cx));
         let full = row(&mut vcx, 0).size.height;
+        let value_h = |vcx: &mut VisualTestContext| {
+            bounds(vcx, format!("edit-value {}", keys[0]))
+                .unwrap()
+                .size
+                .height
+        };
+        assert!(value_h(&mut vcx) > px(0.), "value input drawn");
         start_drag(&mut vcx);
-        assert!(row(&mut vcx, 0).size.height < full, "dragged row collapses");
+        // One line already: the dragged row keeps its height and hides its value.
+        assert_eq!(value_h(&mut vcx), px(0.), "dragged row hides its value");
+        assert!(row(&mut vcx, 0).size.height <= full);
         vcx.update(|window, cx| {
             let editor = main.read(cx).editor.read(cx);
             let name = gpui::Focusable::focus_handle(&editor.rows[0].name, cx);
@@ -1207,6 +1516,11 @@ mod drag_tests {
         assert_eq!(hover(&mut vcx, 1, 0.25), None, "own slot");
         let below_b = hover(&mut vcx, 1, 0.75).expect("line under b");
         let above_c = hover(&mut vcx, 2, 0.25).expect("line over c");
+        // Crossed rows are not hovered: no ↑/↓ beside the drop line.
+        for k in &keys {
+            let up = bounds(&mut vcx, format!("move-up {k}"));
+            assert!(up.is_none(), "arrows on row {k} during the drag");
+        }
         assert_eq!(below_b, above_c, "one gap, one line position");
         assert!((below_b.size.height - px(2.)).abs() < px(0.01));
 
@@ -1248,3 +1562,11 @@ mod drag_tests {
 #[cfg(test)]
 #[path = "editor_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "editor_perf_tests.rs"]
+mod perf_tests;
+
+#[cfg(test)]
+#[path = "editor_row_tests.rs"]
+mod row_tests;

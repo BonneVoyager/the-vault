@@ -35,7 +35,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo run -p vault-cli -- --help
-cargo run -p vault-app
+cargo run -p vault-app              # dev build: 5–10× slower frames, fine for logic, not for feel
+cargo run --release -p vault-app    # use this (or the .app) for eye and performance checks
 ```
 
 Toolchain: Rust pinned in `rust-toolchain.toml` (gpui-pre needs it), edition 2024. macOS 15+ target. No CI yet (see the testing roadmap in `specs/00-overview.md`); run the four checks above before declaring a task done.

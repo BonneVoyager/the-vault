@@ -13,6 +13,8 @@ pub(crate) mod unlock;
 pub use backup::open_backup_window;
 pub use choose::ChooseScreen;
 pub use item_window::open_item_window;
+#[cfg(test)]
+pub(crate) use main::AllArrowsForTests;
 pub use main::icon_view;
 pub use main::{ColumnsResized, MainScreen};
 #[cfg(test)]

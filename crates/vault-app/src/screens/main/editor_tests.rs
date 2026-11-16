@@ -561,7 +561,7 @@ fn icon_picker_opens_from_the_tile_and_works_by_keyboard(cx: &mut TestAppContext
 }
 
 /// Inserts `item` into the open vault and selects it; returns its id.
-fn insert_and_select(
+pub(super) fn insert_and_select(
     state: &Entity<AppState>,
     item: vault_core::Item,
     vcx: &mut VisualTestContext,
@@ -881,7 +881,7 @@ fn choose_image_row_takes_a_drop_and_the_picker_stays_open(cx: &mut TestAppConte
 }
 
 /// The name input of row `key`.
-fn name_input(
+pub(super) fn name_input(
     main: &Entity<MainScreen>,
     key: u64,
     vcx: &mut VisualTestContext,
@@ -1012,7 +1012,7 @@ fn picker_on(
     (dir, state, vcx, default)
 }
 
-fn leak(s: String) -> &'static str {
+pub(super) fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
@@ -1381,7 +1381,7 @@ fn pasted_note_over_the_field_limit_is_cut_and_saves(cx: &mut TestAppContext) {
 }
 
 /// Key down and up: a focused row's keyboard click fires on key up.
-fn press(vcx: &mut VisualTestContext, key: &'static str) {
+pub(super) fn press(vcx: &mut VisualTestContext, key: &'static str) {
     vcx.simulate_keystrokes(key);
     vcx.simulate_event(gpui::KeyUpEvent {
         keystroke: gpui::Keystroke::parse(key).unwrap(),
@@ -2022,6 +2022,86 @@ fn password_notices_follow_the_typed_value(cx: &mut TestAppContext) {
             }]
         ));
     });
+}
+
+/// The editor's cached score of row `key`: (weak, reused count) of its notices.
+fn cached_issues(
+    main: &Entity<MainScreen>,
+    key: u64,
+    vcx: &mut VisualTestContext,
+) -> (bool, Option<usize>) {
+    main.read_with(vcx, |m, cx| {
+        let scored = &m.editor.read(cx).scores.rows[&key];
+        let weak = scored.bits < crate::audit::WEAK_BELOW_BITS;
+        let reused = scored.issues.iter().find_map(|i| match i {
+            crate::audit::Issue::Reused { count } => Some(*count),
+            crate::audit::Issue::Weak { .. } => None,
+        });
+        assert_eq!(
+            weak,
+            matches!(
+                scored.issues.first(),
+                Some(crate::audit::Issue::Weak { .. })
+            ),
+            "weak strip iff the meter scores weak"
+        );
+        (weak, reused)
+    })
+}
+
+/// The cached password notices are rescored when the typed value changes (weak and reused
+/// → strong and unique → back) and when the saved vault changes under the edit (the other
+/// user of the password deleted: reused → unique without typing).
+#[gpui::test]
+fn cached_notices_follow_value_and_vault_changes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let other = insert_and_select(&state, pw_login("Other", "123", &state, &vcx), &mut vcx);
+    let item = pw_login("Bank", "123", &state, &vcx);
+    let field = item.fields[0].id;
+    insert_and_select(&state, item, &mut vcx);
+    let weak = leak(format!("issue-strip {field} Weak Password"));
+    let reused = leak(format!("issue-strip {field} Reused Password"));
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let key = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().keys[0]);
+    assert_eq!(cached_issues(&main, key, &mut vcx), (true, Some(2)));
+    assert!(vcx.debug_bounds(weak).is_some() && vcx.debug_bounds(reused).is_some());
+
+    let input = value_input(&main, key, &mut vcx);
+    retype(&input, "an-entirely-Different-passphrase-7", &mut vcx);
+    assert_eq!(
+        cached_issues(&main, key, &mut vcx),
+        (false, None),
+        "strong, unique"
+    );
+    assert!(vcx.debug_bounds(weak).is_none() && vcx.debug_bounds(reused).is_none());
+
+    retype(&input, "123", &mut vcx);
+    assert_eq!(
+        cached_issues(&main, key, &mut vcx),
+        (true, Some(2)),
+        "weak, reused again"
+    );
+
+    // A vault change while editing: the only other user of "123" is deleted.
+    state.update(&mut vcx, |s, cx| {
+        s.vault
+            .as_mut()
+            .unwrap()
+            .edit(|v| v.delete(other, 20))
+            .unwrap()
+            .unwrap();
+        s.vault_changed();
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        cached_issues(&main, key, &mut vcx),
+        (true, None),
+        "now unique"
+    );
+    assert!(vcx.debug_bounds(weak).is_some() && vcx.debug_bounds(reused).is_none());
 }
 
 /// 05 §2.3 "Detail header is pinned", edit mode (owner 2026-11-12): with 40 fields, scrolling
