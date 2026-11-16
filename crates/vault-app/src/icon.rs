@@ -1,76 +1,31 @@
 //! Item icons (specs/05-ui.md §2.3 item list and detail header): what an item's tile shows.
 //!
-//! Three layers, decided here without gpui; `screens::main::icon_view` draws the result.
-//! 1. Automatic: the item's website field maps to a bundled Simple Icons brand logo
-//!    (`assets/brand-icons.tsv`), else the letter avatar.
-//! 2. Manual: `Item.icon` (01 §4) with kind `symbol` (a curated Lucide symbol plus a colour),
-//!    `logo` (a pack slug), or `letter` (a colour-only choice tinting the letter avatar).
+//! Decided here without gpui; `screens::main::icon_view` draws the result.
+//! 1. Automatic: the letter avatar (first letter of the title on the item's palette colour).
+//! 2. Manual: `Item.icon` (01 §4) with kind `symbol` (a Lucide icon from the full bundled
+//!    catalog, stored by its `IconName` identifier, plus an optional colour) or `letter`
+//!    (a colour-only choice tinting the letter avatar). The 40 curated [`SYMBOLS`] are what
+//!    the picker shows without a query and what field icons may use.
 //! 3. Kind `image`: `value` is the id (lowercase hyphenated UUID) of an attachment of the
 //!    same item holding a 128 px PNG ([`IconSpec::Image`]). That attachment is hidden from
 //!    every attachment list ([`is_icon_attachment`]). A value that is not a UUID resolves to
 //!    the automatic icon; a missing or undecodable blob is drawn as the automatic icon too.
-//!    Any other kind this build does not know resolves to [`IconSpec::Unsupported`] and
-//!    draws as the letter avatar. The stored value is never touched, so a newer app's
-//!    choice survives.
 //!
-//! Website to logo (simplest interpretation, owner may refine): strip the scheme, path,
-//! query, fragment, userinfo and port; lowercase; strip `www.`; drop a two-level public
-//! suffix from [`TWO_LEVEL_SUFFIXES`] when the host ends in one, else drop the last label;
-//! the label left at the end is the brand slug candidate (`mail.google.com` → `google`,
-//! `bbc.co.uk` → `bbc`). IP addresses, single-label hosts and IPv6 literals have none. No
-//! network lookups and no full public-suffix list.
-//!
-//! The brand pack ships zlib-compressed (~2.0 MB, see `build.rs`) and is inflated on first
-//! use; the unlock paths warm it on the background executor while the KDF runs. The
-//! inflated text (~4.7 MB) is leaked and stays on the heap for the process lifetime.
+//! Kind `logo` (the brand pack, removed 2026-11-16) counts as no icon. Any other kind this
+//! build does not know resolves to [`IconSpec::Unsupported`] and draws as the letter
+//! avatar. The stored value is never touched, so a newer app's choice survives.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use gpui_kit_assets::IconName;
-use vault_core::{AttachmentRef, ExposeSecret as _, FieldKind, Item, ItemIcon, Uuid};
+use vault_core::{AttachmentRef, Item, ItemIcon, Uuid};
 
 use crate::listing;
 
-/// Brand logos, Simple Icons 24×24 single-path SVGs: `slug\ttitle\thex\tpath` per line.
-/// `assets/brand-icons.tsv` as compressed by `build.rs` (zlib-wrapped deflate), inflated by
-/// [`brand_tsv`] on the first brand lookup.
-const BRAND_DEFLATE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/brand-icons.tsv.deflate"));
-
-/// Byte length of the uncompressed table, recorded by `build.rs`.
-const BRAND_TSV_LEN: &str = env!("VAULT_BRAND_TSV_LEN");
-
-// The point of compressing: build.rs enforces the same budget; this pins it at compile time
-// for the bytes actually embedded.
-const _: () = assert!(
-    BRAND_DEFLATE.len() < 5 * 1024 * 1024 / 2,
-    "brand blob over 2.5 MiB"
-);
-
-/// Inflates the embedded brand table. The blob is build output, not user data: corruption
-/// is a broken build, so it panics.
-fn brand_tsv() -> String {
-    use std::io::Read as _;
-    let len: usize = BRAND_TSV_LEN
-        .parse()
-        .expect("VAULT_BRAND_TSV_LEN from build.rs is not a number");
-    let mut bytes = Vec::with_capacity(len);
-    flate2::read::ZlibDecoder::new(BRAND_DEFLATE)
-        .read_to_end(&mut bytes)
-        .expect("embedded brand-icon table is corrupt (zlib inflate failed)");
-    assert_eq!(
-        bytes.len(),
-        len,
-        "embedded brand-icon table inflated to the wrong length"
-    );
-    String::from_utf8(bytes).expect("embedded brand-icon table is not UTF-8")
-}
-
-/// Asset path prefix under which [`brand_svg`] serves pack logos (`brand/github.svg`).
-pub const BRAND_ASSET_PREFIX: &str = "brand/";
-
 /// `Item.icon.kind` values this build writes or reads.
 pub const KIND_SYMBOL: &str = "symbol";
+/// Written by older builds for a brand logo; read as no icon.
 pub const KIND_LOGO: &str = "logo";
 pub const KIND_LETTER: &str = "letter";
 pub const KIND_IMAGE: &str = "image";
@@ -84,13 +39,6 @@ pub const PALETTE: [u32; 8] = [
 /// VoiceOver names of the [`PALETTE`] swatches.
 pub const PALETTE_NAMES: [&str; 8] = [
     "Blue", "Green", "Red", "Amber", "Purple", "Teal", "Pink", "Orange",
-];
-
-/// Public suffixes with two labels that the website mapping strips whole.
-pub const TWO_LEVEL_SUFFIXES: [&str; 20] = [
-    "co.uk", "com.au", "co.jp", "com.br", "co.nz", "co.za", "com.mx", "co.in", "org.uk", "ac.uk",
-    "gov.uk", "net.au", "org.au", "co.kr", "com.tr", "com.ar", "com.sg", "com.hk", "co.il",
-    "com.cn",
 ];
 
 /// The picker's symbols: stored name (the `IconName` variant name), icon, label.
@@ -140,110 +88,171 @@ pub const SYMBOLS: [(&str, IconName, &str); 40] = [
 /// Columns of the picker's symbol and colour grids.
 pub const GRID_COLS: usize = 8;
 
-/// One brand of the bundled pack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Brand {
-    pub title: &'static str,
-    pub hex: u32,
-    /// SVG path data on a 24×24 viewBox.
-    pub path: &'static str,
+#[cfg(test)]
+thread_local! {
+    /// Calls of [`search`] on this thread, for the "not per render" test.
+    pub static SEARCH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The bundled brand pack, parsed once on first use.
-pub struct BrandPack {
-    brands: HashMap<&'static str, Brand>,
+/// Most results the picker's search shows (05 "Icon search").
+pub const SEARCH_CAP: usize = 120;
+
+/// One icon of the bundled Lucide catalog.
+struct CatalogIcon {
+    icon: IconName,
+    /// The `IconName` variant name, the stored form (`"Gamepad2"`).
+    id: String,
+    /// The kebab-case asset name with hyphens as spaces, lowercase (`"gamepad 2"`).
+    words: String,
 }
 
-/// The inflated table is leaked here, once per process (a `LazyLock` initialiser runs at
-/// most once), so [`Brand`] and the pack's keys stay `&'static str` as they were when the
-/// table was `include_str!`ed.
-static PACK: LazyLock<BrandPack> =
-    LazyLock::new(|| BrandPack::parse(Box::leak(brand_tsv().into_boxed_str())));
+/// The whole catalog in `IconName::ALL` order, and its identifiers, built on first use
+/// (about 1,830 short strings).
+#[allow(clippy::type_complexity)]
+static CATALOG: LazyLock<(
+    Vec<CatalogIcon>,
+    HashMap<String, usize>,
+    HashMap<IconName, usize>,
+)> = LazyLock::new(|| {
+    let icons: Vec<CatalogIcon> = IconName::ALL
+        .iter()
+        .map(|&icon| {
+            let path = icon.path();
+            let kebab = path
+                .strip_prefix("icons/")
+                .and_then(|p| p.strip_suffix(".svg"))
+                .unwrap_or(&path);
+            CatalogIcon {
+                icon,
+                id: format!("{icon:?}"),
+                words: kebab.replace('-', " ").to_lowercase(),
+            }
+        })
+        .collect();
+    let ids = icons
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id.clone(), i))
+        .collect();
+    let by_icon = icons.iter().enumerate().map(|(i, c)| (c.icon, i)).collect();
+    (icons, ids, by_icon)
+});
 
-impl BrandPack {
-    pub fn get() -> &'static BrandPack {
-        &PACK
+/// No allocation: called for every grid cell's tooltip and label.
+fn catalog_entry(icon: IconName) -> Option<&'static CatalogIcon> {
+    let (icons, _, by_icon) = &*CATALOG;
+    by_icon.get(&icon).map(|&i| &icons[i])
+}
+
+/// The picker's search results for `query` (05 "Icon search"), at most [`SEARCH_CAP`]:
+/// curated [`SYMBOLS`] whose label, identifier or name contains it, in their order, then
+/// catalog icons whose name (kebab-case, hyphens as spaces) contains it, name-prefix
+/// matches first, alphabetical within each group. Case-insensitive; hyphens in the query
+/// count as spaces. Empty for an empty query (the grid shows [`SYMBOLS`]).
+pub fn search(query: &str) -> Vec<PickerCell> {
+    #[cfg(test)]
+    SEARCH_CALLS.with(|c| c.set(c.get() + 1));
+    let q = query.trim().replace('-', " ").to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
     }
+    let curated = SYMBOLS.iter().enumerate().filter(|(_, (id, icon, label))| {
+        label.to_lowercase().contains(&q)
+            || id.to_lowercase().contains(&q)
+            || catalog_entry(*icon).is_some_and(|c| c.words.contains(&q))
+    });
+    let mut rest: Vec<(bool, &CatalogIcon)> = CATALOG
+        .0
+        .iter()
+        .filter(|c| !SYMBOLS.iter().any(|(_, i, _)| *i == c.icon) && c.words.contains(&q))
+        .map(|c| (!c.words.starts_with(&q), c))
+        .collect();
+    rest.sort_unstable_by(|a, b| (a.0, &a.1.words).cmp(&(b.0, &b.1.words)));
+    curated
+        .map(|(i, _)| PickerCell::Symbol(i))
+        .chain(rest.into_iter().map(|(_, c)| PickerCell::Icon(c.icon)))
+        .take(SEARCH_CAP)
+        .collect()
+}
 
-    /// Parses `slug\ttitle\thex\tpath` lines. A malformed line is skipped, never fatal:
-    /// a wrong field count, an empty slug, a hex that is not six hex digits, or path data
-    /// with characters outside SVG path syntax (which also keeps it safe to splice into
-    /// the generated SVG document).
-    pub fn parse(tsv: &'static str) -> Self {
-        let brands = tsv
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.split('\t');
-                let (slug, title, hex, path) =
-                    (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
-                if parts.next().is_some() || slug.is_empty() || path.is_empty() {
-                    return None;
-                }
-                let path_ok = path
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || " .,-+".contains(c));
-                if !path_ok {
-                    return None;
-                }
-                let hex = parse_hex6(hex)?;
-                Some((slug, Brand { title, hex, path }))
-            })
-            .collect();
-        Self { brands }
-    }
+/// The open picker's search (item and field pickers share it; one is open at a time):
+/// the query, its results computed once per change, and the keyboard cursor in them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PickerSearch {
+    query: String,
+    hits: Vec<PickerCell>,
+    hit: Option<usize>,
+}
 
-    pub fn brand(&self, slug: &str) -> Option<(&'static str, Brand)> {
-        self.brands.get_key_value(slug).map(|(k, b)| (*k, *b))
+impl PickerSearch {
+    /// True while there is a query: the grid shows [`Self::hits`], not [`SYMBOLS`].
+    pub fn active(&self) -> bool {
+        !self.query.trim().is_empty()
     }
 
     #[cfg(test)]
-    pub fn brand_count(&self) -> usize {
-        self.brands.len()
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn hits(&self) -> &[PickerCell] {
+        &self.hits
+    }
+
+    /// The keyboard cursor's index in [`Self::hits`], if it is in them.
+    pub fn hit(&self) -> Option<usize> {
+        self.hit
+    }
+
+    /// A new query: runs [`search`] once and puts the cursor back in the field. Returns
+    /// false (and changes nothing) when the query is unchanged.
+    pub fn set_query(&mut self, query: String) -> bool {
+        if query == self.query {
+            return false;
+        }
+        self.hits = search(&query);
+        self.query = query;
+        self.hit = None;
+        true
+    }
+
+    /// Arrow over the results, [`GRID_COLS`] per row: ↓ (or →) from the field enters
+    /// them, ↑ from their first row leaves them, ←/→ stop at the ends.
+    pub fn step(&mut self, m: Move) {
+        let last = self.hits.len().checked_sub(1);
+        self.hit = match (self.hit, m, last) {
+            (_, _, None) => None,
+            (None, Move::Down | Move::Right, Some(_)) => Some(0),
+            (None, ..) => None,
+            (Some(i), Move::Up, _) => i.checked_sub(GRID_COLS),
+            (Some(i), Move::Down, Some(l)) => Some((i + GRID_COLS).min(l)),
+            (Some(i), Move::Left, _) => Some(i.saturating_sub(1)),
+            (Some(i), Move::Right, Some(l)) => Some((i + 1).min(l)),
+        };
+    }
+
+    /// What Enter picks: the result under the cursor, else the first one.
+    pub fn chosen(&self) -> Option<PickerCell> {
+        self.hits.get(self.hit.unwrap_or(0)).copied()
     }
 }
 
-/// The SVG document for pack logo `slug`, served by the app asset source at
-/// `brand/<slug>.svg`. gpui draws it as a one-colour mask, so it carries no fill.
-pub fn brand_svg(slug: &str) -> Option<String> {
-    let (_, brand) = BrandPack::get().brand(slug)?;
-    Some(format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\"><path d=\"{}\"/></svg>",
-        brand.path
-    ))
+/// The catalog icon behind a search result or grid cell (`Symbol(i)` is [`SYMBOLS`]`[i]`).
+pub fn cell_icon(cell: PickerCell) -> Option<IconName> {
+    match cell {
+        PickerCell::Symbol(i) => SYMBOLS.get(i).map(|(_, icon, _)| *icon),
+        PickerCell::Icon(icon) => Some(icon),
+        _ => None,
+    }
 }
 
-/// Asset path of pack logo `slug`.
-pub fn brand_asset_path(slug: &str) -> String {
-    format!("{BRAND_ASSET_PREFIX}{slug}.svg")
-}
-
-/// The brand-slug candidate for a website field value (see the module doc), or `None`.
-pub fn registrable_label(raw: &str) -> Option<String> {
-    let s = raw.trim();
-    let s = s.split_once("://").map_or(s, |(_, rest)| rest);
-    let authority = s.split(['/', '?', '#']).next().unwrap_or("");
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    if host_port.starts_with('[') {
-        return None; // IPv6 literal
-    }
-    let host = host_port.split(':').next().unwrap_or("");
-    let host = host.trim_end_matches('.').to_lowercase();
-    let host = host.strip_prefix("www.").unwrap_or(&host);
-    if host.parse::<std::net::Ipv4Addr>().is_ok() {
-        return None;
-    }
-    let mut labels: Vec<&str> = host.split('.').collect();
-    if labels.len() < 2 || labels.iter().any(|l| l.is_empty()) {
-        return None;
-    }
-    let n = labels.len();
-    let tail = format!("{}.{}", labels[n - 2], labels[n - 1]);
-    labels.truncate(if TWO_LEVEL_SUFFIXES.contains(&tail.as_str()) {
-        n - 2
-    } else {
-        n - 1
-    });
-    labels.last().map(|l| (*l).to_owned())
+/// Display name of a catalog icon outside [`SYMBOLS`]: its words, capitalised
+/// (`"Gamepad 2"`).
+pub fn catalog_label(icon: IconName) -> String {
+    catalog_entry(icon).map_or_else(
+        || format!("{icon:?}"),
+        |c| crate::text::capitalize_first(&c.words),
+    )
 }
 
 /// What an item's tile shows.
@@ -251,15 +260,13 @@ pub fn registrable_label(raw: &str) -> Option<String> {
 pub enum IconSpec {
     /// Letter avatar: first letter of the title on `color`.
     Letter { letter: String, color: u32 },
-    /// Pack logo `slug` in brand colour `hex`.
-    Logo { slug: &'static str, hex: u32 },
-    /// Curated symbol on `color`.
+    /// A catalog symbol on `color`.
     Symbol { name: IconName, color: u32 },
     /// Custom image: the item's attachment `attachment` (a 128 px PNG). The view draws
     /// the decoded image, or the automatic icon while it is not available.
     Image { attachment: Uuid },
-    /// An `icon.kind` this build cannot draw (e.g. `image` before layer 3). Drawn as the
-    /// letter avatar; the stored icon is kept as is.
+    /// An `icon.kind` this build cannot draw. Drawn as the letter avatar; the stored icon
+    /// is kept as is.
     Unsupported {
         kind: String,
         letter: String,
@@ -268,27 +275,21 @@ pub enum IconSpec {
 }
 
 impl IconSpec {
-    /// Short description for debug selectors and VoiceOver ("logo github").
+    /// Short description for debug selectors ("symbol Mail #3B6CF0").
     pub fn describe(&self) -> String {
         match self {
             Self::Letter { letter, color } => format!("letter {letter} #{color:06X}"),
-            Self::Logo { slug, .. } => format!("logo {slug}"),
             Self::Symbol { name, color } => format!("symbol {name:?} #{color:06X}"),
             Self::Image { .. } => "image".to_owned(),
             Self::Unsupported { kind, .. } => format!("unsupported {kind}"),
         }
     }
 
-    /// User-facing name of what is shown ("GitHub logo", "Bank symbol", "Letter").
+    /// User-facing name of what is shown ("Bank symbol", "Alarm clock symbol", "Letter").
     pub fn label(&self) -> String {
         match self {
             Self::Letter { .. } | Self::Unsupported { .. } => "Letter".to_owned(),
-            Self::Logo { slug, .. } => BrandPack::get()
-                .brand(slug)
-                .map_or_else(|| "Logo".to_owned(), |(_, b)| format!("{} logo", b.title)),
-            Self::Symbol { name, .. } => {
-                symbol_label(*name).map_or_else(|| "Symbol".to_owned(), |l| format!("{l} symbol"))
-            }
+            Self::Symbol { name, .. } => format!("{} symbol", symbol_label(*name)),
             Self::Image { .. } => "Custom image".to_owned(),
         }
     }
@@ -311,27 +312,23 @@ fn parse_hex6(s: &str) -> Option<u32> {
     u32::from_str_radix(s, 16).ok()
 }
 
-/// The symbol stored as `name`, if it is in the curated set.
+/// The catalog icon stored as `name` (its `IconName` identifier), if this build has it.
 pub fn symbol(name: &str) -> Option<IconName> {
-    SYMBOLS
-        .iter()
-        .find(|(n, ..)| *n == name)
-        .map(|(_, i, _)| *i)
+    let (icons, ids, _) = &*CATALOG;
+    ids.get(name).map(|&i| icons[i].icon)
 }
 
-/// Stored name of symbol `icon`, if it is in the curated set.
+/// Stored name of catalog icon `icon`.
 pub fn symbol_name(icon: IconName) -> Option<&'static str> {
-    SYMBOLS
-        .iter()
-        .find(|(_, i, _)| *i == icon)
-        .map(|(n, ..)| *n)
+    catalog_entry(icon).map(|c| c.id.as_str())
 }
 
-fn symbol_label(icon: IconName) -> Option<&'static str> {
+/// Display name: the curated label, else the catalog name.
+pub fn symbol_label(icon: IconName) -> String {
     SYMBOLS
         .iter()
         .find(|(_, i, _)| *i == icon)
-        .map(|(.., l)| *l)
+        .map_or_else(|| catalog_label(icon), |(.., l)| (*l).to_owned())
 }
 
 /// The id-derived palette colour of `item`.
@@ -339,17 +336,13 @@ pub fn palette_color(item: &Item) -> u32 {
     PALETTE[listing::avatar_slot(item.id, PALETTE.len())]
 }
 
-/// What `item`'s tile shows: an explicit icon first, else the automatic logo or letter.
+/// What `item`'s tile shows: an explicit icon first, else the automatic letter.
 pub fn resolve(item: &Item) -> IconSpec {
     let letter = || listing::avatar_letter(&item.title);
     let Some(icon) = &item.icon else {
         return automatic(item);
     };
-    let color = icon
-        .color
-        .as_deref()
-        .and_then(parse_color)
-        .unwrap_or_else(|| palette_color(item));
+    let color = color_override(Some(icon)).unwrap_or_else(|| palette_color(item));
     let as_letter = || IconSpec::Letter {
         letter: letter(),
         color,
@@ -358,16 +351,10 @@ pub fn resolve(item: &Item) -> IconSpec {
         KIND_SYMBOL => {
             symbol(&icon.value).map_or_else(as_letter, |name| IconSpec::Symbol { name, color })
         }
-        KIND_LOGO => BrandPack::get()
-            .brand(&icon.value)
-            .map_or_else(as_letter, |(slug, b)| IconSpec::Logo { slug, hex: b.hex }),
-        // "Automatic shape with a colour override" (orchestrator decision 2026-10-31):
-        // the brand logo when one matches (logos keep the brand colour), else the letter
-        // in the chosen colour.
-        KIND_LETTER => match automatic(item) {
-            logo @ IconSpec::Logo { .. } => logo,
-            _ => as_letter(),
-        },
+        // The removed brand pack's kind: no icon (owner decision 2026-11-16).
+        KIND_LOGO => automatic(item),
+        // "Automatic shape with a colour override": the letter in the chosen colour.
+        KIND_LETTER => as_letter(),
         KIND_IMAGE => match image_attachment(icon) {
             Some(attachment) => IconSpec::Image { attachment },
             None => automatic(item),
@@ -404,36 +391,12 @@ pub fn image_icon(id: Uuid) -> ItemIcon {
     ItemIcon::new(KIND_IMAGE, id.to_string())
 }
 
-/// What `item` shows with no icon set: the brand logo for its website, else the letter.
+/// What `item` shows with no icon set: the letter avatar in its palette colour.
 pub fn automatic(item: &Item) -> IconSpec {
-    let logo = website(item)
-        .and_then(|url| registrable_label(&url))
-        .and_then(|label| BrandPack::get().brand(&label));
-    match logo {
-        Some((slug, b)) => IconSpec::Logo { slug, hex: b.hex },
-        None => IconSpec::Letter {
-            letter: listing::avatar_letter(&item.title),
-            color: palette_color(item),
-        },
+    IconSpec::Letter {
+        letter: listing::avatar_letter(&item.title),
+        color: palette_color(item),
     }
-}
-
-/// The website of `item`: its first URL field, else a non-sensitive field named "website".
-fn website(item: &Item) -> Option<String> {
-    item.fields
-        .iter()
-        .find(|f| f.kind == FieldKind::Url)
-        .or_else(|| {
-            item.fields
-                .iter()
-                // A section heading named "Website" is a heading: its value never counts.
-                .find(|f| {
-                    f.kind != FieldKind::Section
-                        && f.name.eq_ignore_ascii_case("website")
-                        && !f.kind.is_sensitive()
-                })
-        })
-        .map(|f| f.value.expose_secret().to_owned())
 }
 
 // --- Picker choices (edit mode). Each returns the new `Item.icon`. ---
@@ -456,7 +419,7 @@ pub enum Shape {
 }
 
 /// The shape `icon` stands for. Anything that is not a known symbol or an image (no
-/// icon, `letter`, `logo`, an unknown kind) counts as Automatic.
+/// icon, `letter`, `logo`, an unknown kind or identifier) counts as Automatic.
 pub fn shape(icon: Option<&ItemIcon>) -> Shape {
     match icon {
         Some(i) if i.kind == KIND_SYMBOL => {
@@ -467,9 +430,15 @@ pub fn shape(icon: Option<&ItemIcon>) -> Shape {
     }
 }
 
-/// The colour override stored in `icon`, if any (a valid `#RRGGBB`).
+/// The colour override stored in `icon`, if any: one of the [`PALETTE`] colours, and
+/// never on a legacy `logo` icon (no icon).
 pub fn color_override(icon: Option<&ItemIcon>) -> Option<u32> {
-    icon.and_then(|i| i.color.as_deref()).and_then(parse_color)
+    icon.filter(|i| i.kind != KIND_LOGO)
+        .and_then(|i| i.color.as_deref())
+        .and_then(parse_color)
+        // Only the 8 swatches, all readable with a white glyph; any other stored
+        // `#RRGGBB` (the CLI writes arbitrary ones) means the palette colour.
+        .filter(|c| PALETTE.contains(c))
 }
 
 /// The colour the picker shows as selected: the override, else the item's palette colour.
@@ -496,11 +465,8 @@ pub fn choose_automatic(current: Option<&ItemIcon>) -> Option<ItemIcon> {
     compose(Shape::Automatic, color_override(current), current)
 }
 
-/// A symbol, keeping a colour override. A symbol outside the curated set changes nothing.
+/// A catalog symbol, keeping a colour override.
 pub fn choose_symbol(current: Option<&ItemIcon>, icon: IconName) -> Option<ItemIcon> {
-    if symbol_name(icon).is_none() {
-        return current.cloned();
-    }
     compose(Shape::Symbol(icon), color_override(current), current)
 }
 
@@ -517,88 +483,13 @@ pub fn choose_color(current: Option<&ItemIcon>, color: u32, default: u32) -> Opt
 }
 
 /// What "Automatic" means for `item` right now, for the picker's Automatic row: the
-/// automatic shape in the effective colour (the brand logo when one matches, else the
-/// letter tinted with the colour override, or the palette colour without one). Updates
+/// letter tinted with the colour override, or the palette colour without one. Updates
 /// with every colour pick, like the header tile.
 pub fn automatic_preview(item: &Item) -> IconSpec {
-    match (automatic(item), color_override(item.icon.as_ref())) {
-        (IconSpec::Letter { letter, .. }, Some(color)) => IconSpec::Letter { letter, color },
-        (spec, _) => spec,
+    IconSpec::Letter {
+        letter: listing::avatar_letter(&item.title),
+        color: effective_color(item),
     }
-}
-
-/// Why the colour row is disabled for `item`: the Automatic shape resolves to a brand
-/// logo, which keeps the brand colour. `None` when it is enabled.
-pub fn color_disabled_reason(item: &Item) -> Option<&'static str> {
-    let logo = matches!(automatic(item), IconSpec::Logo { .. });
-    (shape(item.icon.as_ref()) == Shape::Automatic && logo).then_some("Logos use the brand colour")
-}
-
-// --- Tile colours. ---
-
-/// Tile background.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TileBg {
-    /// Filled with this colour.
-    Fill(u32),
-    /// The appearance's secondary surface (theme `secondary`).
-    Surface,
-}
-
-/// Glyph colour.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Glyph {
-    White,
-    /// The tile's own colour (brand or chosen colour).
-    Own(u32),
-    /// The theme foreground.
-    Foreground,
-}
-
-/// Above this relative luminance a colour is "near white": a white glyph on it falls under
-/// 1.5:1 contrast. Such tiles use the neutral surface in both appearances.
-pub const NEAR_WHITE: f32 = 0.65;
-/// Below this a colour is "near black" (GitHub `#181717` is 0.009): in dark appearance it
-/// disappears into the window, so the tile uses the neutral surface.
-pub const NEAR_BLACK: f32 = 0.02;
-/// Minimum contrast for drawing the glyph in its own colour on the neutral surface.
-pub const GLYPH_CONTRAST: f32 = 3.0;
-
-/// Background and glyph for a tile of colour `color` in the given appearance. `surface`
-/// is the appearance's secondary surface. Usually a filled tile with a white glyph; a
-/// near-white colour, or a near-black one in dark appearance, gets the neutral surface with
-/// the glyph in its own colour, or in the foreground colour when that is unreadable too.
-pub fn tile_look(color: u32, dark: bool, surface: u32) -> (TileBg, Glyph) {
-    let l = luminance(color);
-    let neutral = l > NEAR_WHITE || (dark && l < NEAR_BLACK);
-    if !neutral {
-        return (TileBg::Fill(color), Glyph::White);
-    }
-    let glyph = if contrast(color, surface) >= GLYPH_CONTRAST {
-        Glyph::Own(color)
-    } else {
-        Glyph::Foreground
-    };
-    (TileBg::Surface, glyph)
-}
-
-/// WCAG relative luminance of `0xRRGGBB`.
-pub fn luminance(c: u32) -> f32 {
-    let lin = |v: u32| {
-        let v = v as f32 / 255.;
-        if v <= 0.04045 {
-            v / 12.92
-        } else {
-            ((v + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * lin((c >> 16) & 0xFF) + 0.7152 * lin((c >> 8) & 0xFF) + 0.0722 * lin(c & 0xFF)
-}
-
-/// WCAG contrast ratio of two colours.
-pub fn contrast(a: u32, b: u32) -> f32 {
-    let (la, lb) = (luminance(a), luminance(b));
-    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
 // --- Picker grid cursor (keyboard). ---
@@ -611,6 +502,8 @@ pub enum PickerCell {
     Symbol(usize),
     Color(usize),
     Image,
+    /// A catalog icon in the search results (not on the cursor grid).
+    Icon(IconName),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -635,7 +528,7 @@ pub struct PickerCursor {
 impl PickerCursor {
     pub fn at(cell: PickerCell) -> Self {
         match cell {
-            PickerCell::Automatic => Self { row: 0, col: 0 },
+            PickerCell::Automatic | PickerCell::Icon(_) => Self { row: 0, col: 0 },
             PickerCell::Symbol(i) => Self {
                 row: 1 + i / GRID_COLS,
                 col: i % GRID_COLS,

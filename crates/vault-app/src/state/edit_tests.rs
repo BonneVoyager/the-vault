@@ -751,7 +751,6 @@ fn icon_picker_choices_are_part_of_the_edit(cx: &mut TestAppContext) {
         assert_eq!(kept.kind, "letter");
         assert_eq!(kept.color, Some(crate::icon::format_color(PALETTE[ix])));
         // Automatic + the default colour: no icon at all. Saved too.
-        assert!(crate::icon::color_disabled_reason(&s.edit_buffer().unwrap().item).is_none());
         let def_ix = PALETTE.iter().position(|c| *c == default).unwrap();
         s.choose_icon(PickerCell::Color(def_ix), cx);
         assert_eq!(s.edit_buffer().unwrap().item.icon, None);

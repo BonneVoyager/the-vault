@@ -244,13 +244,6 @@ mod tests {
                 assert_eq!(*name, crate::text::capitalize_first(name), "{name}");
             }
         }
-        // The website is found by kind, whatever its label.
-        let mut login = Template::Login.new_item("x", Uuid::new_v4(), 1);
-        login.fields[2].value = SecretString::new("https://github.com".into());
-        assert!(matches!(
-            crate::icon::automatic(&login),
-            crate::icon::IconSpec::Logo { slug: "github", .. }
-        ));
         assert_eq!(card.fields[1].kind, FieldKind::MonthYear);
         // 05 §2.3 (2026-11-15): CVV and License key are PINs, outside the password audit.
         assert_eq!(card.field("CVV").map(|f| f.kind), Some(FieldKind::Pin));

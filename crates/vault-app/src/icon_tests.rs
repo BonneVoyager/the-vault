@@ -1,12 +1,6 @@
-use std::sync::Arc;
-
-use vault_core::{Field, SecretString, Uuid};
+use vault_core::{Field, FieldKind, SecretString, Uuid};
 
 use super::*;
-
-/// The vault theme's secondary surfaces (`bg_elevated`) and foregrounds.
-const LIGHT_SURFACE: u32 = 0xF7F7F8;
-const DARK_SURFACE: u32 = 0x2A2A2D;
 
 fn item(title: &str, fields: &[(&str, FieldKind, &str)]) -> Item {
     let mut it = Item::new(title, Uuid::new_v4(), 1);
@@ -24,115 +18,6 @@ fn with_icon(mut it: Item, kind: &str, value: &str, color: Option<&str>) -> Item
     it
 }
 
-fn hex_of(slug: &str) -> u32 {
-    BrandPack::get().brand(slug).unwrap().1.hex
-}
-
-#[test]
-fn registrable_label_cases() {
-    let cases: &[(&str, Option<&str>)] = &[
-        ("https://github.com/login", Some("github")),
-        ("github.com", Some("github")),
-        ("  HTTPS://WWW.GitHub.COM  ", Some("github")),
-        ("https://mail.google.com/mail/u/0", Some("google")),
-        ("https://www.bbc.co.uk/news", Some("bbc")),
-        ("amazon.com.au", Some("amazon")),
-        ("https://shop.rakuten.co.jp", Some("rakuten")),
-        (
-            "http://user:p@ss@accounts.example.com:8443/x?y#z",
-            Some("example"),
-        ),
-        ("ftp://alice@files.example.org:21", Some("example")),
-        ("example.com?q=1", Some("example")),
-        ("https://bücher.de/", Some("bücher")),
-        ("https://ПРИМЕР.рф", Some("пример")),
-        ("example.com.", Some("example")),
-        ("co.uk", None),
-        ("localhost:8080", None),
-        ("http://192.168.1.1/admin", None),
-        ("http://[::1]:80/", None),
-        ("", None),
-        ("a..b.com", None),
-    ];
-    for (input, want) in cases {
-        assert_eq!(
-            registrable_label(input).as_deref(),
-            *want,
-            "input {input:?}"
-        );
-    }
-}
-
-#[test]
-fn pack_loads_and_has_github() {
-    let pack = BrandPack::get();
-    assert!(pack.brand_count() > 3000, "{} brands", pack.brand_count());
-    let (slug, gh) = pack.brand("github").unwrap();
-    assert_eq!(slug, "github");
-    assert_eq!(gh.title, "GitHub");
-    assert!(!gh.path.is_empty());
-    let svg = brand_svg("github").unwrap();
-    assert!(svg.starts_with("<svg") && svg.contains(gh.path));
-    assert_eq!(brand_svg("no-such-brand"), None);
-}
-
-/// The compressed table inflates to the source TSV byte for byte, so the pack is what the
-/// old `include_str!` produced: same brand count, same GitHub entry.
-#[test]
-fn compressed_pack_matches_source_table() {
-    let src = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/assets/brand-icons.tsv"
-    ))
-    .unwrap();
-    // The 2.5 MiB budget is a compile-time assert in icon.rs.
-    assert!(
-        brand_tsv() == src,
-        "inflated table differs from the source TSV"
-    );
-
-    let pack = BrandPack::get();
-    assert_eq!(pack.brand_count(), BRAND_COUNT);
-    let (_, gh) = pack.brand("github").unwrap();
-    assert_eq!((gh.title, gh.hex), ("GitHub", 0x181717));
-}
-
-/// Brands in `assets/brand-icons.tsv` that pass [`BrandPack::parse`]; update with the table.
-const BRAND_COUNT: usize = 3466;
-
-#[test]
-fn every_pack_svg_parses_with_gpuis_renderer() {
-    struct NoAssets;
-    impl gpui::AssetSource for NoAssets {
-        fn load(&self, _: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
-            Ok(None)
-        }
-        fn list(&self, _: &str) -> gpui::Result<Vec<gpui::SharedString>> {
-            Ok(Vec::new())
-        }
-    }
-    let renderer = gpui::SvgRenderer::new(Arc::new(NoAssets));
-    for slug in ["github", "google", "unity", "1001tracklists"] {
-        let svg = brand_svg(slug).unwrap();
-        assert!(renderer.parse_svg(svg.as_bytes()).is_ok(), "{slug}");
-    }
-}
-
-#[test]
-fn malformed_pack_lines_are_skipped() {
-    let pack = BrandPack::parse(
-        "ok\tOK\t00FF00\tM0 0h24v24H0z\n\
-         short\tShort\t00FF00\n\
-         badhex\tBad\t00FF0\tM0 0z\n\
-         nothex\tBad\tGGGGGG\tM0 0z\n\
-         inject\tBad\t000000\tM0 0\"/><script/>\n\
-         \tNoSlug\t000000\tM0 0z\n\
-         extra\tX\t000000\tM0 0z\tmore\n",
-    );
-    assert_eq!(pack.brand_count(), 1);
-    assert!(pack.brand("ok").is_some());
-}
-
 #[test]
 fn colour_parsing() {
     assert_eq!(parse_color("#3B6CF0"), Some(0x3B6CF0));
@@ -145,59 +30,9 @@ fn colour_parsing() {
 }
 
 #[test]
-fn resolve_automatic_logo_from_url_field() {
-    let it = item(
-        "Work account",
-        &[("site", FieldKind::Url, "https://github.com/login")],
-    );
-    assert_eq!(
-        resolve(&it),
-        IconSpec::Logo {
-            slug: "github",
-            hex: hex_of("github")
-        }
-    );
-}
-
-#[test]
-fn resolve_automatic_uses_a_website_field_and_skips_unknown_brands() {
-    let it = item("Mail", &[("website", FieldKind::Text, "www.google.com")]);
-    assert!(matches!(
-        resolve(&it),
-        IconSpec::Logo { slug: "google", .. }
-    ));
-
-    let it = item(
-        "Bank",
-        &[("url", FieldKind::Url, "https://my-tiny-bank.example")],
-    );
-    let IconSpec::Letter { letter, color } = resolve(&it) else {
-        panic!("letter expected");
-    };
-    assert_eq!(letter, "B");
-    assert_eq!(color, palette_color(&it));
-
-    // A sensitive field named "website" is never read.
-    let it = item("X", &[("website", FieldKind::Password, "github.com")]);
-    assert!(matches!(resolve(&it), IconSpec::Letter { .. }));
-    // The first URL field wins over a "website" text field.
-    let it = item(
-        "X",
-        &[
-            ("website", FieldKind::Text, "google.com"),
-            ("url", FieldKind::Url, "github.com"),
-        ],
-    );
-    assert!(matches!(
-        resolve(&it),
-        IconSpec::Logo { slug: "github", .. }
-    ));
-}
-
-#[test]
 fn resolve_explicit_kinds() {
     let base = || item("github", &[("url", FieldKind::Url, "github.com")]);
-    // Symbol beats the automatic logo, with and without colour.
+    // A symbol, with and without colour.
     assert_eq!(
         resolve(&with_icon(base(), "symbol", "Landmark", Some("#30A46C"))),
         IconSpec::Symbol {
@@ -222,19 +57,22 @@ fn resolve_explicit_kinds() {
             color: palette_color(&it)
         }
     );
-    // Logo by slug.
-    assert!(matches!(
-        resolve(&with_icon(base(), "logo", "spotify", None)),
-        IconSpec::Logo {
-            slug: "spotify",
-            ..
+    // Any catalog icon, not only the 40 curated ones.
+    assert_eq!(
+        resolve(&with_icon(base(), "symbol", "AlarmClock", Some("#30A46C"))),
+        IconSpec::Symbol {
+            name: IconName::AlarmClock,
+            color: 0x30A46C
         }
-    ));
-    // A colour-only choice no longer turns a logo into a letter (2026-10-31).
-    assert!(matches!(
+    );
+    // A colour-only choice is the tinted letter, website or not.
+    assert_eq!(
         resolve(&with_icon(base(), "letter", "", Some("#E5484D"))),
-        IconSpec::Logo { slug: "github", .. }
-    ));
+        IconSpec::Letter {
+            letter: "G".into(),
+            color: 0xE5484D
+        }
+    );
 }
 
 #[test]
@@ -292,58 +130,6 @@ fn symbol_names_match_icon_variants_and_are_unique() {
 }
 
 #[test]
-fn contrast_rule_in_both_appearances() {
-    let unity = hex_of("unity"); // FFFFFF
-    let github = hex_of("github"); // 181717
-    let netflix = hex_of("netflix"); // E50914
-    assert_eq!(unity, 0xFFFFFF);
-
-    // Saturated brand: filled tile, white glyph, both appearances.
-    for dark in [false, true] {
-        let surface = if dark { DARK_SURFACE } else { LIGHT_SURFACE };
-        assert_eq!(
-            tile_look(netflix, dark, surface),
-            (TileBg::Fill(netflix), Glyph::White)
-        );
-    }
-    // Near white: neutral tile. Light: the white glyph is unreadable on the light surface,
-    // so foreground. Dark: the brand colour reads on the dark surface.
-    assert_eq!(
-        tile_look(unity, false, LIGHT_SURFACE),
-        (TileBg::Surface, Glyph::Foreground)
-    );
-    assert_eq!(
-        tile_look(unity, true, DARK_SURFACE),
-        (TileBg::Surface, Glyph::Own(unity))
-    );
-    // Near black: filled in light, neutral with the foreground glyph in dark.
-    assert_eq!(
-        tile_look(github, false, LIGHT_SURFACE),
-        (TileBg::Fill(github), Glyph::White)
-    );
-    assert_eq!(
-        tile_look(github, true, DARK_SURFACE),
-        (TileBg::Surface, Glyph::Foreground)
-    );
-    // Yellow (near white by luminance) reads on the dark surface in its own colour.
-    assert_eq!(
-        tile_look(0xFFDD00, true, DARK_SURFACE),
-        (TileBg::Surface, Glyph::Own(0xFFDD00))
-    );
-    // Every palette colour is a filled tile in both appearances.
-    for c in PALETTE {
-        assert!(matches!(
-            tile_look(c, false, LIGHT_SURFACE).0,
-            TileBg::Fill(_)
-        ));
-        assert!(matches!(
-            tile_look(c, true, DARK_SURFACE).0,
-            TileBg::Fill(_)
-        ));
-    }
-}
-
-#[test]
 fn picker_choices() {
     // The four storage mappings (default = the item's palette colour).
     let (default, x) = (PALETTE[0], PALETTE[4]);
@@ -380,8 +166,11 @@ fn picker_choices() {
     assert_eq!(triple(&choose_automatic(sx.as_ref())), triple(&l));
     assert_eq!(choose_automatic(s.as_ref()), None);
     assert_eq!(choose_automatic(None), None);
-    // A symbol outside the set changes nothing.
-    assert_eq!(choose_symbol(sx.as_ref(), IconName::Zap), sx);
+    // A catalog icon outside the 40 is stored by its identifier, keeping the colour.
+    assert_eq!(
+        triple(&choose_symbol(sx.as_ref(), IconName::Zap)),
+        Some(("symbol".into(), "Zap".into(), Some(format_color(x))))
+    );
     // Shapes.
     assert_eq!(shape(None), Shape::Automatic);
     assert_eq!(shape(l.as_ref()), Shape::Automatic);
@@ -391,40 +180,6 @@ fn picker_choices() {
     // A colour on an image: the automatic shape in that colour (the image is given up).
     assert_eq!(triple(&choose_color(Some(&img), x, default)), triple(&l));
     assert_eq!(choose_color(Some(&img), default, default), None);
-}
-
-#[test]
-fn letter_kind_is_automatic_with_a_colour_override() {
-    let logo_item = || item("github", &[("url", FieldKind::Url, "github.com")]);
-    // A colour override on a logo-matching item still shows the logo.
-    let it = with_icon(logo_item(), "letter", "", Some("#E5484D"));
-    assert!(matches!(
-        resolve(&it),
-        IconSpec::Logo { slug: "github", .. }
-    ));
-    assert_eq!(
-        color_disabled_reason(&it),
-        Some("Logos use the brand colour")
-    );
-    assert_eq!(
-        color_disabled_reason(&logo_item()),
-        Some("Logos use the brand colour")
-    );
-    // Without a logo it is the tinted letter, and the colour row is enabled.
-    let plain = with_icon(item("Bank", &[]), "letter", "", Some("#E5484D"));
-    assert_eq!(
-        resolve(&plain),
-        IconSpec::Letter {
-            letter: "B".into(),
-            color: 0xE5484D
-        }
-    );
-    assert_eq!(color_disabled_reason(&plain), None);
-    assert_eq!(effective_color(&plain), 0xE5484D);
-    // A symbol on a logo item can be coloured; no override means the palette colour.
-    let sym = with_icon(logo_item(), "symbol", "Bug", None);
-    assert_eq!(color_disabled_reason(&sym), None);
-    assert_eq!(effective_color(&sym), palette_color(&sym));
 }
 
 #[test]
@@ -535,10 +290,7 @@ fn image_kind_resolves_to_its_attachment() {
     assert_eq!(resolve(&upper), IconSpec::Image { attachment: id });
     let bad = with_icon(base(), "image", "att-1", None);
     assert_eq!(resolve(&bad), automatic(&bad));
-    assert!(matches!(
-        resolve(&bad),
-        IconSpec::Logo { slug: "github", .. }
-    ));
+    assert!(matches!(resolve(&bad), IconSpec::Letter { .. }));
     // The stored form is the lowercase hyphenated UUID, no colour.
     let icon = image_icon(id);
     assert_eq!(icon.kind, KIND_IMAGE);
@@ -584,14 +336,137 @@ fn automatic_preview_uses_the_effective_colour() {
             color: x
         }
     );
-    let logo = with_icon(
-        item("gh", &[("url", FieldKind::Url, "github.com")]),
-        "letter",
-        "",
-        Some(&format_color(x)),
+}
+
+/// 05 "Item list" (2026-11-16): no brand logos. A website gives the letter avatar, and a
+/// stored kind "logo" (older builds) is no icon.
+#[test]
+fn automatic_is_the_letter_and_logo_kind_is_no_icon() {
+    let it = item(
+        "Work account",
+        &[("site", FieldKind::Url, "https://github.com/login")],
     );
-    assert!(matches!(
-        automatic_preview(&logo),
-        IconSpec::Logo { slug: "github", .. }
-    ));
+    let letter = IconSpec::Letter {
+        letter: "W".into(),
+        color: palette_color(&it),
+    };
+    assert_eq!(resolve(&it), letter);
+    assert_eq!(automatic(&it), letter);
+    let logo = with_icon(it.clone(), "logo", "github", Some("#E5484D"));
+    assert_eq!(
+        resolve(&logo),
+        letter,
+        "kind logo = no icon, colour ignored"
+    );
+    assert_eq!(shape(logo.icon.as_ref()), Shape::Automatic);
+    // Its colour is no override either: not in the picker, not written back.
+    assert_eq!(color_override(logo.icon.as_ref()), None);
+    assert_eq!(effective_color(&logo), palette_color(&logo));
+    assert_eq!(automatic_preview(&logo), letter);
+    assert_eq!(choose_automatic(logo.icon.as_ref()), None);
+}
+
+/// Stored colours outside the 8 swatches (the CLI writes any `#RRGGBB`) draw in the
+/// item's palette colour, so a white glyph always reads (05 "Icon search").
+#[test]
+fn only_palette_colours_are_drawn() {
+    let base = || item("Bank", &[]);
+    let white = with_icon(base(), "symbol", "Mail", Some("#FFFFFF"));
+    assert_eq!(
+        resolve(&white),
+        IconSpec::Symbol {
+            name: IconName::Mail,
+            color: palette_color(&white)
+        }
+    );
+    assert_eq!(effective_color(&white), palette_color(&white));
+    let tinted = with_icon(base(), "letter", "", Some("#ffffff"));
+    assert_eq!(
+        resolve(&tinted),
+        IconSpec::Letter {
+            letter: "B".into(),
+            color: palette_color(&tinted)
+        }
+    );
+    // A palette colour is kept (either case).
+    let kept = with_icon(base(), "symbol", "Mail", Some("#8e4ec6"));
+    assert_eq!(
+        resolve(&kept),
+        IconSpec::Symbol {
+            name: IconName::Mail,
+            color: 0x8E4EC6
+        }
+    );
+    assert_eq!(effective_color(&kept), 0x8E4EC6);
+}
+
+fn words(hits: &[PickerCell]) -> Vec<String> {
+    hits.iter()
+        .map(|h| match h {
+            PickerCell::Symbol(i) => format!("*{}", SYMBOLS[*i].0),
+            PickerCell::Icon(icon) => format!("{icon:?}"),
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+/// 05 "Icon search": curated symbols first, then name-prefix matches, then the others,
+/// alphabetical (by kebab name) within each; hyphens count as spaces; capped at 120.
+#[test]
+fn icon_search_ranking_and_cap() {
+    assert!(search("").is_empty(), "empty query: the plain symbol grid");
+    assert!(search("   ").is_empty());
+    let clock = words(&search("Clock"));
+    assert_eq!(&clock[..4], ["Clock", "Clock1", "Clock10", "Clock11"]);
+    let first_other = clock.iter().position(|w| w == "AlarmClock").unwrap();
+    assert_eq!(first_other, 21, "21 names start with clock");
+    assert_eq!(
+        &clock[first_other..first_other + 3],
+        ["AlarmClock", "AlarmClockCheck", "AlarmClockMinus"]
+    );
+    assert_eq!(clock.last().unwrap(), "RotateCwFadingClock");
+    // Curated symbols first (by label, identifier or name), then the catalog without them.
+    let mail = words(&search("mail"));
+    assert_eq!(mail[0], "*Mail");
+    assert_eq!(&mail[1..3], ["MailBadge", "MailCheck"]);
+    assert_eq!(mail.last().unwrap(), "Voicemail");
+    assert_eq!(
+        mail.iter().filter(|w| w.ends_with("Mail")).count(),
+        1,
+        "no duplicate"
+    );
+    let term = words(&search("terminal"));
+    assert_eq!(term[0], "*SquareTerminal", "curated by label");
+    // Hyphens are spaces; case does not matter.
+    assert_eq!(search("alarm-clock"), search("ALARM CLOCK"));
+    assert_eq!(words(&search("alarm-clock"))[0], "AlarmClock");
+    assert_eq!(search("a").len(), SEARCH_CAP);
+    assert_eq!(SEARCH_CAP, 120);
+    assert!(search("zzzqqqxx").is_empty());
+}
+
+#[test]
+fn picker_search_steps_and_picks_once_per_query() {
+    let mut s = PickerSearch::default();
+    SEARCH_CALLS.with(|c| c.set(0));
+    assert!(s.set_query("clock".into()));
+    assert!(!s.set_query("clock".into()), "unchanged query: no search");
+    assert_eq!(SEARCH_CALLS.with(|c| c.get()), 1);
+    assert!(s.active());
+    assert_eq!(
+        s.chosen(),
+        Some(PickerCell::Icon(IconName::Clock)),
+        "Enter: first"
+    );
+    s.step(Move::Down);
+    assert_eq!(s.hit(), Some(0));
+    s.step(Move::Down);
+    s.step(Move::Right);
+    assert_eq!(s.hit(), Some(GRID_COLS + 1));
+    s.step(Move::Up);
+    s.step(Move::Up);
+    assert_eq!(s.hit(), None, "back in the field");
+    assert_eq!(cell_icon(PickerCell::Symbol(0)), Some(SYMBOLS[0].1));
+    assert_eq!(symbol_label(IconName::AlarmClock), "Alarm clock");
+    assert_eq!(symbol_label(IconName::Landmark), "Bank");
 }

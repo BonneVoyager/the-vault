@@ -413,6 +413,9 @@ pub struct AppState {
     /// cursor. Closed when the edit ends or its row goes; read via
     /// [`AppState::field_icon_picker`].
     field_icon_picker: Option<(u64, crate::icon::PickerCursor)>,
+    /// The open icon picker's search (item or field picker; reset when either opens or
+    /// closes). Never persisted.
+    pub icon_search: crate::icon::PickerSearch,
     pub generator: Generator,
     /// Open generator popover, if any.
     pub generator_target: Option<GeneratorTarget>,
@@ -534,6 +537,7 @@ impl AppState {
             sort_menu_open: false,
             add_field_menu_open: false,
             field_icon_picker: None,
+            icon_search: Default::default(),
             generator: Generator::default(),
             generator_target: None,
             settings_open: false,
@@ -1008,15 +1012,6 @@ impl AppState {
         } else {
             Duration::ZERO
         };
-        if busy.is_unlock() {
-            // Inflate and parse the brand pack (~33 ms) while the KDF runs, not on the UI
-            // thread at the first list draw. A concurrent first lookup waits on the LazyLock.
-            executor
-                .spawn(async {
-                    crate::icon::BrandPack::get();
-                })
-                .detach();
-        }
         #[cfg(test)]
         let (work_time, clock) = (self.fake_work_time, executor.clone());
         // Signalled when `work` returns, so quit can wait for it (`wait_for_background`).

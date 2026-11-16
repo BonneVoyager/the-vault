@@ -122,7 +122,7 @@ Field = {
   "value":       tstr           for "totp": full otpauth:// URI
   "modified_at": u64            unix millis
   "section":     tstr | null    optional grouping label
-  "icon":        tstr           (2026-11-07, optional, no version bump; app-interpreted symbol name from the app's symbol list (the identifiers of `icon::SYMBOLS`, e.g. "KeyRound"; the fixture's "key" is deliberately a name the app does not know); core validates the type only, a non-string non-null value is Malformed; writers omit the key when there is no icon, readers treat missing, null or "" as none; part of the field, so it merges with the field by id and stamp (03 §5) and a change to it alone restamps the field like a name or value change; older readers keep it as an unknown key)
+  "icon":        tstr           (2026-11-07, optional, no version bump; app-interpreted symbol name, any identifier of the bundled Lucide catalog since 2026-11-16 (was the 40 `icon::SYMBOLS` only), e.g. "KeyRound"; the fixture's "key" is deliberately a name the app does not know; core validates the type only, a non-string non-null value is Malformed; writers omit the key when there is no icon, readers treat missing, null or "" as none; part of the field, so it merges with the field by id and stamp (03 §5) and a change to it alone restamps the field like a name or value change; older readers keep it as an unknown key)
 }
 
 HistoryEntry = { "value": tstr, "replaced_at": u64, "field_id": bytes(16) (version 2, optional; the field the value belonged to) }

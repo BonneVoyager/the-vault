@@ -1,59 +1,10 @@
-//! Asset source: gpui-component's default icons, the few extra Lucide icons we use, and
-//! the app icon raster and unlock wheel shown on the unlock screen.
+//! Asset source: the full Lucide catalog of gpui-kit-assets (`AllAssets`, which also holds
+//! gpui-component's own icons; the item and field icon pickers search all of it), and the
+//! app icon raster and unlock wheel shown on the unlock screen.
 
 use std::borrow::Cow;
 
 use gpui::{AssetSource, Result, SharedString};
-
-gpui_kit_assets::icon_assets!(
-    ExtraIcons,
-    [
-        Lock,
-        KeyRound,
-        StickyNote,
-        CreditCard,
-        IdCard,
-        // License template (Server is registered below with the item symbols).
-        FileBadge,
-        Tag,
-        LayoutList,
-        GripVertical,
-        WandSparkles,
-        FingerprintPattern,
-        ScanQrCode,
-        Trash,
-        // Placeholder of a field's icon button in edit mode.
-        CircleDashed,
-        // Item icon symbols (icon::SYMBOLS) not in gpui-kit's default set.
-        Landmark,
-        Wallet,
-        ShoppingCart,
-        Gift,
-        Mail,
-        MessageCircle,
-        Shield,
-        Users,
-        House,
-        Briefcase,
-        GraduationCap,
-        Cloud,
-        Server,
-        Database,
-        Code,
-        Bug,
-        Wifi,
-        Smartphone,
-        Gamepad2,
-        Music,
-        Film,
-        Camera,
-        Image,
-        MapPin,
-        Car,
-        Plane,
-        Coffee
-    ]
-);
 
 /// Asset path of the app icon raster (`img(APP_ICON)`): 256 px, drawn at 128 pt so it is
 /// sharp on Retina. Rendered from `assets/icon/vault.svg`.
@@ -81,7 +32,7 @@ static EMBEDDED: [(&str, &[u8]); 3] = [
     ),
 ];
 
-/// The app icon, then our extra icons, then gpui-kit's default component icons.
+/// The app icon rasters, then the whole icon catalog.
 pub struct AppAssets;
 
 impl AssetSource for AppAssets {
@@ -89,23 +40,11 @@ impl AssetSource for AppAssets {
         if let Some((_, bytes)) = EMBEDDED.iter().find(|(p, _)| *p == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
-        // Brand logos are generated from the bundled pack on demand; gpui caches the
-        // rasterised tile per path and size, so this runs once per logo and size.
-        if let Some(slug) = path
-            .strip_prefix(crate::icon::BRAND_ASSET_PREFIX)
-            .and_then(|p| p.strip_suffix(".svg"))
-        {
-            return Ok(crate::icon::brand_svg(slug).map(|svg| Cow::Owned(svg.into_bytes())));
-        }
-        if let Some(bytes) = ExtraIcons.load(path)? {
-            return Ok(Some(bytes));
-        }
-        gpui_kit_assets::Assets.load(path)
+        gpui_kit_assets::AllAssets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut paths = gpui_kit_assets::Assets.list(path)?;
-        paths.extend(ExtraIcons.list(path)?);
+        let mut paths = gpui_kit_assets::AllAssets.list(path)?;
         paths.extend(
             EMBEDDED
                 .iter()
@@ -160,12 +99,11 @@ mod tests {
                 assert_eq!(frames.get_pixel(x, y), original.get_pixel(x, y));
             }
         }
-        let brand = AppAssets
-            .load("brand/github.svg")
-            .unwrap()
-            .expect("brand logo");
-        assert!(brand.starts_with(b"<svg"));
-        assert!(AppAssets.load("brand/no-such-brand.svg").unwrap().is_none());
+        // The whole catalog loads, not only the default set (05 "Icon search").
+        for icon in gpui_kit_assets::IconName::ALL {
+            let path = icon.path();
+            assert!(AppAssets.load(&path).unwrap().is_some(), "{path}");
+        }
         let listed = AppAssets.list("icon/").unwrap();
         assert!(listed.iter().any(|p| p == APP_ICON_WHEEL_STRIP));
 

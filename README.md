@@ -19,7 +19,7 @@ Pre-release and not yet signed or notarized. It is built and reviewed by an agen
 - Hold ⌥ to reveal every masked value of the shown item, in the main window or an item window
 - Tags, search, and weak or reused password warnings (local audit)
 - File attachments, encrypted per file, up to 100 MB each
-- Item icons: automatic brand logos from a bundled, offline icon pack, or a symbol, colour, or custom image chosen per item
+- Item icons: a Lucide symbol searchable from the full catalog, a colour, or a custom image chosen per item; a letter avatar otherwise
 - Field icons: an optional symbol next to any field name, chosen from the same symbol set
 - Sync through any folder (iCloud Drive, Dropbox, NAS) with field-level merge and conflict-copy absorption
 - Rotating encrypted backups
@@ -122,9 +122,6 @@ specs/                the specs
 - [docs/spec-traceability.md](docs/spec-traceability.md): every guarantee in specs 02 and 03 mapped to its tests, with the uncovered rules listed
 - [CLAUDE.md](CLAUDE.md): working rules for contributors and agents
 
-## Credits
-
-- Brand logos come from [Simple Icons](https://simpleicons.org) (CC0 1.0), regenerated with `scripts/fetch-brand-icons.sh`; brands remain trademarks of their owners.
 
 ## License
 

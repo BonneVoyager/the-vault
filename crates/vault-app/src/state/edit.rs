@@ -774,33 +774,69 @@ impl AppState {
 
     /// Opens (on the current choice) or closes the icon picker. Not an edit by itself.
     pub fn set_icon_picker(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.icon_search = Default::default();
         if let Some(b) = self.edit_buffer_mut() {
             b.icon_picker = open.then(|| PickerCursor::for_icon(b.item.icon.as_ref()));
             cx.notify();
         }
     }
 
-    /// Arrow key in the open icon picker.
-    pub fn icon_picker_move(&mut self, m: Move, cx: &mut Context<Self>) {
-        if let Some(cursor) = self.edit_buffer_mut().and_then(|b| b.icon_picker.as_mut()) {
-            *cursor = cursor.step(m);
+    /// The open picker's search field changed: the results are computed here, once.
+    pub fn set_icon_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if self.icon_search.set_query(query) {
             cx.notify();
         }
     }
 
-    /// Enter in the open icon picker: choose the cell under the cursor.
+    /// The open picker's keyboard cursor as a grid cell index (search result or curated
+    /// symbol), for scrolling it into view.
+    pub fn icon_picker_cursor_index(&self) -> Option<usize> {
+        if self.icon_search.active() {
+            return self.icon_search.hit();
+        }
+        let cursor = self
+            .field_icon_picker()
+            .map(|(_, c)| c)
+            .or_else(|| self.edit_buffer().and_then(|b| b.icon_picker))?;
+        match cursor.cell() {
+            PickerCell::Symbol(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Arrow key in the open icon picker. With a search query the cursor walks the
+    /// results (see `icon::PickerSearch::step`).
+    pub fn icon_picker_move(&mut self, m: Move, cx: &mut Context<Self>) {
+        if self.edit_buffer().and_then(|b| b.icon_picker).is_none() {
+            return;
+        }
+        if self.icon_search.active() {
+            self.icon_search.step(m);
+        } else if let Some(cursor) = self.edit_buffer_mut().and_then(|b| b.icon_picker.as_mut()) {
+            *cursor = cursor.step(m);
+        }
+        cx.notify();
+    }
+
+    /// Enter in the open icon picker: choose the cell under the cursor (with a search
+    /// query, the result under the cursor, else the first result).
     pub fn icon_picker_choose(&mut self, cx: &mut Context<Self>) {
-        if let Some(cell) = self
-            .edit_buffer()
-            .and_then(|b| b.icon_picker)
-            .map(PickerCursor::cell)
-        {
+        let Some(cursor) = self.edit_buffer().and_then(|b| b.icon_picker) else {
+            return;
+        };
+        let cell = if self.icon_search.active() {
+            self.icon_search.chosen()
+        } else {
+            Some(cursor.cell())
+        };
+        if let Some(cell) = cell {
             self.choose_icon(cell, cx);
         }
     }
 
-    /// A click or Enter on a picker cell: Automatic clears the icon, a symbol sets kind
-    /// `symbol` (keeping a chosen colour), a colour recolours a symbol or tints the letter.
+    /// A click or Enter on a picker cell: Automatic clears the icon, a symbol (curated or
+    /// any catalog icon) sets kind `symbol` (keeping a chosen colour), a colour recolours a
+    /// symbol or tints the letter.
     /// Part of the edit: saved or discarded with it. The picker stays open.
     pub fn choose_icon(&mut self, cell: PickerCell, cx: &mut Context<Self>) {
         if cell == PickerCell::Image {
@@ -812,23 +848,22 @@ impl AppState {
             cx.notify();
             return;
         }
+        let searching = self.icon_search.active();
         self.edit(cx, |b| {
             let current = b.item.icon.as_ref();
             b.item.icon = match cell {
                 PickerCell::Automatic => icon::choose_automatic(current),
-                PickerCell::Symbol(i) => match icon::SYMBOLS.get(i) {
-                    Some((_, name, _)) => icon::choose_symbol(current, *name),
+                PickerCell::Symbol(_) | PickerCell::Icon(_) => match icon::cell_icon(cell) {
+                    Some(name) => icon::choose_symbol(current, name),
                     None => current.cloned(),
                 },
                 PickerCell::Color(i) => match icon::PALETTE.get(i) {
-                    // Disabled while Automatic shows a brand logo.
-                    Some(_) if icon::color_disabled_reason(&b.item).is_some() => current.cloned(),
                     Some(c) => icon::choose_color(current, *c, icon::palette_color(&b.item)),
                     None => current.cloned(),
                 },
                 PickerCell::Image => current.cloned(),
             };
-            if let Some(cursor) = b.icon_picker.as_mut() {
+            if let Some(cursor) = b.icon_picker.as_mut().filter(|_| !searching) {
                 *cursor = PickerCursor::at(cell);
             }
         });
@@ -852,39 +887,57 @@ impl AppState {
                 return;
             }
             self.field_icon_picker = Some((key, PickerCursor::for_field_icon(f.icon_name())));
+            self.icon_search = Default::default();
         } else if self.field_icon_picker.is_some_and(|(k, _)| k == key) {
             self.field_icon_picker = None;
+            self.icon_search = Default::default();
         }
         cx.notify();
     }
 
-    /// Arrow key in the open field icon picker.
+    /// Arrow key in the open field icon picker (over the search results while there is
+    /// a query).
     pub fn field_icon_picker_move(&mut self, m: Move, cx: &mut Context<Self>) {
         if let Some((key, cursor)) = self.field_icon_picker() {
-            self.field_icon_picker = Some((key, cursor.step_symbols(m)));
+            if self.icon_search.active() {
+                self.icon_search.step(m);
+            } else {
+                self.field_icon_picker = Some((key, cursor.step_symbols(m)));
+            }
             cx.notify();
         }
     }
 
-    /// Enter in the open field icon picker: choose the cell under the cursor.
+    /// Enter in the open field icon picker: choose the cell under the cursor (with a
+    /// query, the result under the cursor, else the first result).
     pub fn field_icon_picker_choose(&mut self, cx: &mut Context<Self>) {
         if let Some((key, cursor)) = self.field_icon_picker() {
-            self.choose_field_icon(key, cursor.cell(), cx);
+            let cell = if self.icon_search.active() {
+                self.icon_search.chosen()
+            } else {
+                Some(cursor.cell())
+            };
+            if let Some(cell) = cell {
+                self.choose_field_icon(key, cell, cx);
+            }
         }
     }
 
-    /// "No icon" (`PickerCell::Automatic`) or a symbol for row `key`, then the picker
-    /// closes. Part of the edit: saved or discarded with it.
+    /// "No icon" (`PickerCell::Automatic`) or a catalog icon for row `key`, then the
+    /// picker closes. Part of the edit: saved or discarded with it.
     pub fn choose_field_icon(&mut self, key: u64, cell: PickerCell, cx: &mut Context<Self>) {
         let icon = match cell {
             PickerCell::Automatic => None,
-            PickerCell::Symbol(i) => match icon::SYMBOLS.get(i) {
-                Some((name, ..)) => Some((*name).to_owned()),
-                None => return,
-            },
+            PickerCell::Symbol(_) | PickerCell::Icon(_) => {
+                match icon::cell_icon(cell).and_then(icon::symbol_name) {
+                    Some(name) => Some(name.to_owned()),
+                    None => return,
+                }
+            }
             PickerCell::Color(_) | PickerCell::Image => return,
         };
         self.field_icon_picker = None;
+        self.icon_search = Default::default();
         self.edit(cx, |b| b.set_field_icon(key, icon));
     }
 
@@ -1015,6 +1068,7 @@ impl AppState {
         self.edit_session = self.edit_session.wrapping_add(1);
         self.add_field_menu_open = false;
         self.field_icon_picker = None;
+        self.icon_search = Default::default();
         self.delete_confirm = None;
         self.discard_prompt = None;
         self.generator_target = None;
@@ -1054,6 +1108,7 @@ impl AppState {
         self.mode = Mode::View;
         self.add_field_menu_open = false;
         self.field_icon_picker = None;
+        self.icon_search = Default::default();
     }
 
     /// Removes the references of image icons the edit in progress added (Cancel, lock).

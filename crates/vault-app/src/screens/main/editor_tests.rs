@@ -494,11 +494,15 @@ fn icon_picker_opens_from_the_tile_and_works_by_keyboard(cx: &mut TestAppContext
         id
     });
     vcx.run_until_parked();
-    // Automatic: the GitHub logo, in the list row and the detail header (light appearance).
+    // Automatic: the letter avatar, also with a website (no brand logos since 2026-11-16).
+    let auto = state.read_with(&vcx, |s, _| {
+        crate::icon::automatic(s.selected_item().unwrap()).describe()
+    });
+    assert!(auto.starts_with("letter W "), "{auto}");
     assert!(
-        vcx.debug_bounds("icon-tile logo github fill white")
+        vcx.debug_bounds(leak(format!("icon-tile {auto} fill white")))
             .is_some(),
-        "automatic logo"
+        "automatic letter"
     );
 
     state.update(&mut vcx, |s, cx| s.begin_edit(cx));
@@ -729,7 +733,7 @@ fn image_icon_draws_and_falls_back_to_automatic(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     assert!(vcx.debug_bounds(shown).is_some(), "list row and header");
 
-    // Damage the blob and lock/unlock: the decode fails, the automatic logo shows.
+    // Damage the blob and lock/unlock: the decode fails, the automatic letter shows.
     let store = crate::state::attachments_fake();
     state.update(&mut vcx, |s, cx| {
         s.set_attachment_store(store.clone());
@@ -741,8 +745,12 @@ fn image_icon_draws_and_falls_back_to_automatic(cx: &mut TestAppContext) {
     state.update(&mut vcx, |s, cx| s.select(id, cx));
     vcx.run_until_parked();
     assert!(vcx.debug_bounds(shown).is_none(), "no broken tile");
+    let auto = state.read_with(&vcx, |s, _| {
+        crate::icon::automatic(s.selected_item().unwrap()).describe()
+    });
+    assert!(auto.starts_with("letter B "), "{auto}");
     assert!(
-        vcx.debug_bounds("icon-tile logo github fill white")
+        vcx.debug_bounds(leak(format!("icon-tile {auto} fill white")))
             .is_some(),
         "automatic icon instead"
     );
@@ -1093,34 +1101,6 @@ fn picker_shape_and_colour_are_independent(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn logo_disables_the_colour_row(cx: &mut TestAppContext) {
-    use crate::icon::PALETTE;
-    let (_dir, state, mut vcx, default) = picker_on("Code", Some("https://github.com"), cx);
-    assert!(
-        vcx.debug_bounds("icon-color-disabled").is_some(),
-        "hint shown"
-    );
-    assert!(
-        vcx.debug_bounds("icon-auto-preview logo github").is_some(),
-        "Automatic previews the logo"
-    );
-    assert!(vcx.debug_bounds("icon-auto-selected").is_some());
-    let x_ix = PALETTE.iter().position(|c| *c != default).unwrap();
-    click(&mut vcx, format!("icon-color {x_ix}"));
-    state.read_with(&vcx, |s, _| {
-        assert_eq!(s.edit_buffer().unwrap().item.icon, None, "click ignored");
-    });
-    // With a symbol the colour row works again.
-    click(&mut vcx, "icon-symbol 0".into());
-    assert!(vcx.debug_bounds("icon-color-disabled").is_none());
-    click(&mut vcx, format!("icon-color {x_ix}"));
-    state.read_with(&vcx, |s, _| {
-        let i = s.edit_buffer().unwrap().item.icon.clone().unwrap();
-        assert_eq!(i.color, Some(crate::icon::format_color(PALETTE[x_ix])));
-    });
-}
-
-#[gpui::test]
 fn non_image_files_are_refused_on_drop(cx: &mut TestAppContext) {
     // gpui 0.3.10's open panel has no file-type filter, so a PDF can be chosen or
     // dropped; the magic-byte check refuses it with the same toast either way.
@@ -1251,13 +1231,9 @@ fn section_values_never_surface(cx: &mut TestAppContext) {
 
     state.update(&mut vcx, |s, cx| {
         let item = s.selected_item().unwrap().clone();
-        // Name lookups skip sections: not the subtitle or ⌘⇧U, not the logo's website.
+        // Name lookups skip sections: not the subtitle or ⌘⇧U.
         assert_eq!(crate::listing::subtitle(&item), "");
         assert!(crate::listing::username_field(&item).is_none());
-        assert!(!matches!(
-            crate::icon::automatic(&item),
-            crate::icon::IconSpec::Logo { .. }
-        ));
         // Copy targets: ⌘⇧U and copy-by-index copy nothing.
         s.copy(crate::state::CopyTarget::Username, cx);
         s.copy(crate::state::CopyTarget::Field(item.fields[0].id), cx);
@@ -1830,7 +1806,7 @@ fn field_icon_picker_by_keyboard_no_icon_and_cancel(cx: &mut TestAppContext) {
 /// Tab from the open picker reaches "No icon"; Enter or Space there clears the icon
 /// like its click, not the keyboard cursor's cell (which sits on the chosen symbol).
 #[gpui::test]
-fn tab_to_no_icon_then_enter_or_space_clears(cx: &mut TestAppContext) {
+fn shift_tab_to_no_icon_then_enter_or_space_clears(cx: &mut TestAppContext) {
     use crate::icon::SYMBOLS;
     let dir = tempfile::tempdir().unwrap();
     let (state, main, mut vcx) = open(dir.path(), cx);
@@ -1847,19 +1823,22 @@ fn tab_to_no_icon_then_enter_or_space_clears(cx: &mut TestAppContext) {
             format!("field-icon-button {password} {:?}", SYMBOLS[1].1),
         );
         assert!(vcx.debug_bounds("field-icon-symbol-chosen 1").is_some());
-        let (panel, none) = main.read_with(&vcx, |m, cx| {
-            let r = m.editor.read(cx).rows.iter().find(|r| r.key == password);
-            let f = &r.unwrap().icon_focus;
-            (f.panel.clone(), f.none.clone())
+        let (search, none) = main.read_with(&vcx, |m, cx| {
+            let e = m.editor.read(cx);
+            let r = e.rows.iter().find(|r| r.key == password);
+            (
+                gpui::Focusable::focus_handle(&e.icon_search, cx),
+                r.unwrap().icon_focus.none.clone(),
+            )
         });
         assert!(
-            vcx.update(|w, _| panel.is_focused(w)),
-            "the panel has the focus"
+            vcx.update(|w, _| search.is_focused(w)),
+            "the search field has the focus (05 \"Icon search\")"
         );
-        press(&mut vcx, "tab");
+        press(&mut vcx, "shift-tab");
         assert!(
             vcx.update(|w, _| none.is_focused(w)),
-            "Tab reaches \"No icon\""
+            "Shift-Tab reaches \"No icon\" above it"
         );
         press(&mut vcx, key);
         assert_eq!(field_icon(&state, password, &vcx), None, "{key} clears");
@@ -2398,4 +2377,222 @@ fn clearing_pin_history_leaves_the_password_history(cx: &mut TestAppContext) {
         let ids: Vec<_> = item.history.iter().map(|h| h.field_id).collect();
         assert_eq!(ids, [Some(pw_id)]);
     });
+}
+
+fn search_query(state: &Entity<AppState>, vcx: &VisualTestContext) -> String {
+    state.read_with(vcx, |s, _| s.icon_search.query().to_owned())
+}
+
+fn search_hit(state: &Entity<AppState>, vcx: &VisualTestContext) -> Option<usize> {
+    state.read_with(vcx, |s, _| s.icon_search.hit())
+}
+
+/// 05 "Icon search" (Lucide catalog): the field is focused on open; typing searches the
+/// catalog once per query change; Space types; a catalog icon is stored as kind
+/// `symbol` and takes the swatches; the list row shows it; no-match text.
+#[gpui::test]
+fn icon_search_picks_a_catalog_icon(cx: &mut TestAppContext) {
+    use crate::icon::PALETTE;
+    let (_dir, state, mut vcx, default) = picker_on("Notes", Some("https://github.com"), cx);
+    // Empty query: the 40 curated symbols as before.
+    assert!(vcx.debug_bounds("icon-search").is_some());
+    assert!(vcx.debug_bounds("icon-symbol 39").is_some());
+    let grid = vcx.debug_bounds("icon-grid").unwrap().size;
+
+    vcx.simulate_keystrokes("c l o c k");
+    vcx.run_until_parked();
+    assert_eq!(search_query(&state, &vcx), "clock");
+    assert!(vcx.debug_bounds("icon-symbol 39").is_none());
+    assert!(vcx.debug_bounds("icon-hit 0 Clock").is_some());
+    assert!(vcx.debug_bounds("icon-hit 1 Clock1").is_some());
+    assert_eq!(
+        vcx.debug_bounds("icon-grid").unwrap().size,
+        grid,
+        "fixed size"
+    );
+
+    // Results are computed once per query change: redraws and arrows do not search.
+    crate::icon::SEARCH_CALLS.with(|c| c.set(0));
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("down up");
+    vcx.run_until_parked();
+    assert_eq!(crate::icon::SEARCH_CALLS.with(|c| c.get()), 0);
+
+    // Space types in the field; with a query ←/→ move the caret, not the cursor.
+    vcx.simulate_keystrokes("cmd-a a l a r m space c");
+    vcx.run_until_parked();
+    assert_eq!(search_query(&state, &vcx), "alarm c");
+    vcx.simulate_keystrokes("left x");
+    vcx.run_until_parked();
+    assert_eq!(search_query(&state, &vcx), "alarm xc");
+    assert_eq!(search_hit(&state, &vcx), None, "no cursor move");
+
+    // ↓ enters the results, → moves, Enter picks: stored as kind symbol.
+    vcx.simulate_keystrokes("cmd-a c l o c k down right enter");
+    vcx.run_until_parked();
+    let icon = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().item.icon.clone());
+    let icon = icon.expect("icon chosen");
+    assert_eq!(
+        (icon.kind.as_str(), icon.value.as_str(), icon.color),
+        ("symbol", "Clock1", None)
+    );
+    assert!(vcx.debug_bounds("icon-hit-chosen 1 Clock1").is_some());
+    assert!(vcx.debug_bounds("icon-auto-selected").is_none());
+
+    // Swatches apply to catalog icons; the header tile follows.
+    let x_ix = PALETTE.iter().position(|c| *c != default).unwrap();
+    click(&mut vcx, format!("icon-color {x_ix}"));
+    let tile = leak(format!(
+        "icon-tile symbol Clock1 #{:06X} fill white",
+        PALETTE[x_ix]
+    ));
+    assert!(vcx.debug_bounds(tile).is_some(), "{tile}");
+    // Dark appearance: the same filled tile with a white glyph (no contrast fallbacks).
+    for mode in [
+        gpui_component::ThemeMode::Dark,
+        gpui_component::ThemeMode::Light,
+    ] {
+        vcx.update(|window, cx| gpui_component::Theme::change(mode, Some(window), cx));
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds(tile).is_some(), "{mode:?}");
+    }
+
+    // No match (the swatch click took the focus; a click puts it back in the field).
+    click(&mut vcx, "icon-search".into());
+    vcx.simulate_keystrokes("cmd-a z z q q x");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("icon-no-match").is_some());
+
+    // Save: the list row shows it.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("icon-picker").is_none());
+    vcx.simulate_keystrokes("cmd-s");
+    vcx.run_until_parked();
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    let notes = state.read_with(&vcx, |s, _| s.selection).unwrap();
+    // Another item in the detail column, so the only Clock1 tile is the list row's.
+    insert_and_select(&state, vault_core::Item::new("Zeta", device, 10), &mut vcx);
+    let shown = vcx.debug_bounds(tile).expect("list tile");
+    assert!(
+        (0..4).any(|ix| vcx
+            .debug_bounds(leak(format!("item-row {ix}")))
+            .is_some_and(|row| row.contains(&shown.center()))),
+        "list row shows the catalog icon"
+    );
+
+    // Reopened: the query is gone; Automatic gives the (tinted) letter again.
+    state.update(&mut vcx, |s, cx| s.select(notes, cx));
+    vcx.run_until_parked();
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    click(&mut vcx, "edit-icon".into());
+    assert_eq!(search_query(&state, &vcx), "");
+    assert!(vcx.debug_bounds("icon-symbol 39").is_some());
+    click(&mut vcx, "icon-picker-automatic".into());
+    state.read_with(&vcx, |s, _| {
+        let icon = s.edit_buffer().unwrap().item.icon.clone().unwrap();
+        assert_eq!(icon.kind, "letter", "the colour stays");
+    });
+}
+
+/// The keyboard cursor stays visible: moving it past the visible rows scrolls the grid,
+/// and a query change scrolls back to the top.
+#[gpui::test]
+fn icon_search_grid_scrolls_to_the_cursor(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    insert_and_select(&state, vault_core::Item::new("Notes", device, 10), &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    click(&mut vcx, "edit-icon".into());
+    let scroll = vcx.update(|_, cx| main.read(cx).editor.read(cx).icon_scroll.clone());
+    vcx.simulate_keystrokes("a");
+    vcx.run_until_parked();
+    let rows = crate::icon::SEARCH_CAP.div_ceil(crate::icon::GRID_COLS);
+    assert!(rows > 6, "{rows} rows, more than the 5 that fit");
+    assert_eq!(scroll.offset().y, px(0.));
+    // ↓ enters the results on row 0; six more reach row 6, below the fold.
+    vcx.simulate_keystrokes("down down down down down down down");
+    vcx.run_until_parked();
+    assert_eq!(search_hit(&state, &vcx), Some(6 * crate::icon::GRID_COLS));
+    assert!(scroll.offset().y < px(0.), "scrolled");
+    // Child bounds are unscrolled layout bounds: shift them by the offset.
+    let (view, row) = (scroll.bounds(), scroll.bounds_for_item(6).unwrap());
+    let dy = scroll.offset().y;
+    assert!(
+        row.top() + dy >= view.top() && row.bottom() + dy <= view.bottom(),
+        "cursor row {row:?} inside {view:?}"
+    );
+    vcx.simulate_keystrokes("up up up up up up");
+    vcx.run_until_parked();
+    assert_eq!(scroll.offset().y, px(0.));
+    // Scrolled down again, then the query changes: new results start at the top.
+    vcx.simulate_keystrokes("down down down down down down");
+    vcx.run_until_parked();
+    assert!(scroll.offset().y < px(0.));
+    vcx.simulate_keystrokes("r");
+    vcx.run_until_parked();
+    assert_eq!(search_query(&state, &vcx), "ar");
+    assert_eq!(scroll.offset().y, px(0.));
+    assert_eq!(search_hit(&state, &vcx), None);
+}
+
+/// 05 "Field icons" + "Icon search": the field picker has the same search; a catalog
+/// icon is stored on the field and drawn in the read-mode row. After a cell click the
+/// picker still works by keyboard (arrows, Esc).
+#[gpui::test]
+fn field_icon_search_picks_a_catalog_icon(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let (id, [user, _, password]) = editing_with_section(&state, &mut vcx);
+    click(&mut vcx, format!("field-icon-button {user} none"));
+    assert!(vcx.debug_bounds("icon-search").is_some(), "search field");
+    assert!(vcx.debug_bounds("field-icon-symbol 39").is_some());
+    vcx.simulate_keystrokes("a l a r m space c l o c k");
+    vcx.run_until_parked();
+    assert_eq!(search_query(&state, &vcx), "alarm clock");
+    assert!(vcx.debug_bounds("field-icon-symbol 39").is_none());
+    click(&mut vcx, "field-icon-hit 0 AlarmClock".into());
+    assert_eq!(
+        field_icon(&state, user, &vcx).as_deref(),
+        Some("AlarmClock")
+    );
+    assert!(
+        state.read_with(&vcx, |s, _| s.field_icon_picker().is_none()),
+        "a pick closes"
+    );
+    assert!(name_focused(&main, user, &mut vcx));
+    assert!(
+        vcx.debug_bounds(leak(format!("field-icon-button {user} AlarmClock")))
+            .is_some()
+    );
+
+    // Reopened: empty query; arrows and Esc still work.
+    click(&mut vcx, format!("field-icon-button {password} none"));
+    assert_eq!(search_query(&state, &vcx), "");
+    vcx.simulate_keystrokes("down right");
+    vcx.run_until_parked();
+    let cursor = state.read_with(&vcx, |s, _| s.field_icon_picker().map(|(_, c)| c.cell()));
+    assert_eq!(cursor, Some(crate::icon::PickerCell::Symbol(1)));
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(
+        state.read_with(&vcx, |s, _| s.field_icon_picker().is_none()),
+        "Esc closes"
+    );
+    assert!(name_focused(&main, password, &mut vcx));
+
+    vcx.simulate_keystrokes("cmd-s");
+    vcx.run_until_parked();
+    let item = state.read_with(&vcx, |s, _| {
+        s.unlocked_vault().unwrap().get(id).unwrap().clone()
+    });
+    assert_eq!(item.fields[0].icon.as_deref(), Some("AlarmClock"));
+    assert!(
+        vcx.debug_bounds("field-row-icon 0 AlarmClock").is_some(),
+        "read mode draws it from the catalog"
+    );
 }

@@ -518,7 +518,7 @@ fn edit_field_generator(cx: &mut TestAppContext) {
 fn edit_icon_picker(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (state, mut vcx) = main_window(dir.path(), SHORT, cx);
-    // A symbol first: the colour row is enabled (on the automatic logo it is not).
+    // A symbol first.
     state.update(&mut vcx, |s, cx| {
         s.begin_edit(cx);
         s.set_icon_picker(true, cx);
@@ -539,27 +539,22 @@ fn edit_icon_picker(cx: &mut TestAppContext) {
         },
         &mut vcx,
     );
-    // Back to Automatic on the GitHub logo: the colour swatches are disabled.
+    // Back to Automatic (a letter now, also for this item with a website): the colour
+    // swatches stay enabled.
     state.update(&mut vcx, |s, cx| {
-        s.choose_icon(crate::icon::PickerCell::Automatic, cx);
-        assert!(crate::icon::color_disabled_reason(&s.edit_buffer().unwrap().item).is_some());
+        s.choose_icon(crate::icon::PickerCell::Automatic, cx)
     });
     audit(
         Case {
-            label: "icon picker, logo",
-            targets: &["edit-icon", "icon-auto", "icon-symbol", "icon-image"],
-            disabled: &[
-                "move-up-0",
-                &last_down,
-                "icon-color-0",
-                "icon-color-1",
-                "icon-color-2",
-                "icon-color-3",
-                "icon-color-4",
-                "icon-color-5",
-                "icon-color-6",
-                "icon-color-7",
+            label: "icon picker, automatic",
+            targets: &[
+                "edit-icon",
+                "icon-auto",
+                "icon-symbol",
+                "icon-color",
+                "icon-image",
             ],
+            disabled: &["move-up-0", &last_down],
         },
         &mut vcx,
     );

@@ -307,6 +307,11 @@ pub struct Editor {
     row_width: Rc<Cell<Pixels>>,
     /// Focus of the open icon picker (arrow keys and Enter move and choose).
     icon_focus: gpui::FocusHandle,
+    /// The icon pickers' search field (05 "Icon search"), shared by the item picker and
+    /// the field pickers (one is open at a time); its text mirrors `AppState::icon_search`.
+    icon_search: Entity<InputState>,
+    /// The icon picker's grid scroll, moved to keep the keyboard cursor in view.
+    icon_scroll: ScrollHandle,
     /// Live password notices, rescored only when a value changes.
     scores: IssueCache,
     /// Key of the row under the pointer: it shows its ↑/↓ buttons.
@@ -330,7 +335,20 @@ impl Editor {
     ) -> Self {
         let title = ui::text_input("Title", window, cx);
         let tags = ui::text_input("Add tag", window, cx);
+        let icon_search = ui::text_input("Search icons", window, cx);
         let subscriptions = vec![
+            cx.subscribe_in(
+                &icon_search,
+                window,
+                |this, input, ev: &InputEvent, _, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        let query = ui::input_text(input, cx);
+                        this.state.update(cx, |s, cx| s.set_icon_query(query, cx));
+                        // New results start at the top.
+                        this.icon_scroll.set_offset(gpui::Point::default());
+                    }
+                },
+            ),
             cx.subscribe_in(
                 &title,
                 window,
@@ -381,6 +399,8 @@ impl Editor {
             drag: Rc::default(),
             row_width: Rc::new(Cell::new(px(280.))),
             icon_focus: cx.focus_handle(),
+            icon_search,
+            icon_scroll: ScrollHandle::new(),
             scores: IssueCache::default(),
             hovered: None,
             flash: None,
@@ -1078,6 +1098,7 @@ impl Editor {
                         &self.state,
                         key,
                         &row.icon_focus,
+                        (&self.icon_search, &self.icon_scroll),
                         &name_focus,
                         cx,
                     ))
@@ -1378,6 +1399,8 @@ impl Render for Editor {
             .child(super::icon_view::picker_trigger(
                 &self.state,
                 &self.icon_focus,
+                &self.icon_search,
+                &self.icon_scroll,
                 &gpui::Focusable::focus_handle(&self.title, cx),
                 HEADER_TILE,
                 cx,
