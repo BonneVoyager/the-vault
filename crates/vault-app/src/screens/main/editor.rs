@@ -7,12 +7,13 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, Context, Entity, FocusHandle, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window,
-    div, prelude::FluentBuilder as _, px,
+    Anchor, AnimationExt as _, AnyElement, App, AppContext as _, Context, Entity, FocusHandle,
+    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    WeakEntity, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Backspace, Input, InputEvent, InputState, Textarea, TextareaState};
@@ -120,6 +121,23 @@ impl Render for DragPreview {
             .child(Tag::secondary().small().child(row.kind))
             .pr(px(4.))
     }
+}
+
+/// Move flash (05 "Edit-mode field rows", owner 2026-11-16): the accent at 18 % under a
+/// row that a click on ↑/↓ or a drop just moved, fading to clear.
+const FLASH_ALPHA: f32 = 0.18;
+const FLASH_FADE: Duration = Duration::from_millis(900);
+/// Under Reduce Motion: a solid fill this long, then none.
+const FLASH_SOLID: Duration = Duration::from_millis(300);
+
+/// The flash in progress. Its fade is a `with_animation` keyed by `generation`, so other
+/// re-renders do not replay it; a timer drops it at the end, so nothing keeps drawing
+/// frames after (a finished `with_animation` would otherwise stay in the tree).
+#[derive(Clone, Copy)]
+struct Flash {
+    key: u64,
+    generation: u64,
+    reduce_motion: bool,
 }
 
 /// Field drag in progress, shared with the element listeners. Only meaningful while
@@ -293,6 +311,13 @@ pub struct Editor {
     scores: IssueCache,
     /// Key of the row under the pointer: it shows its ↑/↓ buttons.
     hovered: Option<u64>,
+    /// The move flash showing, if any, and its timer (dropping the task cancels it).
+    flash: Option<Flash>,
+    flash_generation: u64,
+    flash_end: Option<gpui::Task<()>>,
+    /// Editor renders, for the tests that no frame keeps running after a flash.
+    #[cfg(test)]
+    renders: usize,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -358,6 +383,11 @@ impl Editor {
             icon_focus: cx.focus_handle(),
             scores: IssueCache::default(),
             hovered: None,
+            flash: None,
+            flash_generation: 0,
+            flash_end: None,
+            #[cfg(test)]
+            renders: 0,
             _subscriptions: subscriptions,
         }
     }
@@ -374,6 +404,8 @@ impl Editor {
                 self.drag.clear();
                 self.scores.clear();
                 self.hovered = None;
+                self.flash = None;
+                self.flash_end = None;
                 ui::clear_input(&self.title, window, cx);
                 ui::clear_input(&self.tags, window, cx);
             }
@@ -390,6 +422,8 @@ impl Editor {
             self.scores.clear();
             // Row keys restart per session: a stale key would light another row.
             self.hovered = None;
+            self.flash = None;
+            self.flash_end = None;
             ui::set_input(&self.title, &buffer.item.title, window, cx);
             ui::clear_input(&self.tags, window, cx);
             ui::focus_input(&self.title, window, cx);
@@ -571,9 +605,38 @@ impl Editor {
         }
     }
 
+    /// Flashes row `key` after a click-move or drop, replacing any flash (05 "Move flash").
+    fn start_flash(&mut self, key: u64, cx: &mut Context<Self>) {
+        self.flash_generation += 1;
+        let generation = self.flash_generation;
+        let reduce_motion = self.state.read(cx).reduce_motion;
+        self.flash = Some(Flash {
+            key,
+            generation,
+            reduce_motion,
+        });
+        let length = if reduce_motion {
+            FLASH_SOLID
+        } else {
+            FLASH_FADE
+        };
+        self.flash_end = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(length).await;
+            this.update(cx, |e, cx| {
+                if e.flash.is_some_and(|f| f.generation == generation) {
+                    e.flash = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     /// The field rows: the one drop target for field drags, so a release between rows
     /// (or over the history block) lands where the line showed.
-    fn rows_container(&self, rows: Vec<AnyElement>) -> impl IntoElement {
+    fn rows_container(&self, rows: Vec<AnyElement>, this: &WeakEntity<Self>) -> impl IntoElement {
+        let this = this.clone();
         let width = self.row_width.clone();
         let (leave, drag, state) = (self.drag.clone(), self.drag.clone(), self.state.clone());
         ui::v_flex()
@@ -598,6 +661,7 @@ impl Editor {
                     .and_then(|(from, (t, lower))| drop_index(from, t, lower));
                 if let Some(to) = to {
                     state.update(cx, |s, cx| s.edit(cx, |b| b.move_field(key, to)));
+                    this.update(cx, |e, cx| e.start_flash(key, cx)).ok();
                 }
             })
             .children(rows)
@@ -660,10 +724,15 @@ impl Editor {
                     // A click moves the row out from under the pointer: hand the hover
                     // to the row now there before the frame, so the moved row does not
                     // blink its arrows. By keyboard, focus (and the arrows) follow it.
-                    if !matches!(ev, gpui::ClickEvent::Keyboard(_)) {
+                    let by_mouse = !matches!(ev, gpui::ClickEvent::Keyboard(_));
+                    if by_mouse {
                         this.update(cx, |e, _| e.hovered = swapped).ok();
                     }
                     state.update(cx, |s, cx| s.edit(cx, |b| b.move_field(key, to)));
+                    // Only a click flashes: by keyboard, focus already marks the row.
+                    if by_mouse {
+                        this.update(cx, |e, cx| e.start_flash(key, cx)).ok();
+                    }
                 })
         };
         // Hidden arrows keep their space and their Tab stops: two empty divs holding the
@@ -778,6 +847,13 @@ impl Editor {
             .border_color(theme.border)
             // The row being dragged collapses to its header line at 40 % opacity.
             .when(is_ghost, |row| row.opacity(0.4))
+            // First child: painted under the row's content, inside its border, so the
+            // inputs' text and the hairline rule are untouched.
+            .children(
+                self.flash
+                    .filter(|f| f.key == key)
+                    .map(|f| move_flash(f, theme.primary)),
+            )
             .on_hover({
                 let this = this.clone();
                 move |hovered, _, cx| {
@@ -1171,8 +1247,30 @@ fn value_placeholder(kind: FieldKind) -> &'static str {
     }
 }
 
+/// The flash fill of row `flash.key` (05 "Move flash"): the accent at 18 % fading to
+/// clear with an ease-out, or solid under Reduce Motion (its timer removes it).
+fn move_flash(flash: Flash, accent: gpui::Hsla) -> AnyElement {
+    let fill = div()
+        .debug_selector(move || format!("move-flash {}", flash.key))
+        .absolute()
+        .inset_0();
+    if flash.reduce_motion {
+        return fill.bg(accent.opacity(FLASH_ALPHA)).into_any_element();
+    }
+    fill.with_animation(
+        ("move-flash", flash.generation),
+        gpui::Animation::new(FLASH_FADE).with_easing(gpui::ease_out_quint()),
+        move |el, t| el.bg(accent.opacity(FLASH_ALPHA * (1. - t))),
+    )
+    .into_any_element()
+}
+
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
         // Built first: the menu keeps its focus handles in element state (`&mut App`).
         let add_field_open = self.state.read(cx).add_field_menu_open;
         let add_field = {
@@ -1367,7 +1465,7 @@ impl Render for Editor {
             .when(rows.is_empty(), |col| {
                 col.child(ui::muted("No fields. Add one below.", cx))
             })
-            .child(self.rows_container(rows))
+            .child(self.rows_container(rows, &this))
             .child(ui::h_flex().child(add_field));
 
         ui::v_flex()

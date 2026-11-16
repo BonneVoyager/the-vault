@@ -372,3 +372,250 @@ impl gpui::Styled for Holder {
         &mut self.0
     }
 }
+
+/// Keys of the rows showing a move flash.
+fn flashing(vcx: &mut VisualTestContext, keys: &[u64]) -> Vec<u64> {
+    keys.iter()
+        .copied()
+        .filter(|k| vcx.debug_bounds(leak(format!("move-flash {k}"))).is_some())
+        .collect()
+}
+
+/// The fill painted for row `key`'s flash: accent hue, its alpha.
+fn flash_alpha(vcx: &mut VisualTestContext, key: u64) -> f32 {
+    let area = bounds(vcx, format!("move-flash {key}"));
+    vcx.update(|window, cx| {
+        let accent = cx.theme().primary;
+        let area = area.scale(window.scale_factor());
+        let close = |a: gpui::ScaledPixels, b: gpui::ScaledPixels| (a.0 - b.0).abs() < 1.;
+        let fill = window
+            .painted_quads()
+            .into_iter()
+            .filter(|q| {
+                close(q.bounds.origin.x, area.origin.x)
+                    && close(q.bounds.origin.y, area.origin.y)
+                    && close(q.bounds.size.width, area.size.width)
+                    && close(q.bounds.size.height, area.size.height)
+            })
+            .find_map(|q| q.background.as_solid())
+            .expect("flash fill painted");
+        assert!(
+            (fill.h - accent.h).abs() < 0.01
+                && (fill.s - accent.s).abs() < 0.01
+                && (fill.l - accent.l).abs() < 0.01,
+            "fill {fill:?} is not the accent {accent:?}"
+        );
+        fill.a
+    })
+}
+
+/// An item in edit mode, row 1 hovered; returns the row keys.
+fn editing_with_hover(state: &Entity<AppState>, vcx: &mut VisualTestContext) -> Vec<u64> {
+    plain_item(state, vcx);
+    state.update(vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let keys = state.read_with(vcx, |s, _| s.edit_buffer().unwrap().keys.clone());
+    let row1 = bounds(vcx, format!("edit-row {}", keys[1])).center();
+    vcx.simulate_mouse_move(row1, None, Modifiers::none());
+    vcx.run_until_parked();
+    keys
+}
+
+fn click_down(vcx: &mut VisualTestContext, key: u64) {
+    let down = bounds(vcx, format!("move-down {key}")).center();
+    vcx.simulate_click(down, Modifiers::none());
+    vcx.run_until_parked();
+}
+
+fn advance(vcx: &mut VisualTestContext, ms: u64) {
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_millis(ms));
+    vcx.run_until_parked();
+}
+
+/// 05 "Move flash": a click on ↓ flashes the moved row only, in the accent at up to
+/// 18 %; a second move restarts it on that row; its timer removes the fill 900 ms
+/// after the last move. Afterwards the editor re-renders no more than with no flash
+/// ever shown, and no animation frame is requested. The fade's own progress runs on
+/// real time and is not exercised here.
+#[gpui::test]
+fn click_move_flash_moves_with_a_second_move_and_its_timer_ends_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let keys = editing_with_hover(&state, &mut vcx);
+    let renders =
+        |vcx: &mut VisualTestContext| main.read_with(vcx, |m, cx| m.editor.read(cx).renders);
+    let start = renders(&mut vcx);
+    advance(&mut vcx, 2_000);
+    let baseline = renders(&mut vcx) - start;
+    click_down(&mut vcx, keys[1]);
+    assert_eq!(flashing(&mut vcx, &keys), [keys[1]]);
+    let a = flash_alpha(&mut vcx, keys[1]);
+    assert!(a > 0. && a <= 0.18 + 1e-3, "alpha {a}");
+
+    // The row now under the pointer (keys[2]) moves down too: the flash moves with it.
+    advance(&mut vcx, 400);
+    click_down(&mut vcx, keys[2]);
+    assert_eq!(
+        flashing(&mut vcx, &keys),
+        [keys[2]],
+        "restarted on the new row"
+    );
+    advance(&mut vcx, 600);
+    assert_eq!(
+        flashing(&mut vcx, &keys),
+        [keys[2]],
+        "the first timer did not end it"
+    );
+    advance(&mut vcx, 301);
+    assert!(flashing(&mut vcx, &keys).is_empty(), "gone after 900 ms");
+
+    let before = renders(&mut vcx);
+    advance(&mut vcx, 2_000);
+    assert_eq!(
+        renders(&mut vcx) - before,
+        baseline,
+        "no extra re-renders after the flash"
+    );
+    assert_no_frame_loop(&mut vcx);
+}
+
+/// Delivers two frames (tests have no frame loop): the first may run a callback left
+/// from earlier renders; the second must run none, so no animation keeps requesting
+/// frames.
+fn assert_no_frame_loop(vcx: &mut VisualTestContext) {
+    vcx.update(|window, cx| window.simulate_next_frame(cx));
+    vcx.run_until_parked();
+    let ran = vcx.update(|window, cx| window.simulate_next_frame(cx));
+    assert_eq!(ran, 0, "frames keep being requested");
+}
+
+/// A flash in progress ends with the edit: cancelling clears it, and so does starting
+/// another item's edit directly (row keys restart, so a stale flash would land on the
+/// new item's row with the same key).
+#[gpui::test]
+fn flash_ends_with_the_edit(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let flash = |vcx: &mut VisualTestContext| {
+        main.read_with(vcx, |m, cx| m.editor.read(cx).flash.map(|f| f.key))
+    };
+
+    // Cancel mid-flash.
+    let keys = editing_with_hover(&state, &mut vcx);
+    click_down(&mut vcx, keys[1]);
+    assert_eq!(flash(&mut vcx), Some(keys[1]));
+    state.update(&mut vcx, |s, cx| s.cancel_edit(cx));
+    vcx.run_until_parked();
+    assert_eq!(flash(&mut vcx), None, "cleared on cancel");
+    assert!(flashing(&mut vcx, &keys).is_empty());
+    assert_no_frame_loop(&mut vcx);
+
+    // Another item's edit begins mid-flash, in one update (no read-mode frame between).
+    let keys = editing_with_hover(&state, &mut vcx);
+    click_down(&mut vcx, keys[1]);
+    assert_eq!(flash(&mut vcx), Some(keys[1]));
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    let mut other = vault_core::Item::new("Other", device, 1);
+    other.fields = (0..4)
+        .map(|i| {
+            let v = SecretString::new("v".into());
+            vault_core::Field::new(format!("f{i}"), FieldKind::Text, v, 1)
+        })
+        .collect();
+    let other_id = state.update(&mut vcx, |s, _| {
+        let id = s
+            .vault
+            .as_mut()
+            .unwrap()
+            .edit(|v| v.insert(other, 10))
+            .unwrap();
+        s.vault_changed();
+        id
+    });
+    state.update(&mut vcx, |s, cx| {
+        s.cancel_edit(cx);
+        s.select(other_id, cx);
+        s.begin_edit(cx);
+    });
+    vcx.run_until_parked();
+    let next = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().keys.clone());
+    assert!(next.contains(&keys[1]), "keys restart per edit");
+    assert_eq!(flash(&mut vcx), None, "cleared for the new edit");
+    assert!(flashing(&mut vcx, &next).is_empty());
+    assert_no_frame_loop(&mut vcx);
+}
+
+/// A keyboard move (Space on a focused ↑) does not flash.
+#[gpui::test]
+fn keyboard_move_does_not_flash(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    vcx.update(|w, _| w.activate_window());
+    let keys = editing_with_hover(&state, &mut vcx);
+    let value = value_input(&main, keys[2], &mut vcx);
+    vcx.update(|window, cx| ui::focus_input(&value, window, cx));
+    vcx.update(|w, _| w.refresh());
+    vcx.run_until_parked();
+    press(&mut vcx, "tab");
+    press(&mut vcx, "space");
+    let order = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().keys.clone());
+    assert_eq!(order, [keys[0], keys[2], keys[1], keys[3]], "moved up");
+    assert!(flashing(&mut vcx, &keys).is_empty());
+}
+
+/// Under Reduce Motion the fill is solid 18 % for 300 ms, then gone (no fade).
+#[gpui::test]
+fn reduce_motion_flash_is_solid_for_300_ms(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    state.update(&mut vcx, |s, cx| s.set_reduce_motion(true, cx));
+    let keys = editing_with_hover(&state, &mut vcx);
+    click_down(&mut vcx, keys[1]);
+    assert!(
+        (flash_alpha(&mut vcx, keys[1]) - 0.18).abs() < 1e-3,
+        "solid"
+    );
+    advance(&mut vcx, 299);
+    assert!(
+        (flash_alpha(&mut vcx, keys[1]) - 0.18).abs() < 1e-3,
+        "still solid"
+    );
+    advance(&mut vcx, 2);
+    assert!(flashing(&mut vcx, &keys).is_empty(), "cleared at 300 ms");
+}
+
+/// A drop flashes the dropped row.
+#[gpui::test]
+fn drop_flashes_the_dropped_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    plain_item(&state, &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let keys = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().keys.clone());
+    let none = Modifiers::none();
+    let grip = bounds(&mut vcx, format!("grip {}", keys[0])).center();
+    vcx.simulate_mouse_down(grip, gpui::MouseButton::Left, none);
+    vcx.simulate_mouse_move(grip + point(px(0.), px(6.)), gpui::MouseButton::Left, none);
+    vcx.run_until_parked();
+    let b = bounds(&mut vcx, format!("edit-row {}", keys[2]));
+    let at = point(b.center().x, b.top() + b.size.height * 0.75);
+    vcx.simulate_mouse_move(at, gpui::MouseButton::Left, none);
+    vcx.run_until_parked();
+    assert!(
+        flashing(&mut vcx, &keys).is_empty(),
+        "no flash while dragging"
+    );
+    vcx.simulate_mouse_up(at, gpui::MouseButton::Left, none);
+    vcx.run_until_parked();
+    let order = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().keys.clone());
+    assert_eq!(
+        order,
+        [keys[1], keys[2], keys[0], keys[3]],
+        "dropped after row 2"
+    );
+    assert_eq!(flashing(&mut vcx, &keys), [keys[0]]);
+    let a = flash_alpha(&mut vcx, keys[0]);
+    assert!(a > 0. && a <= 0.18 + 1e-3, "alpha {a}");
+}

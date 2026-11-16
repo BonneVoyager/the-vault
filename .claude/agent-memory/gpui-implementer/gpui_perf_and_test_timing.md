@@ -40,3 +40,17 @@ Verified 2026-11-15 against gpui-pre =0.3.10, gpui-component =0.8.1.
 - The cursor audit's inspector scan (scroll-event picking inside one `vcx.update`) never produces
   hover, and `simulate_mouse_move` before the scan does not survive it either: hover-only controls
   need a test switch (vault: `screens::show_all_arrows_for_tests`, thread-local) to be audited.
+
+**Timed visual effects testable with the fake clock (2026-11-16, move flash)**
+- Pattern: `with_animation((name, generation), ..)` for the visual fade (real time, keyed so
+  re-renders do not replay it) + a `cx.spawn` `background_executor().timer(len)` that removes the
+  element at the end (generation-checked; storing the Task cancels the previous one). Tests drive
+  the end with `vcx.executor().advance_clock(..)`; only assert colour ranges at the start
+  (0 < a <= max), never mid-fade values. Reduce Motion variant: plain solid `.bg`, same timer.
+- "No redraws after" check: a `#[cfg(test)] renders` counter in the view. The open() harness has
+  its own periodic re-renders (~2/s from app ticks), so compare against a baseline window taken
+  before the effect, not against zero. Animation frames (`request_animation_frame`) are never
+  delivered on the test platform, so this only catches notify loops.
+- Frame-leak check: `vcx.update(|w, cx| w.simulate_next_frame(cx))` (test-support, returns how many
+  `on_next_frame` callbacks ran) delivers one frame; call once, `run_until_parked`, call again and
+  assert the second returns 0 (vault: editor_row_tests `assert_no_frame_loop`).

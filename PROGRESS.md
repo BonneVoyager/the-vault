@@ -87,9 +87,12 @@ Rows now use read mode's `field_row` geometry (7 px padding, 16 px gap, 28 px li
 ### 2026-11-16 — Edit-row eye-check fixes (gpui-implementer, code-reviewer SHIP)
 Owner found: moved row's arrows blinked away from the pointer; arrows showed while the row's input was focused; edit title smaller than read title. Rule now (05): ↑/↓ visible only while the pointer is over the row or an arrow itself has keyboard focus (`ui::focus_ring_allowed`); hidden arrows are empty slots keeping space and the focus handles so Tab still reaches ↑ (`invisible()` would drop the Tab stop); a click-move hands hover to the row taking the moved row's place; keyboard moves keep focus on the row. Title: shared `detail::title_text` style applied to the input itself (the old style sat on a wrapper the Input ignores). Accepted notes: one-frame flash possible when swapping rows of unequal height; a click elsewhere after keyboard-focusing an arrow hides it with focus on the slot. Tests: `arrows_show_on_hover_and_focus_only` (updated), `click_move_shows_arrows_only_under_the_pointer`, `edit_title_matches_the_read_title_size`.
 
-## CHECKPOINT — Editor perf + edit rows (option A) + eye-check fixes 2026-11-16
-Committed: 116bf2d (PIN wave). Uncommitted: editor perf (cache, one-pass history, harness), edit rows option A plus the 2026-11-16 fixes (editor.rs, detail.rs, main.rs, mod.rs, cursor audit guard, editor_row_tests.rs, editor_perf_tests.rs), spec 05 wording, CLAUDE.md `--release` note, this file, gpui-implementer memory.
-Workspace: fmt PASS, clippy PASS; `cargo test --workspace` 1258 / 16 ignored on the pre-fix tree; vault-app after all fixes 543 passed / 1 ignored; QA ledger 249 + CLI 107 green (ledger unaffected by these app-only changes).
-Eye check passed 2026-11-16. Awaiting owner: commit.
+### 2026-11-16 — Move flash on edit rows (owner decision, option A; gpui-implementer, code-reviewer SHIP)
+After a mouse ↑/↓ move or a drag drop the row fills with `theme.primary` at 18 % and fades over 900 ms ease-out (`with_animation` keyed by a per-move counter; a timer removes the fill, cancelled on drop/edit end, generation-checked so an old timer cannot clear a new flash); keyboard moves do not flash; Reduce Motion: solid 300 ms. Tests: `click_move_flash_moves_with_a_second_move_and_its_timer_ends_it`, `keyboard_move_does_not_flash`, `reduce_motion_flash_is_solid_for_300_ms`, `drop_flashes_the_dropped_row`, `flash_ends_with_the_edit` (+ `assert_no_frame_loop` helper; the fade's own progress runs on the real clock and is not exercised headlessly). editor.rs +113.
+
+## CHECKPOINT — Editor perf + edit rows (option A) + fixes + move flash 2026-11-16
+Committed: 116bf2d (PIN wave). Uncommitted: editor perf, edit rows option A with the 2026-11-16 fixes and the move flash (editor.rs, detail.rs, main.rs, mod.rs, cursor audit guard, editor_row_tests.rs, editor_perf_tests.rs), spec 05, CLAUDE.md `--release` note, this file, gpui-implementer memory.
+Workspace: fmt PASS, clippy PASS; vault-app 547 passed / 1 ignored (before the test-only follow-ups; row_tests 12 passed after); `cargo test --workspace` 1258 / 16 ignored earlier on this wave's base; QA ledger 249 + CLI 107 green.
+Eye check passed 2026-11-16 (flash). Awaiting owner: commit.
 Bug hunt: not yet run for this wave.
 
