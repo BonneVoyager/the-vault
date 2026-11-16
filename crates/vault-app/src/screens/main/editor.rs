@@ -46,8 +46,9 @@ struct Row {
     value: ValueInput,
     /// Focus of this row's field icon picker (05 "Field icons").
     icon_focus: super::icon_view::FieldIconFocus,
-    /// The ↑/↓ and trash buttons' focus: owned here so a row with a focused button
-    /// keeps its arrows shown, and focus stays on the button when the row moves.
+    /// The ↑/↓ and trash buttons' focus: owned here so keyboard focus on ↑/↓ shows them
+    /// (and their hidden slots keep the Tab stops), and focus stays on the button when
+    /// the row moves.
     up: FocusHandle,
     down: FocusHandle,
     trash: FocusHandle,
@@ -62,18 +63,6 @@ impl Row {
             ValueInput::Area(a) => Some(gpui::Focusable::focus_handle(a, cx)),
             ValueInput::None => None,
         }
-    }
-
-    /// The row's own button and icon-picker focus handles (not the inputs').
-    fn focus_handles(&self) -> impl Iterator<Item = &FocusHandle> {
-        [
-            &self.up,
-            &self.down,
-            &self.trash,
-            &self.icon_focus.panel,
-            &self.icon_focus.none,
-        ]
-        .into_iter()
     }
 }
 
@@ -574,8 +563,9 @@ impl Editor {
                 // A Tab stop: the row's `tab_index` does not apply to a tracked handle.
                 none: cx.focus_handle().tab_stop(true),
             },
-            up: cx.focus_handle(),
-            down: cx.focus_handle(),
+            // Tab stops by the handle itself: a tracked handle ignores `tab_index`.
+            up: cx.focus_handle().tab_stop(true),
+            down: cx.focus_handle().tab_stop(true),
             trash: cx.focus_handle(),
             _subscriptions: subs,
         }
@@ -641,27 +631,51 @@ impl Editor {
         let name_focus = gpui::Focusable::focus_handle(&row.name, cx);
         let value_focus = row.value_focus(cx);
         let value_focused = value_focus.as_ref().is_some_and(|h| h.is_focused(window));
-        // ↑/↓ only on the hovered row and the row holding focus (perf: a Button each).
-        // No hover arrows during a field drag: only the drop line marks rows then.
+        // ↑/↓ (owner 2026-11-16): only while the pointer is over the row, or while one of
+        // them has keyboard focus (`focus_ring_allowed`: focus arrived by keyboard and no
+        // click since; a click on a gpui-component Button never takes focus). Never
+        // because the row's inputs are focused, which follow the row when it moves (the
+        // old rule lit a moved row away from the pointer); none during a field drag.
+        let arrow_focused =
+            (row.up.is_focused(window) || row.down.is_focused(window)) && ui::focus_ring_allowed();
         let show_arrows = !is_ghost
             && (all_arrows()
                 || (dragged_ix.is_none() && self.hovered == Some(key))
-                || value_focused
-                || name_focus.is_focused(window)
-                || row.focus_handles().any(|h| h.is_focused(window)));
+                || arrow_focused);
 
         let mover = |id: &'static str, icon: IconName, label: &str, to: Option<usize>, focus| {
             let state = self.state.clone();
+            let this = this.clone();
+            // The row that takes this row's place, i.e. the one under the pointer after
+            // a click-move (for rows of equal height; the paint-time hover check corrects
+            // it otherwise).
+            let swapped = to.and_then(|to| buffer.keys.get(to).copied());
             ui::icon_button((id, key), icon, label)
                 .track_focus(focus)
                 .debug_selector(move || format!("{id} {key}"))
                 .disabled(to.is_none())
                 .clickable_when(to.is_some())
-                .on_click(move |_, _, cx| {
-                    if let Some(to) = to {
-                        state.update(cx, |s, cx| s.edit(cx, |b| b.move_field(key, to)));
+                .on_click(move |ev, _, cx| {
+                    let Some(to) = to else { return };
+                    // A click moves the row out from under the pointer: hand the hover
+                    // to the row now there before the frame, so the moved row does not
+                    // blink its arrows. By keyboard, focus (and the arrows) follow it.
+                    if !matches!(ev, gpui::ClickEvent::Keyboard(_)) {
+                        this.update(cx, |e, _| e.hovered = swapped).ok();
                     }
+                    state.update(cx, |s, cx| s.edit(cx, |b| b.move_field(key, to)));
                 })
+        };
+        // Hidden arrows keep their space and their Tab stops: two empty divs holding the
+        // buttons' focus handles (`invisible()` would drop the Tab stops). Tab onto one
+        // focuses the handle, which shows the real button in its place.
+        let slot = |id: &'static str, focus: &FocusHandle| {
+            div()
+                .id((id, key))
+                .flex_none()
+                .size_6()
+                .track_focus(focus)
+                .tab_index(0)
         };
         let arrows = if show_arrows {
             ui::h_flex()
@@ -686,8 +700,8 @@ impl Editor {
             ui::h_flex()
                 .flex_none()
                 .gap(px(4.))
-                .child(div().flex_none().size_6())
-                .child(div().flex_none().size_6())
+                .child(slot("move-up-slot", &row.up))
+                .child(slot("move-down-slot", &row.down))
         };
         let remove = {
             let state = self.state.clone();
@@ -1275,9 +1289,9 @@ impl Render for Editor {
                     .debug_selector(|| "editor-title".into())
                     .flex_1()
                     .min_w_0()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(ui::input(&self.title)),
+                    // Read mode's title size and weight, on the input itself (an Input
+                    // sets its own text size, so a wrapper's would not reach it).
+                    .child(super::detail::title_text(ui::input(&self.title))),
             )
             .child(
                 Button::new("cancel-edit")

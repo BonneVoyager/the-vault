@@ -109,9 +109,10 @@ fn arrows_on(vcx: &mut VisualTestContext, keys: &[u64]) -> Vec<bool> {
         .collect()
 }
 
-/// ↑/↓ are drawn only on the hovered row and the row holding focus; the trash always.
-/// Tab from a value input reaches the row's ↑, and Space on it moves the row with
-/// focus (and the arrows) following it.
+/// ↑/↓ are drawn only on the hovered row or while one of them has keyboard focus, never
+/// for a focused name or value input; the trash always. Tab from a value input reaches
+/// the row's (hidden) ↑, which then shows, and Space on it moves the row with focus and
+/// the arrows following it.
 #[gpui::test]
 fn arrows_show_on_hover_and_focus_only(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -141,11 +142,11 @@ fn arrows_show_on_hover_and_focus_only(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     assert_eq!(arrows_on(&mut vcx, &keys), [false; 4]);
 
-    // Focus in row 2's name input.
+    // Focus in row 2's name input, then its value input: no arrows.
     let name = name_input(&main, keys[2], &mut vcx);
     vcx.update(|window, cx| ui::focus_input(&name, window, cx));
     vcx.run_until_parked();
-    assert_eq!(arrows_on(&mut vcx, &keys), [false, false, true, false]);
+    assert_eq!(arrows_on(&mut vcx, &keys), [false; 4], "name focus");
 
     // Keyboard: from row 2's value input, Tab lands on its ↑ (the eye and chip are
     // not Tab stops), Space moves the row up and ↑ keeps focus at the new index.
@@ -153,6 +154,7 @@ fn arrows_show_on_hover_and_focus_only(cx: &mut TestAppContext) {
     vcx.update(|window, cx| ui::focus_input(&value, window, cx));
     vcx.update(|w, _| w.refresh());
     vcx.run_until_parked();
+    assert_eq!(arrows_on(&mut vcx, &keys), [false; 4], "value focus");
     press(&mut vcx, "tab");
     let up_focused = |vcx: &mut VisualTestContext| {
         vcx.update(|window, cx| {
@@ -270,4 +272,103 @@ fn hover_does_not_carry_into_the_next_edit(cx: &mut TestAppContext) {
         "stale hover kept"
     );
     assert_eq!(arrows_on(&mut vcx, &next), [false; 4]);
+}
+
+/// A click on ↓ moves the row out from under the pointer: afterwards only the row the
+/// pointer is over shows arrows, not the moved row, even though its value input (which
+/// moves with it) holds focus. The click does not focus the ↓ (gpui-component Buttons
+/// prevent focus on mouse down).
+#[gpui::test]
+fn click_move_shows_arrows_only_under_the_pointer(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    vcx.update(|w, _| w.activate_window());
+    plain_item(&state, &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let keys = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().keys.clone());
+    let value = value_input(&main, keys[1], &mut vcx);
+    vcx.update(|window, cx| ui::focus_input(&value, window, cx));
+    let row1 = bounds(&mut vcx, format!("edit-row {}", keys[1])).center();
+    vcx.simulate_mouse_move(row1, None, Modifiers::none());
+    vcx.run_until_parked();
+    let down = bounds(&mut vcx, format!("move-down {}", keys[1])).center();
+    vcx.simulate_click(down, Modifiers::none());
+    vcx.run_until_parked();
+
+    let order = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().keys.clone());
+    assert_eq!(order, [keys[0], keys[2], keys[1], keys[3]], "moved down");
+    let under = vcx
+        .debug_bounds(leak(format!("edit-row {}", keys[2])))
+        .unwrap();
+    assert!(
+        under.contains(&down),
+        "the swapped row is under the pointer"
+    );
+    let (down_focused, value_focused) = vcx.update(|window, cx| {
+        let editor = main.read(cx).editor.read(cx);
+        let row = editor.rows.iter().find(|r| r.key == keys[1]).unwrap();
+        let value = gpui::Focusable::focus_handle(&value, cx);
+        (row.down.is_focused(window), value.is_focused(window))
+    });
+    assert!(!down_focused, "a click does not focus ↓");
+    assert!(value_focused, "the moved row's value input keeps focus");
+    assert_eq!(
+        arrows_on(&mut vcx, &keys),
+        [false, false, true, false],
+        "arrows on the row under the pointer only"
+    );
+    assert_eq!(
+        main.read_with(&vcx, |m, cx| m.editor.read(cx).hovered),
+        Some(keys[2])
+    );
+}
+
+/// The edit-mode title input draws the title at read mode's size and weight: the drawn
+/// width of "Rows" in the input equals that line shaped in the read title's style.
+#[gpui::test]
+fn edit_title_matches_the_read_title_size(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    plain_item(&state, &mut vcx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let (advance, expected, base) = vcx.update(|window, cx| {
+        let title = main.read(cx).editor.read(cx).title.clone();
+        let drawn = title
+            .read(cx)
+            .range_to_bounds(&(0.."Rows".len()))
+            .expect("title laid out");
+        let shape = |el: gpui::StyleRefinement, window: &mut Window| {
+            let mut style = window.text_style();
+            gpui::Refineable::refine(&mut style, &el.text);
+            let size = style.font_size.to_pixels(window.rem_size());
+            let run = style.to_run("Rows".len());
+            window
+                .text_system()
+                .shape_line("Rows".into(), size, &[run], None)
+                .width
+        };
+        let read = super::super::detail::title_text(Holder::default()).0;
+        let plain = Holder::default().0;
+        (drawn.size.width, shape(read, window), shape(plain, window))
+    });
+    assert!(
+        (expected - base).abs() > px(1.),
+        "the check tells sizes apart"
+    );
+    assert!(
+        (advance - expected).abs() < px(1.),
+        "title advance {advance:?}, read style {expected:?} (plain {base:?})"
+    );
+}
+
+/// A bare `Styled` to read a style helper's refinement back.
+#[derive(Default)]
+struct Holder(gpui::StyleRefinement);
+
+impl gpui::Styled for Holder {
+    fn style(&mut self) -> &mut gpui::StyleRefinement {
+        &mut self.0
+    }
 }

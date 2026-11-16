@@ -1106,8 +1106,9 @@ pub fn clear_focus_ring_on_click<E: gpui::InteractiveElement>(el: E) -> E {
     })
 }
 
-/// Whether the focused element of the window last rendered may draw its ring.
-#[cfg(test)]
+/// Whether the focused element of the window last rendered may draw its ring, i.e. focus
+/// reached it from the keyboard and no click came since (`update_focus_ring`). The
+/// editor's ↑/↓ use it to tell keyboard focus from click focus.
 pub fn focus_ring_allowed() -> bool {
     RING_ALLOWED.get()
 }

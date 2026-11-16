@@ -161,6 +161,12 @@ pub(crate) fn field_row_colors(cx: &App) -> (gpui::Hsla, gpui::Hsla) {
 /// Gap between a field's icon and its label (05 "Field icons").
 pub(crate) const FIELD_ICON_GAP: f32 = 8.;
 
+/// The item title's text style, shared by the read-mode header and the editor's title
+/// input so pressing Edit does not change the title's look (05, 2026-11-16).
+pub(crate) fn title_text<E: gpui::Styled>(el: E) -> E {
+    el.text_xl().font_weight(FontWeight::SEMIBOLD)
+}
+
 /// Gap between a field row's label column and its value column.
 pub(crate) const FIELD_ROW_GAP: f32 = 16.;
 
@@ -642,8 +648,7 @@ impl ReadDetail<'_> {
                             let title = item.title.clone();
                             move || format!("detail-title {title}")
                         })
-                        .text_xl()
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .map(title_text)
                         .truncate()
                         .child(item.title.clone()),
                 ),
