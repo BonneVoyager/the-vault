@@ -6,7 +6,7 @@ use gpui_component::Root;
 use vault_core::{Field, FieldKind, Item, KdfParams, SecretString, Uuid};
 use vault_sync::{NoopHooks, SyncedVault};
 
-use super::{Case, audit, install};
+use super::{Case, Hit, audit, install};
 use crate::root::VaultRoot;
 use crate::state::{AppState, ChooseIntent, GenTab, GeneratorTarget};
 use crate::{actions, theme};
@@ -129,9 +129,23 @@ fn main_window(
     (state, vcx)
 }
 
-/// Clicks the element named `suffix` (at least 24 px in both directions).
-fn click(suffix: &str, vcx: &mut VisualTestContext) {
-    let hit = super::find(vcx, suffix, 24.).unwrap_or_else(|| panic!("no {suffix} on screen"));
+/// Clicks the centre of the element with debug selector `selector`.
+fn click(selector: &'static str, vcx: &mut VisualTestContext) {
+    let bounds = vcx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("no {selector} on screen"));
+    vcx.simulate_click(bounds.center(), gpui::Modifiers::none());
+    vcx.run_until_parked();
+}
+
+/// Clicks `suffix` where the audit that returned `hits` first saw it with the pointer
+/// (topmost row first). The screen must not have changed since that audit.
+fn click_hit(hits: &[Hit], suffix: &str, vcx: &mut VisualTestContext) {
+    let hit = hits
+        .iter()
+        .filter(|h| h.matches(suffix) && h.cursor == gpui::CursorStyle::PointingHand)
+        .min_by(|a, b| (a.at.y, a.at.x).partial_cmp(&(b.at.y, b.at.x)).unwrap())
+        .unwrap_or_else(|| panic!("no {suffix} on screen"));
     vcx.simulate_click(hit.at, gpui::Modifiers::none());
     vcx.run_until_parked();
 }
@@ -514,16 +528,22 @@ fn edit_field_generator(cx: &mut TestAppContext) {
     );
 }
 
-#[gpui::test]
-fn edit_icon_picker(cx: &mut TestAppContext) {
-    let dir = tempfile::tempdir().unwrap();
-    let (state, mut vcx) = main_window(dir.path(), SHORT, cx);
-    // A symbol first.
+/// The icon picker open with a symbol chosen.
+fn icon_picker(dir: &Path, cx: &mut TestAppContext) -> (Entity<AppState>, VisualTestContext) {
+    let (state, mut vcx) = main_window(dir, SHORT, cx);
     state.update(&mut vcx, |s, cx| {
         s.begin_edit(cx);
         s.set_icon_picker(true, cx);
         s.choose_icon(crate::icon::PickerCell::Symbol(0), cx);
     });
+    vcx.run_until_parked();
+    (state, vcx)
+}
+
+#[gpui::test]
+fn edit_icon_picker(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mut vcx) = icon_picker(dir.path(), cx);
     let (last_down, _arrows) = last_move_down(&state, &vcx);
     audit(
         Case {
@@ -539,11 +559,19 @@ fn edit_icon_picker(cx: &mut TestAppContext) {
         },
         &mut vcx,
     );
-    // Back to Automatic (a letter now, also for this item with a website): the colour
-    // swatches stay enabled.
+}
+
+/// After a symbol, back to Automatic (a letter now, also for this item with a website):
+/// the colour swatches stay enabled. Its own test so it scans in parallel with the one
+/// above.
+#[gpui::test]
+fn edit_icon_picker_automatic(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mut vcx) = icon_picker(dir.path(), cx);
     state.update(&mut vcx, |s, cx| {
         s.choose_icon(crate::icon::PickerCell::Automatic, cx)
     });
+    let (last_down, _arrows) = last_move_down(&state, &vcx);
     audit(
         Case {
             label: "icon picker, automatic",
@@ -591,7 +619,7 @@ fn settings_general(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (_, mut vcx) = settings(0, dir.path(), cx);
     let targets = [SETTINGS, &["auto-lock", "clipboard-clear", "lock-on-sleep"]].concat();
-    audit(
+    let hits = audit(
         Case {
             label: "settings general",
             targets: &targets,
@@ -599,7 +627,7 @@ fn settings_general(cx: &mut TestAppContext) {
         },
         &mut vcx,
     );
-    click("auto-lock", &mut vcx);
+    click_hit(&hits, "auto-lock", &mut vcx);
     audit(
         Case {
             label: "auto-lock menu",
@@ -627,7 +655,7 @@ fn settings_sync(cx: &mut TestAppContext) {
         ],
     ]
     .concat();
-    audit(
+    let hits = audit(
         Case {
             label: "settings sync",
             targets: &targets,
@@ -635,8 +663,8 @@ fn settings_sync(cx: &mut TestAppContext) {
         },
         &mut vcx,
     );
-    click("delete-backup", &mut vcx);
-    audit(
+    click_hit(&hits, "delete-backup", &mut vcx);
+    let hits = audit(
         Case {
             label: "backup delete confirm",
             targets: &["backup-delete-cancel", "backup-delete-ok"],
@@ -645,7 +673,7 @@ fn settings_sync(cx: &mut TestAppContext) {
         &mut vcx,
     );
     let backup = state.read_with(&vcx, |s, _| s.sync.backups[0].path.clone());
-    click("backup-delete-ok", &mut vcx);
+    click_hit(&hits, "backup-delete-ok", &mut vcx);
     state.read_with(&vcx, |s, _| {
         assert!(
             s.sync.backups.iter().all(|b| b.path != backup),

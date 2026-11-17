@@ -31,3 +31,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # functions, so they are driven directly; everything else in vault-macos stays code read only.
 [target.'cfg(target_os = "macos")'.dependencies]
 vault-macos = { path = "../../crates/vault-macos" }
+
+# Deps at opt-level 1 so Argon2 and friends are usable in tests.
+[profile.dev.package."*"]
+opt-level = 1

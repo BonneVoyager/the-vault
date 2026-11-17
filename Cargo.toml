@@ -21,3 +21,11 @@ debug = "line-tables-only"
 split-debuginfo = "packed"
 strip = "symbols"
 # panic stays "unwind": catch_unwind boundaries (KDBX parser, background tasks) need it.
+
+# Dev profile: deps at opt-level 1 so Argon2, gpui and friends are usable in tests; our crates stay at 0.
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.dev.package.vault-app]
+# No debuginfo for the app crate: each debug rebuild otherwise leaves ~256 stale .o files in target/debug/deps.
+debug = false

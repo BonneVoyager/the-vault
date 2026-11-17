@@ -841,10 +841,12 @@ fn fo13_cli_concurrent_distinct_attributes_all_survive() {
             vec!["--set-env".into(), "password=QA_SECRET".into()],
         ];
         let url = format!("https://r{rep}.example");
+        // by id, not title: the title job renames the item while the others still resolve it
+        let id_arg = id.to_string();
         let kids: Vec<Child> = jobs
             .iter()
             .map(|j| {
-                let mut args = vec!["edit", "Item"];
+                let mut args = vec!["edit", id_arg.as_str()];
                 args.extend(j.iter().map(|s| s.as_str()));
                 spawn(&p, &args, &[("QA_URL", &url), ("QA_SECRET", &secret)])
             })

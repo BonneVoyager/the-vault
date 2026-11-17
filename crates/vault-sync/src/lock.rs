@@ -30,8 +30,57 @@ use crate::error::SyncError;
 use crate::package;
 
 /// How long a save (or open) waits for another holder before giving up with
-/// [`SyncError::SaveLockTimeout`].
+/// [`SyncError::SaveLockTimeout`] (03 §2). Tests may shorten it with
+/// [`shorten_lock_timeout_for_tests`]; production always uses this value.
 pub(crate) const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Test override of [`LOCK_TIMEOUT`] in milliseconds; `u64::MAX` = none. Only compiled for tests and
+/// the `test-support` feature, so a production build has no override to read.
+#[cfg(any(test, feature = "test-support"))]
+static LOCK_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Tests only: make every later package-lock wait in this process give up after `timeout`
+/// instead of [`LOCK_TIMEOUT`] (10 s), so a test that holds `.lock` and expects
+/// [`SyncError::SaveLockTimeout`] does not sleep 10 s.
+///
+/// The override is process-global and can only go down: a call with a longer value than an
+/// earlier one keeps the shorter, and there is no reset. Tests in one binary run in
+/// parallel, so restoring or raising it mid-run could let one test's long setting make
+/// another's expected timeout slow (or a scoped guard could restore 10 s under a test that
+/// is still waiting). Tests in this workspace never contend for one package's lock on
+/// purpose except to see the timeout (each uses its own temp dir), so a short process-wide
+/// value cannot fail a test that expects the lock to be granted. Clamped to at least 1 ms.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn shorten_lock_timeout_for_tests(timeout: Duration) {
+    let ms = u64::try_from(timeout.as_millis())
+        .unwrap_or(u64::MAX - 1)
+        .clamp(1, u64::MAX - 1);
+    LOCK_TIMEOUT_OVERRIDE_MS.fetch_min(ms, Ordering::Relaxed);
+}
+
+/// The timeout for a given override (`u64::MAX` = none): the 10 s default unless a test shortened it.
+#[cfg(any(test, feature = "test-support"))]
+fn timeout_with_override(override_ms: u64) -> Duration {
+    if override_ms == u64::MAX {
+        LOCK_TIMEOUT
+    } else {
+        Duration::from_millis(override_ms)
+    }
+}
+
+/// The wait `PackageLock::exclusive`/`shared` use.
+#[cfg(any(test, feature = "test-support"))]
+fn lock_timeout() -> Duration {
+    timeout_with_override(LOCK_TIMEOUT_OVERRIDE_MS.load(Ordering::Relaxed))
+}
+
+/// The wait `PackageLock::exclusive`/`shared` use.
+#[cfg(not(any(test, feature = "test-support")))]
+fn lock_timeout() -> Duration {
+    LOCK_TIMEOUT
+}
 
 /// Holds the lock until dropped. `None` inside: no lock could be taken on this volume (see
 /// the module docs) and the guard does nothing.
@@ -42,7 +91,7 @@ pub(crate) struct PackageLock {
 
 impl PackageLock {
     /// Exclusive lock for a write of the primary. [`SyncError::SaveLockTimeout`] after
-    /// [`LOCK_TIMEOUT`]; an I/O fault on the lock file is an error; a volume without locking
+    /// [`LOCK_TIMEOUT`] (or a test's shorter override); an I/O fault on the lock file is an error; a volume without locking
     /// yields a no-op guard.
     pub(crate) fn exclusive(package: &Path) -> Result<Self, SyncError> {
         Self::take(package, true)
@@ -58,7 +107,7 @@ impl PackageLock {
         let Some(file) = open_lock_file(&path, exclusive)? else {
             return Ok(Self { _file: None });
         };
-        acquire(file, &path, exclusive, LOCK_TIMEOUT, |f, x| {
+        acquire(file, &path, exclusive, lock_timeout(), |f, x| {
             if x { f.try_lock() } else { f.try_lock_shared() }
         })
     }
@@ -223,6 +272,37 @@ mod tests {
         assert!(try_acquire(dir.path(), false).is_err());
         drop(held);
         try_acquire(dir.path(), true).unwrap();
+    }
+
+    /// The spec'd wait is 10 s and is what applies without an override.
+    #[test]
+    fn default_lock_timeout_is_ten_seconds() {
+        assert_eq!(LOCK_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(timeout_with_override(u64::MAX), Duration::from_secs(10));
+        assert_eq!(timeout_with_override(250), Duration::from_millis(250));
+    }
+
+    /// The test override shortens real `PackageLock` waits, and a later longer value never
+    /// raises it again (other tests in this binary may be relying on the short one).
+    #[test]
+    fn lock_timeout_override_is_honoured_and_only_lowers() {
+        shorten_lock_timeout_for_tests(Duration::from_millis(100));
+        shorten_lock_timeout_for_tests(Duration::from_secs(60));
+        let effective = lock_timeout();
+        assert!(effective <= Duration::from_millis(100), "{effective:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let held = PackageLock::exclusive(dir.path()).unwrap();
+        for exclusive in [true, false] {
+            let start = Instant::now();
+            let err = PackageLock::take(dir.path(), exclusive).unwrap_err();
+            let waited = start.elapsed();
+            assert!(matches!(err, SyncError::SaveLockTimeout(_)), "{err:?}");
+            assert!(waited >= effective, "{waited:?} < {effective:?}");
+            // Generous bound for a loaded machine; the default would take 10 s.
+            assert!(waited < Duration::from_secs(5), "{waited:?}");
+        }
+        drop(held);
     }
 
     #[test]

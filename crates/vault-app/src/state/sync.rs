@@ -1116,9 +1116,11 @@ mod tests {
     }
 
     /// The package's save lock held by "another process" (03 §2): the save waits out the
-    /// 10 s timeout once, toasts, and the autosave retries once 2 s later.
+    /// lock timeout once (10 s in production, shortened here), toasts, and the autosave
+    /// retries once 2 s later.
     #[gpui::test]
     fn busy_save_toasts_and_autosave_retries_once(cx: &mut TestAppContext) {
+        vault_sync::shorten_lock_timeout_for_tests(Duration::from_millis(200));
         let dir = tempfile::tempdir().unwrap();
         let (state, _other, _) = two_devices(dir.path(), cx);
         let lock = fs::OpenOptions::new()

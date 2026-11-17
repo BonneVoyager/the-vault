@@ -32,6 +32,8 @@ specs/                the specs
 ```
 cargo build --workspace
 cargo test --workspace
+cargo nextest run --workspace --exclude vault-app --exclude vault-macos --no-fail-fast   # ~2× faster for the non-UI crates; vault-macos has harness=false binaries, run it with cargo test
+cd qa/spec-checks && cargo nextest run --no-fail-fast   # ledger ~3× faster than cargo test
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo run -p vault-cli -- --help
@@ -39,7 +41,7 @@ cargo run -p vault-app              # dev build: 5–10× slower frames, fine fo
 cargo run --release -p vault-app    # use this (or the .app) for eye and performance checks
 ```
 
-Toolchain: Rust pinned in `rust-toolchain.toml` (gpui-pre needs it), edition 2024. macOS 15+ target. No CI yet (see the testing roadmap in `specs/00-overview.md`); run the four checks above before declaring a task done.
+Toolchain: Rust pinned in `rust-toolchain.toml` (gpui-pre needs it), edition 2024. macOS 15+ target. No CI yet (see the testing roadmap in `specs/00-overview.md`); run the four checks above before declaring a task done. Dev profile: deps at opt-level 1, vault-app without debuginfo (both in the root `Cargo.toml`); keep `target/` tidy — a debug `target/debug/deps` past ~100k files makes every watcher-starting test pay seconds of FSEvents scan, so `cargo clean` when it grows.
 
 ## Phases (see 00-overview.md)
 

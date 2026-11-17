@@ -274,19 +274,13 @@ fn inspector_width(vcx: &mut VisualTestContext) -> Pixels {
 ///
 /// The window is widened by the inspector's panel while scanning, so the content keeps
 /// its size and `Hit::at` points stay valid for clicks afterwards.
+///
+/// Cost: nearly all of it is gpui's, per grid point and pick depth. Each scroll event
+/// that changes the inspector's active element refreshes the window, and gpui then runs
+/// `InputRateTracker::record_input`, which `retain`s over every such event of the last
+/// 100 ms: quadratic in the event rate, about half the scan's CPU. The other half is one
+/// full window draw per element first seen.
 pub fn scan(vcx: &mut VisualTestContext) -> Vec<Hit> {
-    scan_with(vcx, STEP, |_| false)
-}
-
-/// Where the element `suffix` is, from a coarse scan that stops at the first match.
-/// `step` must not exceed the element's size.
-pub fn find(vcx: &mut VisualTestContext, suffix: &str, step: f32) -> Option<Hit> {
-    scan_with(vcx, step, |h| h.matches(suffix))
-        .into_iter()
-        .find(|h| h.matches(suffix))
-}
-
-fn scan_with(vcx: &mut VisualTestContext, step: f32, stop: impl Fn(&Hit) -> bool) -> Vec<Hit> {
     vcx.run_until_parked();
     let viewport = vcx.update(|window, _| window.viewport_size());
     let extra = inspector_width(vcx);
@@ -299,9 +293,9 @@ fn scan_with(vcx: &mut VisualTestContext, step: f32, stop: impl Fn(&Hit) -> bool
         window.toggle_inspector(cx);
         window.draw(cx).clear(cx);
         let (w, h) = (viewport.width.as_f32(), viewport.height.as_f32());
-        let mut y = step / 2.;
-        'grid: while y < h {
-            let mut x = step / 2.;
+        let mut y = STEP / 2.;
+        while y < h {
+            let mut x = STEP / 2.;
             while x < w {
                 let at = point(px(x), px(y));
                 let stack = scanner.stack(at, window, cx);
@@ -325,20 +319,16 @@ fn scan_with(vcx: &mut VisualTestContext, step: f32, stop: impl Fn(&Hit) -> bool
                     ),
                     None => ("<window>".to_owned(), Bounds::default()),
                 };
-                let hit = hits
-                    .entry((name.clone(), format!("{cursor:?}")))
+                hits.entry((name.clone(), format!("{cursor:?}")))
                     .or_insert(Hit {
                         name,
                         cursor,
                         at,
                         bounds,
                     });
-                if stop(hit) {
-                    break 'grid;
-                }
-                x += step;
+                x += STEP;
             }
-            y += step;
+            y += STEP;
         }
         window.toggle_inspector(cx);
         window.draw(cx).clear(cx);

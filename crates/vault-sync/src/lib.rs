@@ -39,6 +39,9 @@ pub use backup::{
 pub use cloud::{CloudError, CloudHooks, NoopHooks, SyncLocation, classify_location};
 pub use error::{SaveBlocked, SyncError};
 pub use event::SyncEvent;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use lock::shorten_lock_timeout_for_tests;
 pub use package::VAULT_FILE_NAME;
 pub use synced::{
     BeforeWrite, DOWNLOAD_TIMEOUT, LastWritten, LockOutcome, LockedSummary, MAX_VAULT_FILE_SIZE,

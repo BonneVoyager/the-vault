@@ -11,3 +11,4 @@ Run `cargo fmt -p <my crate>` (or rustfmt on my files) to format, and only `carg
 **How to apply:** scope formatting to the task crate; when workspace checks fail, `git status` first to see whether the failures are in files someone else is editing, and report rather than fix.
 
 When a task explicitly asks for `cargo fmt --all`, first run `cargo fmt --all -- --check` and only write if every Diff is in my own files (2026-11-10 that was the case).
+2026-11-17: `cargo fmt --all -- --check` showed diffs in another agent's cursor_audit.rs, so I formatted only my files with `rustfmt --edition 2024 <files>` (works; picks up rustfmt.toml) and did not run `cargo fmt --all` in write mode.
