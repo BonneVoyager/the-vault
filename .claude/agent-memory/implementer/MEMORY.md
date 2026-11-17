@@ -6,3 +6,5 @@
 - [gpui activation policy](gpui-activation-policy.md) — Dock policy via gpui set_activation_policy, LSUIElement bundle, gpui caches+reapplies policy, test recorder
 - [vault-app session guards](vault-app-session-guards.md) — session_gen/lock_gen for secondary windows, clipboard lock guard, gpui double-lease panic, bounded_read.rs, CLI sanitize_line, slow app tests
 - [build profiles](build-profiles.md) — dist profile choice + numbers, brand-icons.tsv now compressed via build.rs (sizes, decode cost), rustfmt blocked -> use cargo fmt --check, noisy-bench protocol, panic=abort banned
+- [fuzzing](fuzzing.md) — fuzz/ standalone cargo-fuzz crate, nightly install gotcha, VaultKeyHandle seed-key trick, cmin renames seeds
+- [zip 9 + zxcvbn deps](deps-zip-zxcvbn.md) — zip 9 EOCD window, ZIP64 markers, declared-size gotchas, fuzz/ also declares zip; zxcvbn 64-bit ceiling, clock reads, audit cost

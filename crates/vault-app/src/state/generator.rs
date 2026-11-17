@@ -4,7 +4,10 @@
 use std::ops::RangeInclusive;
 
 use gpui::Context;
-use vault_core::{FieldKind, PassphraseSpec, PasswordSpec, SecretString, passphrase, password};
+use vault_core::{
+    FieldKind, PassphraseSpec, PasswordSpec, SecretString, generated_bits,
+    generated_passphrase_bits, passphrase, password,
+};
 
 use super::{AppState, Mode};
 
@@ -64,9 +67,25 @@ impl Generator {
         &self.preview
     }
 
+    /// Bits for the preview's meter (05 §2.4): the exact entropy of the current tab's
+    /// settings (`generated_bits` / `generated_passphrase_bits`), not the zxcvbn estimate
+    /// used for typed values, since the output is uniformly random by construction.
+    pub fn preview_bits(&self) -> f64 {
+        match self.tab {
+            GenTab::Password => generated_bits(&self.password),
+            GenTab::Passphrase => generated_passphrase_bits(&self.passphrase),
+        }
+    }
+
     #[cfg(test)]
     fn set_preview_for_tests(&mut self, preview: SecretString) {
         self.preview = preview;
+    }
+
+    /// Drops the preview (lock): no generated value outlives the session. The spec stays;
+    /// [`AppState::open_generator`] regenerates before the popover shows again.
+    pub fn clear_preview(&mut self) {
+        self.preview = SecretString::new(String::new());
     }
 
     pub fn regenerate(&mut self) {
@@ -223,6 +242,19 @@ mod tests {
             assert_eq!(b.pushed, vec![key]);
             assert!(st.generator_target.is_none());
         });
+    }
+
+    /// 05 §2.4: default length 20; the meter reads the settings' exact entropy.
+    #[test]
+    fn default_is_twenty_and_meter_uses_generated_bits() {
+        let mut g = Generator::default();
+        assert_eq!(g.password.length, 20);
+        assert_eq!(g.preview().expose_secret().chars().count(), 20);
+        assert_eq!(g.preview_bits(), generated_bits(&g.password));
+        assert!((g.preview_bits() - 20. * 83f64.log2()).abs() < 1e-9);
+        assert_eq!(crate::ui::strength_label(g.preview_bits()).0, "Strong");
+        g.set_tab(GenTab::Passphrase);
+        assert_eq!(g.preview_bits(), generated_passphrase_bits(&g.passphrase));
     }
 
     #[test]

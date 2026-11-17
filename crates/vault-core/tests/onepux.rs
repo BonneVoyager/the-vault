@@ -284,11 +284,14 @@ fn oversized_export_data_is_too_large() {
         import_1pux(&z, Uuid::nil(), NOW),
         Err(ImportError::TooLarge(m)) if m.contains("larger than 64 MiB")
     ));
-    // A declared size that lies small does not get past the inflate backstop either.
+    // A declared size that lies small is refused too. Since zip 9 the reader itself stops one
+    // byte past the declared size and fails the read, so this surfaces as `Malformed` before
+    // the importer's own `take(64 MiB + 1)` backstop is reached (with zip 2.6.1 it was the
+    // backstop's `TooLarge`). Either way nothing past the cap is inflated.
     let lying = with_declared_size(z, "export.data", 16);
     assert!(matches!(
         import_1pux(&lying, Uuid::nil(), NOW),
-        Err(ImportError::TooLarge(m)) if m.contains("inflates past 64 MiB")
+        Err(ImportError::Malformed(m)) if m == "cannot read export.data"
     ));
 }
 
@@ -418,7 +421,7 @@ fn declared_entry_count_over_the_cap_is_refused_before_any_entry_is_read() {
         import_1pux(&at_cap, Uuid::nil(), NOW),
         Err(ImportError::Malformed(_))
     ));
-    // Only the "on this disk" count forged (the field zip 2.6.1 actually reads).
+    // Only the "on this disk" count forged (the field zip 9.6 actually reads).
     let mut disk_only = z.clone();
     let at = eocd(&disk_only);
     disk_only[at + 8..at + 10].copy_from_slice(&60_000u16.to_le_bytes());
@@ -437,6 +440,15 @@ fn declared_entry_count_over_the_cap_is_refused_before_any_entry_is_read() {
     offset64[at + 16..at + 20].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(matches!(
         import_1pux(&offset64, Uuid::nil(), NOW),
+        Err(ImportError::TooLarge(m)) if m.contains("ZIP64")
+    ));
+    // Only the directory size forged (small count, real offset): zip 9.6's `may_be_zip64`
+    // also fires on this and would take the entry count from an appended ZIP64 record.
+    let mut size64 = z.clone();
+    let at = eocd(&size64);
+    size64[at + 12..at + 16].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(matches!(
+        import_1pux(&size64, Uuid::nil(), NOW),
         Err(ImportError::TooLarge(m)) if m.contains("ZIP64")
     ));
     // Errors never echo archive bytes.
@@ -460,7 +472,7 @@ fn declared_entry_count_over_the_cap_is_refused_before_any_entry_is_read() {
     // with several entries still imports.
     let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default();
-    w.set_comment("exported by a tool");
+    w.set_comment("exported by a tool").unwrap();
     for (name, body) in [
         ("export.attributes", b"{}".as_slice()),
         ("export.data", data.as_bytes()),
@@ -475,6 +487,18 @@ fn declared_entry_count_over_the_cap_is_refused_before_any_entry_is_read() {
             .unwrap()
             .is_empty()
     );
+    // The window matches zip 9.6's own search (22 + 4 + 65536 bytes from the end): a record
+    // 65560 bytes from the end, which zip would still consider, is checked too.
+    let mut far = vec![0x50, 0x4b, 0x05, 0x06];
+    far.extend_from_slice(&[0; 18]);
+    far[8..10].copy_from_slice(&60_000u16.to_le_bytes());
+    far[10..12].copy_from_slice(&60_000u16.to_le_bytes());
+    far.extend_from_slice(&[0; 65_538]);
+    assert!(matches!(
+        import_1pux(&far, Uuid::nil(), NOW),
+        Err(ImportError::TooLarge(_))
+    ));
+
     // Too short to hold a record at all.
     assert!(matches!(
         import_1pux(b"PK\x05\x06", Uuid::nil(), NOW),

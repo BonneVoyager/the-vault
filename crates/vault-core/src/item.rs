@@ -779,11 +779,32 @@ mod tests {
         );
         assert!(!s.contains("hunter"));
         assert!(!s.contains("secret-"));
-        assert!(!s.contains("167"), "key byte 0xA7 = 167 must not appear");
-        assert!(
-            !s.contains("184"),
-            "nonce byte 0xB8 = 184 is not printed either"
-        );
+        // Key and nonce bytes in any rendering: the decimal list Debug would print (commas and
+        // spaces cannot occur in the random UUIDs also printed here) and long hex runs (16
+        // digits of one byte repeated: a chance collision with a random id is negligible).
+        let key_dec = format!("{:?}", [0xA7u8; 32]);
+        let key_dec_run = "167, 167, 167";
+        let nonce_dec = format!("{:?}", [0xB8u8; 24]);
+        let nonce_dec_run = "184, 184, 184";
+        for needle in [
+            key_dec.as_str(),
+            key_dec_run,
+            "a7a7a7a7a7a7a7a7",
+            "A7A7A7A7A7A7A7A7",
+        ] {
+            assert!(!s.contains(needle), "key bytes must not appear: {needle}");
+        }
+        for needle in [
+            nonce_dec.as_str(),
+            nonce_dec_run,
+            "b8b8b8b8b8b8b8b8",
+            "B8B8B8B8B8B8B8B8",
+        ] {
+            assert!(
+                !s.contains(needle),
+                "nonce bytes are not printed either: {needle}"
+            );
+        }
         assert!(s.contains("doc.pdf"));
         assert!(s.contains("REDACTED"));
         assert!(s.contains("1 extras redacted"));

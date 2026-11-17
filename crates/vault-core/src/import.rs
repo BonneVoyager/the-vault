@@ -212,17 +212,23 @@ const MAX_ZIP_ENTRIES: u64 = 10_000;
 /// The fixed part of the EOCD record; a comment of up to `u16::MAX` bytes may follow it.
 const EOCD_LEN: usize = 22;
 const EOCD_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
+/// How far back from the end zip 9.6 looks for the EOCD signature (`get_metadata`:
+/// fixed record + magic + `1 << 16`). Must not be narrower than zip's, or a record zip
+/// would fall back to could escape the count check.
+const EOCD_SEARCH_WINDOW: usize = EOCD_LEN + 4 + (1 << 16);
 
 /// Refuse an archive whose End of Central Directory record declares more than
 /// [`MAX_ZIP_ENTRIES`] entries, before the zip reader builds its directory.
 ///
-/// Mirrors how zip 2.6.1 finds the record: the signature is searched backwards from the
-/// end over the last `EOCD_LEN + u16::MAX` bytes (the record plus the longest possible
-/// comment). Every candidate whose comment fits in the file is checked, not just the last,
-/// so a fake record appended behind a real one cannot hide the real count; zip 2.6.1 reads
-/// the zip32 count from the "entries on this disk" field, so both count fields are bounded.
-/// An EOCD with either ZIP64 marker (`u16::MAX` entries or a `u32::MAX` directory offset)
-/// is refused too: the reader would take the real values from a ZIP64 record, and no 1PUX
+/// Mirrors how zip 9.6 finds the record: the signature is searched backwards from the end
+/// over the last [`EOCD_SEARCH_WINDOW`] bytes (the record, the signature again and 64 KiB of
+/// comment, zip's own bound). Every candidate whose comment fits in the file is checked, not
+/// just the last, so a fake record appended behind a real one cannot hide the real count;
+/// zip 9.6 reads the zip32 count from the "entries on this disk" field, so both count fields
+/// are bounded.
+/// An EOCD with any of the three ZIP64 markers zip 9.6's `may_be_zip64` checks (`u16::MAX`
+/// entries, a `u32::MAX` directory size or a `u32::MAX` directory offset) is refused too:
+/// the reader would take the real values from a ZIP64 record, and no 1PUX
 /// the app can read (1 GiB) needs one. With no plausible record in the window the archive
 /// is `Malformed` (zip would keep scanning through trailing junk; a 1PUX has none). The
 /// messages are fixed strings and never echo bytes from the file.
@@ -231,7 +237,7 @@ fn check_zip_entry_count(bytes: &[u8]) -> Result<(), ImportError> {
     if len < EOCD_LEN {
         return Err(malformed("not a valid zip archive"));
     }
-    let window_start = len.saturating_sub(EOCD_LEN + usize::from(u16::MAX));
+    let window_start = len.saturating_sub(EOCD_SEARCH_WINDOW);
     let mut found = false;
     for pos in (window_start..=len - EOCD_LEN).rev() {
         let record = &bytes[pos..pos + EOCD_LEN];
@@ -246,8 +252,12 @@ fn check_zip_entry_count(bytes: &[u8]) -> Result<(), ImportError> {
         found = true;
         let on_this_disk = u16_at(8);
         let total = u16_at(10);
-        let directory_offset = u32::from_le_bytes([record[16], record[17], record[18], record[19]]);
-        if total == u16::MAX || directory_offset == u32::MAX {
+        let u32_at = |at: usize| {
+            u32::from_le_bytes([record[at], record[at + 1], record[at + 2], record[at + 3]])
+        };
+        let directory_size = u32_at(12);
+        let directory_offset = u32_at(16);
+        if total == u16::MAX || directory_size == u32::MAX || directory_offset == u32::MAX {
             return Err(too_large("1PUX archive declares a ZIP64 central directory"));
         }
         if u64::from(on_this_disk.max(total)) > MAX_ZIP_ENTRIES {
@@ -519,7 +529,9 @@ pub fn import_1pux(bytes: &[u8], device_id: Uuid, now: Millis) -> Result<Vec<Ite
     // `files/`, which this importer never opens), so this is the only bound on the JSON the
     // caller ends up holding. The declared size can lie, so the inflate path below keeps its
     // own `take(MAX + 1)` backstop; together they refuse both an honest oversize entry (before
-    // reading a byte of it) and a zip bomb that declares itself small.
+    // reading a byte of it) and a zip bomb that declares itself small. (zip 9 also stops one
+    // byte past the declared size and fails the read, which surfaces as `Malformed`; the
+    // backstop does not depend on that.)
     let declared = zip
         .by_index_raw(index)
         .map_err(|_| malformed("cannot read export.data"))?

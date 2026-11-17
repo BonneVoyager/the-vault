@@ -627,7 +627,8 @@ impl SettingsView {
                 );
         }
         let busy = s.busy == Some(Busy::Restoring);
-        strip
+        // The master password is the strip's only input: a revealed one is never copied out.
+        ui::refuse_plain_copy(strip)
             .child(
                 div()
                     .text_sm()
@@ -882,11 +883,14 @@ mod tests {
 
         cx.update(gpui_component::init);
         let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        let mut settings = None;
         let window = cx.add_window(|window, cx| {
             theme::apply(window, cx);
             let view = cx.new(|cx| SettingsView::new(state.clone(), window, cx));
+            settings = Some(view.clone());
             Root::new(view, window, cx)
         });
+        let settings = settings.unwrap();
         let mut vcx = VisualTestContext::from_window(window.into(), cx);
         state.update(&mut vcx, |s, cx| {
             s.install_unlocked_for_tests(vault);
@@ -921,6 +925,17 @@ mod tests {
             matches!(sync[..], [("sync", 4), ("backups", n)] if n >= 2),
             "{sync:?}"
         );
+        // Restore's backup password: revealed, it never reaches the pasteboard.
+        state.update(&mut vcx, |s, cx| {
+            let backup = s.sync.backups[0].path.clone();
+            s.request_restore(backup, cx);
+            s.confirm_restore(cx);
+        });
+        vcx.run_until_parked();
+        let restore = settings.read_with(&vcx, |v, _| v.restore_input.clone());
+        ui::assert_revealed_copy_refused(&restore, &mut vcx);
+        state.update(&mut vcx, |s, cx| s.cancel_restore(cx));
+        vcx.run_until_parked();
 
         show_tab(TRANSFER_TAB, &state, &mut vcx);
         assert_eq!(check_dividers(&mut vcx), [("transfer", 4)]);

@@ -50,24 +50,21 @@ static LOCK_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
 /// another's expected timeout slow (or a scoped guard could restore 10 s under a test that
 /// is still waiting). Tests in this workspace never contend for one package's lock on
 /// purpose except to see the timeout (each uses its own temp dir), so a short process-wide
-/// value cannot fail a test that expects the lock to be granted. Clamped to at least 1 ms.
+/// value cannot fail a test that expects the lock to be granted. Clamped to 1 ms ..=
+/// [`LOCK_TIMEOUT`], so even a first call with a longer value cannot raise the wait past 10 s.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn shorten_lock_timeout_for_tests(timeout: Duration) {
-    let ms = u64::try_from(timeout.as_millis())
-        .unwrap_or(u64::MAX - 1)
-        .clamp(1, u64::MAX - 1);
+    let ms = timeout.min(LOCK_TIMEOUT).as_millis();
+    let ms = u64::try_from(ms).unwrap_or(1).max(1);
     LOCK_TIMEOUT_OVERRIDE_MS.fetch_min(ms, Ordering::Relaxed);
 }
 
-/// The timeout for a given override (`u64::MAX` = none): the 10 s default unless a test shortened it.
+/// The timeout for a given override (`u64::MAX` = none): the 10 s default unless a test shortened
+/// it. Never above [`LOCK_TIMEOUT`], whatever the stored value.
 #[cfg(any(test, feature = "test-support"))]
 fn timeout_with_override(override_ms: u64) -> Duration {
-    if override_ms == u64::MAX {
-        LOCK_TIMEOUT
-    } else {
-        Duration::from_millis(override_ms)
-    }
+    Duration::from_millis(override_ms).min(LOCK_TIMEOUT)
 }
 
 /// The wait `PackageLock::exclusive`/`shared` use.
@@ -286,6 +283,17 @@ mod tests {
     /// raises it again (other tests in this binary may be relying on the short one).
     #[test]
     fn lock_timeout_override_is_honoured_and_only_lowers() {
+        // A longer value can never raise the wait past 10 s, even as the first (only) value;
+        // checked through the pure mapping because other tests in this binary may already
+        // have shortened the process-wide override.
+        assert_eq!(timeout_with_override(u64::MAX), LOCK_TIMEOUT);
+        assert_eq!(timeout_with_override(60_000), LOCK_TIMEOUT);
+        assert_eq!(timeout_with_override(10_001), LOCK_TIMEOUT);
+        assert_eq!(timeout_with_override(100), Duration::from_millis(100));
+        assert!(lock_timeout() <= LOCK_TIMEOUT);
+        shorten_lock_timeout_for_tests(Duration::from_secs(60));
+        assert!(lock_timeout() <= LOCK_TIMEOUT, "{:?}", lock_timeout());
+
         shorten_lock_timeout_for_tests(Duration::from_millis(100));
         shorten_lock_timeout_for_tests(Duration::from_secs(60));
         let effective = lock_timeout();

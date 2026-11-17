@@ -470,3 +470,86 @@ fn picker_search_steps_and_picks_once_per_query() {
     assert_eq!(symbol_label(IconName::AlarmClock), "Alarm clock");
     assert_eq!(symbol_label(IconName::Landmark), "Bank");
 }
+
+/// Bug-hunt 2026-11-17 note 3: `vault edit --icon symbol:key-round` stores Lucide's kebab
+/// name; the PascalCase identifier and the kebab name (any case) resolve to one icon.
+#[test]
+fn stored_symbol_accepts_identifier_and_kebab_name() {
+    for name in ["KeyRound", "key-round", "Key-Round", "KEY-ROUND"] {
+        assert_eq!(symbol(name), Some(IconName::KeyRound), "{name}");
+        let it = with_icon(item("github", &[]), "symbol", name, None);
+        assert!(
+            matches!(
+                resolve(&it),
+                IconSpec::Symbol {
+                    name: IconName::KeyRound,
+                    ..
+                }
+            ),
+            "{name}"
+        );
+        assert_eq!(shape(it.icon.as_ref()), Shape::Symbol(IconName::KeyRound));
+        assert_eq!(
+            PickerCursor::for_icon(it.icon.as_ref()).cell(),
+            PickerCursor::for_icon(choose_symbol(None, IconName::KeyRound).as_ref()).cell()
+        );
+    }
+    // A catalog icon outside the curated set, digits included.
+    assert_eq!(symbol("gamepad-2"), Some(IconName::Gamepad2));
+    assert_eq!(symbol("Gamepad2"), Some(IconName::Gamepad2));
+    // Only the identifier is exact-case; a lowercase identifier is not a kebab name.
+    assert_eq!(symbol("keyround"), None);
+    assert_eq!(symbol("key round"), None);
+    // Mixed case is lowercased in a SYMBOL_NAME_MAX-byte stack buffer: a longer name
+    // fails to resolve instead of allocating; a long lowercase name is looked up as is.
+    let long_upper = format!("Key-Round{}", "x".repeat(SYMBOL_NAME_MAX));
+    assert_eq!(symbol(&long_upper), None);
+    assert_eq!(symbol(&long_upper.to_ascii_lowercase()), None);
+    assert_eq!(symbol("KEY-ROUND-É"), None);
+    // The picker keeps writing the identifier.
+    let s = choose_symbol(None, IconName::KeyRound).unwrap();
+    assert_eq!(s.value, "KeyRound");
+    assert_eq!(symbol_name(IconName::KeyRound), Some("KeyRound"));
+}
+
+#[test]
+fn unknown_stored_symbol_still_falls_back_to_letter() {
+    for name in ["no-such-icon", "NoSuchIcon", "", "-", "key-round-"] {
+        let it = with_icon(item("github", &[]), "symbol", name, None);
+        assert!(
+            matches!(resolve(&it), IconSpec::Letter { .. }),
+            "{name}: {:?}",
+            resolve(&it)
+        );
+        assert_eq!(shape(it.icon.as_ref()), Shape::Automatic, "{name}");
+    }
+}
+
+/// Field icons (`Field.icon`) go through the same lookup: read-mode rows and the drag
+/// preview call `symbol`, and the field picker opens on the matching curated cell.
+#[test]
+fn field_icon_accepts_identifier_and_kebab_name() {
+    let key = SYMBOLS
+        .iter()
+        .position(|(_, i, _)| *i == IconName::KeyRound)
+        .unwrap();
+    for name in ["KeyRound", "key-round", "Key-Round"] {
+        let mut f = Field::new("PIN", FieldKind::Text, SecretString::new("1".into()), 1);
+        f.icon = Some(name.to_owned());
+        assert_eq!(
+            f.icon_name().and_then(symbol),
+            Some(IconName::KeyRound),
+            "{name}"
+        );
+        assert_eq!(
+            PickerCursor::for_field_icon(f.icon_name()).cell(),
+            PickerCell::Symbol(key),
+            "{name}"
+        );
+    }
+    assert_eq!(symbol("no-such-icon"), None);
+    assert_eq!(
+        PickerCursor::for_field_icon(Some("no-such-icon")).cell(),
+        PickerCell::Automatic
+    );
+}

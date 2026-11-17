@@ -974,6 +974,11 @@ impl Editor {
         // The dragged row collapses to its header line.
         .filter(|_| !is_ghost);
         let notes = matches!(row.value, ValueInput::Area(_));
+        // A revealed secret copies through the concealed, auto-clearing pasteboard path.
+        let sensitive_input = match &row.value {
+            ValueInput::Line(input) if field.kind.is_sensitive() => Some(input.clone()),
+            _ => None,
+        };
         let content = ui::h_flex()
             .debug_selector(move || format!("edit-content {key}"))
             .w_full()
@@ -986,6 +991,12 @@ impl Editor {
                     .debug_selector(move || format!("edit-value {key}"))
                     .flex_1()
                     .min_w_0()
+                    .when_some(sensitive_input, |d, input| {
+                        let state = self.state.clone();
+                        ui::route_input_copy(d, &input, move |value, _, cx| {
+                            state.update(cx, |s, cx| s.copy_secret(value, cx));
+                        })
+                    })
                     .children(value),
             )
             .child(trailing);
@@ -1332,9 +1343,9 @@ impl Render for Editor {
             Mode::New(kind, _) => Some(kind),
             _ => None,
         };
-        // History sits under its row as in read mode (a PIN's under that PIN, the rest
-        // under the first password), with per-entry remove buttons (edit mode only; a new
-        // item has no history).
+        // History sits under its row as in read mode (under its own password or PIN row;
+        // a removed field's under the first password, else the first PIN), with per-entry
+        // remove buttons (edit mode only; a new item has no history).
         let mut rows: Vec<AnyElement> = Vec::with_capacity(self.rows.len() + 1);
         let fields = &buffer.item.fields;
         // Each stored entry's row, in one pass: field index -> its entries, in item order.

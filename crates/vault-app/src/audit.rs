@@ -13,8 +13,10 @@ pub use vault_core::generator::strength_bits;
 use vault_core::{ExposeSecret, FieldKind, Item, UnlockedVault, Uuid};
 
 /// A password scoring under this many bits of estimated entropy is weak. Same cut-off as
-/// the "Weak" band of the generator's strength meter (`ui::strength_label`).
-pub const WEAK_BELOW_BITS: f64 = 40.;
+/// the "Weak" band of the generator's strength meter (`ui::strength_label`). Eased from 40
+/// to 36 on 2026-11-17 (05 §2.1) so a 12-character random password (about 39.8 bits under
+/// zxcvbn) is not flagged.
+pub const WEAK_BELOW_BITS: f64 = 36.;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Issue {
@@ -123,7 +125,9 @@ pub fn reuse_count(vault: &UnlockedVault, value: &str, exclude: Uuid) -> usize {
 /// in one item is not reuse.
 ///
 /// Grouping keys are `&str` borrowed from the vault for the duration of this call; no
-/// password is copied into an owned string.
+/// password is copied into an owned string. Each distinct value is scored with
+/// [`strength_bits`] (zxcvbn, up to ~13 ms for a long random value) at most once per
+/// call; the scores are dropped with the map when the call returns.
 pub fn audit(vault: &UnlockedVault) -> Issues {
     // The item's non-empty passwords, borrowed: (field id, value).
     fn passwords(item: &Item) -> impl Iterator<Item = (Uuid, &str)> {
@@ -132,11 +136,17 @@ pub fn audit(vault: &UnlockedVault) -> Issues {
             (f.kind == FieldKind::Password && !value.is_empty()).then_some((f.id, value))
         })
     }
-    // Password value -> ids of the live items that use it (each id once).
-    let mut by_value: HashMap<&str, Vec<Uuid>> = HashMap::new();
+    // Per distinct password value: the live items that use it (each id once) and its
+    // strength, scored on first use below.
+    #[derive(Default)]
+    struct Seen {
+        ids: Vec<Uuid>,
+        bits: Option<f64>,
+    }
+    let mut by_value: HashMap<&str, Seen> = HashMap::new();
     for item in vault.items() {
         for (_, value) in passwords(item) {
-            let ids = by_value.entry(value).or_default();
+            let ids = &mut by_value.entry(value).or_default().ids;
             if ids.last() != Some(&item.id) {
                 ids.push(item.id);
             }
@@ -147,14 +157,16 @@ pub fn audit(vault: &UnlockedVault) -> Issues {
     for item in vault.items() {
         let mut found = Vec::new();
         for (field, value) in passwords(item) {
-            let bits = strength_bits(value);
+            // Every value was entered by the first pass.
+            let seen = by_value.entry(value).or_default();
+            let bits = *seen.bits.get_or_insert_with(|| strength_bits(value));
+            let count = seen.ids.len();
             if bits < WEAK_BELOW_BITS {
                 found.push(FieldIssue {
                     field,
                     issue: Issue::Weak { bits },
                 });
             }
-            let count = by_value.get(value).map_or(0, Vec::len);
             if count >= 2 {
                 found.push(FieldIssue {
                     field,
@@ -214,6 +226,38 @@ mod tests {
             [Issue::Weak { bits }] => assert!(*bits < WEAK_BELOW_BITS),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// 05 §2.1 / §2.3 (2026-11-17): Weak < 36, so a 12-character random generator output is
+    /// not flagged while "password123" still is. zxcvbn spots chance patterns in about 0.4 %
+    /// of 12-character outputs (measured over 5000: min 31.7 bits, 1st percentile 37.2,
+    /// median 39.9), so a literal "none of 50" would fail about 1 run in 6; the test asserts
+    /// the typical output clears the bar and at most 3 of 50 do not (false failure ~5e-5).
+    #[test]
+    fn twelve_char_random_is_not_weak_but_password123_is() {
+        assert_eq!(WEAK_BELOW_BITS, 36.);
+        let spec = vault_core::generator::PasswordSpec {
+            length: 12,
+            ..Default::default()
+        };
+        let mut bits: Vec<f64> = (0..50)
+            .map(|_| {
+                let pw = vault_core::generator::password(&spec);
+                vault_core::strength_bits(pw.expose_secret())
+            })
+            .collect();
+        bits.sort_by(f64::total_cmp);
+        let weak = bits.iter().filter(|&&b| b < WEAK_BELOW_BITS).count();
+        assert!(bits[25] >= WEAK_BELOW_BITS, "median {:.1} bits", bits[25]);
+        assert!(weak <= 3, "{weak} of 50 flagged weak: {bits:?}");
+
+        assert!(vault_core::strength_bits("password123") < WEAK_BELOW_BITS);
+        let mut v = vault();
+        let id = login(&mut v, "Old", &["password123"]);
+        assert!(matches!(
+            kinds(&audit(&v), id).as_slice(),
+            [Issue::Weak { .. }]
+        ));
     }
 
     #[test]
@@ -373,6 +417,98 @@ mod tests {
             value_issues(&v, "123", a).as_slice(),
             [Issue::Weak { .. }]
         ));
+    }
+
+    #[test]
+    fn shared_value_is_scored_once_with_identical_results() {
+        let mut v = vault();
+        let a = login(&mut v, "A", &["abcdefgh", STRONG]);
+        let b = login(&mut v, "B", &["abcdefgh"]);
+        let c = login(&mut v, "C", &[STRONG_2]);
+        let issues = audit(&v);
+        let bits = strength_bits("abcdefgh");
+        let (fa, fb) = (field_ids(&v, a), field_ids(&v, b));
+        // Both items carry the same bits, equal to a fresh score, weak before reused.
+        assert_eq!(
+            issues[&a],
+            [
+                FieldIssue {
+                    field: fa[0],
+                    issue: Issue::Weak { bits },
+                },
+                FieldIssue {
+                    field: fa[0],
+                    issue: Issue::Reused { count: 2 },
+                },
+            ]
+        );
+        assert_eq!(
+            issues[&b],
+            [
+                FieldIssue {
+                    field: fb[0],
+                    issue: Issue::Weak { bits },
+                },
+                FieldIssue {
+                    field: fb[0],
+                    issue: Issue::Reused { count: 2 },
+                },
+            ]
+        );
+        assert!(!issues.contains_key(&c));
+        // The per-value path agrees with the vault-wide audit, field by field.
+        for id in [a, b] {
+            let item = v.get(id).unwrap();
+            let per_field: Vec<Issue> = item
+                .fields
+                .iter()
+                .flat_map(|f| value_issues(&v, f.value.expose_secret(), id))
+                .collect();
+            assert_eq!(per_field, kinds(&issues, id));
+        }
+        // Deterministic: a second run over the same vault is identical.
+        assert_eq!(audit(&v), issues);
+    }
+
+    /// 500 items of 20 pseudo-random characters, `distinct` distinct values.
+    fn bench_vault(distinct: usize) -> UnlockedVault {
+        const ALPHABET: &[u8] =
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#%&*+-=?@";
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let values: Vec<String> = (0..distinct)
+            .map(|_| {
+                (0..20)
+                    .map(|_| {
+                        seed = seed
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        ALPHABET[(seed >> 33) as usize % ALPHABET.len()] as char
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut v = vault();
+        for i in 0..500 {
+            login(&mut v, &format!("Item {i}"), &[&values[i % distinct]]);
+        }
+        v
+    }
+
+    /// Timing only: `cargo test -p vault-app audit_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn audit_timing_500_items() {
+        for distinct in [50, 500] {
+            let v = bench_vault(distinct);
+            let _ = audit(&v); // warm-up
+            let runs = 5;
+            let start = std::time::Instant::now();
+            for _ in 0..runs {
+                std::hint::black_box(audit(&v));
+            }
+            let per_run = start.elapsed() / runs;
+            eprintln!("audit: 500 items, {distinct} distinct values: {per_run:?} per run");
+        }
     }
 
     #[test]

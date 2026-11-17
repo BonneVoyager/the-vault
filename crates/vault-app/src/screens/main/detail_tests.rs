@@ -1457,4 +1457,121 @@ fn removed_field_history_falls_back_to_a_password_or_pin_row() {
     both.fields.push(login("x", "p", d).fields.remove(1));
     assert_eq!(history_row(&both.fields, &entry), Some(1), "password first");
     assert_eq!(history_row(&Item::new("n", d, 1).fields, &entry), None);
+    // Two passwords (2026-11-17): a removed field's entry still goes to the first one,
+    // while each password's own entry sits under its own row.
+    let mut two = login("x", "p", d);
+    two.fields.push(Field::new(
+        "Recovery",
+        FieldKind::Password,
+        SecretString::new("r".into()),
+        1,
+    ));
+    assert_eq!(history_row(&two.fields, &entry), Some(1), "first password");
+    let own = |field: usize| HistoryEntry {
+        field_id: Some(two.fields[field].id),
+        ..entry.clone()
+    };
+    assert_eq!(history_row(&two.fields, &own(1)), Some(1));
+    assert_eq!(history_row(&two.fields, &own(2)), Some(2));
+    // A field that is no longer a password or PIN (kind changed) falls back too.
+    assert_eq!(history_row(&two.fields, &own(0)), Some(1), "text field");
+}
+
+/// The item with two password fields "Password" and "Recovery" whose history holds one
+/// entry of the first and two of the second, at distinct stamps (separate saves).
+fn two_password_history(
+    dir: &std::path::Path,
+    cx: &mut TestAppContext,
+) -> (Entity<AppState>, Uuid, [Uuid; 2], VisualTestContext) {
+    let (state, ids, mut vcx) = open_items(
+        dir,
+        |d| {
+            let mut item = Item::new("Twin", d, 1);
+            let pw = |name: &str, v: &str| {
+                Field::new(name, FieldKind::Password, SecretString::new(v.into()), 1)
+            };
+            item.fields = vec![pw("Password", "a1"), pw("Recovery", "b1")];
+            vec![item]
+        },
+        cx,
+    );
+    let id = ids[0];
+    let fields = [field_id(&state, id, 0, &vcx), field_id(&state, id, 1, &vcx)];
+    state.update(&mut vcx, |s, cx| {
+        s.vault
+            .as_mut()
+            .unwrap()
+            .edit(|v| {
+                v.set_field(id, fields[0], SecretString::new("a2".into()), 20)?;
+                v.set_field(id, fields[1], SecretString::new("b2".into()), 30)?;
+                v.set_field(id, fields[1], SecretString::new("b3".into()), 40)
+            })
+            .unwrap()
+            .unwrap();
+        s.vault_changed();
+        s.select(id, cx);
+        s.toggle_history(cx);
+    });
+    vcx.run_until_parked();
+    (state, id, fields, vcx)
+}
+
+/// 05 §2.3 (owner 2026-11-17, bug-hunt note 1): with two password fields each entry sits
+/// under its own field's row, each disclosure counting and copying only its own.
+#[gpui::test]
+fn two_password_fields_show_their_own_history(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _id, _fields, mut vcx) = two_password_history(dir.path(), cx);
+    let board = FakePasteboard::default();
+    state.update(&mut vcx, |s, _| s.set_pasteboard(Box::new(board.clone())));
+    let at = |vcx: &mut VisualTestContext, k: &'static str| vcx.debug_bounds(k).expect(k);
+    let (first, second) = (at(&mut vcx, "field-value 0"), at(&mut vcx, "field-value 1"));
+    let (t1, t2) = (
+        at(&mut vcx, "history-toggle"),
+        at(&mut vcx, "history-toggle pw1"),
+    );
+    assert!(first.bottom() <= t1.top() && t1.bottom() <= second.top());
+    assert!(second.bottom() <= t2.top());
+    // The first password row keeps "Password history"; later rows use the field's name.
+    at(&mut vcx, "history-label Password history (1)");
+    at(&mut vcx, "history-label Recovery history (2)");
+    assert!(!shown("history-label Password history (2)", &mut vcx));
+    at(&mut vcx, "history-entry 0 Password");
+    assert!(!shown("history-entry 1 Password", &mut vcx), "one entry");
+    at(&mut vcx, "history-entry 0 Recovery pw1");
+    at(&mut vcx, "history-entry 1 Recovery pw1");
+    assert!(!shown("history-entry 0 Password pw1", &mut vcx));
+    click("history-copy 1 pw1", &mut vcx);
+    assert_eq!(board.contents().as_deref(), Some("b1"));
+    click("history-copy 0", &mut vcx);
+    assert_eq!(board.contents().as_deref(), Some("a1"));
+}
+
+/// "Clear history" under the second password's disclosure marks only that field's
+/// entries; the first password's entry stays, before and after Save.
+#[gpui::test]
+fn clearing_the_second_password_history_keeps_the_first(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, id, fields, mut vcx) = two_password_history(dir.path(), cx);
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    click("history-clear pw1", &mut vcx);
+    state.read_with(&vcx, |s, _| {
+        let b = s.edit_buffer().unwrap();
+        let left: Vec<_> = b.history().map(|h| h.field_id).collect();
+        assert_eq!(left, [Some(fields[0])]);
+    });
+    assert!(
+        shown("history-removed 2 pw1", &mut vcx),
+        "second counts two"
+    );
+    assert!(!shown("history-removed 2", &mut vcx));
+    assert!(shown("history-remove 0", &mut vcx), "first entry kept");
+    vcx.update(|_, cx| state.update(cx, |s, cx| s.save_edit(cx)));
+    vcx.run_until_parked();
+    state.read_with(&vcx, |s, _| {
+        let item = s.unlocked_vault().unwrap().get(id).unwrap();
+        let ids: Vec<_> = item.history.iter().map(|h| h.field_id).collect();
+        assert_eq!(ids, [Some(fields[0])]);
+    });
 }

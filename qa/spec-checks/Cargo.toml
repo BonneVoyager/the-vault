@@ -25,7 +25,7 @@ tempfile = "3"
 argon2_rs = { package = "rust-argon2", version = "3" }
 crossbeam-channel = "0.5"
 keepass = { version = "0.17", default-features = false, features = ["save_kdbx4"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.6", default-features = false, features = ["deflate"] }
 
 # 2026-11-15: vault-macos host facts (04 §1b) and login-launch detection (04 §5d) are plain library
 # functions, so they are driven directly; everything else in vault-macos stays code read only.

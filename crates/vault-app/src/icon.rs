@@ -106,13 +106,15 @@ struct CatalogIcon {
     words: String,
 }
 
-/// The whole catalog in `IconName::ALL` order, and its identifiers, built on first use
-/// (about 1,830 short strings).
+/// The whole catalog in `IconName::ALL` order, its identifiers, an icon index and its
+/// lowercase kebab-case Lucide names (`"gamepad-2"`), built on first use (about 1,830
+/// short strings each).
 #[allow(clippy::type_complexity)]
 static CATALOG: LazyLock<(
     Vec<CatalogIcon>,
     HashMap<String, usize>,
     HashMap<IconName, usize>,
+    HashMap<String, usize>,
 )> = LazyLock::new(|| {
     let icons: Vec<CatalogIcon> = IconName::ALL
         .iter()
@@ -135,12 +137,17 @@ static CATALOG: LazyLock<(
         .map(|(i, c)| (c.id.clone(), i))
         .collect();
     let by_icon = icons.iter().enumerate().map(|(i, c)| (c.icon, i)).collect();
-    (icons, ids, by_icon)
+    let kebabs = icons
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.words.replace(' ', "-"), i))
+        .collect();
+    (icons, ids, by_icon, kebabs)
 });
 
 /// No allocation: called for every grid cell's tooltip and label.
 fn catalog_entry(icon: IconName) -> Option<&'static CatalogIcon> {
-    let (icons, _, by_icon) = &*CATALOG;
+    let (icons, _, by_icon, _) = &*CATALOG;
     by_icon.get(&icon).map(|&i| &icons[i])
 }
 
@@ -312,11 +319,32 @@ fn parse_hex6(s: &str) -> Option<u32> {
     u32::from_str_radix(s, 16).ok()
 }
 
-/// The catalog icon stored as `name` (its `IconName` identifier), if this build has it.
+/// The catalog icon stored as `name`, if this build has it: its `IconName` identifier
+/// (`KeyRound`, exact case, what the pickers write) or its kebab-case Lucide name
+/// (`key-round`, any case, what a CLI user may type). Items and fields both resolve here.
+///
+/// Runs per render, so it never allocates: a name without ASCII uppercase is looked up as
+/// is; otherwise it is lowercased into a [`SYMBOL_NAME_MAX`]-byte stack buffer, and a longer
+/// mixed-case name does not resolve (every catalog name is far shorter).
 pub fn symbol(name: &str) -> Option<IconName> {
-    let (icons, ids, _) = &*CATALOG;
-    ids.get(name).map(|&i| icons[i].icon)
+    let (icons, ids, _, kebabs) = &*CATALOG;
+    ids.get(name)
+        .or_else(|| {
+            if !name.bytes().any(|b| b.is_ascii_uppercase()) {
+                return kebabs.get(name);
+            }
+            let mut buf = [0u8; SYMBOL_NAME_MAX];
+            let lower = buf.get_mut(..name.len())?;
+            lower.copy_from_slice(name.as_bytes());
+            lower.make_ascii_lowercase();
+            // Only ASCII bytes changed, so the bytes are still the UTF-8 they were.
+            kebabs.get(std::str::from_utf8(lower).ok()?)
+        })
+        .map(|&i| icons[i].icon)
 }
+
+/// Longest mixed-case stored symbol name [`symbol`] lowercases (bytes).
+pub const SYMBOL_NAME_MAX: usize = 64;
 
 /// Stored name of catalog icon `icon`.
 pub fn symbol_name(icon: IconName) -> Option<&'static str> {
@@ -585,7 +613,8 @@ impl PickerCursor {
 
     /// Where a field's icon picker opens: on the field's symbol, else on "No icon".
     pub fn for_field_icon(name: Option<&str>) -> Self {
-        name.and_then(|n| SYMBOLS.iter().position(|(s, ..)| *s == n))
+        name.and_then(symbol)
+            .and_then(|icon| SYMBOLS.iter().position(|(_, i, _)| *i == icon))
             .map_or(Self::at(PickerCell::Automatic), |i| {
                 Self::at(PickerCell::Symbol(i))
             })

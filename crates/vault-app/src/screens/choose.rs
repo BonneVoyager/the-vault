@@ -341,7 +341,12 @@ impl ChooseScreen {
                 ))
             })
             .child(field_label("Master password", cx))
-            .child(ui::input(&self.password).mask_toggle())
+            // A revealed (or suggested) master password is never copied out.
+            .child(ui::refuse_plain_copy(
+                div()
+                    .w_full()
+                    .child(ui::input(&self.password).mask_toggle()),
+            ))
             .child(ui::master_password_feedback(
                 &self.check,
                 "create-suggest",
@@ -519,6 +524,19 @@ mod tests {
         assert!(!masked, "revealed once");
         assert!(shown("master-write-it-down", &mut vcx));
         assert!(shown("create-submit ready", &mut vcx));
+
+        // The revealed phrase never reaches the pasteboard: ⌘C/⌘X are swallowed.
+        vcx.update(|window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+            ui::focus_input(&password, window, cx);
+        });
+        vcx.simulate_keystrokes("cmd-a cmd-c cmd-x");
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let board = cx.read_from_clipboard().and_then(|c| c.text());
+            assert_eq!(board.as_deref(), Some("before"));
+            assert_eq!(ui::input_text(&password, cx), pw, "Cut removed nothing");
+        });
 
         // Editing the revealed phrase masks it again and drops the note.
         vcx.update(|window, cx| ui::focus_input(&password, window, cx));

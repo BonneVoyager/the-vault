@@ -301,6 +301,104 @@ pub fn password_input<T>(
     })
 }
 
+/// Copy and Cut out of a sensitive input never take the toolkit's path.
+///
+/// gpui-component refuses them only while the input is masked; once revealed, ⌘C/⌘X go
+/// straight to `cx.write_to_clipboard`: a plain, syncable entry with no auto-clear. Put
+/// this on a container whose focusable descendants are all sensitive inputs: both actions
+/// are captured on the way down and dropped. See [`route_input_copy`] to copy instead.
+pub fn refuse_plain_copy<E: gpui::InteractiveElement>(el: E) -> E {
+    el.capture_action(|_: &gpui_component::input::Copy, _, cx| cx.stop_propagation())
+        .capture_action(|_: &gpui_component::input::Cut, _, cx| cx.stop_propagation())
+}
+
+/// Like [`refuse_plain_copy`] for one input, but a revealed value is handed to `copy`
+/// (the concealed, host-only, auto-clearing path) instead of being dropped: the selection,
+/// or the whole value when nothing is selected. Cut needs a selection; it hands it over
+/// and then deletes it as the toolkit would (one undo step, emits Change). A masked input
+/// copies nothing, as in the toolkit.
+pub fn route_input_copy<E: gpui::InteractiveElement>(
+    el: E,
+    input: &Entity<InputState>,
+    copy: impl Fn(SecretString, &mut Window, &mut App) + 'static,
+) -> E {
+    let copy = Rc::new(copy);
+    let (copy_input, cut_input, cut_copy) = (input.clone(), input.clone(), copy.clone());
+    el.capture_action(move |_: &gpui_component::input::Copy, window, cx| {
+        cx.stop_propagation();
+        if input_is_masked(&copy_input, cx) {
+            return;
+        }
+        let state = copy_input.read(cx);
+        let selected = state.selected_text();
+        let value = if selected.len() > 0 {
+            SecretString::new(selected.to_string())
+        } else {
+            SecretString::new(state.text().to_string())
+        };
+        if !value.expose_secret().is_empty() {
+            copy(value, window, cx);
+        }
+    })
+    .capture_action(move |_: &gpui_component::input::Cut, window, cx| {
+        cx.stop_propagation();
+        let state = cut_input.read(cx);
+        if state.presentation().is_masked() || !state.is_editable() {
+            return;
+        }
+        let selected = state.selected_text();
+        if selected.len() == 0 {
+            return;
+        }
+        let value = SecretString::new(selected.to_string());
+        cut_copy(value, window, cx);
+        // `replace` swaps the selection, like the toolkit's own Cut.
+        cut_input.update(cx, |s, cx| s.replace("", window, cx));
+    })
+}
+
+/// Test check for [`refuse_plain_copy`]: reveals `input` (typing a value if empty), then
+/// ⌘A ⌘C must select everything (proof the keys reached the rendered input) yet leave the
+/// toolkit clipboard untouched, and ⌘X must leave both the clipboard and the text
+/// untouched (Cut refused, not just Copy). The input is masked again afterwards.
+#[cfg(test)]
+pub fn assert_revealed_copy_refused(input: &Entity<InputState>, vcx: &mut gpui::VisualTestContext) {
+    vcx.update(|window, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+        input.update(cx, |s, cx| s.set_masked(false, window, cx));
+        focus_input(input, window, cx);
+    });
+    if vcx.update(|_, cx| input_is_empty(input, cx)) {
+        vcx.simulate_input("typed-secret");
+    }
+    vcx.simulate_keystrokes("cmd-a cmd-c");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let state = input.read(cx);
+        assert_eq!(
+            state.selected_range(),
+            0..state.text().len(),
+            "⌘A reached the input"
+        );
+        let board = cx.read_from_clipboard().and_then(|c| c.text());
+        assert_eq!(board.as_deref(), Some("before"), "revealed password copied");
+    });
+    let text_before = vcx.update(|_, cx| input.read(cx).text().to_string());
+    vcx.simulate_keystrokes("cmd-x");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let state = input.read(cx);
+        assert_eq!(
+            state.text().to_string(),
+            text_before,
+            "⌘X left the text intact"
+        );
+        let board = cx.read_from_clipboard().and_then(|c| c.text());
+        assert_eq!(board.as_deref(), Some("before"), "revealed password cut");
+        input.update(cx, |s, cx| s.set_masked(true, window, cx));
+    });
+}
+
 /// The styled gpui-component input element for `state`.
 pub fn input(state: &Entity<InputState>) -> Input {
     Input::new(state)
@@ -536,15 +634,26 @@ pub fn danger_pill(message: impl Into<SharedString>, cx: &App) -> Div {
     pill(message, cx).border_color(danger).text_color(danger)
 }
 
-/// Label and level (0 weak, 1 fair, 2 good, 3 strong) for an entropy estimate.
+/// Bits at which the strength bar is full: `strength_bits` (zxcvbn) never exceeds 64.
+pub const STRENGTH_FULL_BITS: f64 = 64.;
+
+/// Label and level (0 weak, 1 fair, 2 good, 3 strong) for a strength in bits, shared by
+/// typed values (`strength_bits`, zxcvbn, at most 64) and the generator preview
+/// (`generated_bits`, exact entropy, may exceed 64). Owner decision 2026-11-17, option B
+/// (05 §2.1; Weak eased from 40 to 36 on 2026-11-17): Weak < 36, Fair < 50, Good < 56, Strong ≥ 56; 0 bits is "Empty".
 pub fn strength_label(bits: f64) -> (&'static str, u8) {
     match bits {
         b if b <= 0. => ("Empty", 0),
-        b if b < 40. => ("Weak", 0),
-        b if b < 60. => ("Fair", 1),
-        b if b < 80. => ("Good", 2),
+        b if b < crate::audit::WEAK_BELOW_BITS => ("Weak", 0),
+        b if b < 50. => ("Fair", 1),
+        b if b < 56. => ("Good", 2),
         _ => ("Strong", 3),
     }
+}
+
+/// Fraction of the strength bar filled for `bits`: full at [`STRENGTH_FULL_BITS`].
+pub fn strength_fill(bits: f64) -> f32 {
+    (bits / STRENGTH_FULL_BITS).clamp(0., 1.) as f32
 }
 
 /// Strength bar plus a text label (§6: not colour alone).
@@ -569,7 +678,7 @@ pub fn strength_meter(bits: f64, cx: &App) -> Div {
                         .h_full()
                         .rounded(px(2.))
                         .bg(color)
-                        .w(relative((bits / 100.).clamp(0., 1.) as f32)),
+                        .w(relative(strength_fill(bits))),
                 ),
         )
         .child(
@@ -581,7 +690,7 @@ pub fn strength_meter(bits: f64, cx: &App) -> Div {
 }
 
 /// Minimum estimated strength of a new master password (create vault, change password).
-/// `strength_bits` is the generator's naive length x log2(pool) estimate; 50 bits is our
+/// `strength_bits` is log2 of zxcvbn's guess estimate (at most 64); 50 bits is our
 /// reading of "stronger than a short dictionary word", and a 4-word passphrase clears it.
 pub const MIN_MASTER_BITS: f64 = 50.;
 pub const WEAK_MASTER_PASSWORD: &str =
@@ -1328,4 +1437,32 @@ fn only_the_main_window_is_blurred(cx: &mut gpui::TestAppContext) {
         assert_eq!(main_options(None, true, cx).window_background, Blurred);
         assert_eq!(main_window_options(None, cx).window_background, Opaque);
     });
+}
+
+#[cfg(test)]
+mod strength_tests {
+    use super::{STRENGTH_FULL_BITS, strength_fill, strength_label};
+
+    /// 05 §2.1, option B (Weak eased to 36 on 2026-11-17): Weak < 36, Fair < 50, Good < 56, Strong ≥ 56, bar full at 64.
+    #[test]
+    fn strength_buckets_follow_option_b() {
+        assert_eq!(strength_label(0.), ("Empty", 0));
+        assert_eq!(strength_label(0.5), ("Weak", 0));
+        assert_eq!(strength_label(35.9), ("Weak", 0));
+        assert_eq!(strength_label(36.), ("Fair", 1));
+        assert_eq!(strength_label(39.9), ("Fair", 1));
+        assert_eq!(strength_label(40.), ("Fair", 1));
+        assert_eq!(strength_label(49.9), ("Fair", 1));
+        assert_eq!(strength_label(50.), ("Good", 2));
+        assert_eq!(strength_label(55.9), ("Good", 2));
+        assert_eq!(strength_label(56.), ("Strong", 3));
+        assert_eq!(strength_label(64.), ("Strong", 3));
+        assert_eq!(strength_label(127.5), ("Strong", 3));
+
+        assert_eq!(STRENGTH_FULL_BITS, 64.);
+        assert_eq!(strength_fill(0.), 0.);
+        assert_eq!(strength_fill(32.), 0.5);
+        assert_eq!(strength_fill(64.), 1.);
+        assert_eq!(strength_fill(127.5), 1.);
+    }
 }

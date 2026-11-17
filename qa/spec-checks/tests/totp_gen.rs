@@ -500,7 +500,7 @@ fn g04_strength_bits() {
     use vault_core::generator::*;
     assert!(strength_bits("") <= 0.0 + f64::EPSILON);
     assert!(strength_bits("aaaaaaaa") < strength_bits("aZ3$kq9!"));
-    assert!(strength_bits("password") < 40.0, "'password' weak");
+    assert!(strength_bits("password") < 36.0, "'password' weak");
     assert!(strength_bits("correct horse battery staple") >= 50.0);
     let g = password(&PasswordSpec {
         length: 20,

@@ -80,20 +80,9 @@ impl Default for PassphraseSpec {
     }
 }
 
-fn class_chars(set: &str, exclude_ambiguous: bool) -> Vec<char> {
-    set.chars()
-        .filter(|c| !(exclude_ambiguous && AMBIGUOUS.contains(*c)))
-        .collect()
-}
-
-/// Random password with at least one character from every enabled class.
-///
-/// **`length` is clamped up to [`PasswordSpec::min_length`]** (the number of enabled classes,
-/// at least 1): the "one of each class" guarantee needs that many characters, so a request
-/// for fewer yields exactly `min_length()` characters, never an empty or class-less string.
-/// Callers that would rather reject such a request must validate `length` themselves. If no
-/// class is enabled, lowercase is used.
-pub fn password(spec: &PasswordSpec) -> SecretString {
+/// The classes [`password`] draws from for `spec`, after the class toggles and
+/// exclude-ambiguous: the enabled ones, or lowercase alone when none is enabled.
+fn spec_classes(spec: &PasswordSpec) -> Vec<Vec<char>> {
     let mut classes: Vec<Vec<char>> = Vec::new();
     for (enabled, set) in [
         (spec.lower, LOWER),
@@ -108,6 +97,24 @@ pub fn password(spec: &PasswordSpec) -> SecretString {
     if classes.is_empty() {
         classes.push(class_chars(LOWER, spec.exclude_ambiguous));
     }
+    classes
+}
+
+fn class_chars(set: &str, exclude_ambiguous: bool) -> Vec<char> {
+    set.chars()
+        .filter(|c| !(exclude_ambiguous && AMBIGUOUS.contains(*c)))
+        .collect()
+}
+
+/// Random password with at least one character from every enabled class.
+///
+/// **`length` is clamped up to [`PasswordSpec::min_length`]** (the number of enabled classes,
+/// at least 1): the "one of each class" guarantee needs that many characters, so a request
+/// for fewer yields exactly `min_length()` characters, never an empty or class-less string.
+/// Callers that would rather reject such a request must validate `length` themselves. If no
+/// class is enabled, lowercase is used.
+pub fn password(spec: &PasswordSpec) -> SecretString {
+    let classes = spec_classes(spec);
     debug_assert_eq!(classes.len(), spec.class_count());
     let length = spec.length.max(spec.min_length());
     let pool: Vec<char> = classes.iter().flatten().copied().collect();
@@ -164,50 +171,57 @@ pub fn passphrase(spec: &PassphraseSpec) -> SecretString {
     SecretString::new(std::mem::take(&mut *out))
 }
 
-/// Naive entropy estimate with a repetition penalty. The pool is inferred from the character
-/// classes present (26 lower, 26 upper, 10 digits, 32 for anything else). Then:
-/// (a) a run of `r >= 3` equal characters counts as one character plus `log2(r)` bits;
-/// (b) a string that is `k >= 2` exact repeats of a unit `u` scores `strength_bits(u) + log2(k)`.
-/// Rule (b) is applied after rule (a).
+/// Entropy in bits of a [`password`] for `spec`: `log2(pool) × length`, where the pool is
+/// the characters left after the class toggles and exclude-ambiguous and the length is the
+/// one [`password`] actually produces (raised to [`PasswordSpec::min_length`]). This is the
+/// generator preview's meter (05 §2.4): plain arithmetic over the generator's own uniform
+/// choices, unlike [`strength_bits`], which estimates an arbitrary typed value. The
+/// "one of each class" step makes the true figure very slightly lower (well under a bit
+/// at the default settings); the uniform-pool figure is the one the spec names.
+pub fn generated_bits(spec: &PasswordSpec) -> f64 {
+    let pool: usize = spec_classes(spec).iter().map(Vec::len).sum();
+    let length = spec.length.max(spec.min_length());
+    (pool as f64).log2() * length as f64
+}
+
+/// Entropy in bits of a [`passphrase`] for `spec`: `log2(wordlist size) × words` (7776 words,
+/// about 12.9 bits each; `words` raised to 1 as [`passphrase`] does), plus `log2(10)` when a
+/// digit is appended. Capitalisation and the separator are fixed by the spec, so they add
+/// nothing.
+pub fn generated_passphrase_bits(spec: &PassphraseSpec) -> f64 {
+    let words = spec.words.max(1) as f64;
+    let digit = if spec.number { 10f64.log2() } else { 0.0 };
+    (wordlist().len() as f64).log2() * words + digit
+}
+
+/// How many leading characters [`strength_bits`] scores. zxcvbn's matcher is super-linear
+/// in the input length (about 14 ms for 100 random characters in a release build), so a
+/// long value cannot stall an editor keystroke.
+pub const STRENGTH_SCORED_CHARS: usize = 100;
+
+/// Estimated strength in bits: `log2` of the number of guesses
+/// [zxcvbn](https://crates.io/crates/zxcvbn) expects an attacker to need
+/// (`guesses_log10 * log2(10)`). zxcvbn finds dictionary words, keyboard patterns, repeats,
+/// sequences and dates, so repetition is penalised smoothly instead of by a fixed rule.
+///
+/// - Only the first [`STRENGTH_SCORED_CHARS`] characters are scored.
+/// - The empty string scores `0.0`.
+/// - zxcvbn counts guesses in a saturating `u64`, so the result never exceeds 64 bits: a
+///   generated 20-character password or 4-word passphrase scores about 64.
+/// - The scored prefix lives in a pre-sized `Zeroizing<String>` (never reallocated, so no
+///   unwiped partial copy is left behind). zxcvbn makes its own transient copies of the
+///   scored text (its own 100-character `String`, per-matcher char buffers, match tokens);
+///   all are dropped before the call returns and none is cached.
+/// - zxcvbn reads the clock for the current year (dates near it are guessed first), so a
+///   value containing a recent year may score differently from one year to the next.
 pub fn strength_bits(pw: &str) -> f64 {
-    let chars: Vec<char> = pw.chars().collect();
-    let n = chars.len();
-    // (b) shortest unit that tiles the whole string at least twice.
-    for len in 1..=n / 2 {
-        if n.is_multiple_of(len) && chars.chunks(len).all(|c| c == &chars[..len]) {
-            let unit: String = chars[..len].iter().collect();
-            return strength_bits(&unit) + ((n / len) as f64).log2();
-        }
-    }
-    let mut pool = 0u32;
-    if pw.chars().any(|c| c.is_ascii_lowercase()) {
-        pool += 26;
-    }
-    if pw.chars().any(|c| c.is_ascii_uppercase()) {
-        pool += 26;
-    }
-    if pw.chars().any(|c| c.is_ascii_digit()) {
-        pool += 10;
-    }
-    if pw.chars().any(|c| !c.is_ascii_alphanumeric()) {
-        pool += 32;
-    }
-    if pool == 0 {
+    let mut scored: Zeroizing<String> = Zeroizing::new(String::with_capacity(
+        pw.len().min(4 * STRENGTH_SCORED_CHARS),
+    ));
+    scored.extend(pw.chars().take(STRENGTH_SCORED_CHARS));
+    if scored.is_empty() {
         return 0.0;
     }
-    // (a) collapse runs of one character.
-    let mut bits = 0.0;
-    let per_char = f64::from(pool).log2();
-    let mut i = 0;
-    while i < n {
-        let run = chars[i..].iter().take_while(|&&c| c == chars[i]).count();
-        // Doubles ("ss", "ee") are ordinary in real passwords; only runs of 3+ are penalised.
-        bits += if run >= 3 {
-            per_char + (run as f64).log2()
-        } else {
-            per_char * run as f64
-        };
-        i += run;
-    }
-    bits
+    let log10 = zxcvbn::zxcvbn(&scored, &[]).guesses_log10();
+    (log10 * std::f64::consts::LOG2_10).max(0.0)
 }

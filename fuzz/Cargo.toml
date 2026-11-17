@@ -1,0 +1,64 @@
+[package]
+name = "vault-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "^0.4.10"
+
+[dependencies.vault-core]
+path = "../crates/vault-core"
+# `sync` exposes `LockedVault::unlock_with_key` / `VaultKeyHandle`; `kdbx` exposes `import_kdbx`.
+features = ["sync", "kdbx"]
+
+# Own workspace: fuzzing builds with `cargo +nightly fuzz` and must stay out of the main
+# workspace (stable pin, `cargo build --workspace`).
+[workspace]
+
+[[bin]]
+name = "vault_parse"
+path = "fuzz_targets/vault_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inner_payload"
+path = "fuzz_targets/inner_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "import_kdbx"
+path = "fuzz_targets/import_kdbx.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "import_1pux"
+path = "fuzz_targets/import_1pux.rs"
+test = false
+doc = false
+bench = false
+
+# Seed generator (`seed.sh`): decrypts the fixtures and builds sample 1PUX archives.
+[[bin]]
+name = "seed"
+path = "src/bin/seed.rs"
+test = false
+doc = false
+bench = false
+
+[dependencies.zip]
+version = "^9.6.1"
+default-features = false
+features = ["deflate"]
+
+[dependencies.serde_json]
+version = "^1.0.128"

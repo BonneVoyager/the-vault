@@ -337,7 +337,7 @@ impl SecurityView {
             return (touch_row, None);
         }
         let working = busy == Some(Busy::DisablingTouchId);
-        let prompt = strip(false, cx)
+        let prompt = ui::refuse_plain_copy(strip(false, cx))
             .child(
                 div()
                     .text_sm()
@@ -383,7 +383,8 @@ impl SecurityView {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let ready = self.check.ready() && !ui::input_is_empty(&self.current, cx);
-        strip(false, cx)
+        // Every input here is a master password: a revealed one is never copied out.
+        ui::refuse_plain_copy(strip(false, cx))
             .child(ui::input(&self.current).small().mask_toggle())
             .child(ui::input(&self.new).small().mask_toggle())
             .child(ui::master_password_feedback(
@@ -428,7 +429,7 @@ impl SecurityView {
         error: Option<gpui::SharedString>,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        strip(false, cx)
+        ui::refuse_plain_copy(strip(false, cx))
             .child(div().text_sm().child(
                 "Re-calibrating measures this Mac and re-protects the vault key so one unlock \
                  takes about half a second. Enter your master password.",
@@ -477,7 +478,7 @@ impl SecurityView {
         error: Option<gpui::SharedString>,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        strip(true, cx)
+        ui::refuse_plain_copy(strip(true, cx))
             .child(div().text_sm().child(ROTATE_WARNING))
             .children(
                 self.prompt(SecurityForm::RotateKey)
@@ -825,6 +826,19 @@ mod tests {
         assert!(shown("master-write-it-down", &mut vcx));
         assert!(shown("change-submit ready", &mut vcx));
 
+        // The revealed phrase never reaches the pasteboard: ⌘C/⌘X are swallowed.
+        vcx.update(|w, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+            ui::focus_input(&new, w, cx);
+        });
+        vcx.simulate_keystrokes("cmd-a cmd-c cmd-x");
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let board = cx.read_from_clipboard().and_then(|c| c.text());
+            assert_eq!(board.as_deref(), Some("before"));
+            assert_eq!(ui::input_text(&new, cx), phrase, "Cut removed nothing");
+        });
+
         // Cancel: fields cleared and masked again.
         vcx.update(|w, cx| view.update(cx, |v, cx| v.open(None, w, cx)));
         vcx.run_until_parked();
@@ -834,6 +848,25 @@ mod tests {
             assert!(ui::input_is_masked(&new, cx));
         });
         state.read_with(&vcx, |s, _| assert!(s.security.form.is_none()));
+    }
+
+    /// The single-password prompts (turn off Touch ID, re-calibrate, rotate key): a
+    /// revealed password never reaches the pasteboard.
+    #[gpui::test]
+    fn password_prompts_refuse_plain_copy(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, view, mut vcx) = window(dir.path(), cx);
+        state.update(&mut vcx, |s, cx| s.toggle_security_advanced(cx));
+        for form in [
+            SecurityForm::DisableTouchId,
+            SecurityForm::Recalibrate,
+            SecurityForm::RotateKey,
+        ] {
+            vcx.update(|w, cx| view.update(cx, |v, cx| v.open(Some(form), w, cx)));
+            vcx.run_until_parked();
+            let input = view.read_with(&vcx, |v, _| v.prompt(form).unwrap().clone());
+            ui::assert_revealed_copy_refused(&input, &mut vcx);
+        }
     }
 
     /// "Copy diagnostics" sits below Encryption strength at the bottom of the tab; a

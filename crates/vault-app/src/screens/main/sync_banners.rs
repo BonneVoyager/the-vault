@@ -53,11 +53,11 @@ pub fn render(
             .child(
                 ui::h_flex()
                     .gap(px(8.))
-                    .child(
+                    .child(ui::refuse_plain_copy(
                         div()
                             .flex_1()
                             .child(ui::input(key_input).small().mask_toggle()),
-                    )
+                    ))
                     .child(
                         Button::new("key-mismatch-submit")
                             .primary()

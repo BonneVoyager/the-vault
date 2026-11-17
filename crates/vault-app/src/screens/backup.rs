@@ -314,7 +314,8 @@ impl BackupWindow {
         let theme = cx.theme();
         ui::centered(cx)
             .child(
-                ui::card(cx)
+                // The password is the card's only input: a revealed one is never copied out.
+                ui::refuse_plain_copy(ui::card(cx))
                     .w(px(380.))
                     .gap(px(10.))
                     .child(ui::illustration(IconName::Inbox, Some(IconName::Eye), cx))
@@ -802,6 +803,9 @@ mod tests {
             assert!(!w.is_open());
             assert_eq!(w.error.as_deref(), Some("Wrong password. Try again."));
         });
+        // Revealed, the password never reaches the pasteboard; typing below replaces it.
+        let password = view.read_with(&vcx, |w, _| w.password.clone());
+        ui::assert_revealed_copy_refused(&password, &mut vcx);
 
         // Typed and submitted like a user: the field is emptied as soon as it is read.
         vcx.simulate_input(PW);

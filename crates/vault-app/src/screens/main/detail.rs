@@ -997,15 +997,16 @@ impl ReadDetail<'_> {
     }
 }
 
-/// The row whose disclosure shows history entry `h` (05 §2.3): a PIN's entries sit under
-/// that PIN row; every other entry under the first password row, as before PINs, or the
-/// first PIN row when there is no password (a removed PIN's entries on a Card).
+/// The row whose disclosure shows history entry `h` (05 §2.3, owner decision 2026-11-17):
+/// an entry whose field is a current password or PIN sits under that field's row; an
+/// entry of a removed field (or without a field id) under the first password row, else
+/// the first PIN row (a removed PIN's entries on a Card).
 pub(super) fn history_row(fields: &[Field], h: &HistoryEntry) -> Option<usize> {
     h.field_id
         .and_then(|id| {
             fields
                 .iter()
-                .position(|f| f.id == id && f.kind == FieldKind::Pin)
+                .position(|f| f.id == id && matches!(f.kind, FieldKind::Password | FieldKind::Pin))
         })
         .or_else(|| fields.iter().position(|f| f.kind == FieldKind::Password))
         .or_else(|| fields.iter().position(|f| f.kind == FieldKind::Pin))
@@ -1058,14 +1059,28 @@ fn history_view(
     let editing = removed.is_some();
     let count = history.len().min(HISTORY_SHOWN);
     let pending = removed.unwrap_or(0);
-    // A PIN row's disclosure: its own label and selectors (" pin<row>" suffix); one shared
-    // open flag for the item.
+    // A PIN row's disclosure: its own label and selectors (" pin<row>" suffix); a password
+    // row other than the first gets " pw<row>" so element ids stay unique; one shared open
+    // flag for the item.
     let pin = fields.get(row).is_some_and(|f| f.kind == FieldKind::Pin);
+    let first_password = fields.iter().position(|f| f.kind == FieldKind::Password);
+    // Wording: "PIN history", "Password history" on the first password row, and the
+    // field's display name on later password rows ("Recovery history"; "Password" when
+    // the name is empty) so two disclosures are told apart.
     let (what, sfx, id_sfx) = if pin {
-        ("PIN", format!(" pin{row}"), format!("-pin{row}"))
+        ("PIN".to_owned(), format!(" pin{row}"), format!("-pin{row}"))
+    } else if first_password == Some(row) {
+        ("Password".to_owned(), String::new(), String::new())
     } else {
-        ("Password", String::new(), String::new())
+        let name = fields.get(row).map_or("", |f| f.name.trim());
+        let what = if name.is_empty() {
+            "Password".to_owned()
+        } else {
+            text::capitalize_first(name)
+        };
+        (what, format!(" pw{row}"), format!("-pw{row}"))
     };
+    let label = format!("{what} history ({count})");
     let id = |name: &str| SharedString::from(format!("{name}{id_sfx}"));
     let toggle = {
         let actions = actions.clone();
@@ -1089,7 +1104,12 @@ fn history_view(
                 })
                 .size_3(),
             )
-            .child(format!("{what} history ({count})"))
+            .child({
+                // Tests read the wording from the selector (no painted-text API).
+                let label = label.clone();
+                let selector = format!("history-label {label}");
+                div().debug_selector(move || selector).child(label)
+            })
             .when(pending > 0, |row| {
                 // Tests read the count from the selector (no painted-text API).
                 row.child(
@@ -1179,8 +1199,13 @@ fn history_view(
                 .children(remove.map(|r| div().flex_none().child(r)))
         });
 
-    // Marks only this disclosure's entries.
-    let stamps: Vec<_> = history.iter().map(|h| h.replaced_at).collect();
+    // Marks only this disclosure's entries, by (stamp, field id). Removal itself is per
+    // stamp in core, so an entry of another field sharing the stamp (both fields changed
+    // in one save) goes with it.
+    let stamps: Vec<_> = history
+        .iter()
+        .map(|h| (h.replaced_at, h.field_id))
+        .collect();
     let clear_sfx = sfx.clone();
     let clear = (editing && count > 0).then(|| {
         let state = state.clone();
@@ -1193,7 +1218,9 @@ fn history_view(
                 .clickable()
                 .on_click(move |_, _, cx| {
                     state.update(cx, |s, cx| {
-                        s.edit(cx, |b| b.clear_history(|h| stamps.contains(&h.replaced_at)))
+                        s.edit(cx, |b| {
+                            b.clear_history(|h| stamps.contains(&(h.replaced_at, h.field_id)))
+                        })
                     })
                 }),
         )

@@ -456,6 +456,42 @@ done < <(awk -F'|' '/^\| / && NR>1 {print $3}' "$HELP" | grep -v -- '---' | grep
 [ -z "$stale" ] && ok "help.md shortcuts all appear in 05 §4 keymap" || bad "help.md lists shortcuts not in 05 §4" "$stale"
 grep -qiE "⌘1.*(list|item list)|⌘2.*detail" "$HELP" && bad "help.md describes removed ⌘1/⌘2 pane keys" || ok "help.md has no removed ⌘1/⌘2 pane keys"
 
+# ---- 2026-11-17: save-lock wait (03 §2), --icon identifiers (01 §4, 05 §2.3 icon search) ----
+export VAULT_FILE="$T/lk.vault"
+v init --kdf-test-params >/dev/null 2>&1
+v add --title Seed >/dev/null 2>&1
+# 03 §2 "The lock wait is 10 s (`SaveLockTimeout`, nothing written) ... production code has no override."
+perl -MFcntl=:flock -e '$|=1; open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; print "locked\n"; sleep 60' "$VAULT_FILE/.lock" >"$T/perl.out" &
+PERLPID=$!
+for _ in $(seq 1 50); do grep -q locked "$T/perl.out" 2>/dev/null && break; sleep 0.1; done
+before=$(shasum "$VAULT_FILE/vault.bin")
+s0=$(date +%s)
+VAULT_LOCK_TIMEOUT_MS=1 VAULT_LOCK_TIMEOUT=0 v add --title Blocked >"$T/o" 2>&1; rc=$?
+el=$(( $(date +%s) - s0 ))
+kill $PERLPID 2>/dev/null; wait $PERLPID 2>/dev/null
+after=$(shasum "$VAULT_FILE/vault.bin")
+if [ $rc -ne 0 ] && [ $el -ge 9 ] && [ $el -le 20 ] && [ "$before" = "$after" ] && ! ls -a "$VAULT_FILE" | grep -q '\.tmp'; then ok "held .lock: add waits ~10 s ($el s), fails, writes nothing; env vars do not shorten it"; else bad "held .lock" "rc=$rc elapsed=${el}s same=$([ "$before" = "$after" ] && echo y || echo n)" "$(cat "$T/o")"; fi
+grep -q "$MPW" "$T/o" && bad "lock timeout message echoes the master password" || ok "lock timeout message carries no master password"
+v add --title Unblocked >"$T/o" 2>&1 && ok "add succeeds once the lock is released" || bad "add after lock release" "$(cat "$T/o")"
+# --icon symbol:<any identifier> (01 §4 any Lucide identifier; 05 §2.3 CLI accepts any #RRGGBB)
+II="$ROOT/qa/spec-checks/target/debug/item_icons"
+if [ ! -x "$II" ]; then (cd "$ROOT/qa/spec-checks" && cargo build -q --bin item_icons); fi
+icfail=""
+for spec in "symbol:a-arrow-down|value=\"a-arrow-down\"" "symbol:AArrowDown:#abcdef|color=\"#abcdef\"" "symbol:NotInCatalog|value=\"NotInCatalog\"" "symbol:../x|value=\"../x\""; do
+  arg="${spec%%|*}"; want="${spec#*|}"
+  v edit Seed --icon "$arg" >"$T/o" 2>&1 || icfail="$icfail [$arg rc]"
+  "$II" "$VAULT_FILE/vault.bin" "$MPW" | grep '^"Seed"' | grep -qF "$want" || icfail="$icfail [$arg stored: $("$II" "$VAULT_FILE/vault.bin" "$MPW" | grep '^"Seed"')]"
+done
+[ -z "$icfail" ] && ok "--icon symbol:<identifier> stored verbatim (kebab, Pascal, unknown, lowercase colour)" || bad "--icon identifiers" "$icfail"
+v edit Seed --icon "symbol:$(printf 'E\033[2J\007x')" >/dev/null 2>&1
+v get Seed >"$T/o" 2>&1; rc=$?
+if [ $rc = 0 ] && ! LC_ALL=C grep -q $'\033' "$T/o" && ! LC_ALL=C grep -q $'\007' "$T/o"; then ok "get sanitises control bytes in an icon value"; else bad "get prints raw control bytes from icon" "$(od -c "$T/o" | head -5)"; fi
+# six concurrent --icon edits of one item: all succeed, exactly one icon survives (03 §5 same attribute)
+pids=(); for i in 1 2 3 4 5 6; do v edit Seed --icon "symbol:c-$i" >"$T/ic$i" 2>&1 & pids+=($!); done
+fails=0; for p in "${pids[@]}"; do wait "$p" || fails=$((fails+1)); done
+cur=$("$II" "$VAULT_FILE/vault.bin" "$MPW" | grep '^"Seed"')
+if [ $fails = 0 ] && echo "$cur" | grep -qE 'value="c-[1-6]"'; then ok "6 concurrent --icon edits: all succeed, one survives"; else bad "concurrent --icon" "fails=$fails $cur"; fi
+
 echo
 echo "CLI checks: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]

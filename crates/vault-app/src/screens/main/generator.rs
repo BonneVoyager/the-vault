@@ -15,7 +15,7 @@ use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{ActiveTheme as _, Icon, Selectable as _, Sizable as _};
 use gpui_kit_assets::IconName;
-use vault_core::{ExposeSecret as _, strength_bits};
+use vault_core::ExposeSecret as _;
 
 use crate::state::{
     AppState, CharClass, GenTab, GeneratorTarget, LENGTH_RANGE, SEPARATORS, WORDS_RANGE,
@@ -115,7 +115,8 @@ impl Render for GeneratorView {
         let g = &s.generator;
         let theme = cx.theme();
         let preview = g.preview().expose_secret().to_owned();
-        let bits = strength_bits(&preview);
+        // Exact entropy of the settings, not zxcvbn (05 §2.4).
+        let bits = g.preview_bits();
         let can_use = matches!(s.generator_target, Some(GeneratorTarget::Field(_)));
         let tab = g.tab;
         let state = self.state.clone();

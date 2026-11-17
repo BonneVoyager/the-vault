@@ -1,10 +1,13 @@
 //! Clipboard with auto-clear (specs/05-ui.md §2.3, §3; specs/04-macos.md §3).
 //!
-//! [`copy_secret`] is the only place a secret reaches the system pasteboard. It writes
-//! through vault-macos with `org.nspasteboard.ConcealedType`, so clipboard managers skip
-//! the entry. [`Clipboard`] remembers the pasteboard's change count right after our write
-//! and later clears only if that count is unchanged, so a value the user copied from
-//! another app is never wiped.
+//! [`copy_secret`] is the only place a secret field value reaches the system pasteboard.
+//! It writes through vault-macos with `org.nspasteboard.ConcealedType`, so clipboard
+//! managers skip the entry. ⌘C/⌘X in a revealed sensitive editor input are routed here
+//! too (`ui::route_input_copy`); the toolkit's own Copy writes plain text, so every other
+//! revealable input must refuse it (`ui::refuse_plain_copy`). Notes text is plain by spec.
+//! [`Clipboard`] remembers the pasteboard's change count right after our write and later
+//! clears only if that count is unchanged, so a value the user copied from another app is
+//! never wiped.
 
 use vault_core::SecretString;
 use vault_macos::ChangeCount;

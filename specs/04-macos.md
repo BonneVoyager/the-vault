@@ -83,7 +83,7 @@ impl Clipboard {
 }
 ```
 
-`vault-app` schedules `clear_if_unchanged` after the configured delay (default 30 s). Also clear on lock.
+`vault-app` schedules `clear_if_unchanged` after the configured delay (default 30 s). Also clear on lock. Every copy of a secret in the app goes through this path, including the input's own ⌘C/⌘X (security review 2026-11-17): in a revealed password, PIN, one-time-code or unknown-kind editor input, Copy and Cut copy the selection (or the whole value when nothing is selected) through the concealed, this-Mac-only, auto-clearing path; Cut needs a selection and then deletes it (with nothing selected it does nothing, like the toolkit); every revealable master-password input (create, change, the Touch ID, re-calibrate and rotate-key prompts, KDBX import, backup viewer, Settings restore, sync banners) refuses Copy and Cut outright. Notes are plain by 05 §2.3. The generator preview is cleared on lock.
 
 ### 3b. Screen capture (best effort)
 

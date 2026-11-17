@@ -1929,6 +1929,131 @@ fn unknown_field_icon_survives_rename_and_save(cx: &mut TestAppContext) {
     assert_eq!(field.icon.as_deref(), Some("x-future-symbol"));
 }
 
+/// A revealed password row copies through our concealed, auto-clearing path, never the
+/// toolkit's plain `write_to_clipboard`: ⌘C copies the selection (or the whole value) and
+/// shows the "Copied — clears in N s" toast, ⌘X with nothing selected does nothing (04 §3),
+/// ⌘X copies and deletes a selection and ⌘Z brings it back; a masked row copies nothing.
+/// A PIN row takes the same path.
+#[gpui::test]
+fn revealed_secret_copies_through_the_concealed_path(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    let mut item = pw_login("Bank", "s3cret-pw", &state, &vcx);
+    item.fields.push(vault_core::Field::new(
+        "PIN",
+        FieldKind::Pin,
+        SecretString::new("4821".into()),
+        10,
+    ));
+    insert_and_select(&state, item, &mut vcx);
+    let board = crate::clipboard::fake::FakePasteboard::default();
+    state.update(&mut vcx, |s, _| s.set_pasteboard(Box::new(board.clone())));
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let (key, pin_key) = state.read_with(&vcx, |s, _| {
+        let keys = &s.edit_buffer().unwrap().keys;
+        (keys[0], keys[1])
+    });
+    let input = value_input(&main, key, &mut vcx);
+    let toolkit = |vcx: &mut VisualTestContext| {
+        vcx.update(|_, cx| cx.read_from_clipboard().and_then(|c| c.text()))
+    };
+    let take_toast = |vcx: &mut VisualTestContext| {
+        state.update(vcx, |s, _| s.toast.take().map(|t| t.message.to_string()))
+    };
+    let buffer_value = |key: u64, vcx: &mut VisualTestContext| {
+        state.read_with(vcx, |s, _| {
+            let value = &s.edit_buffer().unwrap().field(key).unwrap().value;
+            value.expose_secret().to_owned()
+        })
+    };
+    vcx.update(|window, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("before".into()));
+        ui::focus_input(&input, window, cx);
+    });
+
+    // Masked: nothing anywhere.
+    vcx.simulate_keystrokes("cmd-a cmd-c");
+    vcx.run_until_parked();
+    assert_eq!(board.contents(), None);
+    assert_eq!(take_toast(&mut vcx), None);
+
+    // Revealed (the eye): selection goes to our pasteboard only, with the toast.
+    vcx.update(|window, cx| input.update(cx, |s, cx| s.set_masked(false, window, cx)));
+    vcx.simulate_keystrokes("cmd-a cmd-c");
+    vcx.run_until_parked();
+    assert_eq!(board.contents().as_deref(), Some("s3cret-pw"));
+    assert_eq!(toolkit(&mut vcx).as_deref(), Some("before"));
+    assert_eq!(
+        take_toast(&mut vcx).as_deref(),
+        Some("Copied — clears in 30 s")
+    );
+
+    // No selection: the whole value.
+    board.set("");
+    vcx.simulate_keystrokes("right cmd-c");
+    vcx.run_until_parked();
+    assert_eq!(board.contents().as_deref(), Some("s3cret-pw"));
+    assert!(take_toast(&mut vcx).is_some());
+
+    // Cut with no selection: nothing copied anywhere, value intact (04 §3).
+    board.set("");
+    vcx.simulate_keystrokes("cmd-x");
+    vcx.run_until_parked();
+    assert_eq!(board.contents().as_deref(), Some(""));
+    assert_eq!(toolkit(&mut vcx).as_deref(), Some("before"));
+    assert_eq!(take_toast(&mut vcx), None);
+    vcx.update(|_, cx| assert_eq!(ui::input_text(&input, cx), "s3cret-pw"));
+    assert_eq!(buffer_value(key, &mut vcx), "s3cret-pw");
+
+    // Cut: copied our way, then deleted from the input and the edit buffer.
+    vcx.simulate_keystrokes("cmd-a cmd-x");
+    vcx.run_until_parked();
+    assert_eq!(board.contents().as_deref(), Some("s3cret-pw"));
+    assert_eq!(toolkit(&mut vcx).as_deref(), Some("before"));
+    assert!(take_toast(&mut vcx).is_some());
+    vcx.update(|_, cx| assert_eq!(ui::input_text(&input, cx), ""));
+    assert_eq!(buffer_value(key, &mut vcx), "");
+
+    // Undo puts the cut text back in the input and the edit buffer.
+    vcx.simulate_keystrokes("cmd-z");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(ui::input_text(&input, cx), "s3cret-pw"));
+    assert_eq!(buffer_value(key, &mut vcx), "s3cret-pw");
+
+    // A PIN row: masked copies nothing; revealed copies through the same path.
+    let pin = value_input(&main, pin_key, &mut vcx);
+    board.set("");
+    vcx.update(|window, cx| ui::focus_input(&pin, window, cx));
+    vcx.simulate_keystrokes("cmd-a cmd-c");
+    vcx.run_until_parked();
+    assert_eq!(board.contents().as_deref(), Some(""));
+    vcx.update(|window, cx| pin.update(cx, |s, cx| s.set_masked(false, window, cx)));
+    vcx.simulate_keystrokes("cmd-a cmd-c");
+    vcx.run_until_parked();
+    assert_eq!(board.contents().as_deref(), Some("4821"));
+    assert_eq!(toolkit(&mut vcx).as_deref(), Some("before"));
+    assert_eq!(
+        take_toast(&mut vcx).as_deref(),
+        Some("Copied — clears in 30 s")
+    );
+}
+
+/// The key-mismatch banner's master password (sync_banners): revealed, it never reaches
+/// the pasteboard.
+#[gpui::test]
+fn key_mismatch_password_refuses_plain_copy(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, main, mut vcx) = open(dir.path(), cx);
+    state.update(&mut vcx, |s, cx| {
+        s.sync.key_mismatch = true;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    let input = main.read_with(&vcx, |m, _| m.key_input.clone());
+    ui::assert_revealed_copy_refused(&input, &mut vcx);
+}
+
 fn pw_login(
     title: &str,
     password: &str,
@@ -2290,6 +2415,8 @@ fn pin_and_password_edits_keep_separate_history_rows(cx: &mut TestAppContext) {
     let pin_toggle = at(&mut vcx, "history-toggle pin1");
     assert!(pw_row.bottom() <= pw_toggle.top() && pw_toggle.bottom() <= pin_row.top());
     assert!(pin_row.bottom() <= pin_toggle.top());
+    at(&mut vcx, "history-label Password history (1)");
+    at(&mut vcx, "history-label PIN history (1)");
     at(&mut vcx, "history-entry 0 Password");
     at(&mut vcx, "history-entry 0 CVV pin1");
     assert!(

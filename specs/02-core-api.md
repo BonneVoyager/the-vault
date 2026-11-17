@@ -169,7 +169,9 @@ pub struct PasswordSpec { pub length: usize, pub lower: bool, pub upper: bool, p
 pub struct PassphraseSpec { pub words: usize, pub separator: char, pub capitalize: bool, pub number: bool }
 pub fn password(spec: &PasswordSpec) -> SecretString;    // guarantees ≥1 char from each enabled class
 pub fn passphrase(spec: &PassphraseSpec) -> SecretString; // EFF large wordlist, bundled via include_str!
-pub fn strength_bits(pw: &str) -> f64;                    // naive entropy estimate for the UI meter, with a repetition penalty: runs of three or more of one character, and whole-string repeats of a shorter unit, score as the unit plus log2(repeat count), so "aaaaaaaaaaa" or "abcabcabcabc" cannot pass the 50-bit gate
+pub fn generated_bits(spec: &PasswordSpec) -> f64;        // exact entropy of the generator's own uniform draws: log2(pool) × length (2026-11-17; the UI generator preview uses this, not strength_bits)
+pub fn generated_passphrase_bits(spec: &PassphraseSpec) -> f64; // log2(7776) × words (+ log2(10) with the digit)
+pub fn strength_bits(pw: &str) -> f64;                    // log2 of the zxcvbn guess estimate for the first 100 characters (0 for empty, at most 64 because zxcvbn caps guesses at 2^64); used by the UI meter, the weak-password audit and the 50-bit master minimum. Replaced the naive pool×length estimate 2026-11-17 (owner decision, strength-meter cliffs). zxcvbn reads the clock (the current year once per process for date patterns, and a monotonic timer per call); these are the only clock reads in vault-core and the accepted exception to the no-I/O rule; `time` is built without local-offset so no tz or libc lookup; zip 9 pulls `nix`/`libc` into the graph but only its never-called extract paths use them.
 ```
 
 Defaults: password 20 chars, all classes, exclude ambiguous. Passphrase 4 words, `-`, capitalize, number.

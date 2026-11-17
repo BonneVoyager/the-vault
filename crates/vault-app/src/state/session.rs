@@ -76,6 +76,9 @@ impl AppState {
         self.template_picker = None;
         self.sort_menu_open = false;
         self.generator_target = None;
+        // The preview is often the newest saved password; it must not outlive the
+        // session. `open_generator` regenerates, so this costs no UX.
+        self.generator.clear_preview();
     }
 
     /// The decrypted vault, only while the session is unlocked.
@@ -277,7 +280,8 @@ impl AppState {
         }
     }
 
-    pub(super) fn copy_secret(&mut self, value: SecretString, cx: &mut Context<Self>) {
+    /// Copies `value` with auto-clear and the "Copied" toast in the detail pane.
+    pub(crate) fn copy_secret(&mut self, value: SecretString, cx: &mut Context<Self>) {
         let Some(secs) = self.copy_value_for_window(value, cx) else {
             return;
         };
@@ -772,6 +776,22 @@ mod tests {
         // A second lock has nothing of ours left to clear.
         state.update(cx, |s, cx| s.lock(cx));
         assert_eq!(board.clear_calls().len(), 1);
+    }
+
+    /// The generator's preview is often the newest saved password: lock drops it.
+    #[gpui::test]
+    fn lock_drops_the_generator_preview(cx: &mut TestAppContext) {
+        use crate::state::GeneratorTarget;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = state_with_items(dir.path(), cx);
+        state.update(cx, |s, cx| {
+            s.open_generator(GeneratorTarget::Global, cx);
+            assert!(!s.generator.preview().expose_secret().is_empty());
+            s.lock(cx);
+            assert!(s.generator_target.is_none());
+            let after = s.generator.preview().expose_secret();
+            assert!(after.is_empty(), "preview cleared on lock");
+        });
     }
 
     #[gpui::test]

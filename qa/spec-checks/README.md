@@ -56,6 +56,21 @@ cargo fmt --all -- --check                     # formatting is part of the manua
   macOS-only path dependency on `vault-macos` for these plain functions; the rest of vault-macos
   stays code read only. `run_all.sh` gains concurrent attribute edits (3 reps), concurrent
   `--tag`, and a docs/help.md shortcut table vs 05 §4 consistency check.
+- 2026-11-17 additions: `lock_hook` (03 §2 save-lock wait and the `test-support` hook
+  `shorten_lock_timeout_for_tests`: 10 s default, lowers, "can only lower it" both above the
+  default and after a lower call, zero, 17 concurrent callers keep the minimum, the production
+  CLI waits 10 s with override-looking env vars set, and the shipping feature graph of vault-app
+  and vault-cli has no `test-support`; every library case runs in its own `src/bin/lock_hook`
+  child because the override is process-wide, and the lock is held by a perl `flock`),
+  `icon_catalog` (01 §4 item and field icons with any strings after the 2026-11-16 Lucide catalog
+  change: round trip with odd kinds/identifiers/colours, two- and three-device merge,
+  cloned-device ties, the legacy kind "logo" from `v1-icon.vault` through edits and merges, a
+  65 MiB icon refused by the 64 MiB save cap, every fixture opens and round-trips, the CLI
+  `--icon symbol:<name>[:#RRGGBB]` storing odd identifiers verbatim and refusing bad shapes,
+  hostile icons from a peer through get/list/export/edit/sync of both conflict-copy shapes, and
+  the CLI on the icon fixture incl. `upgrade`), `src/bin/item_icons` (item icons via the
+  independent decoder), and a `run_all.sh` section for the held-lock wait, `--icon` identifiers,
+  control bytes in an icon value and six concurrent `--icon` edits.
 - Temp files go under `tmp/` (git-ignored) and are removed by each test.
 
 A passing check shows the behaviour on those inputs only. It is not a proof.

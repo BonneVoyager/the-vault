@@ -1,5 +1,8 @@
 use vault_core::ExposeSecret;
-use vault_core::generator::{PassphraseSpec, PasswordSpec, passphrase, password, strength_bits};
+use vault_core::generator::{
+    PassphraseSpec, PasswordSpec, STRENGTH_SCORED_CHARS, generated_bits, generated_passphrase_bits,
+    passphrase, password, strength_bits,
+};
 
 const SYMBOLS: &str = "!@#$%^&*()-_=+[]{};:,.<>?/";
 const AMBIGUOUS: &str = "0O1lI|`'\"";
@@ -187,28 +190,132 @@ fn passphrase_options() {
 #[test]
 fn strength() {
     assert_eq!(strength_bits(""), 0.0);
-    assert!((strength_bits("abcd") - 4.0 * 26f64.log2()).abs() < 1e-9);
     assert!(strength_bits("aA1!aA1!") > strength_bits("aaaaaaaa"));
+    assert!(strength_bits("password") < 20.0);
+    assert!(
+        strength_bits("Password1!") < 40.0,
+        "a dictionary word with a suffix is weak"
+    );
+}
+
+/// zxcvbn replaced the naive pool x length estimate with its run/tile rules (2026-11-17):
+/// one more character must not move the score across the scale.
+#[test]
+fn strength_has_no_cliff_on_repetition() {
+    let (a, b) = (
+        strength_bits("erererreerererre"),
+        strength_bits("erererreerererrer"),
+    );
+    assert!((a - b).abs() <= 10.0, "{a} vs {b}");
+    assert!(strength_bits("aaaaaaaaaaa") < 50.0);
+    assert!(strength_bits("abcabcabcabc") < 50.0);
+}
+
+/// The 50-bit master minimum (05 §2.1) must be clearable by the suggested passphrase, and a
+/// default generated password must stay out of the weak band.
+#[test]
+fn generated_secrets_clear_the_master_minimum() {
+    for _ in 0..200 {
+        let p = passphrase(&PassphraseSpec::default());
+        let bits = strength_bits(p.expose_secret());
+        assert!(bits >= 50.0, "4-word passphrase scored {bits}");
+        let pw = password(&PasswordSpec::default());
+        let bits = strength_bits(pw.expose_secret());
+        assert!(bits >= 50.0, "20-char password scored {bits}");
+    }
 }
 
 #[test]
-fn strength_penalises_repetition() {
-    assert!(strength_bits("aaaaaaaaaaa") < 20.0);
-    assert!(strength_bits("abcabcabcabc") < 30.0);
-    assert!(strength_bits("abcabcabcabc") > strength_bits("abc"));
-    // Ordinary passwords, including ones with a doubled letter, are unchanged.
-    let expected = 10.0 * 94f64.log2();
-    assert!((strength_bits("Password1!") - expected).abs() < 0.1);
-    for _ in 0..50 {
-        let pw = password(&PasswordSpec::default());
-        let s = pw.expose_secret();
-        let naive = 20.0 * 94f64.log2();
-        let got = strength_bits(s);
-        assert!(got <= naive + 1e-9, "{got} for a generated password");
-        // Without a run of 3 (or a tiled unit, impossible at this length) nothing is penalised.
-        let cs: Vec<char> = s.chars().collect();
-        if !cs.windows(3).any(|w| w[0] == w[1] && w[1] == w[2]) {
-            assert!((got - naive).abs() < 0.1, "{got} for a run-free password");
-        }
-    }
+fn strength_scores_only_a_bounded_prefix() {
+    let head = "Tr0ub4dor&3-correct-horse";
+    let long = format!("{head}{}", "z".repeat(10_000));
+    let capped: String = long.chars().take(STRENGTH_SCORED_CHARS).collect();
+    assert_eq!(strength_bits(&long), strength_bits(&capped));
+    assert!(strength_bits(&long) <= 64.0 + 1e-9);
+}
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() < 0.05
+}
+
+/// 05 §2.4: the generator preview's meter is log2(pool) × length over the generator's own
+/// pool. Default pool: 25 lower + 24 upper + 8 digits + 26 symbols (ambiguous excluded).
+#[test]
+fn generated_bits_is_pool_entropy_times_length() {
+    let default = PasswordSpec::default();
+    assert_eq!(default.length, 20);
+    let b = generated_bits(&default);
+    assert!(close(b, 20.0 * 83f64.log2()), "{b}"); // ≈ 127.5
+    let all = PasswordSpec {
+        exclude_ambiguous: false,
+        ..PasswordSpec::default()
+    };
+    assert!(close(generated_bits(&all), 20.0 * 88f64.log2()), "≈ 129.2");
+    let sixteen = PasswordSpec {
+        length: 16,
+        ..PasswordSpec::default()
+    };
+    assert!(
+        close(generated_bits(&sixteen), 16.0 * 83f64.log2()),
+        "≈ 102.0"
+    );
+    let lower_only = PasswordSpec {
+        length: 10,
+        lower: true,
+        upper: false,
+        digits: false,
+        symbols: false,
+        exclude_ambiguous: false,
+    };
+    assert!(close(generated_bits(&lower_only), 10.0 * 26f64.log2()));
+    // No class enabled: lowercase, as `password` does; length raised to min_length().
+    let none = PasswordSpec {
+        length: 0,
+        lower: false,
+        upper: false,
+        digits: false,
+        symbols: false,
+        exclude_ambiguous: true,
+    };
+    assert!(close(generated_bits(&none), 25f64.log2()));
+    let short = PasswordSpec {
+        length: 1,
+        ..PasswordSpec::default()
+    };
+    assert!(close(generated_bits(&short), 4.0 * 83f64.log2()));
+}
+
+#[test]
+fn generated_passphrase_bits_is_wordlist_entropy_plus_digit() {
+    let plain = PassphraseSpec {
+        number: false,
+        ..PassphraseSpec::default()
+    };
+    assert_eq!(plain.words, 4);
+    assert!(
+        close(generated_passphrase_bits(&plain), 4.0 * 7776f64.log2()),
+        "≈ 51.7"
+    );
+    let with_digit = PassphraseSpec::default();
+    assert!(with_digit.number);
+    assert!(close(
+        generated_passphrase_bits(&with_digit),
+        4.0 * 7776f64.log2() + 10f64.log2()
+    ));
+    // Capitalisation and separator add nothing; zero words is one word, as `passphrase` does.
+    let other = PassphraseSpec {
+        separator: '.',
+        capitalize: false,
+        ..PassphraseSpec::default()
+    };
+    assert_eq!(
+        generated_passphrase_bits(&other),
+        generated_passphrase_bits(&with_digit)
+    );
+    let zero = PassphraseSpec {
+        words: 0,
+        number: false,
+        ..PassphraseSpec::default()
+    };
+    assert!(close(generated_passphrase_bits(&zero), 7776f64.log2()));
 }

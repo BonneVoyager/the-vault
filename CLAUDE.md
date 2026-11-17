@@ -12,7 +12,7 @@ Native macOS password manager in Rust. Codename: **vault**. Specs live in `specs
 - Secrets are `secrecy::SecretString` / `SecretVec` or wrapped in `zeroize::Zeroizing`. Never `String` for passwords, keys, or TOTP secrets. Never log them, never `Debug`-print them.
 - Prefer small PR-sized changes. If a task needs more than ~400 lines of diff, stop and outline the split first.
 - When a spec is ambiguous, pick the simplest interpretation, implement it, and note the choice in the PR summary. Do not silently expand scope.
-- Do not add dependencies without listing them and why. Pin versions in `Cargo.toml` (`=x.y.z` for gpui and gpui-component; caret elsewhere).
+- Do not add dependencies without listing them and why; `deny.toml` (licences, sources, bans) must stay clean after any dependency change. Pin versions in `Cargo.toml` (`=x.y.z` for gpui and gpui-component; caret elsewhere).
 - After each major wave and before the owner commits it, remind the owner to run the `bug-hunter` agent (`.claude/agents/bug-hunter.md`): an independent spec-derived hunt that writes its checks before reading the code and reports to `docs/qa/`. It is slow and costly, so it never runs automatically; the orchestrator's checkpoint must end with "Bug hunt: run / not yet run for this wave".
 
 ## Workspace
@@ -36,12 +36,15 @@ cargo nextest run --workspace --exclude vault-app --exclude vault-macos --no-fai
 cd qa/spec-checks && cargo nextest run --no-fail-fast   # ledger ~3× faster than cargo test
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+cargo deny check                    # only when Cargo.toml or Cargo.lock changed (~5 s, offline)
+cargo audit                         # weekly or before a release build, in the root and in qa/spec-checks (fetches the advisory DB)
+cd fuzz && ./seed.sh && cargo +nightly fuzz run <target> -- -max_total_time=120   # only after a change to the vault format, the item decoder or an importer; targets: vault_parse inner_payload import_kdbx import_1pux
 cargo run -p vault-cli -- --help
 cargo run -p vault-app              # dev build: 5–10× slower frames, fine for logic, not for feel
 cargo run --release -p vault-app    # use this (or the .app) for eye and performance checks
 ```
 
-Toolchain: Rust pinned in `rust-toolchain.toml` (gpui-pre needs it), edition 2024. macOS 15+ target. No CI yet (see the testing roadmap in `specs/00-overview.md`); run the four checks above before declaring a task done. Dev profile: deps at opt-level 1, vault-app without debuginfo (both in the root `Cargo.toml`); keep `target/` tidy — a debug `target/debug/deps` past ~100k files makes every watcher-starting test pay seconds of FSEvents scan, so `cargo clean` when it grows.
+Toolchain: Rust pinned in `rust-toolchain.toml` (gpui-pre needs it), edition 2024. macOS 15+ target. No CI yet (see the testing roadmap in `specs/00-overview.md`); run the four checks (build, test, clippy, fmt) before declaring a task done; the deny/audit/fuzz lines run only on their stated triggers so they never slow a wave. Dev profile: deps at opt-level 1, vault-app without debuginfo (both in the root `Cargo.toml`); keep `target/` tidy — a debug `target/debug/deps` past ~100k files makes every watcher-starting test pay seconds of FSEvents scan, so `cargo clean` when it grows.
 
 ## Phases (see 00-overview.md)
 

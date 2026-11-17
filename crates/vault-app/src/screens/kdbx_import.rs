@@ -89,7 +89,8 @@ impl Render for KdbxImportView {
         };
         let busy = s.busy.is_some();
         let theme = cx.theme();
-        ui::v_flex().debug_selector(|| "kdbx-import-form".into()).w_full().min_w_0().p(px(12.)).gap(px(10.))
+        // The password is the form's only input: a revealed one is never copied out.
+        ui::refuse_plain_copy(ui::v_flex()).debug_selector(|| "kdbx-import-form".into()).w_full().min_w_0().p(px(12.)).gap(px(10.))
             .on_action(cx.listener(|this, _: &gpui_component::dialog::Confirm, window, cx| {
                 this.submit(window, cx);
             }))
@@ -176,6 +177,9 @@ mod tests {
                 "password refocused for retry"
             );
         });
+        // Revealed, the password still never reaches the pasteboard; typing replaces it.
+        let password = input.borrow().clone().unwrap();
+        ui::assert_revealed_copy_refused(&password, &mut vcx);
         vcx.simulate_input("kdbx-password");
         vcx.simulate_keystrokes("enter");
         vcx.run_until_parked();

@@ -193,7 +193,7 @@ struct EditArgs {
     /// Remove a tag (repeatable).
     #[arg(long = "untag")]
     untags: Vec<String>,
-    /// auto, symbol:<IconName>[:#RRGGBB] or letter:#RRGGBB.
+    /// auto, symbol:<Lucide identifier, e.g. KeyRound or key-round>[:#RRGGBB] or letter:#RRGGBB.
     #[arg(long)]
     icon: Option<String>,
     /// Set a field value: <field-id-or-name>=<value> (repeatable). A new name creates a text
