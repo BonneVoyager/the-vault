@@ -15,7 +15,7 @@ offset  size   field
 10+N    *      body               CBOR array of Record (to EOF)
 ```
 
-Parsers reject: wrong magic, `format_version > SUPPORTED`, `header_len` beyond EOF, trailing bytes after the body array.
+Parsers reject: wrong magic, `format_version > SUPPORTED`, `format_version` 0 (`UnsupportedVersion(0)`; the minimum is 1), `header_len` beyond EOF, trailing bytes after the body array, an empty body or a manifest that is not the last record (`Malformed`). (spec aligned to code 2026-11-19)
 
 ## 2. Header (plaintext CBOR map)
 
@@ -36,6 +36,8 @@ Parsers reject: wrong magic, `format_version > SUPPORTED`, `header_len` beyond E
 }
 ```
 
+KDF acceptance range (`kdf::MAX_T_COST`, `MAX_P_COST`, `MAX_M_COST_KIB`): every parameter must be non-zero, `t_cost <= 16`, `p_cost <= 64`, `m_cost <= 1_048_576` KiB (1 GiB). The parser rejects anything outside as `Malformed` before any Argon2 run, so a hostile header cannot make unlock allocate or iterate without bound; creation enforces the same range. The defaults and calibration (§6) stay inside it. (spec aligned to code 2026-11-19)
+
 ### KeySlot
 
 ```
@@ -50,10 +52,10 @@ Parsers reject: wrong magic, `format_version > SUPPORTED`, `header_len` beyond E
 
 - `password` slot: KEK = `Argon2id(password_utf8_nfc, salt, m,t,p) → 32 bytes`. The password is NFC-normalised before hashing.
 - `enclave` slot (phase 4): KEK is a random 32-byte key held in the Keychain, access-controlled by Touch ID. The slot itself is identical in structure.
-- `passkey` slot (post-phase-5, macOS 15): extra keys `credential_id: bytes`, `prf_salt: bytes(32)` (random, static per slot), `rp_id: tstr`. KEK = `HKDF-SHA256(ikm = prf_output, salt = vault_id, info = "vault/slot/passkey/v1")` where `prf_output` is the 32-byte WebAuthn PRF result for `prf_salt` from the passkey assertion. The password slot stays; either factor unlocks. The PRF output must be identical on every device that holds the synced passkey; verify this before relying on cross-device unlock. Not yet implemented.
+- `passkey` slot (post-phase-5, macOS 15): extra keys `credential_id: bytes`, `prf_salt: bytes(32)` (random, static per slot), `rp_id: tstr`. KEK = `HKDF-SHA256(ikm = prf_output, salt = vault_id, info = "vault/slot/passkey/v1")` where `prf_output` is the 32-byte WebAuthn PRF result for `prf_salt` from the passkey assertion. The password slot stays; either factor unlocks. The PRF output must be identical on every device that holds the synced passkey; verify this before relying on cross-device unlock. Not yet implemented: the code has no `Passkey` slot kind, so a `passkey` slot parses as an opaque slot of kind `Other` (kept verbatim, skipped at unlock). (spec aligned to code 2026-11-19)
 - `recovery` slot (v2): reserved.
 
-AAD for unwrapping any slot: `magic || format_version || vault_id || slot.id || slot.kind`. The header's slots and `format_version` are therefore one unit: a merge adopts the format version together with the slots (03 §5; bug hunt 2026-10-31). Tampering with KDF params does not break unwrap (they're not in AAD by design — otherwise you can't rotate them); it just makes derivation produce the wrong KEK and the tag fails. Tampering with `vault_id` fails every slot. Once a file carries `slots_modified_at`, the KDF params and slots are additionally bound through the manifest's `header_digest` (§4), so tampering with them is detected via the manifest on the `unlock_with_key` path (`Tampered(Manifest)`); on the password path a KDF edit still surfaces as `WrongPassword` because the slot unwrap fails before the manifest is reached.
+AAD for unwrapping any slot: `magic || format_version || vault_id || slot.id || slot.kind`. The header's slots and `format_version` are therefore one unit: a merge adopts the format version together with the slots (03 §5; bug hunt 2026-10-31). Tampering with KDF params does not break unwrap (they're not in AAD by design — otherwise you can't rotate them); it just makes derivation produce the wrong KEK and the tag fails. Tampering with `vault_id` fails every slot. Once a file carries `slots_modified_at`, the KDF params and slots are additionally bound through the manifest's `header_digest` (§4), so tampering with them is detected via the manifest on the `unlock_with_key` path (`Tampered(Manifest)`); on the password path an in-range KDF edit still surfaces as `WrongPassword` because the slot unwrap fails before the manifest is reached; an out-of-range edit is `Malformed` at parse (range above). (spec aligned to code 2026-11-19)
 
 Multiple `password` slots are allowed in the format but v1 UI exposes one.
 
@@ -110,7 +112,7 @@ AAD = `vault_id || item.id || modified_at_be64 || format_version_be16`.
   "fields":      [Field]
   "attachments": [AttachmentRef]   (v1.1, empty in v1)
   "removed_attachments": [{ "id": bytes(16), "removed_at": u64 }]   (v1.1, optional; tombstones so a removal survives merge, capped at 64 only during a merge and only for markers neither side still references, see 03 §5; purged with item tombstones)
-  "history":     [HistoryEntry]    last 10 password values, optional
+  "history":     [HistoryEntry]    last 10 `password` or `pin` values, optional
   "removed_history": [u64]         optional; `replaced_at` stamps of history entries the user deleted (never the value), cap 10 newest, purged with item tombstones
   "removed_fields": [{ "id": bytes(16), "removed_at": u64 }]   (version 2, optional; field removal tombstones, newest first, cap 64, written only when non-empty, purged with item tombstones; 03 §5)
 }
@@ -174,7 +176,7 @@ All nonces are 24 bytes from `OsRng`. Never derived, never counted. A fresh nonc
 
 ## 6. KDF calibration
 
-`kdf::calibrate(target: Duration) -> KdfParams` — start at defaults, double `m_cost` until a single derivation takes ≥ target (default 500 ms) or hits 1 GiB. Run on vault creation and offered in settings. Params are per-vault; a vault created on a fast machine is slower to open on a slow one, which is acceptable.
+`KdfParams::calibrate(target: Duration) -> KdfParams` — start at defaults, double `m_cost` until a single derivation takes ≥ target (default 500 ms) or hits 1 GiB. Run on vault creation and offered in settings. Params are per-vault; a vault created on a fast machine is slower to open on a slow one, which is acceptable.
 
 ## 7. Errors
 
@@ -187,11 +189,13 @@ pub enum VaultError {
     WrongPassword,               // every password slot failed to unwrap
     NoUsableSlot,                // no slot of a kind this version can unlock (decided from plaintext, before Argon2)
     Tampered(TamperKind),
+    FieldNotFound,               // field operation: no such field id / name (not a file error)
+    AmbiguousField,              // set_field_named: more than one field has the name
 }
-pub enum TamperKind { Header, Item(Uuid), Manifest, ItemCount }
+pub enum TamperKind { Header, Item(Uuid), Manifest, ItemCount }   // Header and ItemCount are reserved: never produced
 ```
 
-`WrongPassword` and `Tampered(Header)` are indistinguishable at the crypto level (both are AEAD tag failures on slots). Report `WrongPassword` when at least one password slot exists and all fail, and the header parsed cleanly; report `NoUsableSlot` when there is no password slot at all (for example a file written by a newer version whose slot kinds this version does not know); report `Tampered(Header)` only on structural damage. Do not try to be cleverer than that.
+`WrongPassword` and `Tampered(Header)` are indistinguishable at the crypto level (both are AEAD tag failures on slots). Report `WrongPassword` when at least one password slot exists and all fail, and the header parsed cleanly; report `NoUsableSlot` when there is no password slot at all (for example a file written by a newer version whose slot kinds this version does not know); structural damage (including a short or garbled header) is `Malformed`, and `Tampered(Header)` is never produced; a change of item count is caught by the manifest and reported as `Tampered(Manifest)`, so `TamperKind::ItemCount` is never produced either. (spec aligned to code 2026-11-19) Do not try to be cleverer than that.
 
 ## 8. Test vectors
 
@@ -203,11 +207,11 @@ Phase 1 must commit:
 
 ## 9. Versioning
 
-`FORMAT_VERSION` bumps only on incompatible layout changes. Adding optional CBOR map keys is **not** a bump; readers ignore unknown keys, writers preserve unknown keys they read (store them as `Vec<(Value, Value)>` extras on each struct). This is how v1.1 adds attachments without a bump. New enum strings (slot kind, item kind, field kind) are also **not** a bump: readers preserve them as described in §2 and §4.
+`FORMAT_VERSION` bumps only on incompatible layout changes. Adding optional CBOR map keys is **not** a bump; readers ignore unknown keys, writers preserve unknown keys they read (store them as `Vec<(Value, Value)>` extras on each struct, except `HistoryEntry`, `FieldTombstone` and `AttachmentTombstone`, which have no extras and drop unknown keys). (spec aligned to code 2026-11-19) This is how v1.1 adds attachments without a bump. New enum strings (slot kind, item kind, field kind) are also **not** a bump: readers preserve them as described in §2 and §4.
 
 **Version 2** (2026-10-31) adds the required field `id`. A version 1 file is read by deriving each field's id deterministically: UUIDv5 with the item id as namespace over the bytes `"field:" || name || ":" || ordinal`, where ordinal is the number of earlier fields in that item with the same name, as unpadded decimal; ids present in a version 1 file are kept; a duplicate id within an item is Malformed. A save never changes a file's version, because every slot AAD binds the version (§2): a version 1 file stays version 1 and merely gains explicit ids, `removed_fields` and `field_id` as keys older builds preserve as extras. `UnlockedVault::upgrade_format(password, now)` moves a file to version 2 by re-wrapping the password slots; it drops enclave, recovery and opaque slots (same contract as `rotate_vault_key`), so Touch ID must be re-enrolled; the app runs it automatically on the next password unlock of a version 1 file and says so; the CLI exposes it as an explicit command. Every version keeps its fixtures: `v2-basic.vault` carries two same-named fields, an empty-named field, a `removed_fields` marker and a history entry with `field_id`; the version 1 regenerators are historical and refuse to run. A merge never lowers a file's version: the header with the greater `format_version` wins regardless of `slots_modified_at`, so an upgrade is never undone; a slot change made on the older version after another device's upgrade (a password change or Touch ID enrolment) is dropped by the merge and must be redone on the upgraded vault.
 
-Every `FORMAT_VERSION` keeps its fixtures under `tests/fixtures/` forever, and a test opens every fixture in that directory with the current reader. `v1-forward.vault` carries an opaque slot, an unknown item kind, an unknown field kind, and unknown keys at every level. `v1-icon.vault` carries a symbol icon with a colour, a logo icon without one, and an icon-less item. `v1-meta.vault` carries one item with `created_at` and a section heading followed by two text fields, and one item with no `created_at` key. `v2-field-icon.vault` carries one item with a field whose `icon` is "key", a field without the key and a field with `"icon": null`.
+Every `FORMAT_VERSION` keeps its fixtures under `tests/fixtures/` forever, and a test opens every fixture in that directory with the current reader. `v1-forward.vault` carries an opaque slot, an unknown item kind, an unknown field kind, and unknown keys at every level. `v1-icon.vault` carries a symbol icon with a colour, a logo icon without one, and an icon-less item. `v1-meta.vault` carries one item with `created_at` and a section heading followed by two text fields, and one item with no `created_at` key. `v2-field-icon.vault` carries one item with a field whose `icon` is "key", a field without the key and a field with `"icon": null`. `v2-meta.vault` carries one item with all four per-attribute stamps at distinct values and one item without any of them (the pre-stamp shape). `v2-trash-legacy.vault` carries pre-2026-11-03 tombstones: emptied lists and `deleted_at == modified_at`, which still count as trashed (02 "Recently Deleted").
 
 ## 10. Non-goals of the format
 

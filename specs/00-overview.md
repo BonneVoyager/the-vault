@@ -27,7 +27,7 @@ Protects against:
 - Offline brute force of the master password (Argon2id, calibrated ≥ 500 ms on the user's machine)
 - Tampering with the vault file: modified items, swapped items between vaults, deleted or rolled-back individual items, a replaced or re-stamped header (per-item AEAD with AAD + encrypted manifest + header digest). Replacing the WHOLE file with an older complete copy is NOT detected (no external freshness anchor); the old copy is itself authentic and opens. Accepted limit.
 - Casual clipboard snooping (concealed pasteboard type, current-host-only so nothing reaches Universal Clipboard, auto-clear)
-- Weak or reused item passwords (local audit: weak < 40 bits, reused across items; master password minimum 50 bits)
+- Weak or reused item passwords (local audit: weak < 36 bits (spec aligned to code 2026-11-19; eased 2026-11-17, 05 §2.1), reused across items; master password minimum 50 bits)
 
 Does **not** protect against:
 
@@ -81,7 +81,7 @@ Rules of dependency: `vault-core` depends on nothing in the workspace. `vault-sy
 - Round-trip test: create → add 100 items → serialize → parse → unlock → equal
 - Tamper tests: flip a byte in header, in item ciphertext, in manifest, drop an item, swap an item into another vault — all must fail with the right error
 - KDF calibration function works
-- `vault-cli`: `init`, `add`, `get`, `list`, `rm`, `totp`, `gen`, `export`, `import --format csv`; later dev-tool additions: `attach`, `upgrade` (01 §9), `edit` (title, favorite, tags, icon, set/add/remove fields; command-line values are visible in process listings, `--set-env` for secrets) and `sync` (start the watcher, poll once, absorb conflict copies, save), both added 2026-10-31 for the sync lab; `VAULT_DEVICE_ID` overrides the stored device id for one process; concurrent CLI edits of one item from several processes are last-writer-wins per attribute and callers serialise them (03 §5, 2026-11-08)
+- `vault-cli`: `init`, `add`, `get`, `list`, `rm`, `totp`, `gen`, `export`, `import --format csv`; later dev-tool additions: `attach`, `upgrade` (01 §9), `edit` (title, favorite, tags, icon, set/add/remove fields; command-line values are visible in process listings, `--set-env` for secrets) and `sync` (start the watcher, poll until the queue is empty, absorb conflict copies, save only if something changed; fails with "not converged" if any problem was reported (spec aligned to code 2026-11-19)), both added 2026-10-31 for the sync lab; `VAULT_DEVICE_ID` overrides the stored device id for one process; concurrent CLI edits of one item from several processes are last-writer-wins per attribute and callers serialise them (03 §5, 2026-11-08)
 - Format fixture `tests/fixtures/v1-basic.vault` committed with its password in the test
 
 ### Phase 2 — app skeleton
@@ -111,7 +111,7 @@ Unit tests plus diff-based code and security review missed two cross-device defe
 
 1. **Continuous integration**: a macOS job on every push running `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, plus a nightly long job for the items below. Nothing runs today unless someone runs it.
 2. **Property tests for the merge laws** — DONE 2026-11-01 (`vault-core/tests/merge_props.rs`, `proptest`): over random edit scripts on 2–3 devices: commutativity (content equal after one exchange with `modified_at` within 1 ms, fully equal after two: the 03 §5 "+1 bump" is one-sided by construction), idempotence, convergence of N devices within N rounds (N+1 when the `removed_fields` cap fires), `modified_at` never decreases and attribute/field stamps never decrease while an item stays live (a tombstone win replaces the item wholesale), guarantee 9 incl. resurrection. Both high-severity external findings were violations of these laws.
-3. **Fuzzing the parsers** (`cargo-fuzz`): file format, KDBX outer header walk, CSV and 1PUX importers, TOTP URI; fixed time budget per wave, corpus checked in.
+3. **Fuzzing the parsers** (`cargo-fuzz`) — DONE 2026-11-19 for the vault file format, inner payload, KDBX and 1PUX importers (`fuzz/fuzz_targets/`: `vault_parse`, `inner_payload`, `import_kdbx`, `import_1pux`); fixed time budget per wave; the corpus is not checked in (`fuzz/.gitignore`), `fuzz/seed.sh` regenerates it. To do: CSV importer and TOTP URI targets.
 4. **Multi-device simulation** in vault-sync: randomised interleavings of edits, saves, locks and conflict copies of both shapes, compared against a reference model.
 5. **Mutation testing** (`cargo-mutants`) on vault-core and vault-sync per wave, listing tests that do not bite.
 6. **Spec traceability** — DONE 2026-11-01 (`docs/spec-traceability.md`, 220 rules, 4 uncovered as of 2026-11-01; refresh it when a spec section or test file changes): a table mapping every guarantee in 02 and 03 to a named test.

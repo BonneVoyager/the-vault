@@ -2,7 +2,7 @@
 
 The only crate allowed `unsafe` and macOS-only dependencies. Everything here is behind a small trait or function so `vault-app` can be built with stub impls on CI machines without a Secure Enclave.
 
-Dependencies: `objc2`, `objc2-foundation`, `objc2-app-kit`, `objc2-local-authentication`, `security-framework` (Keychain), `core-foundation`. Pin all with `=` (this crate overrides the CLAUDE.md caret rule).
+Dependencies: `objc2`, `objc2-foundation`, `objc2-app-kit`, `objc2-local-authentication`, `objc2-security` (Keychain, Secure Enclave), `objc2-core-foundation`, `objc2-core-graphics`, `objc2-service-management`, `libc`, `rqrr` (spec aligned to code 2026-11-19). Pin all with `=` (this crate overrides the CLAUDE.md caret rule).
 
 Minimum target: macOS 15 (passkey PRF needs it; `LSMinimumSystemVersion 15.0`).
 
@@ -35,11 +35,11 @@ Design (per vault, keyed by `vault_id`):
    c. vault.add_enclave_slot(kek) → slot_id   (vault-core)
    d. Encrypt kek with the SE public key (SecKeyCreateEncryptedData, eciesEncryptionCofactorVariableIVX963SHA256AESGCM)
       → store ciphertext in Keychain generic password item:
-          service = "<bundle id>.enclave", account = "<vault_id>", data = CBOR{ slot_id, ciphertext }
+          service = "<bundle id>.enclave", account = "<vault_id>", data = CBOR{ slot_id, ciphertext, domain_state }
           kSecAttrAccessibleWhenUnlockedThisDeviceOnly, no iCloud sync
    e. zeroize kek.
 2. On unlock via Touch ID:
-   a. Load Keychain item → { slot_id, ciphertext }
+   a. Load Keychain item → { slot_id, ciphertext, domain_state }; a missing domain_state (older item) returns BiometryChanged, forcing a re-enroll (spec aligned to code 2026-11-19)
    b. SecKeyCreateDecryptedData with the SE private key. The OS prompts Touch ID (LAContext with reason "Unlock <vault name>").
    c. vault.unlock_with_kek(slot_id, kek); zeroize kek.
 3. On "Disable Touch ID" or on biometry change (BiometryCurrentSet invalidates the key → decryption errors):
@@ -83,7 +83,7 @@ impl Clipboard {
 }
 ```
 
-`vault-app` schedules `clear_if_unchanged` after the configured delay (default 30 s). Also clear on lock. Every copy of a secret in the app goes through this path, including the input's own ⌘C/⌘X (security review 2026-11-17): in a revealed password, PIN, one-time-code or unknown-kind editor input, Copy and Cut copy the selection (or the whole value when nothing is selected) through the concealed, this-Mac-only, auto-clearing path; Cut needs a selection and then deletes it (with nothing selected it does nothing, like the toolkit); every revealable master-password input (create, change, the Touch ID, re-calibrate and rotate-key prompts, KDBX import, backup viewer, Settings restore, sync banners) refuses Copy and Cut outright. Notes are plain by 05 §2.3. The generator preview is cleared on lock.
+`vault-app` schedules `clear_if_unchanged` after the configured delay (default 30 s). Also clear on lock. Every copy of a secret in the app goes through this path, including the input's own ⌘C/⌘X (security review 2026-11-17): in a revealed password, PIN or one-time-code editor input (unknown-kind inputs get no reveal toggle, stay masked, and ⌘C copies nothing (spec aligned to code 2026-11-19)), Copy and Cut copy the selection (or the whole value when nothing is selected) through the concealed, this-Mac-only, auto-clearing path; Cut needs a selection and then deletes it (with nothing selected it does nothing, like the toolkit); every revealable master-password input (create, change, the Touch ID, re-calibrate and rotate-key prompts, KDBX import, backup viewer, Settings restore, sync banners) refuses Copy and Cut outright. Notes are plain by 05 §2.3. The generator preview is cleared on lock.
 
 ### 3b. Screen capture (best effort)
 
@@ -103,13 +103,13 @@ impl CloudHooks for ICloudHooks {
         // evicted ⇔ status == NSURLUbiquitousItemDownloadingStatusNotDownloaded
         // non-ubiquitous paths → false
     fn ensure_downloaded(&self, path, timeout)
-        // NSFileManager.startDownloadingUbiquitousItemAtURL, then poll status every 250 ms until Current or timeout
+        // NSFileManager.startDownloadingUbiquitousItemAtURL, then poll status every 250 ms until Current, Downloaded or timeout (spec aligned to code 2026-11-19)
     fn pin(&self, path)
         // no public API to pin; best-effort: touch the file's atime hourly while the app runs
 }
 ```
 
-Detecting "is this path inside iCloud Drive": `NSURL.isUbiquitousItemKey` resource value, used only as the last step of the provider label in 03 §1, because File Provider folders under `~/Library/CloudStorage` also report ubiquitous (bug fixed 2026-10-31). Dropbox needs nothing special (it keeps a real file on disk; smart sync placeholders are handled by the file provider transparently on 15+).
+Detecting "is this path inside iCloud Drive": any path under `~/Library/Mobile Documents` is true (covers files that do not exist yet), otherwise the `NSURL.isUbiquitousItemKey` resource value (spec aligned to code 2026-11-19), used only as the last step of the provider label in 03 §1, because File Provider folders under `~/Library/CloudStorage` also report ubiquitous (bug fixed 2026-10-31). Dropbox needs nothing special (it keeps a real file on disk; smart sync placeholders are handled by the file provider transparently on 15+).
 
 ## 5. Idle and lock triggers
 
@@ -159,11 +159,11 @@ Only needed if the app is sandboxed. v1 ships outside the App Store, unsandboxed
 
 ## 7. Packaging — `scripts/package.sh`
 
-1. `cargo build --release -p vault-app`
+1. `cargo build --profile dist -p vault-app` (fat LTO, stripped, dSYM copied next to the bundle) (spec aligned to code 2026-11-19)
 2. Assemble `Vault.app/Contents/{MacOS,Resources,Info.plist}`; Info.plist sets `LSMinimumSystemVersion 15.0`, `NSFaceIDUsageDescription` (required even for Touch ID), `CFBundleIdentifier`, `NSHighResolutionCapable`.
-3. `codesign --deep --options runtime --entitlements entitlements.plist --sign "Developer ID Application: …"`. Entitlements: `com.apple.security.cs.allow-jit` **not** needed; keep the list empty except what gpui requires (check at integration time).
+3. `codesign --deep --options runtime --timestamp --entitlements entitlements.plist --sign "Developer ID Application: …"`. Entitlements: `com.apple.security.cs.allow-jit` **not** needed; keep the list empty except what gpui requires (check at integration time).
 3b. `scripts/check-entitlements.sh <app>` runs on the signed bundle and fails the build if the signature lacks the hardened-runtime flag or if any of these is set: `com.apple.security.get-task-allow`, `cs.disable-library-validation`, `cs.allow-dyld-environment-variables`, `cs.allow-unsigned-executable-memory`, `cs.allow-jit`, `cs.debugger`. `--skip-sign` skips it; `--dry-run` prints it.
-4. `xcrun notarytool submit … --wait`, `xcrun stapler staple`. Credentials: a notarytool keychain profile is preferred over env vars so no password appears on argv.
+4. `xcrun notarytool submit … --wait`, `xcrun stapler staple`, for the app and again for the signed dmg (spec aligned to code 2026-11-19). Credentials: a notarytool keychain profile is preferred over env vars so no password appears on argv.
 5. Produce a `.dmg` with `create-dmg` or `hdiutil`.
 
 Signing identity and notarization credentials come from env vars; the script fails loudly if they're missing. Never commit them.

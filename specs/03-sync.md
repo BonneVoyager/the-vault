@@ -2,7 +2,7 @@
 
 Model: the vault lives at a user-chosen path. iCloud Drive, Dropbox, Google Drive, a NAS mount, and `~/Documents` are all the same thing — a directory that something else may rewrite underneath us. One code path.
 
-Dependencies: `vault-core`, `notify` (+ `notify-debouncer-full`), `tempfile`, `fs2` or `rustix` (for `fsync`), `thiserror`, `tracing`. No async runtime; a dedicated thread for the watcher.
+Dependencies: `vault-core`, `notify` (+ `notify-debouncer-full`), `rustix` (no-replace rename, errno constants), `blake3`, `crossbeam-channel`, `rand`, `unicode-normalization`, `zeroize`, `thiserror`, `tracing`; `tempfile` is dev-only (spec aligned to code 2026-11-19). No async runtime; a dedicated thread for the watcher.
 
 ## 1. Directory layout
 
@@ -14,12 +14,13 @@ Dependencies: `vault-core`, `notify` (+ `notify-debouncer-full`), `tempfile`, `f
     backups/
       <name>-2026-10-28T14-03-11Z.vault.bin
       ...
+    .lock                           advisory save lock (§2), empty
     .vault.bin.tmp-<8 hex>          transient; never left behind on clean exit
 ```
 
 Decided 2026-10-30, before any real vault existed: the package replaces the former `<name>.vault` file plus `<name>.vault.attachments/` and `<name>.vault.backups/` siblings. One Finder item to drag, copy, delete or back up; cloud providers sync the files inside individually, so writes stay small. Without the app installed the package shows as a plain folder, which is intact. Conflict copies come in two shapes (§6): whole sibling packages (iCloud) and per-file copies of `vault.bin` inside the package (Dropbox, Google Drive, Syncthing). Both are absorbed and moved into `backups/`.
 
-Everything in `.backups/` is a complete, independently-openable vault file. Backups are encrypted; the directory is safe to sync.
+Every file in `backups/` is a complete, independently-openable vault file; absorbed conflict packages (§6) are directories there. Backups are encrypted; the directory is safe to sync. (spec aligned to code 2026-11-19)
 
 ### 1.1 Attachments directory
 
@@ -45,7 +46,7 @@ Provider label (2026-10-31, pure classifier in vault-sync `cloud`): under `~/Lib
    rename replaces it only if its (dev, ino, size, mtime) still equal what the pre-write merge read
    (`Mode::ReplaceIf`); when only (dev, ino) differ, a (size, blake3) match of the current bytes
    counts as unchanged (SMB/FUSE mounts and iCloud same-bytes rewrites renumber inodes). A mismatch
-   is `PrimaryChangedDuringSave`: `save` re-reads, re-merges and retries up to 3 times, then returns
+   is `PrimaryChangedDuringSave`: `save` re-reads, re-merges and tries again, up to 3 attempts in total, then returns
    the error with the vault still dirty; the app treats it like a busy lock (friendly message, one
    scheduled retry). Residual: the microseconds between the checks and rename(2); macOS has no
    compare-and-rename.
@@ -62,7 +63,7 @@ Provider label (2026-10-31, pure classifier in vault-sync `cloud`): under `~/Lib
 
 **Not following links (2026-11-06, D-1):** every file the package opens (`.lock`, `vault.bin`, backups, blobs, conflict-copy sources) is opened with `O_NOFOLLOW` and must be a regular file after `fstat`; a symlink or special file is `UnsafePackageEntry`, never a silent fallback (a symlinked `.lock` must not degrade to the no-lock path). `backups/` and `attachments/` must not be symlinks. The package directory itself is resolved once at `open` (documented). Directory components are still path-checked, so a same-uid process that swaps a directory between check and use can race; that is the accepted residual. The backup viewer reads backups through the same no-follow reader (`vault_sync::read_package_entry_capped`); a conflict package in `backups/` whose `vault.bin` is a symlink is not listed (bug-hunt L3, 2026-11-06).
 
-Steps 1–7 run under an exclusive advisory lock on `<name>.vault/.lock` (flock), taken before the pre-write merge's read and released after the rename, so two processes (the app and the CLI, or two CLI commands) cannot interleave a read-modify-write and lose items (V-02). The lock wait is 10 s (`SaveLockTimeout`, nothing written); test builds may shorten it process-wide through the hidden, `test-support`-gated `shorten_lock_timeout_for_tests`, which can only lower it, and production code has no override. On volumes that do not support locking (ENOTSUP/ENOLCK) or where the lock file cannot be created for permission reasons, the save proceeds without the lock and logs a warning once; concurrent writers are then unprotected (accepted). Step 5 ignores only ENOTSUP/EINVAL from the directory fsync; any other error is surfaced and the vault stays dirty. Step 4 uses a native no-replace rename (`renameatx_np(RENAME_EXCL)` via `rustix`) for backups and blobs, with the hard-link fallback only where that is unsupported. Reads of `vault.bin` are capped (64 MiB) and refuse larger files with a typed error before parsing. Writes are capped the same way (bug-hunt M1, 2026-11-06): a save, restore or backup whose sealed bytes exceed 64 MiB is refused with `VaultTooLarge { bytes, cap }` before any temp file is written; the file on disk is unchanged and the in-memory vault stays dirty; merge write-backs and conflict absorption are refused the same way and never mark the primary corrupt. A lock whose unsaved state exceeds the cap writes no Unsaved copy (`LockOutcome::Unpreserved`). The app shows the refusal as a persistent warning and does not retry it; the editor caps each field at 1 MiB (05 §2.3) so users do not reach it. An oversized `vault.bin` written by an older build is still treated as corrupt (accepted). Never write in place. Never truncate-then-write. If step 4 fails, delete the tmp and surface the error; the old file is intact.
+A dirty `save` holds an exclusive advisory lock on `<name>.vault/.lock` (flock) for its whole duration (pre-write merge read through rename, directory fsync, backup, orphan and tmp prune), and `open` takes a shared lock around its read of `vault.bin` (spec aligned to code 2026-11-19), so two processes (the app and the CLI, or two CLI commands) cannot interleave a read-modify-write and lose items (V-02). The lock wait is 10 s (`SaveLockTimeout`, nothing written); test builds may shorten it process-wide through the hidden, `test-support`-gated `shorten_lock_timeout_for_tests`, which can only lower it, and production code has no override. On volumes that do not support locking (ENOTSUP/ENOLCK) or where the lock file cannot be created for permission reasons, the save proceeds without the lock; concurrent writers are then unprotected (accepted). "Locking unsupported" warns once per process; a lock file that cannot be opened for permission reasons warns on every save (spec aligned to code 2026-11-19). Step 5 ignores only ENOTSUP/EOPNOTSUPP/EINVAL/ENOSYS from the directory fsync; any other error is surfaced and the vault stays dirty (spec aligned to code 2026-11-19). A native no-replace rename (`renameatx_np(RENAME_EXCL)` via `rustix`) is used for backups and for blobs copied from a conflict package, with the hard-link fallback only where that is unsupported; `add_attachment` writes its new blob with a plain atomic replace, as ids are random (spec aligned to code 2026-11-19). Reads of `vault.bin` are capped (64 MiB) and refuse larger files with a typed error before parsing. Writes are capped the same way (bug-hunt M1, 2026-11-06): a save, restore or backup whose sealed bytes exceed 64 MiB is refused with `VaultTooLarge { bytes, cap }` before any temp file is written; the file on disk is unchanged and the in-memory vault stays dirty; merge write-backs and conflict absorption are refused the same way and never mark the primary corrupt. A lock whose unsaved state exceeds the cap writes no Unsaved copy (`LockOutcome::Unpreserved`). The app shows the refusal as a persistent warning and does not retry it; the editor caps each field at 1 MiB (05 §2.3) so users do not reach it. An oversized `vault.bin` written by an older build is still treated as corrupt (accepted). Never write in place. Never truncate-then-write. If step 4 fails, delete the tmp and surface the error; the old file is intact.
 
 ## 3. Watching and reacting to external changes
 
@@ -71,7 +72,7 @@ Watcher: one `notify` recursive watch on the package's PARENT directory with no 
 On a debounced event for `<name>.vault/vault.bin`:
 
 ```
-1. stat the file. If (mtime, size) == last_written → ignore (our own write echoing back).
+1. stat the file. If (mtime, ctime, inode, size) == last_written → ignore (our own write echoing back).
 2. read bytes. If blake3(bytes) == last_written.hash → ignore.
 3. parse → LockedVault. If parse fails → emit SyncEvent::CorruptOnDisk, do NOT overwrite, keep in-memory state.
 4. If vault_id != ours → emit SyncEvent::ForeignVault, ignore.
@@ -159,10 +160,10 @@ Cloud providers resolve simultaneous writes by creating a sibling file instead o
 On watcher event for a file matching the Dropbox pattern or any new `*.vault` in `<dir>`:
 
 ```
-1. parse; if vault_id != ours → ignore (it's some other vault the user put there)
+1. parse; if vault_id != ours → emit SyncEvent::ForeignVault once per sibling and ignore (it's some other vault the user put there) (spec aligned to code 2026-11-19)
 2. unlock with cached key (if locked, defer to next unlock; keep a list of pending conflict paths)
 3. ours.merge_from(theirs); save()
-4. whole-package: copy any attachment blobs we lack (never replacing), then move the whole package to <name>.vault/backups/conflict-<timestamp>-<original name>/ — deferred to the next event while blobs referenced by the merged items are still missing from both sides, emitting `SyncEvent::WaitingForBlobs(conflict path)` once per waiting package (never while locked; it may fire again only after the package is absorbed or gone, or after `lock`/`stop_watching`/`start_watching` reset the bookkeeping; a package still waiting at `lock` is re-checked at the next unlock even if watching was stopped meanwhile; `ConflictAbsorbed` follows when the blobs arrive; 2026-11-01); per-file: move the file to <name>.vault/backups/conflict-<timestamp>-<original name>.vault.bin
+4. whole-package: copy any attachment blobs we lack (never replacing), then move the whole package to <name>.vault/backups/conflict-<timestamp>-<original name>/ — deferred to the next event while blobs referenced by the merged items are still missing from both sides, emitting `SyncEvent::WaitingForBlobs(conflict path)` once per waiting package (never while locked; it may fire again only after the package is absorbed or gone, or after `lock`/`stop_watching`/`start_watching` reset the bookkeeping; a package still waiting at `lock` is re-checked at the next unlock even if watching was stopped meanwhile; `ConflictAbsorbed` follows when the blobs arrive; 2026-11-01); per-file: move the file to <name>.vault/backups/conflict-<timestamp>-<original name without .bin>.vault.bin (`vault 2.bin` → `conflict-…-vault 2.vault.bin`; a same-second clash inserts `-N-` after the timestamp) (spec aligned to code 2026-11-19)
 5. emit SyncEvent::ConflictAbsorbed(path)
 ```
 
@@ -199,16 +200,20 @@ impl SyncedVault {
     pub fn vault(&self) -> Option<&UnlockedVault>;
     pub fn edit<R>(&mut self, f: impl FnOnce(&mut UnlockedVault) -> R) -> Result<R, SyncError>; // marks dirty; Err when locked
     pub fn start_watching(&mut self) -> Result<(), SyncError>;                              // explicit; watcher thread + debouncer
-    pub fn poll(&mut self);                                                                 // drains watcher events on the caller's thread
+    pub fn poll(&mut self) -> usize;                                                        // drains watcher events on the caller's thread; callers loop while it returns > 0 (§2)
     pub fn save(&mut self) -> Result<(), SyncError>;
     pub fn is_dirty(&self) -> bool;
+    pub fn stop_watching(&mut self);                                                         // stops the watcher, discards queued signals, forgets WaitingForBlobs bookkeeping
+    pub fn set_before_write(&mut self, hook: Option<BeforeWrite>);                           // §2 hook; survives lock/unlock
+    pub fn set_backup_enabled(&mut self, enabled: bool);                                     // off stops automatic snapshots; backup_now and pre-restore still run
+    pub fn set_retention_multiplier(&mut self, multiplier: f32);                             // clamped 0.5-4.0, NaN resets to 1.0
     pub fn subscribe(&self) -> crossbeam_channel::Receiver<SyncEvent>;
     pub fn backups(&self) -> Result<Vec<BackupInfo>, SyncError>;
     pub fn backup_now(&mut self) -> Result<PathBuf, SyncError>;
     pub fn restore_from(&mut self, backup: &Path, password: &SecretString) -> Result<(), SyncError>;
     pub fn delete_backup(&mut self, backup: &Path) -> Result<(), SyncError>;   // user-initiated; path must be inside backups/ (file or conflict package); refuses the primary; any kind incl. Unsaved/Conflict; name match is NFC-insensitive
 
-    // attachments (v1.1) — streaming; the ref is added to / removed from the item by the caller via `edit`
+    // attachments (v1.1) — streaming; the ref is added to / removed from the item by these calls themselves
     pub fn add_attachment(&mut self, item: Uuid, name: &str, data: impl Read, size: u64, now: Millis) -> Result<Uuid, SyncError>; // seals + writes blob, appends ref, marks dirty
     pub fn open_attachment(&self, item: Uuid, id: Uuid) -> Result<AttachmentReader, SyncError>;  // streaming decrypt; NotDownloaded / Missing
     pub fn attachment_state(&self, id: Uuid) -> AttachmentState;                                  // Present | NotDownloaded | Missing
@@ -234,6 +239,15 @@ pub enum SyncEvent {
 }
 
 pub enum BackupKind { Snapshot, Unsaved, Conflict }
+
+pub const DOWNLOAD_TIMEOUT: Duration;     // 30 s; how long open waits for the provider to materialise the file (§7)
+pub const MAX_VAULT_FILE_SIZE: u64;       // 64 MiB read/write cap (§2)
+pub const DEBOUNCE: Duration;             // 500 ms watcher debounce (§3)
+
+// SyncError variants beyond those named above:
+//   PrimaryTooLarge(PathBuf)      vault file, backup or conflict copy over MAX_VAULT_FILE_SIZE; refused before parsing
+//   UnsafePackageDir(PathBuf)     attachments/ or backups/ is a symlink or not a directory
+//   AttachmentTampered(Uuid)      blob failed authentication (corrupt, truncated, swapped); discard bytes already read
 ```
 
 Backups carry a kind: `Snapshot` (policy in §4), `Unsaved` (taken on lock or quit while edits could not be saved), `Conflict` (absorbed conflict copy, §6). Retention prunes `Snapshot` only; `Unsaved` and `Conflict` are never pruned. `restore_from` snapshots the current file first and works even when the primary no longer parses.
