@@ -99,6 +99,26 @@ pub enum Screen {
     Main,
 }
 
+/// Why the unlock screen shows a message in place of its controls (05 §2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlockBlocked {
+    /// The format version, or every key slot, is newer than this build understands.
+    NewerVersion,
+}
+
+/// The unlock screen's text for [`UnlockBlocked::NewerVersion`].
+pub const NEWER_VERSION: &str = "This vault was created by a newer version of Vault.";
+
+/// The open or unlock failure that blocks unlocking with this build, if `e` is one.
+fn unlock_blocked(e: &SyncError) -> Option<UnlockBlocked> {
+    match e {
+        SyncError::Vault(VaultError::UnsupportedVersion(_) | VaultError::NoUsableSlot) => {
+            Some(UnlockBlocked::NewerVersion)
+        }
+        _ => None,
+    }
+}
+
 /// Background work in flight; the UI shows a spinner and refuses new requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Busy {
@@ -174,6 +194,8 @@ pub enum Sort {
     #[default]
     Alphabetical,
     RecentlyModified,
+    /// Newest `created_at` first; items without one use `modified_at`.
+    RecentlyCreated,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -470,6 +492,8 @@ pub struct AppState {
     /// unlock: gpui forgets an animation's progress while its element is off-screen, so a
     /// non-zero count would replay the shake whenever the unlock screen reappears.
     pub unlock_failures: u32,
+    /// Set when this build cannot unlock the vault at all; cleared by `close_vault`.
+    pub unlock_blocked: Option<UnlockBlocked>,
     /// Bumped on every unlock; keys the locked→unlocked crossfade.
     pub unlock_count: u32,
     /// macOS "Reduce motion": skip the unlock crossfade, the shake and the TOTP pulse.
@@ -576,6 +600,7 @@ impl AppState {
             vault_path: None,
             error: None,
             unlock_failures: 0,
+            unlock_blocked: None,
             unlock_count: 0,
             reduce_motion: false,
             unlock_finish: None,
@@ -834,6 +859,14 @@ impl AppState {
                         this.touch.auto = TouchAuto::OnAppear;
                         this.screen = Screen::Unlock;
                     }
+                    // A newer file: show the unlock card with the reason, so the user
+                    // sees which vault it is and can leave with "Open another vault…".
+                    Err(e) if let Some(blocked) = unlock_blocked(&e) => {
+                        this.vault_path = Some(path.clone());
+                        this.remember(&path);
+                        this.unlock_blocked = Some(blocked);
+                        this.screen = Screen::Unlock;
+                    }
                     Err(e) => {
                         let mut message = error_message(&e);
                         match &e {
@@ -950,6 +983,10 @@ impl AppState {
                     this.password_unlocked(false);
                     this.stale_cleaned(cleaned);
                     this.format_upgraded(upgraded);
+                }
+                (_, Err(e)) if let Some(blocked) = unlock_blocked(&e) => {
+                    this.vault = Some(vault);
+                    this.unlock_blocked = Some(blocked);
                 }
                 (_, Err(e)) => {
                     this.vault = Some(vault);
@@ -1108,6 +1145,7 @@ impl AppState {
         self.clear_save_blocked();
         self.locked = false;
         self.error = None;
+        self.unlock_blocked = None;
         // Items past the 30 days go before anything shows them (05 §2.3), and from every
         // later write, vault-sync's own included (a reopened vault was not `install`ed).
         if let Some(vault) = self.vault.as_mut() {
@@ -1201,6 +1239,7 @@ impl AppState {
         self.epoch = self.epoch.wrapping_add(1);
         self.busy = None;
         self.error = None;
+        self.unlock_blocked = None;
         self.screen = Screen::Choose;
         cx.notify();
     }
@@ -1451,6 +1490,9 @@ fn error_message(e: &SyncError) -> String {
     match e {
         SyncError::Vault(VaultError::WrongPassword) => "Wrong password. Try again.".into(),
         SyncError::Vault(VaultError::BadMagic) => "This file is not a vault.".into(),
+        SyncError::Vault(VaultError::UnsupportedVersion(_) | VaultError::NoUsableSlot) => {
+            NEWER_VERSION.into()
+        }
         SyncError::Vault(VaultError::Tampered(_)) => {
             "This vault failed its integrity check and may have been tampered with.".into()
         }

@@ -95,7 +95,7 @@ pub fn group_label(title: &str) -> String {
 ///
 /// With a search query the order is the core's relevance ranking and there are no group
 /// headers. Without one, `sort` applies and A–Z adds a header row per first letter.
-/// Core items have no creation time, so "recently created" sorts by `modified_at` too.
+/// "Recently created" uses `created_at`, or `modified_at` for items written before it.
 pub fn compute(
     vault: &UnlockedVault,
     query: &str,
@@ -125,6 +125,12 @@ pub fn compute(
             Sort::RecentlyModified => hits.sort_by(|a, b| {
                 b.modified_at
                     .cmp(&a.modified_at)
+                    .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+            }),
+            Sort::RecentlyCreated => hits.sort_by(|a, b| {
+                let created = |i: &Item| i.created_at.unwrap_or(i.modified_at);
+                created(b)
+                    .cmp(&created(a))
                     .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
             }),
         }
@@ -339,6 +345,25 @@ mod tests {
         let l = compute(&v, "ol", &Filter::All, Sort::Alphabetical, Rc::default());
         assert_eq!(l.items, [old]);
         assert_eq!(*l.rows, [Row::Item(old)]);
+    }
+
+    #[test]
+    fn recently_created_falls_back_to_modified() {
+        let mut v = vault();
+        let mut add_created = |title: &str, created: Option<u64>, modified: u64| {
+            let mut item = Item::new(title, v.device_id(), modified);
+            item.created_at = created;
+            v.insert(item, modified)
+        };
+        // `None` (written before created_at existed) reads its modified_at.
+        let a = add_created("a", Some(50), 60);
+        let b = add_created("b", None, 40);
+        let c = add_created("c", Some(5), 70);
+        let d = add_created("D", None, 30);
+        let e = add_created("e", Some(30), 90); // ties with D: title order
+        let l = compute(&v, "", &Filter::All, Sort::RecentlyCreated, Rc::default());
+        assert_eq!(l.items, [a, b, d, e, c]);
+        assert!(l.rows.iter().all(|r| matches!(r, Row::Item(_))));
     }
 
     #[test]

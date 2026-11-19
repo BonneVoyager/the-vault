@@ -1365,10 +1365,11 @@ pub(super) fn press(vcx: &mut VisualTestContext, key: &'static str) {
     vcx.run_until_parked();
 }
 
-fn sort_checked(vcx: &mut VisualTestContext) -> (bool, bool) {
+fn sort_checked(vcx: &mut VisualTestContext) -> (bool, bool, bool) {
     (
         vcx.debug_bounds("sort-name-checked").is_some(),
         vcx.debug_bounds("sort-modified-checked").is_some(),
+        vcx.debug_bounds("sort-created-checked").is_some(),
     )
 }
 
@@ -1378,7 +1379,10 @@ fn sort_menu_opens_by_click_and_closes_on_esc(cx: &mut TestAppContext) {
     let (state, _main, mut vcx) = open(dir.path(), cx);
     click(&mut vcx, "sort".into());
     assert!(state.read_with(&vcx, |s, _| s.sort_menu_open));
-    assert_eq!(sort_checked(&mut vcx), (true, false));
+    assert_eq!(sort_checked(&mut vcx), (true, false, false));
+    for id in ["sort-name", "sort-modified", "sort-created"] {
+        assert!(vcx.debug_bounds(id).is_some(), "{id} shown");
+    }
     press(&mut vcx, "escape");
     assert!(!state.read_with(&vcx, |s, _| s.sort_menu_open));
     assert!(vcx.debug_bounds("sort-name").is_none(), "menu gone");
@@ -1413,7 +1417,15 @@ fn sort_menu_by_keyboard_switches_order(cx: &mut TestAppContext) {
     });
     state.update(&mut vcx, |s, cx| s.open_sort_menu(cx));
     vcx.run_until_parked();
-    assert_eq!(sort_checked(&mut vcx), (false, true));
+    assert_eq!(sort_checked(&mut vcx), (false, true, false));
+    // ↓↓ Enter from the top reaches Recently Created.
+    press(&mut vcx, "down");
+    press(&mut vcx, "down");
+    press(&mut vcx, "enter");
+    assert_eq!(
+        state.read_with(&vcx, |s, _| s.sort),
+        crate::state::Sort::RecentlyCreated
+    );
     state.update(&mut vcx, |s, cx| s.lock(cx));
     vcx.run_until_parked();
     assert!(

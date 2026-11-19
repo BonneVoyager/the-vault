@@ -101,9 +101,6 @@ impl SettingsView {
 const DOCK_HINT: &str = "Also hides the menu bar. A padlock in the menu bar opens Vault instead.";
 const LOGIN_HINT: &str = "Starts in the menu bar when the Dock icon is off.";
 
-/// Toast for the "Move…" stub in Sync & Backup.
-const MOVE_PACKAGE_LATER: &str = "Moving the vault package is coming later. To move it now, quit Vault and drag the \u{201c}.vault\u{201d} package in Finder.";
-
 fn auto_lock_label(minutes: Option<u32>) -> SharedString {
     match minutes {
         None => "Never".into(),
@@ -422,21 +419,13 @@ impl SettingsView {
                     .child(path.display().to_string()),
             )
             .child(
-                ui::h_flex()
-                    .gap(px(8.))
-                    .child(state_button(
-                        "move-vault",
-                        "Move\u{2026}",
-                        &self.state,
-                        |s, cx| s.show_toast(MOVE_PACKAGE_LATER, cx),
-                    ))
-                    .child(
-                        Button::new("reveal-vault")
-                            .small()
-                            .label("Reveal in Finder")
-                            .clickable()
-                            .on_click(move |_, _, cx| cx.reveal_path(&reveal_path)),
-                    ),
+                ui::h_flex().gap(px(8.)).child(
+                    Button::new("reveal-vault")
+                        .small()
+                        .label("Reveal in Finder")
+                        .clickable()
+                        .on_click(move |_, _, cx| cx.reveal_path(&reveal_path)),
+                ),
             )
             .child(ui::muted(status, cx))
             .when_some(sync_error, |col, e| {

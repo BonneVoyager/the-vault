@@ -15,7 +15,8 @@ use super::MainScreen;
 use super::icon_view::item_tile;
 
 use crate::actions::{
-    LIST_CONTEXT, SortAlphabetical, SortRecentlyModified, ToggleSidebar, sidebar_menu_title,
+    LIST_CONTEXT, SortAlphabetical, SortRecentlyCreated, SortRecentlyModified, ToggleSidebar,
+    sidebar_menu_title,
 };
 use crate::audit::{FieldIssue, Issue};
 use crate::listing::{self, Row};
@@ -238,7 +239,12 @@ fn sort_rows(state: &Entity<AppState>, cx: &App) -> Vec<ui::MenuRow> {
             Sort::RecentlyModified,
             || Box::new(SortRecentlyModified),
         ),
-        // "Recently Created" stays hidden until core items carry a created_at.
+        row(
+            "sort-created",
+            "Recently Created",
+            Sort::RecentlyCreated,
+            || Box::new(SortRecentlyCreated),
+        ),
     ]
 }
 

@@ -45,7 +45,9 @@ const KEYHOLE_FADE: f32 = 0.6;
 pub(crate) const KEYHOLE_ORIGIN: (f32, f32) = (44., 44.);
 pub(crate) const KEYHOLE_SIZE: (f32, f32) = (34., 41.);
 
-use crate::state::{AppState, Busy, ChooseIntent, Screen, TouchDenied, UnlockFinish};
+use crate::state::{
+    AppState, Busy, ChooseIntent, NEWER_VERSION, Screen, TouchDenied, UnlockBlocked, UnlockFinish,
+};
 use crate::ui::{self, Clickable as _};
 
 const SHAKE: Duration = Duration::from_millis(300);
@@ -271,6 +273,7 @@ impl Render for UnlockScreen {
         let touch = state.touch_policy();
         let touch_hint = touch.err().and_then(TouchDenied::hint);
         let failures = state.unlock_failures;
+        let blocked = state.unlock_blocked;
         let reduce_motion = state.reduce_motion;
         let theme = cx.theme();
         let vault_label_color = if theme.mode.is_dark() {
@@ -373,8 +376,21 @@ impl Render for UnlockScreen {
                 ))
                 .into_any_element()
         };
-        let mut controls = ui::v_flex().w_full().gap(px(12.)).child(password_field);
-        if let Some(hint) = touch_hint {
+        let mut controls = ui::v_flex().w_full().gap(px(12.));
+        // A vault this build cannot unlock: the reason replaces the field, the Unlock and
+        // Touch ID buttons and the hint; "Open another vault…" stays.
+        if blocked == Some(UnlockBlocked::NewerVersion) {
+            controls = controls.child(
+                div()
+                    .w_full()
+                    .text_center()
+                    .debug_selector(|| "unlock-blocked".into())
+                    .child(NEWER_VERSION),
+            );
+        } else {
+            controls = controls.child(password_field);
+        }
+        if let Some(hint) = touch_hint.filter(|_| blocked.is_none()) {
             controls = controls.child(
                 div()
                     .w_full()
@@ -384,30 +400,40 @@ impl Render for UnlockScreen {
             );
         }
         controls = controls
-            .child(
-                div().w_full().child(
-                    Button::new("unlock")
-                        .primary()
-                        .w_full()
-                        .label("Unlock")
-                        .disabled(unlocking)
-                        .clickable_when(!unlocking)
-                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-                ),
-            )
-            .when(touch.is_ok(), |controls| {
+            .when(blocked.is_none(), |controls| {
                 controls.child(
-                    div().w_full().child(
-                        Button::new("touch-id")
-                            .w_full()
-                            .icon(Icon::new(IconName::FingerprintPattern))
-                            .label("Unlock with Touch ID")
-                            .disabled(unlocking)
-                            .clickable_when(!unlocking)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.update(cx, |s, cx| s.touch_unlock(cx));
-                            })),
-                    ),
+                    div()
+                        .w_full()
+                        .debug_selector(|| "unlock-button".into())
+                        .child(
+                            Button::new("unlock")
+                                .primary()
+                                .w_full()
+                                .label("Unlock")
+                                .disabled(unlocking)
+                                .clickable_when(!unlocking)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.submit(window, cx)),
+                                ),
+                        ),
+                )
+            })
+            .when(touch.is_ok() && blocked.is_none(), |controls| {
+                controls.child(
+                    div()
+                        .w_full()
+                        .debug_selector(|| "unlock-touch-id".into())
+                        .child(
+                            Button::new("touch-id")
+                                .w_full()
+                                .icon(Icon::new(IconName::FingerprintPattern))
+                                .label("Unlock with Touch ID")
+                                .disabled(unlocking)
+                                .clickable_when(!unlocking)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.update(cx, |s, cx| s.touch_unlock(cx));
+                                })),
+                        ),
                 )
             })
             .child(
@@ -543,6 +569,15 @@ mod tests {
         dir: &std::path::Path,
         cx: &mut TestAppContext,
     ) -> (Entity<AppState>, Entity<UnlockScreen>, VisualTestContext) {
+        open_patched(dir, |_| {}, cx)
+    }
+
+    /// [`open`] with `patch` applied to the vault file's bytes before opening.
+    fn open_patched(
+        dir: &std::path::Path,
+        patch: impl FnOnce(&mut Vec<u8>),
+        cx: &mut TestAppContext,
+    ) -> (Entity<AppState>, Entity<UnlockScreen>, VisualTestContext) {
         let path = dir.join("t.vault");
         drop(
             SyncedVault::create(
@@ -554,6 +589,10 @@ mod tests {
             )
             .unwrap(),
         );
+        let file = path.join(vault_sync::VAULT_FILE_NAME);
+        let mut bytes = std::fs::read(&file).unwrap();
+        patch(&mut bytes);
+        std::fs::write(&file, bytes).unwrap();
         let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
         cx.update(|cx| {
             gpui_component::init(cx);
@@ -715,10 +754,43 @@ mod tests {
     fn open_another_vault_is_a_clickable_secondary_action(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (state, _, mut vcx) = open(dir.path(), cx);
+        assert!(vcx.debug_bounds("unlock-button").is_some());
+        assert!(vcx.debug_bounds("unlock-blocked").is_none());
         let switch = vcx.debug_bounds("unlock-switch").unwrap();
         vcx.simulate_click(switch.center(), gpui::Modifiers::none());
         vcx.run_until_parked();
         state.read_with(&vcx, |s, _| assert_eq!(s.screen, Screen::Choose));
+    }
+
+    /// A newer-format vault: the message replaces the field and the Unlock and Touch ID
+    /// buttons; "Open another vault…" stays and still leaves.
+    #[gpui::test]
+    fn newer_version_replaces_the_password_field(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let newer = |b: &mut Vec<u8>| {
+            b[4..6].copy_from_slice(&(vault_core::FORMAT_VERSION + 1).to_be_bytes());
+        };
+        let (state, _, mut vcx) = open_patched(dir.path(), newer, cx);
+        assert_eq!(
+            state.read_with(&vcx, |s, _| s.unlock_blocked),
+            Some(UnlockBlocked::NewerVersion)
+        );
+        assert!(
+            vcx.debug_bounds("unlock-blocked").is_some(),
+            "message shown"
+        );
+        for gone in ["unlock-password", "unlock-button", "unlock-touch-id"] {
+            assert!(vcx.debug_bounds(gone).is_none(), "{gone} hidden");
+        }
+        let name = vcx.debug_bounds("unlock-vault-name").unwrap();
+        assert!(name.size.width > px(0.), "the vault name still shows");
+        let switch = vcx.debug_bounds("unlock-switch").unwrap();
+        vcx.simulate_click(switch.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| {
+            assert_eq!(s.screen, Screen::Choose);
+            assert!(s.unlock_blocked.is_none());
+        });
     }
 
     #[gpui::test]

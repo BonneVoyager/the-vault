@@ -524,3 +524,101 @@ fn lock_without_a_window_rebuilds_the_menus(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(!has_settings(cx), "locked with no window");
 }
+
+/// A vault whose format version is newer than this build: open shows the unlock screen
+/// blocked instead of an error on the choose screen (05 §2.2).
+#[gpui::test]
+fn newer_version_vault_opens_blocked(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("new.vault");
+    drop(
+        SyncedVault::create(
+            &path,
+            &SecretString::new("pw".into()),
+            vault_core::KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap(),
+    );
+    let file = path.join(VAULT_FILE_NAME);
+    let mut bytes = std::fs::read(&file).unwrap();
+    bytes[4..6].copy_from_slice(&(vault_core::FORMAT_VERSION + 1).to_be_bytes());
+    std::fs::write(&file, bytes).unwrap();
+
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    state.update(cx, |s, cx| s.open_vault(path.clone(), cx));
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| {
+        assert_eq!(s.unlock_blocked, Some(UnlockBlocked::NewerVersion));
+        assert_eq!(s.screen, Screen::Unlock);
+        assert_eq!(s.vault_path.as_deref(), Some(path.as_path()));
+        assert!(s.vault.is_none() && s.error.is_none());
+    });
+    state.update(cx, |s, cx| s.close_vault(cx));
+    assert!(state.read_with(cx, |s, _| s.unlock_blocked.is_none()));
+
+    for e in [VaultError::UnsupportedVersion(9), VaultError::NoUsableSlot] {
+        let e = SyncError::Vault(e);
+        assert_eq!(error_message(&e), NEWER_VERSION);
+        assert_eq!(unlock_blocked(&e), Some(UnlockBlocked::NewerVersion));
+    }
+    assert_eq!(
+        unlock_blocked(&SyncError::Vault(VaultError::WrongPassword)),
+        None
+    );
+}
+
+/// A password slot of a kind this build does not know (the header's only `password`
+/// text renamed): a password unlock reports `NoUsableSlot`, which blocks the unlock
+/// screen without counting a failed attempt. A later good unlock clears the flag.
+#[gpui::test]
+fn no_usable_slot_blocks_and_good_unlock_clears(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slot.vault");
+    drop(
+        SyncedVault::create(
+            &path,
+            &SecretString::new("pw".into()),
+            vault_core::KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap(),
+    );
+    let file = path.join(VAULT_FILE_NAME);
+    let good = std::fs::read(&file).unwrap();
+    let at = good.windows(9).position(|w| w == b"hpassword").unwrap();
+    let mut bad = good.clone();
+    bad[at + 8] = b'X';
+    std::fs::write(&file, bad).unwrap();
+
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    state.update(cx, |s, cx| s.open_vault(path.clone(), cx));
+    cx.run_until_parked();
+    assert!(
+        state.read_with(cx, |s, _| s.unlock_blocked.is_none()),
+        "opens"
+    );
+    state.update(cx, |s, cx| s.unlock(SecretString::new("pw".into()), cx));
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| {
+        assert_eq!(s.unlock_blocked, Some(UnlockBlocked::NewerVersion));
+        assert_eq!(s.unlock_failures, 0);
+        assert!(s.error.is_none() && s.locked && s.vault.is_some());
+    });
+    // The file is fixed meanwhile; reopening and a good unlock clear the flag (and a
+    // flag left over on the same session is cleared by `unlocked` too).
+    std::fs::write(&file, good).unwrap();
+    state.update(cx, |s, cx| s.open_vault(path.clone(), cx));
+    cx.run_until_parked();
+    state.update(cx, |s, cx| {
+        s.unlock_blocked = Some(UnlockBlocked::NewerVersion);
+        s.unlock(SecretString::new("pw".into()), cx);
+    });
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| {
+        assert!(!s.locked && s.screen == Screen::Main);
+        assert!(s.unlock_blocked.is_none());
+    });
+}

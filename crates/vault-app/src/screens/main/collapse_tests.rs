@@ -1357,3 +1357,41 @@ fn dark_sidebar_fill_is_translucent_and_ignores_activation(cx: &mut TestAppConte
         "same fill when inactive"
     );
 }
+
+/// View ▸ Sort By lists Name, Recently Modified and Recently Created, with the check on
+/// the current sort.
+#[gpui::test]
+fn view_sort_by_menu_has_three_entries(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, mut vcx) = open(false, dir.path(), cx);
+    state.update(&mut vcx, |s, cx| {
+        s.set_sort(crate::state::Sort::RecentlyCreated, cx);
+        crate::actions::refresh_menus(s, cx);
+    });
+    let menus = vcx.cx.update(|cx| cx.get_menus()).unwrap();
+    let view = menus.iter().find(|m| m.name.as_ref() == "View").unwrap();
+    let sort_by = view
+        .items
+        .iter()
+        .find_map(|i| match i {
+            OwnedMenuItem::Submenu(m) if m.name.as_ref() == "Sort By" => Some(m),
+            _ => None,
+        })
+        .expect("View > Sort By");
+    let entries: Vec<_> = sort_by
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            OwnedMenuItem::Action { name, checked, .. } => Some((name.as_str(), *checked)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("Name", false),
+            ("Recently Modified", false),
+            ("Recently Created", true)
+        ]
+    );
+}

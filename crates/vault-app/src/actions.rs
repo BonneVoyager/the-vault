@@ -79,6 +79,8 @@ actions!(
         SortAlphabetical,
         /// View ▸ Sort By ▸ Recently Modified.
         SortRecentlyModified,
+        /// View ▸ Sort By ▸ Recently Created.
+        SortRecentlyCreated,
         /// ⌘M.
         Minimize,
         /// Window ▸ Zoom.
@@ -315,6 +317,8 @@ fn install_menus(sort: Sort, sidebar_visible: bool, trash: bool, main_active: bo
                     MenuItem::action("Name", SortAlphabetical).checked(sort == Sort::Alphabetical),
                     MenuItem::action("Recently Modified", SortRecentlyModified)
                         .checked(sort == Sort::RecentlyModified),
+                    MenuItem::action("Recently Created", SortRecentlyCreated)
+                        .checked(sort == Sort::RecentlyCreated),
                 ]),
             ),
             MenuItem::separator(),
@@ -458,6 +462,7 @@ pub fn register(state: &Entity<AppState>, cx: &mut App) {
     });
     on_main::<SortAlphabetical>(state, cx, sort_by(Sort::Alphabetical));
     on_main::<SortRecentlyModified>(state, cx, sort_by(Sort::RecentlyModified));
+    on_main::<SortRecentlyCreated>(state, cx, sort_by(Sort::RecentlyCreated));
 
     on_main::<CopyUsername>(state, cx, |s, cx| s.copy(CopyTarget::Username, cx));
     on_main::<CopyPassword>(state, cx, |s, cx| s.copy(CopyTarget::Password, cx));

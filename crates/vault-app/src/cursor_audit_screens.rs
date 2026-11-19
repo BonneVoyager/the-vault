@@ -334,7 +334,7 @@ fn main_sort_menu(cx: &mut TestAppContext) {
     audit(
         Case {
             label: "sort menu",
-            targets: &["sort-name", "sort-modified"],
+            targets: &["sort-name", "sort-modified", "sort-created"],
             disabled: &[],
         },
         &mut vcx,
@@ -645,7 +645,6 @@ fn settings_sync(cx: &mut TestAppContext) {
     let targets = [
         SETTINGS,
         &[
-            "move-vault",
             "reveal-vault",
             "backup-enabled",
             "backup-now",
@@ -662,6 +661,10 @@ fn settings_sync(cx: &mut TestAppContext) {
             disabled: &[],
         },
         &mut vcx,
+    );
+    assert!(
+        hits.iter().all(|h| !h.name.contains("move-vault")),
+        "no Move… button beside Reveal in Finder"
     );
     click_hit(&hits, "delete-backup", &mut vcx);
     let hits = audit(

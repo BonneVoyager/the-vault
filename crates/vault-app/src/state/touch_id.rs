@@ -131,11 +131,14 @@ fn remove_enrollment(
 
 /// Whether an `unlock_with_kek` failure means the enrollment no longer fits this vault:
 /// the KEK opens no slot (`WrongPassword`) or the slot is gone (`Malformed("no such
-/// slot ..")`, e.g. the key was rotated on another Mac). Integrity and I/O errors are not
+/// slot ..")`, e.g. the key was rotated on another Mac), or the slot's kind is unknown to
+/// this build (`NoUsableSlot`, rewritten by a newer version). Integrity and I/O errors are not
 /// the enrollment's fault and leave it alone.
 pub(super) fn kek_error_is_stale(e: &SyncError) -> bool {
     match e {
-        SyncError::Vault(VaultError::WrongPassword) => true,
+        // Our slot's kind is unknown to this build (a newer version rewrote it): the
+        // enrollment is unusable here, while the password slot may still work.
+        SyncError::Vault(VaultError::WrongPassword | VaultError::NoUsableSlot) => true,
         SyncError::Vault(VaultError::Malformed(m)) => m.starts_with("no such slot"),
         _ => false,
     }
@@ -310,7 +313,7 @@ impl AppState {
             TouchAuto::OnAppear => true,
             TouchAuto::OnActivation => activated,
         };
-        if go {
+        if go && self.unlock_blocked.is_none() {
             self.touch.auto = TouchAuto::Off;
             self.touch_unlock(cx);
         }
@@ -318,7 +321,12 @@ impl AppState {
 
     /// "Unlock with Touch ID".
     pub fn touch_unlock(&mut self, cx: &mut Context<Self>) {
-        if self.busy.is_some() || !self.locked || self.touch_policy().is_err() {
+        // A newer-version vault: the unlock card has no Touch ID button (05 §2.2).
+        if self.busy.is_some()
+            || !self.locked
+            || self.unlock_blocked.is_some()
+            || self.touch_policy().is_err()
+        {
             return;
         }
         let Some(vault_id) = self.vault_id else {
@@ -708,6 +716,44 @@ mod tests {
         );
     }
 
+    /// A blocked unlock card (05 §2.2) is the only thing stopping Touch ID here: the
+    /// enrollment and policy are fine. Manual and automatic attempts both wait, and the
+    /// automatic trigger stays pending.
+    #[gpui::test]
+    fn blocked_unlock_holds_back_touch_id(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, bio, _) = setup(dir.path(), cx);
+        enable(&state, cx);
+        lock(&state, cx);
+        let unlock_calls = || {
+            bio.calls()
+                .iter()
+                .filter(|c| matches!(c, Call::Unlock(..)))
+                .count()
+        };
+        let before = unlock_calls();
+        state.update(cx, |s, cx| {
+            assert_eq!(s.touch_policy(), Ok(()), "only the block stands in the way");
+            s.unlock_blocked = Some(crate::state::UnlockBlocked::NewerVersion);
+            s.touch_unlock(cx);
+            assert!(s.busy.is_none(), "manual Touch ID held back");
+            s.touch.auto = TouchAuto::OnAppear;
+            s.auto_touch_unlock(false, cx);
+            assert!(s.busy.is_none(), "automatic Touch ID held back");
+            assert!(matches!(s.touch.auto, TouchAuto::OnAppear), "trigger kept");
+        });
+        cx.run_until_parked();
+        assert_eq!(unlock_calls(), before, "no Touch ID prompt");
+        // Without the block the kept trigger fires.
+        state.update(cx, |s, cx| {
+            s.unlock_blocked = None;
+            s.auto_touch_unlock(false, cx);
+            assert_eq!(s.busy, Some(Busy::TouchUnlocking));
+        });
+        cx.run_until_parked();
+        assert_eq!(unlock_calls(), before + 1);
+    }
+
     #[gpui::test]
     fn touch_unlock_holds_the_minimum(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -1052,6 +1098,9 @@ mod tests {
         use vault_core::TamperKind;
         assert!(kek_error_is_stale(&SyncError::Vault(
             VaultError::WrongPassword
+        )));
+        assert!(kek_error_is_stale(&SyncError::Vault(
+            VaultError::NoUsableSlot
         )));
         assert!(kek_error_is_stale(&SyncError::Vault(
             VaultError::Malformed(format!("no such slot {}", Uuid::new_v4()))
