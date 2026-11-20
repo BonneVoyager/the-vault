@@ -381,7 +381,7 @@ impl BackupWindow {
             .into_any_element()
     }
 
-    fn render_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_detail(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let Some(item) = self.selection.and_then(|id| self.item(id, cx)) else {
             return ui::v_flex()
@@ -391,6 +391,12 @@ impl BackupWindow {
                 .child(ui::muted("This backup has no items", cx))
                 .into_any_element();
         };
+        // Rows: the window less the 280 px list and the detail's 20 px padding each side.
+        let rows = px(window.viewport_size().width.as_f32() - 280. - 40.);
+        let fit = super::main::detail::label_width(
+            super::main::detail::label_fit(&item.fields, window, cx),
+            rows,
+        );
         let fields = item.fields.iter().enumerate().map(|(ix, field)| {
             if field.kind == FieldKind::Section {
                 return super::main::detail::section_row(ix, &field.name, cx);
@@ -484,6 +490,7 @@ impl BackupWindow {
                 ix,
                 field.name.clone().into(),
                 field.icon_name(),
+                fit,
                 value,
                 buttons,
                 &issues,
@@ -549,7 +556,7 @@ impl Render for BackupWindow {
             Some(vault) => {
                 let list = self.render_list(&vault, cx);
                 self.vault = Some(vault);
-                let detail = self.render_detail(cx);
+                let detail = self.render_detail(window, cx);
                 ui::h_flex()
                     .size_full()
                     .child(list)

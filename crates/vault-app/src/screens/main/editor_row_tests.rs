@@ -619,3 +619,205 @@ fn drop_flashes_the_dropped_row(cx: &mut TestAppContext) {
     let a = flash_alpha(&mut vcx, keys[0]);
     assert!(a > 0. && a <= 0.18 + 1e-3, "alpha {a}");
 }
+
+/// 05 §2.3 label column fit (owner 2026-11-20): one item with text fields named
+/// `names`, each carrying `icon`, shown at a `width` × 900 window; returns each row's
+/// (row, label column, label text) bounds as drawn.
+fn labelled(
+    state: &Entity<AppState>,
+    vcx: &mut VisualTestContext,
+    width: f32,
+    names: &[&str],
+    icon: Option<&str>,
+) -> Vec<(Bounds<Pixels>, Bounds<Pixels>, Bounds<Pixels>)> {
+    vcx.simulate_resize(gpui::size(px(width), px(900.)));
+    let device = state.read_with(vcx, |s, _| s.device_id());
+    let mut item = vault_core::Item::new("Labels", device, 1);
+    item.fields = names
+        .iter()
+        .map(|n| {
+            let mut f =
+                vault_core::Field::new(*n, FieldKind::Text, SecretString::new("v".into()), 1);
+            f.icon = icon.map(Into::into);
+            f
+        })
+        .collect();
+    insert_and_select(state, item, vcx);
+    (0..names.len())
+        .map(|ix| {
+            let text = format!("field-label-text {ix} {}", names[ix]);
+            (
+                bounds(vcx, format!("field-row {ix}")),
+                bounds(vcx, format!("field-label {ix}")),
+                bounds(vcx, text),
+            )
+        })
+        .collect()
+}
+
+/// `text`'s advance as read mode draws a label: the theme font at its (scaled) size.
+fn drawn_width(vcx: &mut VisualTestContext, text: &str) -> Pixels {
+    vcx.update(|window, cx| {
+        let theme = gpui_component::ActiveTheme::theme(cx);
+        let run = gpui::TextRun {
+            len: text.len(),
+            font: gpui::font(theme.font_family.clone()),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let size = theme.font_size;
+        window
+            .text_system()
+            .shape_line(text.to_owned().into(), size, &[run], None)
+            .width
+    })
+}
+
+fn base_rule(row: Bounds<Pixels>) -> Pixels {
+    (row.size.width * 0.26).clamp(px(80.), px(140.))
+}
+
+/// Short labels leave the column exactly at the base rule (26 %, 80–140 px).
+#[gpui::test]
+fn short_labels_keep_the_base_column(cx: &mut TestAppContext) {
+    for width in [1600., 760.] {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _main, mut vcx) = open(dir.path(), cx);
+        let rows = labelled(&state, &mut vcx, width, &["Username", "PIN", ""], None);
+        for (row, label, _) in rows {
+            let base = base_rule(row);
+            assert!(
+                (label.size.width - base).abs() < px(0.5),
+                "at {width}: label {:?}, base {base:?}",
+                label.size.width
+            );
+        }
+    }
+}
+
+/// A Login's labels, detail column at its minimum (288 px rows, base 80 px): without
+/// icons the base rule exactly; with icons the base column cannot hold "Username" and
+/// its icon slot, so it widens to exactly that (the rule, under the 40 % cap). With
+/// icons on a wide pane (base 140 px) the base rule again.
+#[gpui::test]
+fn login_labels_at_detail_min(cx: &mut TestAppContext) {
+    let names = ["Username", "Password", "Website", "Notes"];
+    for (width, icon) in [
+        (760., None),
+        (760., Some("KeyRound")),
+        (1600., Some("KeyRound")),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _main, mut vcx) = open(dir.path(), cx);
+        let rows = labelled(&state, &mut vcx, width, &names, icon);
+        if width == 760. {
+            let detail = bounds(&mut vcx, "detail-slot".into());
+            assert!((detail.size.width - px(320.)).abs() < px(1.), "{detail:?}");
+        }
+        let slot = vcx.update(|window, _| window.rem_size()) + px(8.);
+        let mut need = px(0.);
+        for name in names {
+            need = need.max(drawn_width(&mut vcx, name) + icon.map_or(px(0.), |_| slot));
+        }
+        for (ix, (row, label, _)) in rows.into_iter().enumerate() {
+            let base = base_rule(row);
+            let expected = if need > base { need } else { base };
+            assert!(
+                (label.size.width - expected).abs() < px(2.),
+                "{width} {icon:?} {}: label {:?}, base {base:?}, need {need:?}",
+                names[ix],
+                label.size.width
+            );
+            if icon.is_none() || width > 1000. {
+                assert!((label.size.width - base).abs() < px(0.5), "base exactly");
+            }
+        }
+    }
+}
+
+/// A 30-character label widens the column to the drawn label (plus the icon slot) and
+/// stays on one line, at the default and the Larger text size; read mode and the
+/// editor keep equal columns.
+#[gpui::test]
+fn long_label_fits_on_one_line_in_both_modes(cx: &mut TestAppContext) {
+    let long = "Recovery passphrase for backup";
+    assert_eq!(long.len(), 30);
+    for larger in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _main, mut vcx) = open(dir.path(), cx);
+        if larger {
+            state.update(&mut vcx, |s, cx| {
+                s.update_settings(cx, |st| st.text_size = crate::state::TextSize::Larger)
+            });
+        }
+        let rows = labelled(
+            &state,
+            &mut vcx,
+            1600.,
+            &["Username", long],
+            Some("KeyRound"),
+        );
+        let (row, label, text) = rows[1];
+        let slot = vcx.update(|window, _| window.rem_size()) + px(8.);
+        let need = drawn_width(&mut vcx, long) + slot;
+        assert!(
+            need > base_rule(row) && need < row.size.width * 0.4,
+            "{need:?} {row:?}"
+        );
+        assert!(
+            (label.size.width - need).abs() < px(2.),
+            "larger {larger}: column {:?}, drawn label + slot {need:?}",
+            label.size.width
+        );
+        assert!(
+            (text.size.height - rows[0].2.size.height).abs() < px(0.5),
+            "one line: {text:?} vs {:?}",
+            rows[0].2
+        );
+        let (read, edit, _) = read_then_edit(&state, &mut vcx);
+        for (ix, ((_, r), (_, e))) in read.iter().zip(&edit).enumerate() {
+            assert!(
+                (r.size.width - e.size.width).abs() < px(0.5)
+                    && (r.left() - e.left()).abs() < px(0.5),
+                "label {ix}: read {r:?} edit {e:?}"
+            );
+        }
+    }
+}
+
+/// Past 40 % of the row the column stops at the cap and the label wraps; a label
+/// under the base max on a narrow row is capped too (40 %, not its own width).
+#[gpui::test]
+fn label_past_the_cap_wraps(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    let long = "A very long field label that cannot possibly fit on one line here";
+    let rows = labelled(&state, &mut vcx, 1000., &["Username", long], None);
+    let (row, label, text) = rows[1];
+    let cap = row.size.width * 0.4;
+    assert!(drawn_width(&mut vcx, long) > cap);
+    assert!(
+        (label.size.width - cap).abs() < px(1.),
+        "{label:?} vs cap {cap:?}"
+    );
+    assert!(
+        text.size.height > rows[0].2.size.height * 1.5,
+        "wraps: {text:?}"
+    );
+
+    // 133 px: inside the base max, past 40 % of a 288 px row (detail at its minimum).
+    let mid = "Security question";
+    let rows = labelled(&state, &mut vcx, 760., &[mid], None);
+    let (row, label, _) = rows[0];
+    let cap = row.size.width * 0.4;
+    assert!(
+        drawn_width(&mut vcx, mid) > cap,
+        "the check needs a label past the cap"
+    );
+    assert!(
+        (label.size.width - cap).abs() < px(1.),
+        "{label:?} vs cap {cap:?}"
+    );
+}

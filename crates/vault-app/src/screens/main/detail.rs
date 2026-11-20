@@ -9,7 +9,7 @@ use std::{collections::HashSet, rc::Rc};
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Context, Entity, ExternalPaths, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, ease_in_out,
     prelude::FluentBuilder as _, px, relative,
 };
@@ -85,6 +85,8 @@ pub(crate) struct ReadDetail<'a> {
     pub history_open: bool,
     pub actions: DetailActions,
     pub standalone: bool,
+    /// Width of the field rows (`rows_width` of the column), for the label column cap.
+    pub rows_width: Pixels,
     /// ⌥ is held (05 §2.3 "Hold ⌥ to reveal"): masked values render revealed without
     /// touching `revealed`. The reveal buttons keep showing the per-field toggle.
     pub peek: bool,
@@ -173,13 +175,88 @@ pub(crate) const FIELD_ROW_GAP: f32 = 16.;
 /// Minimum height of a field row's value line (fits the row's icon buttons).
 pub(crate) const FIELD_LINE_MIN_H: f32 = 28.;
 
+/// The label column's base rule: 26 % of the row, 80 to 140 px.
+const LABEL_MIN: f32 = 80.;
+const LABEL_MAX: f32 = 140.;
+/// Cap on a column widened to fit a long label, as a fraction of the row.
+const LABEL_FIT_CAP: f32 = 0.40;
+
 /// The label column's width rule, shared by read mode and the editor's rows (05 §2.3
-/// "Edit-mode field rows": same width in both, so pressing Edit moves nothing).
-pub(crate) fn label_column<E: gpui::Styled>(el: E) -> E {
-    el.w(relative(0.26))
-        .min_w(px(80.))
-        .max_w(px(140.))
-        .flex_shrink_0()
+/// "Edit-mode field rows": same width in both, so pressing Edit moves nothing). `width`
+/// is [`label_width`]: `None` keeps the base rule (26 % of the row, 80 to 140 px)
+/// untouched; `Some` is the widened column for a long label.
+pub(crate) fn label_column<E: gpui::Styled>(el: E, width: Option<Pixels>) -> E {
+    let el = el.flex_shrink_0();
+    match width {
+        Some(w) => el.w(w),
+        None => el
+            .w(relative(0.26))
+            .min_w(px(LABEL_MIN))
+            .max_w(px(LABEL_MAX)),
+    }
+}
+
+/// The label column's width for rows `row` wide (owner 2026-11-20):
+/// `max(base, min(fit, 40 % of row))`, or `None` (the base rule) when the fit does not
+/// widen it. Computed here because Taffy has no `min()`/`calc()`.
+pub(crate) fn label_width(fit: Option<Pixels>, row: Pixels) -> Option<Pixels> {
+    let base = (row * 0.26).clamp(px(LABEL_MIN), px(LABEL_MAX));
+    let w = fit?.min(row * LABEL_FIT_CAP);
+    (w > base).then_some(w)
+}
+
+/// Width of the field rows in a column `column` wide, the rows inset by the column's
+/// horizontal padding (`render_item`'s `pad_x`; the editor uses the same).
+pub(crate) fn rows_width(column: f32) -> Pixels {
+    px((column - 2. * (ui::COLUMN_PAD_X - ui::FOCUS_RING_WIDTH)).max(0.))
+}
+
+/// The width the label column needs to show every displayed label of `fields` on one
+/// line (05 §2.3, owner 2026-11-20): the widest capitalised name (sections and empty
+/// names ignored) shaped as read mode draws it (theme font at `theme.font_size`, which
+/// already carries the text-size scale; regular weight), plus the icon slot (`size_4`,
+/// 1 rem, and the gap) when any field draws an icon. Read mode and the editor both pass
+/// their fields here, so the two columns stay equal. Not cached: each render costs one
+/// `shape_line` (a layout-cache hit when unchanged) and a few small allocations per
+/// named field, negligible next to the rows themselves.
+pub(crate) fn label_fit<'a>(
+    fields: impl IntoIterator<Item = &'a Field>,
+    window: &Window,
+    cx: &App,
+) -> Option<Pixels> {
+    let font = gpui::font(cx.theme().font_family.clone());
+    let size = cx.theme().font_size;
+    let (mut widest, mut icon) = (None::<Pixels>, false);
+    for field in fields {
+        if field.kind == FieldKind::Section {
+            continue;
+        }
+        icon |= field.icon_name().and_then(crate::icon::symbol).is_some();
+        let shown = text::capitalize_first(&field.name).replace('\n', " ");
+        if shown.trim().is_empty() {
+            continue;
+        }
+        let run = gpui::TextRun {
+            len: shown.len(),
+            font: font.clone(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let width = window
+            .text_system()
+            .shape_line(shown.into(), size, &[run], None)
+            .width;
+        widest = Some(widest.map_or(width, |w: Pixels| w.max(width)));
+    }
+    let slot = if icon {
+        window.rem_size() + px(FIELD_ICON_GAP)
+    } else {
+        px(0.)
+    };
+    // 1 px against sub-pixel rounding in the wrap.
+    widest.map(|w| (w + slot + px(1.)).ceil())
 }
 
 /// One field row, shared by the detail column, item windows and the backup viewer: the
@@ -188,10 +265,12 @@ pub(crate) fn label_column<E: gpui::Styled>(el: E) -> E {
 /// icons"); none or an unknown name leaves the row as it is without one. `issues` are
 /// the field's password notices, one [`issue_strip`] each under the value (05 §2.3
 /// "Password notices").
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn field_row(
     ix: usize,
     label: SharedString,
     icon: Option<&str>,
+    label_w: Option<Pixels>,
     value: impl IntoElement,
     buttons: Vec<AnyElement>,
     issues: &[FieldIssue],
@@ -210,7 +289,7 @@ pub(crate) fn field_row(
         .border_b_1()
         .border_color(theme.border)
         .child(
-            label_column(div())
+            label_column(div(), label_w)
                 .debug_selector(move || format!("field-label {ix}"))
                 .pt(px(3.))
                 .whitespace_normal()
@@ -493,6 +572,10 @@ impl MainScreen {
         // No fade on a selection change or on Edit/Cancel (owner 2026-10-31): the new
         // content paints on the next frame. A fade keyed on the selection (or the mode)
         // showed as a blink.
+        // The detail column's width as laid out this frame (`MainScreen::render`); the
+        // editor's rows have the same width, so it gets it too.
+        let rows_width = rows_width(self.right_width - self.fitted[1]);
+        self.editor.read(cx).set_rows_width(rows_width);
         let content: AnyElement = match s.shown_item() {
             // Edit mode and onboarding are controls throughout, including in the band.
             _ if s.is_editing() => ui::no_window_drag(div().size_full())
@@ -504,13 +587,14 @@ impl MainScreen {
                 history_open: s.history_open,
                 actions: DetailActions::main(self.state.clone()),
                 standalone: false,
+                rows_width,
                 // Also checked against the window's live modifiers and the focus, so a
                 // key-up that went to another dispatch path cannot leave values revealed.
                 peek: s.option_reveal
                     && ui::option_alone(&window.modifiers())
                     && self.focus_in_screen(window, cx),
             }
-            .render_item(item, s, cx)
+            .render_item(item, s, window, cx)
             .into_any_element(),
             None if detail_placeholder(s) == Some(ONBOARDING_TITLE) => {
                 ui::no_window_drag(div().size_full())
@@ -610,8 +694,15 @@ impl MainScreen {
 }
 
 impl ReadDetail<'_> {
-    pub(crate) fn render_item(&self, item: &Item, s: &AppState, cx: &App) -> gpui::Div {
+    pub(crate) fn render_item(
+        &self,
+        item: &Item,
+        s: &AppState,
+        window: &Window,
+        cx: &App,
+    ) -> gpui::Div {
         let theme = cx.theme();
+        let fit = label_width(label_fit(&item.fields, window, cx), self.rows_width);
         let now = text::now_millis();
         let device = if item.device_id == s.device_id() {
             "this Mac".to_owned()
@@ -681,7 +772,7 @@ impl ReadDetail<'_> {
 
         let mut fields: Vec<AnyElement> = Vec::with_capacity(item.fields.len() + 1);
         for (ix, field) in item.fields.iter().enumerate() {
-            fields.push(self.render_field(ix, field, item, now, cx));
+            fields.push(self.render_field(ix, field, item, now, fit, cx));
             if let Some(history) = self.render_history(item, ix, now, cx) {
                 fields.push(history);
             }
@@ -783,6 +874,7 @@ impl ReadDetail<'_> {
         field: &Field,
         item: &Item,
         now: u64,
+        fit: Option<Pixels>,
         cx: &App,
     ) -> AnyElement {
         if field.kind == FieldKind::Section {
@@ -900,6 +992,7 @@ impl ReadDetail<'_> {
             ix,
             field.name.clone().into(),
             field.icon_name(),
+            fit,
             value,
             buttons,
             &issues,

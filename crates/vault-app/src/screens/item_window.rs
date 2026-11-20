@@ -342,9 +342,13 @@ impl Render for ItemWindow {
                     history_open: self.history_open,
                     actions,
                     standalone: true,
+                    // The root's 1 px border each side.
+                    rows_width: super::main::detail::rows_width(
+                        window.viewport_size().width.as_f32() - 2.,
+                    ),
                     peek,
                 }
-                .render_item(item, s, cx)
+                .render_item(item, s, window, cx)
             });
         ui::clear_focus_ring_on_click(div())
             .id("item-window")
@@ -468,6 +472,34 @@ mod tests {
         });
         let key = format!("issue-strip {field} Weak Password");
         assert!(vcx.debug_bounds(Box::leak(key.into_boxed_str())).is_some());
+    }
+
+    /// The label column cap (05 §2.3, 2026-11-20) uses the item window's real row
+    /// width: a label past it gets exactly 40 % of the drawn row.
+    #[gpui::test]
+    fn long_label_caps_at_40_percent_of_the_item_window_row(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, plain, _) = setup(dir.path(), cx);
+        let long = "A very long field label that cannot possibly fit on one line here";
+        state.update(cx, |s, _| {
+            s.vault
+                .as_mut()
+                .unwrap()
+                .edit(|v| v.update(plain, 11, |it| it.fields[0].name = long.into()))
+                .unwrap()
+                .unwrap();
+            s.vault_changed();
+        });
+        let handle = open(&state, plain, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(handle, cx);
+        vcx.run_until_parked();
+        let row = vcx.debug_bounds("field-row 0").unwrap();
+        let label = vcx.debug_bounds("field-label 0").unwrap();
+        let cap = row.size.width * 0.4;
+        assert!(
+            (label.size.width - cap).abs() < gpui::px(1.),
+            "{label:?} vs cap {cap:?} of {row:?}"
+        );
     }
 
     /// The read-only attachment rows leave out the item's icon image.

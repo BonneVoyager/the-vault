@@ -78,6 +78,8 @@ struct DraggedRow {
     kind: &'static str,
     /// Row width at the last paint: the ghost is drawn at the row's width.
     width: Pixels,
+    /// The rows' label column width (`detail::label_width`), so the ghost's matches.
+    label_w: Option<Pixels>,
 }
 
 /// The ghost under the pointer while dragging: the row's value line at the row's width,
@@ -108,7 +110,7 @@ impl Render for DragPreview {
             .shadow_md()
             .opacity(0.95)
             .child(
-                super::detail::label_column(ui::h_flex())
+                super::detail::label_column(ui::h_flex(), row.label_w)
                     .min_h(px(FIELD_LINE_MIN_H))
                     .gap(px(4.))
                     .child(Icon::new(IconName::GripVertical).size_4().text_color(muted))
@@ -305,6 +307,8 @@ pub struct Editor {
     drag: Rc<FieldDrag>,
     /// Width of the field rows at the last paint, for the drag ghost.
     row_width: Rc<Cell<Pixels>>,
+    /// This render's label column width (`detail::label_width`), shared by every row.
+    label_w: Cell<Option<Pixels>>,
     /// Focus of the open icon picker (arrow keys and Enter move and choose).
     icon_focus: gpui::FocusHandle,
     /// The icon pickers' search field (05 "Icon search"), shared by the item picker and
@@ -398,6 +402,7 @@ impl Editor {
             rows: Vec::new(),
             drag: Rc::default(),
             row_width: Rc::new(Cell::new(px(280.))),
+            label_w: Cell::new(None),
             icon_focus: cx.focus_handle(),
             icon_search,
             icon_scroll: ScrollHandle::new(),
@@ -842,6 +847,7 @@ impl Editor {
                         .and_then(crate::icon::symbol),
                     kind: kind_name(field.kind),
                     width: self.row_width.get(),
+                    label_w: self.label_w.get(),
                 },
                 move |dragged, _, _, cx| {
                     drag.row.set(Some(dragged.key));
@@ -1099,7 +1105,7 @@ impl Editor {
             .gap(px(FIELD_ROW_GAP))
             .border_b_1()
             .child(
-                super::detail::label_column(ui::h_flex())
+                super::detail::label_column(ui::h_flex(), self.label_w.get())
                     .debug_selector(move || format!("edit-label {key}"))
                     .min_h(px(FIELD_LINE_MIN_H))
                     .gap(px(4.))
@@ -1297,6 +1303,15 @@ fn move_flash(flash: Flash, accent: gpui::Hsla) -> AnyElement {
     .into_any_element()
 }
 
+impl Editor {
+    /// The rows' width this frame, from the detail column (`detail::rows_width`), so
+    /// the label column cap matches read mode's on the first edit frame (prepaint
+    /// updates it too, one frame late).
+    pub(super) fn set_rows_width(&self, width: Pixels) {
+        self.row_width.set(width);
+    }
+}
+
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
@@ -1362,6 +1377,12 @@ impl Render for Editor {
             .then(|| self.drag.row.get())
             .flatten()
             .and_then(|k| self.rows.iter().position(|r| r.key == k));
+        // Measured from the buffer's live names, so the column grows as a name is typed.
+        let live = buffer.keys.iter().filter_map(|&k| buffer.field(k));
+        self.label_w.set(super::detail::label_width(
+            super::detail::label_fit(live, window, cx),
+            self.row_width.get(),
+        ));
         let this = cx.entity().downgrade();
         for (ix, row) in self.rows.iter().enumerate() {
             rows.push(self.render_row(ix, row, dragged_ix, buffer, s, &this, window, cx));
