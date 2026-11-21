@@ -80,6 +80,7 @@ pub fn sync_event_label(event: &SyncEvent) -> &'static str {
         SyncEvent::Merged(_) => "merged",
         SyncEvent::ChangedWhileLocked => "changed while locked",
         SyncEvent::ConflictAbsorbed(_) => "conflict absorbed",
+        SyncEvent::UnreadableConflict(_) => "unreadable conflict copy",
         SyncEvent::WaitingForBlobs(_) => "waiting for attachments",
         SyncEvent::CorruptOnDisk => "corrupt on disk",
         SyncEvent::ForeignVault => "foreign vault ignored",
@@ -349,6 +350,11 @@ impl AppState {
             // `ConflictAbsorbed` follows once they do.
             // The copy's items are already merged into the open vault: refresh exactly as
             // `ConflictAbsorbed` does.
+            // A conflict copy that does not parse or has an unsupported version stays in
+            // place (03 §6): tell the user once, by file name only.
+            SyncEvent::UnreadableConflict(path) => {
+                self.show_toast(unreadable_conflict_message(&path), cx);
+            }
             SyncEvent::WaitingForBlobs(path) => {
                 self.vault_changed();
                 self.refresh_backups();
@@ -407,6 +413,13 @@ impl AppState {
                     message: message.into(),
                     offers_trash: false,
                 });
+                // Locked, a newer version's file would otherwise go unnoticed: the next
+                // unlock opens the last readable copy and the strip is cleared by it. The
+                // unlock card says so instead (05 §2.2); `unlocked` and a vault switch
+                // clear it.
+                if self.locked && matches!(blocked, SaveBlocked::NewerVersion(_)) {
+                    self.unlock_blocked = Some(super::UnlockBlocked::NewerVersion);
+                }
             }
             // Both mean the cached key no longer opens the file on disk (a password change
             // or a key rotation elsewhere, or a rollback, which looks the same). vault-sync
@@ -709,6 +722,15 @@ impl AppState {
         self.refresh_backups();
         self.set_toast(Toast::window(format!("Restored from {name}")));
     }
+}
+
+/// Toast for [`SyncEvent::UnreadableConflict`]: the copy's final path component only,
+/// never the full path.
+fn unreadable_conflict_message(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map_or_else(|| "unnamed".into(), |n| n.to_string_lossy());
+    format!("Could not read the conflict copy \u{201c}{name}\u{201d}. It was left in place.")
 }
 
 /// Status line and toast text for a refused save (03 §3).
@@ -1791,6 +1813,61 @@ mod tests {
         state.update(cx, |s, cx| {
             s.handle_sync_event(SyncEvent::KeyMismatch, cx);
             assert!(s.sync.key_mismatch && !s.sync.key_rotated);
+        });
+    }
+
+    /// An unreadable conflict copy toasts its file name (never the path) and changes
+    /// nothing else: no strip, status line, danger or unlock block.
+    #[gpui::test]
+    fn unreadable_conflict_copy_toasts_its_name_only(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        let copy = dir.path().join("t.vault").join("vault 2.bin");
+        for locked in [false, true] {
+            state.update(cx, |s, cx| {
+                if locked {
+                    s.lock(cx);
+                }
+                s.toast = None;
+                let status = s.sync_status.clone();
+                s.handle_sync_event(SyncEvent::UnreadableConflict(copy.clone()), cx);
+                let toast = s.toast.as_ref().unwrap();
+                assert_eq!(
+                    toast.message.as_ref(),
+                    "Could not read the conflict copy \u{201c}vault 2.bin\u{201d}. It was left in place."
+                );
+                assert!(!toast.danger);
+                assert!(!toast.message.contains(&*dir.path().to_string_lossy()));
+                assert_eq!(s.sync_status, status);
+                assert!(s.sync.save_blocked.is_none() && !s.sync.save_failing);
+                assert_eq!(s.unlock_blocked, None);
+                assert_eq!(s.locked, locked);
+                assert_eq!(
+                    s.sync.last_event.map(|(l, _)| l),
+                    Some("unreadable conflict copy")
+                );
+            });
+        }
+    }
+
+    /// A newer version's file seen while locked blocks the unlock card (05 §2.2, bug hunt
+    /// 2026-11-21 N2); unlocked it only raises the strip, and a foreign vault never blocks.
+    #[gpui::test]
+    fn newer_version_while_locked_blocks_the_unlock(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        state.update(cx, |s, cx| {
+            s.handle_sync_event(SyncEvent::SaveBlocked(SaveBlocked::NewerVersion(99)), cx);
+            assert_eq!(s.unlock_blocked, None, "unlocked: the strip only");
+            assert!(s.sync.save_blocked.is_some());
+            s.lock(cx);
+            s.handle_sync_event(SyncEvent::SaveBlocked(SaveBlocked::ForeignVault), cx);
+            assert_eq!(s.unlock_blocked, None, "a foreign vault does not block");
+            s.handle_sync_event(SyncEvent::SaveBlocked(SaveBlocked::NewerVersion(99)), cx);
+            assert_eq!(
+                s.unlock_blocked,
+                Some(super::super::UnlockBlocked::NewerVersion)
+            );
         });
     }
 

@@ -12,7 +12,7 @@ Press ⌘N for a new item and pick a template. ⌘E edits the selected item, ⌘
 
 ## Copying secrets
 
-⌘C on a selected row copies the username, ⌘⇧C the password, ⌘⇧T the current one-time code. The clipboard is cleared after the time set in Settings ▸ General. Hold ⌥ to reveal every secret in the detail view while the key is down.
+⌘C on a selected row copies the username, ⌘⇧C the password, ⌘⇧T the current one-time code. The clipboard is cleared after the time set in Settings ▸ General. Hold ⌥ to reveal the masked values in the detail view while the key is down (the TOTP secret stays hidden).
 
 ## Sync between Macs
 

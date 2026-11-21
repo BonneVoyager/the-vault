@@ -630,10 +630,31 @@ pub fn pill(message: impl Into<SharedString>, cx: &App) -> Div {
         .child(message.into())
 }
 
-/// [`pill`] in the danger colour, for toasts about edits that could not be kept.
+/// The danger pill's fill in light mode: the dark palette's elevated fill (#2A2A2D)
+/// darkened by the smallest uniform step that lifts the #E5484D text to WCAG 4.5:1
+/// (4.53:1; #2A2A2D gave 3.66:1; bug hunt 2026-11-21 N6, owner option A).
+pub const DANGER_PILL_FILL_IN_LIGHT: u32 = 0x18181B;
+
+/// The danger pill's text in dark mode, on the light palette's elevated fill (#F7F7F8):
+/// #E5484D's hue and saturation at the highest lightness that reaches WCAG 4.5:1
+/// (4.52:1). No light fill can lift #E5484D itself there (white tops out at 3.91:1), so
+/// the text darkens instead (N6, orchestrator decision 2026-11-21, flagged to the owner).
+pub const DANGER_PILL_TEXT_IN_DARK: u32 = 0xDE2026;
+
+/// [`pill`] in the danger colour, for toasts about edits that could not be kept: danger
+/// border on the inverted fill. Light mode: [`DANGER_PILL_FILL_IN_LIGHT`] fill, danger
+/// text. Dark mode: the light palette's fill, [`DANGER_PILL_TEXT_IN_DARK`] text.
 pub fn danger_pill(message: impl Into<SharedString>, cx: &App) -> Div {
     let danger = cx.theme().danger;
-    pill(message, cx).border_color(danger).text_color(danger)
+    let dark = cx.theme().is_dark();
+    pill(message, cx)
+        .when(!dark, |p| p.bg(gpui::rgb(DANGER_PILL_FILL_IN_LIGHT)))
+        .border_color(danger)
+        .text_color(if dark {
+            gpui::rgb(DANGER_PILL_TEXT_IN_DARK).into()
+        } else {
+            danger
+        })
 }
 
 /// Bits at which the strength bar is full: `strength_bits` (zxcvbn) never exceeds 64.
@@ -1467,9 +1488,13 @@ mod pill_tests {
         gpui::rgb(value).into()
     }
 
+    /// The library theme in `mode` with our danger token (the pills read `theme.danger`).
     fn set_mode(mode: ThemeMode, cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
-        cx.update(|cx| Theme::change(mode, None, cx));
+        cx.update(|cx| {
+            Theme::change(mode, None, cx);
+            Theme::global_mut(cx).danger = VaultTheme::for_appearance(mode.is_dark()).danger;
+        });
     }
 
     /// Owner decision 2026-11-21, option A: light mode draws the dark palette's pill.
@@ -1508,17 +1533,66 @@ mod pill_tests {
         });
     }
 
-    /// The danger pill inverts only its fill; border and text stay `theme.danger`.
+    /// The danger pill keeps the inverted fill (light mode darkened past the dark
+    /// palette's) and the danger border; its text is danger in light mode and the
+    /// darker same-hue shade in dark mode (N6).
     #[gpui::test]
     fn danger_pill_inverts_fill_only(cx: &mut TestAppContext) {
         for (mode, dark) in [(ThemeMode::Light, false), (ThemeMode::Dark, true)] {
             set_mode(mode, cx);
             cx.update(|cx| {
                 let danger = cx.theme().danger;
+                assert_eq!(danger, hex(0xE5484D));
                 let (fill, border, text) = colours(danger_pill("Not saved", cx));
-                assert_eq!(fill, VaultTheme::for_appearance(!dark).bg_elevated);
+                let (expected_fill, expected_text) = if dark {
+                    (
+                        VaultTheme::for_appearance(false).bg_elevated,
+                        hex(super::DANGER_PILL_TEXT_IN_DARK),
+                    )
+                } else {
+                    (hex(super::DANGER_PILL_FILL_IN_LIGHT), danger)
+                };
+                assert_eq!(fill, expected_fill);
+                assert_ne!(fill, cx.theme().background, "{mode:?}: still inverted");
                 assert_eq!(border, danger);
-                assert_eq!(text, danger);
+                assert_eq!(text, expected_text);
+                // Same hue and saturation as danger (to 8-bit rounding), only darker.
+                assert!((text.h - danger.h).abs() < 0.005, "{mode:?} hue");
+                assert!((text.s - danger.s).abs() < 0.01, "{mode:?} saturation");
+                assert!(text.l <= danger.l, "{mode:?} lightness");
+            });
+        }
+    }
+
+    /// WCAG 2 relative luminance of an sRGB colour.
+    fn luminance(c: Hsla) -> f32 {
+        let c = c.to_rgb();
+        let lin = |v: f32| {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+    }
+
+    /// WCAG 2 contrast ratio of two colours.
+    fn contrast(a: Hsla, b: Hsla) -> f32 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// Bug hunt 2026-11-21 N6: the danger pill's text reaches WCAG 4.5:1 on its fill
+    /// in both appearances.
+    #[gpui::test]
+    fn danger_pill_text_contrast(cx: &mut TestAppContext) {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            set_mode(mode, cx);
+            cx.update(|cx| {
+                let (fill, _, text) = colours(danger_pill("Not saved", cx));
+                let ratio = contrast(text, fill);
+                assert!(ratio >= 4.5, "{mode:?}: {ratio}");
             });
         }
     }

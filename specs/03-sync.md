@@ -160,7 +160,7 @@ Cloud providers resolve simultaneous writes by creating a sibling file instead o
 On watcher event for a file matching the Dropbox pattern or any new `*.vault` in `<dir>`:
 
 ```
-1. parse; if vault_id != ours → emit SyncEvent::ForeignVault once per sibling and ignore (it's some other vault the user put there) (spec aligned to code 2026-11-19)
+1. parse; if the candidate does not parse or carries an unsupported format version → emit SyncEvent::UnreadableConflict(path) once and leave it in place (`vault sync` reports it and exits "not converged"; a copy a provider is still downloading waits via §7 instead; 2026-11-21); if vault_id != ours → emit SyncEvent::ForeignVault once per sibling and ignore (it's some other vault the user put there) (spec aligned to code 2026-11-19)
 2. unlock with cached key (if locked, defer to next unlock; keep a list of pending conflict paths)
 3. ours.merge_from(theirs); save()
 4. whole-package: copy any attachment blobs we lack (never replacing), then move the whole package to <name>.vault/backups/conflict-<timestamp>-<original name>/ — deferred to the next event while blobs referenced by the merged items are still missing from both sides, emitting `SyncEvent::WaitingForBlobs(conflict path)` once per waiting package (never while locked; it may fire again only after the package is absorbed or gone, or after `lock`/`stop_watching`/`start_watching` reset the bookkeeping; a package still waiting at `lock` is re-checked at the next unlock even if watching was stopped meanwhile; `ConflictAbsorbed` follows when the blobs arrive; 2026-11-01); per-file: move the file to <name>.vault/backups/conflict-<timestamp>-<original name without .bin>.vault.bin (`vault 2.bin` → `conflict-…-vault 2.vault.bin`; a same-second clash inserts `-N-` after the timestamp) (spec aligned to code 2026-11-19)
@@ -225,6 +225,7 @@ pub enum SyncEvent {
     ChangedWhileLocked,
     ConflictAbsorbed(PathBuf),
     WaitingForBlobs(PathBuf),    // whole-package conflict merged, move into backups/ deferred for missing blobs (§6 step 4)
+    UnreadableConflict(PathBuf), // a conflict candidate that does not parse or has an unsupported format version (any value, 0 included); left in place, emitted once per path until it parses, is absorbed or disappears, and again after lock/unlock or stop/start watching (bug hunt 2026-11-21 N1)
     CorruptOnDisk,
     ForeignVault,
     CloudUnavailable,

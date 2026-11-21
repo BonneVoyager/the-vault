@@ -1459,3 +1459,272 @@ fn before_write_hook_not_called_on_clean_lock_or_locked_save() {
     assert!(matches!(a.save(), Err(SyncError::Locked)));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
+
+/// `bytes` with the big-endian u16 format version after the 4-byte magic set to `v` (01 §1).
+fn with_version(bytes: &[u8], v: u16) -> Vec<u8> {
+    let mut b = bytes.to_vec();
+    b[4..6].copy_from_slice(&v.to_be_bytes());
+    b
+}
+
+/// Deterministic noise (xorshift), so no dev-dependency is needed for "random bytes".
+fn noise(len: usize) -> Vec<u8> {
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
+/// An [`SyncEvent::UnreadableConflict`] for a candidate named `name` (the path may come back
+/// canonicalised, so only the name is compared).
+fn unreadable(name: &str) -> impl Fn(&SyncEvent) -> bool + '_ {
+    move |e| {
+        matches!(e, SyncEvent::UnreadableConflict(p)
+            if p.file_name().and_then(|n| n.to_str()) == Some(name))
+    }
+}
+
+/// A per-file candidate `vault 2.bin` holding `bytes` (made from our `vault.bin`) is reported
+/// once as unreadable, left in place byte for byte, and not reported again when it fires
+/// another watcher event with the same content.
+fn unreadable_inner_copy_is_reported_once(make: impl FnOnce(&[u8]) -> Vec<u8>) {
+    let (_dir, path, mut a, _b, _id) = two_devices();
+    let package = path.parent().unwrap().to_owned();
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+    let bytes = make(&fs::read(&path).unwrap());
+    let copy = package.join("vault 2.bin");
+    plant(&copy, &bytes);
+
+    let is_unreadable = unreadable("vault 2.bin");
+    assert!(wait_until(|| {
+        a.poll();
+        ea.pump();
+        ea.count(&is_unreadable) == 1
+    }));
+    // Same bytes again: a new event, but nothing new to report.
+    plant(&copy, &bytes);
+    let drained = drain_for(&mut a, 5);
+    ea.pump();
+    assert!(drained > 0, "rewrite produced no watcher signal");
+    assert_eq!(ea.count(&is_unreadable), 1, "{:?}", ea.seen);
+    assert_eq!(fs::read(&copy).unwrap(), bytes, "candidate was touched");
+    assert!(!ea.any(|e| matches!(
+        e,
+        SyncEvent::ConflictAbsorbed(_) | SyncEvent::Error(_) | SyncEvent::ForeignVault
+    )));
+    assert_eq!(titles(&a), ["mail"]);
+}
+
+#[test]
+fn random_bytes_per_file_copy_is_reported_unreadable_once() {
+    unreadable_inner_copy_is_reported_once(|_| noise(4096));
+}
+
+#[test]
+fn truncated_per_file_copy_is_reported_unreadable_once() {
+    unreadable_inner_copy_is_reported_once(|valid| valid[..valid.len() / 2].to_vec());
+}
+
+/// A copy written by a newer format version (or carrying version 0, which is damage) is not
+/// ours to open: reported like any other unreadable copy, never merged or moved.
+#[test]
+fn newer_version_per_file_copy_is_reported_unreadable_once() {
+    unreadable_inner_copy_is_reported_once(|valid| {
+        with_version(valid, vault_core::FORMAT_VERSION + 1)
+    });
+}
+
+#[test]
+fn version_zero_per_file_copy_is_reported_unreadable_once() {
+    unreadable_inner_copy_is_reported_once(|valid| with_version(valid, 0));
+}
+
+/// The once-only bookkeeping resets on `lock` (the candidate is re-checked at the next unlock
+/// without any new watcher event) and on `stop_watching` / `start_watching`.
+#[test]
+fn unreadable_copy_is_reported_again_after_lock_or_restart() {
+    let (_dir, path, mut a, _b, _id) = two_devices();
+    let copy = path.parent().unwrap().join("vault 2.bin");
+    plant(&copy, &noise(512));
+    let mut ea = Events::new(&a);
+    let is_unreadable = unreadable("vault 2.bin");
+    // The start-up scan queues the existing copy.
+    a.start_watching().unwrap();
+    assert!(wait_until(|| {
+        a.poll();
+        ea.pump();
+        ea.count(&is_unreadable) == 1
+    }));
+    drain_for(&mut a, 3);
+    ea.pump();
+    assert_eq!(ea.count(&is_unreadable), 1);
+
+    assert!(matches!(a.lock(), LockOutcome::Clean));
+    a.unlock(&pw()).unwrap();
+    ea.pump();
+    assert_eq!(ea.count(&is_unreadable), 2, "{:?}", ea.seen);
+    drain_for(&mut a, 3);
+    ea.pump();
+    assert_eq!(ea.count(&is_unreadable), 2);
+
+    a.stop_watching();
+    a.start_watching().unwrap();
+    assert!(wait_until(|| {
+        a.poll();
+        ea.pump();
+        ea.count(&is_unreadable) == 3
+    }));
+    drain_for(&mut a, 3);
+    ea.pump();
+    assert_eq!(ea.count(&is_unreadable), 3);
+    assert!(copy.exists());
+}
+
+/// A whole-package sibling whose `vault.bin` (made from our `vault.bin`) does not open gets
+/// the same once-only report; the package stays where it is.
+fn unreadable_sibling_package_is_reported_once(make: impl FnOnce(&[u8]) -> Vec<u8>) {
+    let (dir, path, mut a, _b, _id) = two_devices();
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+    let bytes = make(&fs::read(&path).unwrap());
+    let copy = dir.path().join("test 2.vault");
+    plant_package(&copy, &bytes);
+
+    let is_unreadable = unreadable("test 2.vault");
+    assert!(wait_until(|| {
+        a.poll();
+        ea.pump();
+        ea.count(&is_unreadable) == 1
+    }));
+    plant_package(&copy, &bytes);
+    let drained = drain_for(&mut a, 5);
+    ea.pump();
+    assert!(drained > 0, "rewrite produced no watcher signal");
+    assert_eq!(ea.count(&is_unreadable), 1, "{:?}", ea.seen);
+    assert_eq!(fs::read(copy.join(VAULT_FILE_NAME)).unwrap(), bytes);
+    assert!(!ea.any(|e| matches!(
+        e,
+        SyncEvent::ConflictAbsorbed(_) | SyncEvent::Error(_) | SyncEvent::ForeignVault
+    )));
+    assert_eq!(titles(&a), ["mail"]);
+}
+
+#[test]
+fn random_bytes_sibling_package_is_reported_unreadable_once() {
+    unreadable_sibling_package_is_reported_once(|_| noise(2048));
+}
+
+#[test]
+fn truncated_sibling_package_is_reported_unreadable_once() {
+    unreadable_sibling_package_is_reported_once(|valid| valid[..valid.len() / 2].to_vec());
+}
+
+#[test]
+fn newer_version_sibling_package_is_reported_unreadable_once() {
+    unreadable_sibling_package_is_reported_once(|valid| {
+        with_version(valid, vault_core::FORMAT_VERSION + 1)
+    });
+}
+
+/// Plant `bytes` at `copy` and wait until `name` has been reported `n` times in total.
+fn plant_until_reported(a: &mut SyncedVault, ea: &mut Events, copy: &Path, bytes: &[u8], n: usize) {
+    let name = copy.file_name().unwrap().to_str().unwrap().to_owned();
+    plant(copy, bytes);
+    assert!(
+        wait_until(|| {
+            a.poll();
+            ea.pump();
+            ea.count(unreadable(&name)) == n
+        }),
+        "{:?}",
+        ea.seen
+    );
+}
+
+/// After an unreadable copy is replaced by a readable one (absorbed), a damaged copy under
+/// the same name is reported again.
+#[test]
+fn unreadable_copy_is_reported_again_after_it_became_readable() {
+    let (_dir, path, mut a, mut b, _id) = two_devices();
+    let copy = path.parent().unwrap().join("vault 2.bin");
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+    plant_until_reported(&mut a, &mut ea, &copy, &noise(512), 1);
+
+    b.edit(|v| v.insert(Item::new("from b", Uuid::nil(), T0), T0))
+        .unwrap();
+    plant(&copy, &b.vault().unwrap().serialize());
+    assert!(wait_until(|| {
+        a.poll();
+        ea.pump();
+        ea.any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_)))
+    }));
+    assert!(!copy.exists());
+    assert_eq!(titles(&a), ["from b", "mail"]);
+
+    plant_until_reported(&mut a, &mut ea, &copy, &noise(256), 2);
+    assert!(copy.exists());
+}
+
+/// After an unreadable copy disappears, a damaged copy under the same name is reported again.
+#[test]
+fn unreadable_copy_is_reported_again_after_it_disappeared() {
+    let (_dir, path, mut a, _b, _id) = two_devices();
+    let copy = path.parent().unwrap().join("vault 2.bin");
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+    plant_until_reported(&mut a, &mut ea, &copy, &noise(512), 1);
+
+    fs::remove_file(&copy).unwrap();
+    assert!(
+        drain_for(&mut a, 5) > 0,
+        "removal produced no watcher signal"
+    );
+    ea.pump();
+    assert_eq!(ea.count(unreadable("vault 2.bin")), 1);
+
+    plant_until_reported(&mut a, &mut ea, &copy, &noise(512), 2);
+}
+
+/// A sibling package whose damaged `vault.bin` is removed (the directory stays) and then
+/// arrives damaged again is reported again.
+#[test]
+fn sibling_package_reported_again_after_its_vault_file_disappeared() {
+    let (dir, _path, mut a, _b, _id) = two_devices();
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+    let copy = dir.path().join("test 2.vault");
+    let is_unreadable = unreadable("test 2.vault");
+    plant_package(&copy, &noise(512));
+    assert!(wait_until(|| {
+        a.poll();
+        ea.pump();
+        ea.count(&is_unreadable) == 1
+    }));
+
+    fs::remove_file(copy.join(VAULT_FILE_NAME)).unwrap();
+    assert!(
+        drain_for(&mut a, 5) > 0,
+        "removal produced no watcher signal"
+    );
+    ea.pump();
+    assert_eq!(ea.count(&is_unreadable), 1);
+    assert!(copy.is_dir());
+
+    plant(&copy.join(VAULT_FILE_NAME), &noise(512));
+    assert!(
+        wait_until(|| {
+            a.poll();
+            ea.pump();
+            ea.count(&is_unreadable) == 2
+        }),
+        "{:?}",
+        ea.seen
+    );
+}

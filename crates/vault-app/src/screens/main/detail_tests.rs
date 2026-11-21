@@ -1575,3 +1575,37 @@ fn clearing_the_second_password_history_keeps_the_first(cx: &mut TestAppContext)
         assert_eq!(ids, [Some(fields[0])]);
     });
 }
+
+/// 05 §2.3 "Password notices": the strip's dot is centred on the first text line
+/// (within 1 px) at the default and the Larger text size.
+#[gpui::test]
+fn issue_strip_dot_centres_on_the_first_line(cx: &mut TestAppContext) {
+    for larger in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, ids, mut vcx) = open(dir.path(), &[("Bank", "123")], cx);
+        // Wide enough that the notice is one line: the text box is the line box.
+        vcx.simulate_resize(gpui::size(px(1600.), px(900.)));
+        select(&state, ids[0], &mut vcx);
+        if larger {
+            state.update(&mut vcx, |s, cx| {
+                s.update_settings(cx, |st| st.text_size = crate::state::TextSize::Larger)
+            });
+            vcx.update(|window, _| window.refresh());
+        }
+        vcx.run_until_parked();
+        let pw = field_id(&state, ids[0], 1, &vcx);
+        let dot = vcx
+            .debug_bounds(leak(format!("issue-dot {pw} Weak Password")))
+            .expect("dot drawn");
+        let text = vcx
+            .debug_bounds(leak(format!("issue-text {pw} Weak Password")))
+            .expect("text drawn");
+        let line = text.size.height;
+        assert!(line < dot.size.height * 3., "one line: {text:?}");
+        let (dc, tc) = (dot.center().y, text.top() + line / 2.);
+        assert!(
+            (dc - tc).abs() <= px(1.),
+            "larger {larger}: dot centre {dc:?}, first line centre {tc:?}"
+        );
+    }
+}

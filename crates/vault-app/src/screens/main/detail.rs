@@ -353,6 +353,10 @@ pub(crate) fn issue_strip(fi: &FieldIssue, cx: &App) -> gpui::Div {
     let theme = cx.theme();
     let title = fi.issue.title();
     let selector = format!("issue-strip {} {title}", fi.field);
+    let (dot, text) = (
+        format!("issue-dot {} {title}", fi.field),
+        format!("issue-text {} {title}", fi.field),
+    );
     ui::h_flex()
         .debug_selector(move || selector.clone())
         .w_full()
@@ -366,17 +370,33 @@ pub(crate) fn issue_strip(fi: &FieldIssue, cx: &App) -> gpui::Div {
         .bg(theme.danger.opacity(0.10))
         .text_xs()
         .text_color(theme.foreground)
-        // The dot sits on the first text line (xs line height is about 16 px).
-        .child(div().pt(px(2.)).child(alert_dot(12., cx)))
-        .child(div().flex_1().min_w_0().whitespace_normal().child(
-            gpui::StyledText::new(format!("{title} {}", fi.issue.body())).with_highlights([(
-                0..title.len(),
-                gpui::HighlightStyle {
-                    font_weight: Some(FontWeight::BOLD),
-                    ..Default::default()
-                },
-            )]),
-        ))
+        // The dot is centred on the first text line: a one-line-tall box (zero-width
+        // text in the strip's style sets its height, so it follows the text size), as
+        // `field_row` does for field icons.
+        .child(
+            ui::h_flex()
+                .flex_none()
+                .child(alert_dot(12., cx).debug_selector(move || dot.clone()))
+                .child(div().w_0().overflow_hidden().child("\u{200b}")),
+        )
+        .child(
+            div()
+                .debug_selector(move || text.clone())
+                .flex_1()
+                .min_w_0()
+                .whitespace_normal()
+                .child(
+                    gpui::StyledText::new(format!("{title} {}", fi.issue.body())).with_highlights(
+                        [(
+                            0..title.len(),
+                            gpui::HighlightStyle {
+                                font_weight: Some(FontWeight::BOLD),
+                                ..Default::default()
+                            },
+                        )],
+                    ),
+                ),
+        )
 }
 
 /// A section heading row (01 §4 `"section"`), shared like [`field_row`]: the name

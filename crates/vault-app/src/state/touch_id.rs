@@ -353,37 +353,7 @@ impl AppState {
                     return;
                 }
                 let unlocked = matches!(result, Ok(Ok(())));
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(SyncError::KeyMismatch)) => {
-                        this.error = Some(
-                            "This vault's key changed on another Mac. Enter your master password."
-                                .into(),
-                        );
-                    }
-                    Ok(Err(e)) if kek_error_is_stale(&e) => {
-                        this.mark_stale();
-                        this.error = TouchDenied::Stale.hint().map(SharedString::from);
-                    }
-                    // Tampered, unreadable, ...: say so; the enrollment is fine.
-                    Ok(Err(e)) => this.error = Some(super::error_message(&e).into()),
-                    Err(MacError::UserCancelled) => {}
-                    // Sensor temporarily unreachable (lid closed, ...): the enrollment is
-                    // fine and this is not a failed attempt.
-                    Err(MacError::NotAvailable) => {
-                        this.set_toast(Toast::window(TOUCH_UNAVAILABLE));
-                    }
-                    Err(MacError::BiometryChanged) => {
-                        this.mark_stale();
-                        this.set_toast(Toast::window(
-                            "Touch ID enrollment is no longer valid; enter your master password",
-                        ));
-                    }
-                    Err(e) => {
-                        this.count_touch_failure();
-                        this.set_toast(Toast::window(format!("Touch ID failed: {e}")));
-                    }
-                }
+                this.touch_unlock_result(result);
                 match (outcome, unlocked) {
                     (Outcome::Fresh, true) => {
                         this.vault = Some(vault);
@@ -397,6 +367,45 @@ impl AppState {
                 }
             },
         );
+    }
+
+    /// Reports a Touch ID unlock's failure, if it failed. A vault this build cannot unlock
+    /// blocks the card as on the password path (05 §2.2); a slot it cannot read is checked
+    /// first and still counts as a stale enrollment.
+    fn touch_unlock_result(&mut self, result: Result<Result<(), SyncError>, MacError>) {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(SyncError::KeyMismatch)) => {
+                self.error = Some(
+                    "This vault's key changed on another Mac. Enter your master password.".into(),
+                );
+            }
+            Ok(Err(e)) if kek_error_is_stale(&e) => {
+                self.mark_stale();
+                self.error = TouchDenied::Stale.hint().map(SharedString::from);
+            }
+            Ok(Err(e)) if let Some(blocked) = super::unlock_blocked(&e) => {
+                self.unlock_blocked = Some(blocked);
+            }
+            // Tampered, unreadable, ...: say so; the enrollment is fine.
+            Ok(Err(e)) => self.error = Some(super::error_message(&e).into()),
+            Err(MacError::UserCancelled) => {}
+            // Sensor temporarily unreachable (lid closed, ...): the enrollment is
+            // fine and this is not a failed attempt.
+            Err(MacError::NotAvailable) => {
+                self.set_toast(Toast::window(TOUCH_UNAVAILABLE));
+            }
+            Err(MacError::BiometryChanged) => {
+                self.mark_stale();
+                self.set_toast(Toast::window(
+                    "Touch ID enrollment is no longer valid; enter your master password",
+                ));
+            }
+            Err(e) => {
+                self.count_touch_failure();
+                self.set_toast(Toast::window(format!("Touch ID failed: {e}")));
+            }
+        }
     }
 
     /// Settings toggle on: add an enclave slot, save, enroll the KEK; undo the slot if
@@ -1157,6 +1166,35 @@ mod tests {
             assert!(!p.stale, "a damaged file is not the enrollment's fault");
             assert_eq!(p.failed_touch_attempts, 0);
             assert_eq!(s.touch_policy(), Ok(()));
+        });
+    }
+
+    /// Bug hunt 2026-11-21 N3: a Touch ID unlock that reports a newer format blocks the
+    /// card like the password path, without an error, a failed attempt or a stale mark;
+    /// `NoUsableSlot` (our slot rewritten by a newer version) stays a stale enrollment.
+    #[gpui::test]
+    fn touch_unlock_newer_version_blocks_the_card(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _, _) = setup(dir.path(), cx);
+        enable(&state, cx);
+        lock(&state, cx);
+        state.update(cx, |s, _| {
+            let newer = VaultError::UnsupportedVersion(vault_core::FORMAT_VERSION + 1);
+            s.touch_unlock_result(Ok(Err(SyncError::Vault(newer))));
+            assert_eq!(
+                s.unlock_blocked,
+                Some(crate::state::UnlockBlocked::NewerVersion)
+            );
+            assert!(s.error.is_none() && s.toast.is_none());
+            let p = s.policy().unwrap();
+            assert!(!p.stale);
+            assert_eq!(p.failed_touch_attempts, 0);
+
+            s.unlock_blocked = None;
+            s.touch_unlock_result(Ok(Err(SyncError::Vault(VaultError::NoUsableSlot))));
+            assert_eq!(s.unlock_blocked, None, "a stale slot, not a blocked vault");
+            assert_eq!(s.touch_policy(), Err(TouchDenied::Stale));
+            assert_eq!(s.error.as_deref(), TouchDenied::Stale.hint());
         });
     }
 

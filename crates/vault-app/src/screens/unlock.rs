@@ -793,6 +793,36 @@ mod tests {
         });
     }
 
+    /// Bug hunt 2026-11-21 N2: a newer version's file reported while locked blocks the
+    /// card the same way, keeping "Open another vault…".
+    #[gpui::test]
+    fn newer_version_on_disk_while_locked_blocks_the_card(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _, mut vcx) = open(dir.path(), cx);
+        assert!(vcx.debug_bounds("unlock-button").is_some());
+        state.update(&mut vcx, |s, cx| {
+            assert!(s.locked && s.unlock_blocked.is_none());
+            s.handle_sync_event(
+                vault_sync::SyncEvent::SaveBlocked(vault_sync::SaveBlocked::NewerVersion(99)),
+                cx,
+            );
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert_eq!(
+            state.read_with(&vcx, |s, _| s.unlock_blocked),
+            Some(UnlockBlocked::NewerVersion)
+        );
+        assert!(
+            vcx.debug_bounds("unlock-blocked").is_some(),
+            "message shown"
+        );
+        for gone in ["unlock-password", "unlock-button", "unlock-touch-id"] {
+            assert!(vcx.debug_bounds(gone).is_none(), "{gone} hidden");
+        }
+        assert!(vcx.debug_bounds("unlock-switch").is_some());
+    }
+
     #[gpui::test]
     fn wrong_password_returns_to_the_focused_field(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();

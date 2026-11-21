@@ -63,4 +63,18 @@ pub enum SyncEvent {
     /// and once more for a package still waiting after `lock` + unlock or after watching is
     /// stopped and restarted. The path is as received from the filesystem (not sanitised).
     WaitingForBlobs(PathBuf),
+    /// A conflict candidate at this path (03 §6: a whole-package sibling, whose `vault.bin`
+    /// is meant, or a per-file copy such as `vault 2.bin`) was read but is not a vault file
+    /// this build can open: it does not parse (random bytes, truncated) or carries a format
+    /// version other than ours (newer, or 0). It is not ours to judge, so it is left where it
+    /// is (never deleted or moved) and not merged. Emitted once per candidate while it stays
+    /// unreadable, not on every re-check; it comes again after the candidate was absorbed,
+    /// disappeared or became readable, and once more for a candidate still unreadable after
+    /// `lock` + unlock or after watching is stopped and restarted. It can fire while locked:
+    /// the file is parsed before the locked check (03 §6 step 1 before step 2). A copy whose download
+    /// fails is [`SyncEvent::CloudUnavailable`] instead, one that parses but holds another
+    /// vault is [`SyncEvent::ForeignVault`], and one that cannot be read at all (I/O error,
+    /// over [`crate::MAX_VAULT_FILE_SIZE`]) is [`SyncEvent::Error`]. The path is as received
+    /// from the filesystem (not sanitised).
+    UnreadableConflict(PathBuf),
 }

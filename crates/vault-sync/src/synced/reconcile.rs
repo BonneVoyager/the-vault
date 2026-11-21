@@ -51,12 +51,14 @@ impl SyncedVault {
     /// [`poll`]. A no-op if already watching. Nothing is processed until [`poll`] is called.
     ///
     /// Packages already waiting for blobs are reported again ([`SyncEvent::WaitingForBlobs`])
-    /// when the start-up scan re-checks them: whatever happened while unwatched is unknown.
+    /// when the start-up scan re-checks them, and so are unreadable candidates
+    /// ([`SyncEvent::UnreadableConflict`]): whatever happened while unwatched is unknown.
     ///
     /// [`poll`]: SyncedVault::poll
     pub fn start_watching(&mut self) -> Result<(), SyncError> {
         if self.watcher.is_none() {
             self.waiting_for_blobs.clear();
+            self.unreadable_conflicts.clear();
             self.watcher = Some(Watcher::start(&self.path)?);
         }
         Ok(())
@@ -65,11 +67,12 @@ impl SyncedVault {
     /// Stop watching and discard queued signals. Dropping the debouncer only sets its stop
     /// flag; it does not join, so its threads wind down shortly after this returns (any signal
     /// they still send goes nowhere).
-    /// Also forgets which packages were reported as waiting for blobs: nothing tells us if
-    /// they disappear while unwatched.
+    /// Also forgets which packages were reported as waiting for blobs and which candidates
+    /// as unreadable: nothing tells us if they disappear while unwatched.
     pub fn stop_watching(&mut self) {
         self.watcher = None;
         self.waiting_for_blobs.clear();
+        self.unreadable_conflicts.clear();
     }
 
     pub fn is_watching(&self) -> bool {
@@ -470,6 +473,8 @@ impl SyncedVault {
                 }
             }
             tracing::debug!(path = %path.display(), "candidate package has no vault.bin");
+            // A `vault.bin` arriving later is judged afresh.
+            self.unreadable_conflicts.remove(&package::path_key(path));
             return;
         }
         let Some(opened) = self.open_conflict(path, &inner, kind) else {
@@ -527,7 +532,11 @@ impl SyncedVault {
     ) -> Option<UnlockedVault> {
         let read = match self.read_parsed(inner) {
             Ok(Some(r)) => r,
-            Ok(None) => return None,
+            Ok(None) => {
+                // Vanished since the stat: whatever arrives next is judged afresh.
+                self.unreadable_conflicts.remove(&package::path_key(path));
+                return None;
+            }
             Err(SyncError::Cloud(e)) => {
                 self.cloud_unavailable(inner, &e);
                 return None;
@@ -538,12 +547,21 @@ impl SyncedVault {
             }
         };
         let hash = *blake3::hash(&read.bytes).as_bytes();
-        // Step 1. An unparseable file (perhaps still arriving) is not ours to judge; leave it
-        // alone until its next event.
+        // Step 1. A file that does not parse (damaged, or another format version) is not ours
+        // to judge: leave it where it is, report it once, and look again on its next event.
+        // A copy still downloading never gets here (`ensure_downloaded` above).
+        let key = package::path_key(path);
         let theirs = match read.parsed {
-            Ok(v) => v,
+            Ok(v) => {
+                self.unreadable_conflicts.remove(&key);
+                v
+            }
             Err(e) => {
-                tracing::debug!(path = %path.display(), error = %e, "ignoring unreadable conflict candidate");
+                tracing::debug!(path = %path.display(), error = %e, "leaving unreadable conflict candidate in place");
+                if let Entry::Vacant(slot) = self.unreadable_conflicts.entry(key) {
+                    slot.insert(path.to_owned());
+                    self.emit(SyncEvent::UnreadableConflict(path.to_owned()));
+                }
                 return None;
             }
         };
@@ -555,7 +573,6 @@ impl SyncedVault {
         // Step 2: no key while locked; defer. The list is uncapped by design: it is
         // deduplicated by path key, so it is bounded by the distinct candidates on disk.
         if self.unlocked.is_none() {
-            let key = package::path_key(path);
             if !self
                 .pending_conflicts
                 .iter()
@@ -630,12 +647,13 @@ impl SyncedVault {
         self.emit(event);
     }
 
-    /// Drop per-sibling bookkeeping (reports, blob wait) for a copy that was absorbed or is
-    /// gone, so a new copy under the same name is reported afresh.
+    /// Drop per-sibling bookkeeping (reports, blob wait, unreadable report) for a copy that
+    /// was absorbed or is gone, so a new copy under the same name is reported afresh.
     fn forget_sibling(&mut self, path: &Path) {
         let key = package::path_key(path);
         self.sibling_reports.remove(&key);
         self.waiting_for_blobs.remove(&key);
+        self.unreadable_conflicts.remove(&key);
     }
 
     /// Work deferred while locked: rewrite a corrupt primary and absorb queued copies.

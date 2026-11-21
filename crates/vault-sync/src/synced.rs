@@ -160,6 +160,12 @@ pub struct SyncedVault {
     /// `start_watching`, `stop_watching` and `lock` (whose entries are re-checked at the next
     /// unlock), so a package still waiting after any of those is reported once more.
     waiting_for_blobs: HashMap<PathBuf, PathBuf>,
+    /// Conflict candidates reported as [`SyncEvent::UnreadableConflict`]:
+    /// [`package::path_key`] -> path as received. An entry goes when the candidate is
+    /// absorbed, disappears or parses again; the whole map is cleared by `start_watching`,
+    /// `stop_watching` and `lock` (whose entries are re-checked at the next unlock), so a
+    /// candidate still unreadable after any of those is reported once more.
+    unreadable_conflicts: HashMap<PathBuf, PathBuf>,
     /// The primary was found missing while unlocked ([`SyncEvent::PrimaryMissing`] emitted,
     /// vault marked dirty). Cleared when the primary is read or written again, and on lock.
     primary_missing: bool,
@@ -234,6 +240,7 @@ impl SyncedVault {
             locked_fallback: None,
             sibling_reports: HashMap::new(),
             waiting_for_blobs: HashMap::new(),
+            unreadable_conflicts: HashMap::new(),
             primary_missing: false,
             primary_seen: None,
             prune_clock_offset: Duration::ZERO,
@@ -339,6 +346,7 @@ impl SyncedVault {
             locked_fallback: None,
             sibling_reports: HashMap::new(),
             waiting_for_blobs: HashMap::new(),
+            unreadable_conflicts: HashMap::new(),
             primary_missing: false,
             primary_seen: None,
             prune_clock_offset: Duration::ZERO,
@@ -526,9 +534,12 @@ impl SyncedVault {
         if std::mem::take(&mut self.dirty_from_corrupt) {
             self.rewrite_on_unlock = true;
         }
-        // Packages still waiting for blobs: re-check (and report again) after the next
-        // unlock, even if no watcher event arrives for them meanwhile.
-        for (key, path) in std::mem::take(&mut self.waiting_for_blobs) {
+        // Packages still waiting for blobs and unreadable candidates: re-check (and report
+        // again) after the next unlock, even if no watcher event arrives for them meanwhile.
+        let recheck = std::mem::take(&mut self.waiting_for_blobs)
+            .into_iter()
+            .chain(std::mem::take(&mut self.unreadable_conflicts));
+        for (key, path) in recheck {
             if !self
                 .pending_conflicts
                 .iter()

@@ -465,6 +465,10 @@ fn sync_report(events: impl Iterator<Item = vault_sync::SyncEvent>) -> SyncRepor
             SyncEvent::CloudUnavailable => r
                 .problems
                 .push("cloud copy not downloaded in time".to_owned()),
+            SyncEvent::UnreadableConflict(p) => r.problems.push(format!(
+                "unreadable conflict copy: {}",
+                sanitize_line(&p.display().to_string())
+            )),
             _ => {}
         }
     }
@@ -1533,6 +1537,23 @@ mod tests {
         assert!(!all.contains('\u{1b}'), "{all}");
         assert!(r.lines[0].contains("\\u{1b}[31mred"));
         assert_eq!(r.problems.len(), 2);
+    }
+
+    #[test]
+    fn sync_report_unreadable_conflict_is_a_problem() {
+        use vault_sync::SyncEvent;
+        let r = sync_report(
+            vec![SyncEvent::UnreadableConflict(PathBuf::from(
+                "/x/vault 2.bin\n\u{1b}[2J",
+            ))]
+            .into_iter(),
+        );
+        assert_eq!(r.absorbed, 0);
+        assert!(r.lines.is_empty());
+        assert_eq!(
+            r.problems,
+            vec!["unreadable conflict copy: /x/vault 2.bin\\n\\u{1b}[2J".to_owned()]
+        );
     }
 
     #[test]
