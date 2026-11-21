@@ -109,14 +109,23 @@ pub enum UnlockBlocked {
 /// The unlock screen's text for [`UnlockBlocked::NewerVersion`].
 pub const NEWER_VERSION: &str = "This vault was created by a newer version of Vault.";
 
+/// Shown for a vault that fails its integrity check, and for a header whose format version
+/// is not a newer one (version 0 is damage, 01 §1).
+pub const DAMAGED: &str = "This vault failed its integrity check and may have been tampered with.";
+
+/// Whether `e` reports a format version newer than this build writes. Version 0, or one
+/// at or below [`vault_core::FORMAT_VERSION`], is damage and not "newer".
+fn newer_version(e: &SyncError) -> bool {
+    match e {
+        SyncError::Vault(VaultError::UnsupportedVersion(v)) => *v > vault_core::FORMAT_VERSION,
+        SyncError::Vault(VaultError::NoUsableSlot) => true,
+        _ => false,
+    }
+}
+
 /// The open or unlock failure that blocks unlocking with this build, if `e` is one.
 fn unlock_blocked(e: &SyncError) -> Option<UnlockBlocked> {
-    match e {
-        SyncError::Vault(VaultError::UnsupportedVersion(_) | VaultError::NoUsableSlot) => {
-            Some(UnlockBlocked::NewerVersion)
-        }
-        _ => None,
-    }
+    newer_version(e).then_some(UnlockBlocked::NewerVersion)
 }
 
 /// Background work in flight; the UI shows a spinner and refuses new requests.
@@ -1490,11 +1499,9 @@ fn error_message(e: &SyncError) -> String {
     match e {
         SyncError::Vault(VaultError::WrongPassword) => "Wrong password. Try again.".into(),
         SyncError::Vault(VaultError::BadMagic) => "This file is not a vault.".into(),
-        SyncError::Vault(VaultError::UnsupportedVersion(_) | VaultError::NoUsableSlot) => {
-            NEWER_VERSION.into()
-        }
-        SyncError::Vault(VaultError::Tampered(_)) => {
-            "This vault failed its integrity check and may have been tampered with.".into()
+        e if newer_version(e) => NEWER_VERSION.into(),
+        SyncError::Vault(VaultError::UnsupportedVersion(_) | VaultError::Tampered(_)) => {
+            DAMAGED.into()
         }
         // vault-sync reports the inner file when the package exists but has no vault.bin.
         SyncError::NoVault(p) if p.file_name().is_some_and(|n| n == VAULT_FILE_NAME) => {

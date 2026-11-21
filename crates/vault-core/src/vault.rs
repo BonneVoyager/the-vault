@@ -15,8 +15,10 @@
 //!    (the manifest is required to already be in sorted order) -> `Tampered(Manifest)`.
 //!
 //! `unlock_with_kek` replaces step 1 with a single named slot and shares steps 2-4.
-//! `unlock_with_key` (feature `sync`) skips step 1 entirely and shares steps 2-4, with the
-//! *first* tag failure reported as `WrongPassword` (see its docs).
+//! `unlock_with_key` (feature `sync`) skips step 1 entirely and shares steps 2-4; because no
+//! slot has verified the key, a tag failure *before anything authenticated* is settled by
+//! probing the manifest with the same key (see its docs): `Tampered(Item(id))` if the
+//! manifest opens, `WrongPassword` otherwise.
 //!
 //! Key-slot management (`change_password`, `add_enclave_slot`, `remove_slot`,
 //! `rotate_vault_key`) only edits the plaintext header and the in-memory keys; items are
@@ -75,14 +77,18 @@ fn not_deleted(id: Uuid) -> VaultError {
     VaultError::Malformed(format!("item {id} is not deleted"))
 }
 
-/// The error for an item/manifest AEAD tag failure during unlock. `wrong_key` is true only on
-/// the `unlock_with_key` path (feature `sync`) while no record has authenticated yet, in which
-/// case the failure is reported as the wrong vault key rather than tampering.
-fn tag_failure(wrong_key: bool, kind: TamperKind) -> VaultError {
-    if wrong_key {
+/// The error for an item record whose AEAD tag failed during unlock. `probe_manifest` is
+/// `Some` only on the `unlock_with_key` path (feature `sync`) while no record has
+/// authenticated yet: the key is then unverified, so the manifest is opened with the same
+/// key and AAD the manifest step would use (01 §4). If it opens, the key is this vault's and
+/// the record is damaged: `Tampered(Item(id))` (02 guarantee 4). If it fails too, nothing at
+/// all authenticates under this key: `WrongPassword`. The probe runs only on this failure
+/// path, so a healthy vault still decrypts the manifest exactly once.
+fn item_tag_failure(id: Uuid, probe_manifest: Option<impl FnOnce() -> bool>) -> VaultError {
+    if probe_manifest.is_some_and(|opens| !opens()) {
         VaultError::WrongPassword
     } else {
-        VaultError::Tampered(kind)
+        VaultError::Tampered(TamperKind::Item(id))
     }
 }
 
@@ -255,16 +261,22 @@ impl LockedVault {
     /// Item and manifest verification is the same shared path as [`LockedVault::unlock`]
     /// (items in file order, then the manifest), with one difference in error mapping. No
     /// slot is unwrapped here, so nothing checks the key before item decryption; a wrong key
-    /// would fail every tag and surface as `Tampered`, which is misleading. Interpretation:
-    /// the **first** tag check (the first item record, or the manifest when the vault has no
-    /// items) failing is reported as [`VaultError::WrongPassword`], meaning "wrong vault
-    /// key". Every later failure is a real [`VaultError::Tampered`], because the key has by
-    /// then authenticated at least one record under this vault's `vault_id`. The one case
-    /// this conflates is a correct key with a tampered *first* record (or tampered manifest
-    /// of an empty vault): it is reported as `WrongPassword`; `unlock` with the password
-    /// still reports it as `Tampered`. Likewise a file whose item records were all dropped
-    /// (rolled back to empty, with the manifest left behind) fails its first and only tag
-    /// check on the manifest and maps to `WrongPassword`.
+    /// would fail every tag and surface as `Tampered`, which is misleading. Rule (owner
+    /// decision 2026-11-21, bug-hunt L1): when a tag check fails **before any record has
+    /// authenticated**, the key is settled by opening the manifest with the same key and the
+    /// same AAD the manifest step uses. Manifest opens: the key is this vault's, so a failed
+    /// item record is [`VaultError::Tampered`]`(Item(id))` exactly as on the password path
+    /// (02 guarantee 4 holds here too). Manifest fails as well: nothing authenticates under
+    /// this key, [`VaultError::WrongPassword`], meaning "wrong vault key". Once a record has
+    /// authenticated, every later failure is `Tampered(..)` as usual, with no probe.
+    ///
+    /// The one residual conflation is a vault with **no item records** whose manifest fails:
+    /// the manifest is then the only tag check and there is nothing else to probe, so it is
+    /// reported as `WrongPassword` whether the key is foreign, the manifest was damaged, or
+    /// every item record was dropped (rollback to empty with the manifest left behind).
+    /// `unlock` with the password reports the last two as `Tampered(Manifest)`. A single
+    /// AEAD tag failure carries no information about *why* it failed, and this crate adds no
+    /// verifier record, so this case cannot be split without a format change.
     ///
     /// Consequently `vault-sync` must treat `WrongPassword` from this method as "re-verify
     /// this file with the password" (prompt, then `unlock`), **never** as "adopt the on-disk
@@ -284,29 +296,52 @@ impl LockedVault {
         Ok(vault)
     }
 
-    /// Steps 2-4 of the unlock order (module docs). `first_failure_is_wrong_key` is set only
-    /// by `unlock_with_key`: the very first AEAD tag failure (first item, or the manifest of
-    /// an empty vault) is then reported as `WrongPassword` instead of `Tampered`.
+    /// Steps 2-4 of the unlock order (module docs). `key_unverified` is set only by
+    /// `unlock_with_key` (no slot vouched for the key): a tag failure before any record has
+    /// authenticated is then settled by the manifest probe described in [`item_tag_failure`];
+    /// with no item records at all the failing manifest is the only check and maps to
+    /// `WrongPassword`. The password/KEK paths pass `false` and never probe.
     fn unlock_with_vault_key(
         &self,
         vault_key: crypto::Key32,
-        first_failure_is_wrong_key: bool,
+        key_unverified: bool,
     ) -> Result<UnlockedVault, VaultError> {
         let header = &self.file.header;
         let vault_id = header.vault_id;
         let version = header.format_version;
         let keys = Keys::from_vault_key(vault_key, vault_id);
 
+        let item_count = u32::try_from(self.file.items.len())
+            .map_err(|_| VaultError::Malformed("more than u32::MAX item records".into()))?;
+        let manifest = &self.file.manifest;
+        // A stamped header is bound into the manifest AAD (01 §4 `header_digest`): a header
+        // that was stripped, re-stamped, replaced or spliced fails the manifest step as
+        // Tampered(Manifest) on every unlock path (`unlock_with_key` included; on a vault
+        // with no item records that path reports it as WrongPassword, see `key_unverified`).
+        // Computed once, up front: the same bytes serve the manifest step and, on the key
+        // path only, the probe run when the very first record fails.
+        let digest = header.digest();
+        let aad_manifest = manifest_aad(version, vault_id, item_count, digest.as_ref());
+        let open_manifest = || {
+            crypto::open(
+                &keys.manifest_key,
+                &manifest.nonce,
+                &aad_manifest,
+                &manifest.ct,
+            )
+        };
+
         let mut items = BTreeMap::new();
         let mut record_extras = BTreeMap::new();
         let mut pairs = Vec::with_capacity(self.file.items.len());
         for rec in &self.file.items {
             let aad = item_aad(version, vault_id, rec.id, rec.modified_at);
-            let on_fail = tag_failure(
-                first_failure_is_wrong_key && pairs.is_empty(),
-                TamperKind::Item(rec.id),
-            );
-            let plain = crypto::open(&keys.item_key, &rec.nonce, &aad, &rec.ct).ok_or(on_fail)?;
+            let plain =
+                crypto::open(&keys.item_key, &rec.nonce, &aad, &rec.ct).ok_or_else(|| {
+                    let probe = (key_unverified && pairs.is_empty())
+                        .then_some(|| open_manifest().is_some());
+                    item_tag_failure(rec.id, probe)
+                })?;
             let item = format::decode_item_plain(&plain, rec.id, rec.modified_at, version)?;
             pairs.push((rec.id, rec.modified_at));
             items.insert(rec.id, item);
@@ -315,21 +350,12 @@ impl LockedVault {
             }
         }
 
-        let item_count = u32::try_from(self.file.items.len())
-            .map_err(|_| VaultError::Malformed("more than u32::MAX item records".into()))?;
-        let manifest = &self.file.manifest;
-        // A stamped header is bound into the manifest AAD (01 §4 `header_digest`): a header
-        // that was stripped, re-stamped, replaced or spliced fails here as Tampered(Manifest)
-        // on every unlock path (`unlock_with_key` included; on an *empty* vault that path
-        // reports it as WrongPassword, see `first_failure_is_wrong_key`).
-        let digest = header.digest();
-        let aad = manifest_aad(version, vault_id, item_count, digest.as_ref());
-        let on_fail = tag_failure(
-            first_failure_is_wrong_key && pairs.is_empty(),
-            TamperKind::Manifest,
-        );
-        let plain =
-            crypto::open(&keys.manifest_key, &manifest.nonce, &aad, &manifest.ct).ok_or(on_fail)?;
+        let on_fail = if key_unverified && pairs.is_empty() {
+            VaultError::WrongPassword
+        } else {
+            VaultError::Tampered(TamperKind::Manifest)
+        };
+        let plain = open_manifest().ok_or(on_fail)?;
         let expected = format::decode_manifest(&plain)?;
         pairs.sort_unstable();
         if expected != pairs {

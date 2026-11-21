@@ -81,7 +81,7 @@ impl LockedVault {
     pub fn unlock(&self, password: &SecretString) -> Result<UnlockedVault, VaultError>;
     pub fn unlock_with_kek(&self, slot_id: Uuid, kek: &SecretVec<u8>) -> Result<UnlockedVault, VaultError>; // enclave or passkey slot
     #[cfg(feature = "sync")]
-    pub fn unlock_with_key(&self, key: &VaultKeyHandle, device_id: Uuid) -> Result<UnlockedVault, VaultError>;  // vault-sync only; first tag failure → WrongPassword
+    pub fn unlock_with_key(&self, key: &VaultKeyHandle, device_id: Uuid) -> Result<UnlockedVault, VaultError>;  // vault-sync only. A tag failure before any record authenticates is settled by opening the manifest with the same key: Tampered(Item(id)) if it opens, WrongPassword if not; a vault with no items reports a failing manifest as WrongPassword (nothing to probe). After one record authenticates every failure is Tampered. Guarantee 4 holds on this path (bug hunt 2026-11-21 L1)
 }
 ```
 

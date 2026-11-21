@@ -360,8 +360,8 @@ impl SyncedVault {
     /// [`SyncEvent::KeyRotatedOnDisk`]: then the on-disk vault opened with this password
     /// becomes the in-memory vault, with the previous in-memory items merged into it
     /// ([`SyncEvent::Merged`]), and saving is allowed again. If the on-disk vault instead fails
-    /// its integrity check (a tampered first record looks like a key mismatch to the cached
-    /// key), the in-memory vault wins: [`SyncEvent::CorruptOnDisk`], dirty, rewritten on the
+    /// its integrity check (e.g. tampering that changed the slots, so the cached key no longer
+    /// opened it), the in-memory vault wins: [`SyncEvent::CorruptOnDisk`], dirty, rewritten on the
     /// next save.
     ///
     /// Limitation: a rollback of the file to a version from before a key rotation opens with
@@ -959,10 +959,12 @@ impl SyncedVault {
             }) => {
                 self.snapshot(&current, SystemTime::now(), BackupKind::Snapshot)?;
             }
+            // Only a version above ours is "newer"; version 0 is damage (01 §1) and falls
+            // to the unparseable arm below.
             Some(ReadParsed {
                 parsed: Err(VaultError::UnsupportedVersion(v)),
                 ..
-            }) => {
+            }) if v > vault_core::FORMAT_VERSION => {
                 // A newer build wrote it; replacing it would destroy that device's data.
                 return Err(SyncError::SaveBlocked(SaveBlocked::NewerVersion(v)));
             }

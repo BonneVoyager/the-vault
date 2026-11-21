@@ -558,7 +558,10 @@ fn newer_version_vault_opens_blocked(cx: &mut TestAppContext) {
     state.update(cx, |s, cx| s.close_vault(cx));
     assert!(state.read_with(cx, |s, _| s.unlock_blocked.is_none()));
 
-    for e in [VaultError::UnsupportedVersion(9), VaultError::NoUsableSlot] {
+    for e in [
+        VaultError::UnsupportedVersion(vault_core::FORMAT_VERSION + 1),
+        VaultError::NoUsableSlot,
+    ] {
         let e = SyncError::Vault(e);
         assert_eq!(error_message(&e), NEWER_VERSION);
         assert_eq!(unlock_blocked(&e), Some(UnlockBlocked::NewerVersion));
@@ -567,6 +570,33 @@ fn newer_version_vault_opens_blocked(cx: &mut TestAppContext) {
         unlock_blocked(&SyncError::Vault(VaultError::WrongPassword)),
         None
     );
+}
+
+/// A header with format version 0 is damage (01 §1), not a newer vault: opening it is not
+/// blocked and reports the damaged-file text on the choose screen.
+#[gpui::test]
+fn version_zero_vault_is_damaged_not_newer(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = create(dir.path()).path().to_owned();
+    let file = path.join(VAULT_FILE_NAME);
+    let mut bytes = std::fs::read(&file).unwrap();
+    bytes[4..6].copy_from_slice(&0u16.to_be_bytes());
+    std::fs::write(&file, bytes).unwrap();
+
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    state.update(cx, |s, cx| s.open_vault(path.clone(), cx));
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| {
+        assert_eq!(s.unlock_blocked, None);
+        assert_eq!(s.error.as_deref(), Some(DAMAGED));
+        assert_ne!(s.screen, Screen::Unlock);
+    });
+
+    for v in [0, vault_core::FORMAT_VERSION] {
+        let e = SyncError::Vault(VaultError::UnsupportedVersion(v));
+        assert_eq!(unlock_blocked(&e), None, "version {v}");
+        assert_eq!(error_message(&e), DAMAGED, "version {v}");
+    }
 }
 
 /// A password slot of a kind this build does not know (the header's only `password`

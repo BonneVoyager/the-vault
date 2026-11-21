@@ -85,7 +85,7 @@ On a debounced event for `<name>.vault/vault.bin`:
    e. if ours has anything the on-disk copy lacks (an item, a newer field, a tombstone) → save() as well. Without this write-back two devices never converge when only one side changed. Side effect: unsaved edits can reach disk before the autosave timer.
 ```
 
-Before every `save`, re-read the primary and merge it in (pre-write merge), so a save can never clobber a change that landed between the last watcher event and now. If the on-disk file has a newer `FORMAT_VERSION` or a different `vault_id`, the save is refused with `SyncEvent::SaveBlocked{NewerVersion | ForeignVault}` and the in-memory state is kept.
+Before every `save`, re-read the primary and merge it in (pre-write merge), so a save can never clobber a change that landed between the last watcher event and now. If the on-disk file has a newer `FORMAT_VERSION` (strictly above ours; version 0 or any other unsupported value is corruption and takes the step-3 corruption path, bug hunt 2026-11-21 L3) or a different `vault_id`, the save is refused with `SyncEvent::SaveBlocked{NewerVersion | ForeignVault}` and the in-memory state is kept.
 
 Merge is idempotent and commutative, so a ping-pong between two devices converges in one round trip each.
 
@@ -232,7 +232,7 @@ pub enum SyncEvent {
     BackupDeleted(PathBuf),      // user-initiated delete_backup
     AttachmentsPruned(usize),    // orphan blobs deleted by cleanup (§1.1)
     PrimaryMissing,              // vault.bin vanished while unlocked; kept dirty, next save recreates it
-    KeyMismatch,                 // on-disk file no longer opens with our cached key (password changed elsewhere); edits are kept, next unlock re-verifies
+    KeyMismatch,                 // on-disk file no longer opens with our cached key (password changed elsewhere; a tampered item is CorruptOnDisk, not this, since 2026-11-21); edits are kept, next unlock re-verifies
     KeyRotatedOnDisk,            // vault_key rotated elsewhere; must re-unlock with the password
     SaveBlocked(SaveBlocked),     // NewerVersion | ForeignVault; in-memory state kept; emitted once at first detection and once per refused save
     Error(String),
@@ -250,7 +250,7 @@ pub const DEBOUNCE: Duration;             // 500 ms watcher debounce (§3)
 //   AttachmentTampered(Uuid)      blob failed authentication (corrupt, truncated, swapped); discard bytes already read
 ```
 
-Backups carry a kind: `Snapshot` (policy in §4), `Unsaved` (taken on lock or quit while edits could not be saved), `Conflict` (absorbed conflict copy, §6). Retention prunes `Snapshot` only; `Unsaved` and `Conflict` are never pruned. `restore_from` snapshots the current file first and works even when the primary no longer parses.
+Backups carry a kind: `Snapshot` (policy in §4), `Unsaved` (taken on lock or quit while edits could not be saved), `Conflict` (absorbed conflict copy, §6). Retention prunes `Snapshot` only; `Unsaved` and `Conflict` are never pruned. `restore_from` snapshots the current file first and works even when the primary no longer parses (a version-0 primary counts as unparseable and is kept as an `Unsaved` backup; only a version strictly above ours refuses the restore as `NewerVersion`, bug hunt 2026-11-21 L3).
 
 Autosave: the app calls `save()` 2 s after the last edit (debounced) and immediately on lock, quit, and window close. `vault-sync` does not have its own timer.
 

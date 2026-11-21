@@ -27,10 +27,13 @@ fn unlock_with_key_matches_password_unlock_and_sets_device_id() {
     assert_eq!(by_key.header(), by_password.header());
 }
 
+/// A wrong vault key: the first record fails, the manifest probe fails too, so nothing
+/// authenticates under the key and it is `WrongPassword`, on a 3-item vault and on an empty
+/// one (where the manifest is the first and only tag check).
 #[test]
 fn handle_from_different_vault_is_wrong_password() {
     let mut a = new_vault();
-    populate(&mut a, 2);
+    populate(&mut a, 3);
     let other = new_vault();
     let foreign = other.export_vault_key();
 
@@ -40,7 +43,6 @@ fn handle_from_different_vault_is_wrong_password() {
         VaultError::WrongPassword
     );
 
-    // Same for an empty target: the manifest is the first (and only) tag check.
     let empty = LockedVault::parse(&new_vault().serialize()).unwrap();
     assert_eq!(
         empty.unlock_with_key(&foreign, device()).unwrap_err(),
@@ -85,18 +87,50 @@ fn tampered_second_item_is_still_reported_as_tampered() {
     );
 }
 
+/// 02 guarantee 4 on the key path (bug-hunt 2026-11-21 L1): with the right vault key, a
+/// flipped byte in record 0, 1 or 2 of a 3-item vault is `Tampered(Item(id))` on both
+/// `unlock` and `unlock_with_key`. Record 0 is the interesting one: nothing has authenticated
+/// yet, so the key path settles it by probing the manifest with the same key.
 #[test]
-fn tampered_first_item_is_conflated_with_wrong_key() {
-    // Documented limitation of the heuristic: with the right key and a damaged *first*
-    // record (or every record dropped, see below), `unlock_with_key` says WrongPassword while
-    // `unlock` says Tampered. vault-sync must therefore treat WrongPassword from
-    // `unlock_with_key` as "re-verify with the password", never as "adopt disk silently".
+fn tampered_record_is_tampered_on_both_unlock_paths() {
     let mut v = new_vault();
-    populate(&mut v, 2);
+    populate(&mut v, 3);
+    let handle = v.export_vault_key();
+    let bytes = v.serialize();
+    let file = VaultFile::parse(&bytes).unwrap();
+    assert_eq!(file.items.len(), 3);
+    for rec in 0..3 {
+        let id = file.items[rec].id;
+        let t = rewrite(&bytes, |f| f.items[rec].ct[0] ^= 0x01);
+        let locked = LockedVault::parse(&t).unwrap();
+        let want = VaultError::Tampered(TamperKind::Item(id));
+        assert_eq!(
+            locked.unlock_with_key(&handle, device()).unwrap_err(),
+            want,
+            "record {rec} on unlock_with_key"
+        );
+        assert_eq!(
+            locked.unlock(&pw()).unwrap_err(),
+            want,
+            "record {rec} on unlock"
+        );
+    }
+}
+
+/// With the right key, a damaged first record *and* a damaged manifest cannot be told from
+/// a wrong key (owner decision 2026-11-21: probe fails -> `WrongPassword`); the password
+/// path, which has verified the key against a slot, still reports the record.
+#[test]
+fn tampered_first_record_and_manifest_is_wrong_key_on_key_path() {
+    let mut v = new_vault();
+    populate(&mut v, 3);
     let handle = v.export_vault_key();
     let bytes = v.serialize();
     let first = VaultFile::parse(&bytes).unwrap().items[0].id;
-    let t = rewrite(&bytes, |f| f.items[0].ct[0] ^= 0x01);
+    let t = rewrite(&bytes, |f| {
+        f.items[0].ct[0] ^= 0x01;
+        f.manifest.ct[0] ^= 0x01;
+    });
     let locked = LockedVault::parse(&t).unwrap();
     assert_eq!(
         locked.unlock_with_key(&handle, device()).unwrap_err(),
@@ -106,10 +140,37 @@ fn tampered_first_item_is_conflated_with_wrong_key() {
         locked.unlock(&pw()).unwrap_err(),
         VaultError::Tampered(TamperKind::Item(first))
     );
+}
 
-    // Rollback to empty: all item records dropped, manifest left behind. The manifest is now
-    // the first (and only) tag check, its AAD count no longer matches, so WrongPassword.
-    let t = rewrite(&bytes, |f| f.items.clear());
+/// The residual conflation, pinned so a change is noticed: a vault with no item records has
+/// the manifest as its only tag check and nothing else to probe, so on the key path a
+/// damaged manifest (ct flipped, or every record dropped with the manifest left behind) is
+/// `WrongPassword`, indistinguishable from a foreign key without a format change. `unlock`
+/// with the password reports it as `Tampered(Manifest)`. vault-sync must therefore keep
+/// treating `WrongPassword` from `unlock_with_key` as "re-verify with the password", never
+/// as "adopt disk silently".
+#[test]
+fn empty_vault_manifest_failure_is_wrong_key_on_key_path() {
+    let empty = new_vault();
+    let handle = empty.export_vault_key();
+    let bytes = empty.serialize();
+    let t = rewrite(&bytes, |f| f.manifest.ct[0] ^= 0x01);
+    let locked = LockedVault::parse(&t).unwrap();
+    assert_eq!(
+        locked.unlock_with_key(&handle, device()).unwrap_err(),
+        VaultError::WrongPassword
+    );
+    assert_eq!(
+        locked.unlock(&pw()).unwrap_err(),
+        VaultError::Tampered(TamperKind::Manifest)
+    );
+
+    // Rollback to empty: all item records dropped, manifest left behind. The manifest AAD
+    // count no longer matches, and it is the first (and only) tag check.
+    let mut v = new_vault();
+    populate(&mut v, 2);
+    let handle = v.export_vault_key();
+    let t = rewrite(&v.serialize(), |f| f.items.clear());
     let locked = LockedVault::parse(&t).unwrap();
     assert_eq!(
         locked.unlock_with_key(&handle, device()).unwrap_err(),
@@ -324,8 +385,9 @@ fn flipped_slot_nonce_on_a_fresh_vault_fails_unlock_with_key() {
     assert!(locked.unlock_with_key(&handle, device()).is_ok());
     assert_eq!(locked.unlock(&pw()).unwrap_err(), VaultError::WrongPassword);
 
-    // Empty fresh vault: the manifest is the first tag check on this path, so the tamper is
-    // reported as `WrongPassword` (first-failure rule) but still fails at open.
+    // Empty fresh vault: the manifest is the only tag check on this path and there is nothing
+    // to probe, so the tamper is reported as `WrongPassword` (see
+    // `empty_vault_manifest_failure_is_wrong_key_on_key_path`) but still fails at open.
     let empty = new_vault();
     let handle = empty.export_vault_key();
     let locked = LockedVault::parse(&flip(&empty.serialize())).unwrap();

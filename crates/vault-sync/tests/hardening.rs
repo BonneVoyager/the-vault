@@ -1,6 +1,6 @@
 //! Refusing to overwrite what must not be overwritten, and never losing in-memory state:
-//! save blocks (newer format, foreign vault), key mismatch on lock, tampered files that look
-//! like a key mismatch, tampered changes while locked, and reconciling on save/unlock without a
+//! save blocks (newer format, foreign vault), key mismatch on lock, a tampered first record
+//! (corruption, not a key change), tampered changes while locked, and reconciling on save/unlock without a
 //! watcher.
 
 use std::fs;
@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use tempfile::TempDir;
 use vault_core::format::VaultFile;
-use vault_core::{Item, KdfParams, LockedVault, SecretString, SecretVec, UnlockedVault, Uuid};
+use vault_core::{
+    FORMAT_VERSION, Item, KdfParams, LockedVault, SecretString, SecretVec, UnlockedVault, Uuid,
+};
 use vault_sync::{
     BackupKind, CloudError, CloudHooks, NoopHooks, SaveBlocked, SyncError, SyncEvent, SyncedVault,
     VAULT_FILE_NAME,
@@ -94,13 +96,19 @@ fn plant(dst: &Path, bytes: &[u8]) {
 
 /// `bytes` with the format version in the prefix raised beyond what this build reads.
 fn newer_version(bytes: &[u8]) -> Vec<u8> {
+    with_version(bytes, 0xFFFF)
+}
+
+/// `bytes` with the big-endian u16 format version after the 4-byte magic set to `v` (01 §1).
+fn with_version(bytes: &[u8], v: u16) -> Vec<u8> {
     let mut b = bytes.to_vec();
-    b[4..6].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    b[4..6].copy_from_slice(&v.to_be_bytes());
     b
 }
 
 /// `bytes` with one bit of the first item record's ciphertext flipped: parses, same vault id,
-/// fails its first AEAD tag (which `unlock_with_key` reports as `WrongPassword`).
+/// fails its first AEAD tag (which `unlock_with_key` reports as `Tampered(Item(id))`, since
+/// the manifest still opens with the same key).
 fn tamper_first_item(bytes: &[u8]) -> Vec<u8> {
     let mut f = VaultFile::parse(bytes).unwrap();
     f.items[0].ct[0] ^= 0x01;
@@ -150,6 +158,39 @@ fn newer_format_on_disk_blocks_save_until_a_valid_file_returns() {
     plant(&path, &valid);
     a.save().unwrap();
     assert_eq!(disk_titles(&path), ["from a", "mail"]);
+}
+
+/// Version 0 is damage, not "newer" (01 §1): the save treats it like any unreadable primary
+/// (`CorruptOnDisk`, ours rewrites it), while `FORMAT_VERSION + 1` still blocks the save.
+#[test]
+fn version_zero_on_disk_is_corruption_but_next_version_blocks_save() {
+    let (_dir, path, mut a, _b) = two_devices();
+    let valid = fs::read(&path).unwrap();
+    let zero = with_version(&valid, 0);
+    plant(&path, &zero);
+
+    insert(&mut a, "from a");
+    let rx = a.subscribe();
+    a.save().unwrap();
+    let seen = events(&rx);
+    assert!(seen.contains(&SyncEvent::CorruptOnDisk), "{seen:?}");
+    assert!(
+        !seen.iter().any(|e| matches!(e, SyncEvent::SaveBlocked(_))),
+        "{seen:?}"
+    );
+    assert_ne!(fs::read(&path).unwrap(), zero);
+    assert_eq!(disk_titles(&path), ["from a", "mail"]);
+
+    let next = FORMAT_VERSION + 1;
+    let newer = with_version(&fs::read(&path).unwrap(), next);
+    plant(&path, &newer);
+    insert(&mut a, "later");
+    assert!(matches!(
+        a.save(),
+        Err(SyncError::SaveBlocked(SaveBlocked::NewerVersion(v))) if v == next
+    ));
+    assert!(events(&rx).contains(&SyncEvent::SaveBlocked(SaveBlocked::NewerVersion(next))));
+    assert_eq!(fs::read(&path).unwrap(), newer);
 }
 
 #[test]
@@ -289,23 +330,26 @@ fn key_mismatch_refuses_clean_save_kek_unlock_and_preserves_on_lock() {
 }
 
 #[test]
-fn tampered_first_record_is_not_adopted_as_a_key_change() {
+fn tampered_first_record_on_save_is_corruption_not_a_key_change() {
     let (_dir, path, mut a, _b) = two_devices();
     let tampered = tamper_first_item(&fs::read(&path).unwrap());
     plant(&path, &tampered);
 
     insert(&mut a, "from a");
-    // With the cached key the tampered first record looks like a key mismatch.
-    assert!(matches!(a.save(), Err(SyncError::KeyMismatch)));
-    assert_eq!(fs::read(&path).unwrap(), tampered);
-
-    // The password unlock reveals tampering: in-memory wins, the flag clears, save rewrites.
     let rx = a.subscribe();
-    a.unlock(&pw()).unwrap();
-    assert!(events(&rx).contains(&SyncEvent::CorruptOnDisk));
-    assert_eq!(titles(&a), ["from a", "mail"]);
-    assert!(a.is_dirty());
+    // The cached key still opens the manifest, so the damaged first record is tampering like
+    // any other record: reported as corruption, never adopted as a key change; ours wins and
+    // the save rewrites the file.
     a.save().unwrap();
+    let seen = events(&rx);
+    assert!(seen.contains(&SyncEvent::CorruptOnDisk), "{seen:?}");
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, SyncEvent::KeyMismatch | SyncEvent::KeyRotatedOnDisk)),
+        "{seen:?}"
+    );
+    assert_ne!(fs::read(&path).unwrap(), tampered);
     assert_eq!(disk_titles(&path), ["from a", "mail"]);
     // And a later lock/unlock opens the rewritten file.
     let _ = a.lock();
@@ -402,6 +446,32 @@ fn restore_refuses_to_replace_a_newer_format_primary() {
     ));
     assert_eq!(fs::read(&path).unwrap(), newer);
     assert_eq!(a.backups().unwrap().len(), before);
+}
+
+/// Restore over a version-0 primary keeps its raw bytes like any unparseable primary (it is
+/// damage, not a newer file, 01 §1); over `FORMAT_VERSION + 1` it is still refused.
+#[test]
+fn restore_treats_version_zero_as_unparseable_but_refuses_next_version() {
+    let (_dir, path, mut a, _b) = two_devices();
+    let snap = latest_snapshot(&path);
+    let valid = fs::read(&path).unwrap();
+
+    let next = FORMAT_VERSION + 1;
+    let newer = with_version(&valid, next);
+    plant(&path, &newer);
+    assert!(matches!(
+        a.restore_from(&snap, &pw()),
+        Err(SyncError::SaveBlocked(SaveBlocked::NewerVersion(v))) if v == next
+    ));
+    assert_eq!(fs::read(&path).unwrap(), newer);
+
+    let zero = with_version(&valid, 0);
+    plant(&path, &zero);
+    a.restore_from(&snap, &pw()).unwrap();
+    let raw = unsaved_files(&a);
+    assert_eq!(raw.len(), 1);
+    assert_eq!(fs::read(&raw[0]).unwrap(), zero);
+    assert_eq!(fs::read(&path).unwrap(), fs::read(&snap).unwrap());
 }
 
 /// Times out `ensure_downloaded` while `.0` is set.

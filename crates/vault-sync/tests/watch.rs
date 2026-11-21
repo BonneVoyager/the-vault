@@ -1073,10 +1073,10 @@ fn password_change_with_rotation_elsewhere_reports_key_mismatch() {
     assert_eq!(titles(&a), ["from b", "mail"]);
 }
 
-/// A tampered first item record fails with the cached key exactly like a key change, but the
-/// slots are unchanged: identical slots cannot wrap another key, so it is not a rotation.
+/// A tampered first item record with unchanged slots: the cached key still opens the
+/// manifest, so it is tampering like any later record (`CorruptOnDisk`), never a key event.
 #[test]
-fn tampered_first_record_with_unchanged_slots_is_not_a_rotation() {
+fn tampered_first_record_is_corruption_not_a_key_event() {
     let (_dir, path, mut a, _b, _id) = two_devices();
     a.start_watching().unwrap();
     let mut ea = Events::new(&a);
@@ -1087,14 +1087,13 @@ fn tampered_first_record_with_unchanged_slots_is_not_a_rotation() {
     assert!(wait_until(|| {
         a.poll();
         ea.pump();
-        ea.any(|e| *e == SyncEvent::KeyMismatch)
+        ea.any(|e| *e == SyncEvent::CorruptOnDisk)
     }));
-    assert!(!ea.any(|e| *e == SyncEvent::KeyRotatedOnDisk));
-    // The password unlock tells tampering apart and keeps ours.
-    a.unlock(&pw()).unwrap();
-    ea.pump();
-    assert!(ea.any(|e| *e == SyncEvent::CorruptOnDisk));
+    assert!(!ea.any(|e| matches!(e, SyncEvent::KeyMismatch | SyncEvent::KeyRotatedOnDisk)));
     assert_eq!(titles(&a), ["mail"]);
+    assert!(a.is_dirty());
+    a.save().unwrap();
+    assert_eq!(on_disk(&path).unlock(&pw()).unwrap().items().count(), 1);
 }
 
 /// A flipped nonce in our password slot on disk. The header is bound into the manifest digest

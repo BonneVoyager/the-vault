@@ -1,7 +1,7 @@
 - [Format decisions](format-decisions.md) — AAD byte layouts, canonical-CBOR method, unlock check order, spec interpretations settled in vault-core P2
 - [Mutation + merge decisions](mutation-merge-decisions.md) — P4a: error mapping for unknown id/field, restamp max rule, merge field order, history normalisation, MergeReport counting
 - [Slot management decisions](slot-management-decisions.md) — P4b: rotate drops enclave slots, created_at=0, KEK-length/missing-slot error mapping, change_password re-wraps all password slots
-- [Sync feature decisions](sync-feature-decisions.md) — P3.1: `sync` feature, VaultKeyHandle (no Clone/Debug, duplicate()), unlock_with_key first-tag-failure=WrongPassword, rotation invalidates handles
+- [Sync feature decisions](sync-feature-decisions.md) — P3.1: `sync` feature, VaultKeyHandle (no Clone/Debug, duplicate()), unlock_with_key error mapping = manifest probe (2026-11-21), empty-vault residual, rotation invalidates handles
 - [Forward-compat decisions](forward-compat-decisions.md) — Slot/OpaqueSlot, unit *Kind::Other + kind_raw, NoUsableSlot, fixture policy, what stays Malformed
 - [Attachment decisions](attachment-decisions.md) — v1.1: AttachmentRef, 42-byte chunk AAD bound to ATTACHMENT_VERSION=1 (not file version), seal by value, validate_ref everywhere, removal tombstones (merge-only cap 64 since 2026-11-01) + merge rule, refs in (added_at, id) order everywhere (L1 fix), v1-attach fixture
 - [History tombstone decisions](history-tombstone-decisions.md) — merge::keeps_history = Password | Pin (2026-11-15), removed_history [u64] optional key, cap 10 (HISTORY_CAP), remove-all-with-stamp, clear_history no-op when empty, merge drop after loser push, set_field stamp guard

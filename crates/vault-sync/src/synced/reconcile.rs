@@ -307,7 +307,9 @@ impl SyncedVault {
     /// this vault in a supported format (which also lifts any [`SaveBlocked`]).
     fn vet_primary(&mut self, bytes: &[u8]) -> Option<LockedVault> {
         match LockedVault::parse(bytes) {
-            Err(VaultError::UnsupportedVersion(v)) => {
+            // Version 0 (or anything not above ours) is damage, not "newer" (01 §1): it
+            // falls to the corruption arm below.
+            Err(VaultError::UnsupportedVersion(v)) if v > vault_core::FORMAT_VERSION => {
                 // Written by a newer build: never overwrite it (that would downgrade the
                 // other device's file), and unlike corruption do not schedule a rewrite.
                 tracing::warn!(version = v, "primary written by a newer format version");
