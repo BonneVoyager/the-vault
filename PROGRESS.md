@@ -20,7 +20,7 @@ Phases 1–5 shipped 2026-10-29 (core, CLI, app skeleton, sync, macOS, polish). 
 
 **Tools**: `cargo test --workspace`; `qa/spec-checks` (bug-hunter's regression ledger: `cargo test --no-fail-fast` inside it plus `cli/run_all.sh`); `scripts/sync-lab.sh` (18 scenarios, `--random --seed N --steps M`); `docs/two-device-sync-checklist.md` (manual, owner); `scripts/check-entitlements.sh`.
 
-**Open list** (owner's call, carried forward): attachment-blob retention while a backup references them (deferred); CI (skipped by decision); passkey unlock (needs rp_id domain); signing and notarisation (needs Developer ID); two-Mac checklist run (owner); reference-style Markdown links (fixed 2026-11-01, never eye-checked); saves off the main thread; testing roadmap items in 00 (fuzzing, multi-device simulation, cargo-mutants, traceability, golden screenshots). Dropped by the owner 2026-11-13/15: About licenses, status item tooltip, secret-sharing feature. Deferred by the owner 2026-11-15: strength meter cliffs (exact-tiling repeat rule: "erererre"×2 scores 39 bits, one extra char 80 bits); options were zxcvbn (recommended), partial-repeat penalty, or leave; owner chose leave for now (researched only, nothing in specs or code).
+**Open list** (owner's call, carried forward): attachment-blob retention while a backup references them (deferred); CI (skipped by decision); passkey unlock (needs rp_id domain); signing and notarisation (needs Developer ID); two-Mac checklist run (owner); saves off the main thread; testing roadmap items in 00 (fuzzing, multi-device simulation, cargo-mutants, traceability, golden screenshots). Dropped by the owner 2026-11-13/15: About licenses, status item tooltip, secret-sharing feature. Deferred by the owner 2026-11-15: strength meter cliffs (exact-tiling repeat rule: "erererre"×2 scores 39 bits, one extra char 80 bits); options were zxcvbn (recommended), partial-repeat penalty, or leave; owner chose leave for now (researched only, nothing in specs or code).
 
 ## Waves since the last archived checkpoint
 
@@ -123,8 +123,8 @@ Owner: "do small items". Three listed items were already done on inspection and 
 ## CHECKPOINT — Small items 2026-11-21
 Committed: 8c6fb44 (bug-hunt notes wave). Uncommitted: vault-sync (event.rs, synced.rs, synced/reconcile.rs, tests/watch.rs), vault-app screens/main/detail_tests.rs, specs 03/05, this file, agent memories.
 Checks: fmt PASS, clippy PASS, non-UI workspace 653 passed / 11 skipped, vault-app 580 passed / 2 ignored; ledger 292 and CLI 126 passed earlier in this wave (unaffected since).
-Eye check pending (carried from 2026-11-01): a note with reference-style links `[text][ref]` + `[ref]: https://…` renders a clickable link for http(s), plain text for mailto, and images never load.
-Awaiting owner: eye check, commit. Suggested title: "Sync: re-report an unreadable conflict copy when its bytes change; notice-dot wrap test; spec wording".
+Eye check passed 2026-11-21 (carried from 2026-11-01): reference-style links render clickable for https with a URL tooltip, plain for mailto, definitions hidden in read mode and intact in edit mode.
+Awaiting owner: commit. Suggested title: "Sync: re-report an unreadable conflict copy when its bytes change; notice-dot wrap test; spec wording".
 Bug hunt: not yet run for this wave nor for 8c6fb44 (bug-hunt notes wave).
 
 ## CHECKPOINT — Bug-hunt notes N1–N9 2026-11-21
