@@ -558,8 +558,12 @@ impl SyncedVault {
             }
             Err(e) => {
                 tracing::debug!(path = %path.display(), error = %e, "leaving unreadable conflict candidate in place");
-                if let Entry::Vacant(slot) = self.unreadable_conflicts.entry(key) {
-                    slot.insert(path.to_owned());
+                // Once per content: a replacement with other bytes is reported again (even
+                // within one mtime tick); the same bytes re-delivered are not.
+                let prev = self
+                    .unreadable_conflicts
+                    .insert(key, (path.to_owned(), hash));
+                if prev.is_none_or(|(_, h)| h != hash) {
                     self.emit(SyncEvent::UnreadableConflict(path.to_owned()));
                 }
                 return None;

@@ -1577,7 +1577,8 @@ fn clearing_the_second_password_history_keeps_the_first(cx: &mut TestAppContext)
 }
 
 /// 05 §2.3 "Password notices": the strip's dot is centred on the first text line
-/// (within 1 px) at the default and the Larger text size.
+/// (within 1 px) at the default and the Larger text size, on one line (wide pane) and
+/// when the notice wraps (narrow pane).
 #[gpui::test]
 fn issue_strip_dot_centres_on_the_first_line(cx: &mut TestAppContext) {
     for larger in [false, true] {
@@ -1606,6 +1607,31 @@ fn issue_strip_dot_centres_on_the_first_line(cx: &mut TestAppContext) {
         assert!(
             (dc - tc).abs() <= px(1.),
             "larger {larger}: dot centre {dc:?}, first line centre {tc:?}"
+        );
+
+        // Detail at its minimum: the notice wraps; the dot stays on the first line
+        // (one line is `line` tall, measured above at the same text size).
+        vcx.simulate_resize(gpui::size(px(760.), px(900.)));
+        vcx.run_until_parked();
+        let dot = vcx
+            .debug_bounds(leak(format!("issue-dot {pw} Weak Password")))
+            .expect("dot drawn");
+        let text = vcx
+            .debug_bounds(leak(format!("issue-text {pw} Weak Password")))
+            .expect("text drawn");
+        let strip = strip(pw, "Weak Password", &mut vcx).expect("strip drawn");
+        assert!(
+            text.size.height >= line * 1.9,
+            "larger {larger}: wraps to two or more lines: {text:?} (line {line:?})"
+        );
+        assert!(
+            strip.size.height > line * 1.9,
+            "taller than one line: {strip:?}"
+        );
+        let (dc, tc) = (dot.center().y, text.top() + line / 2.);
+        assert!(
+            (dc - tc).abs() <= px(1.),
+            "larger {larger}, wrapped: dot centre {dc:?}, first line centre {tc:?}"
         );
     }
 }

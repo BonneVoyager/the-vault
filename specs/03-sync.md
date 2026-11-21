@@ -225,7 +225,7 @@ pub enum SyncEvent {
     ChangedWhileLocked,
     ConflictAbsorbed(PathBuf),
     WaitingForBlobs(PathBuf),    // whole-package conflict merged, move into backups/ deferred for missing blobs (§6 step 4)
-    UnreadableConflict(PathBuf), // a conflict candidate that does not parse or has an unsupported format version (any value, 0 included); left in place, emitted once per path until it parses, is absorbed or disappears, and again after lock/unlock or stop/start watching (bug hunt 2026-11-21 N1)
+    UnreadableConflict(PathBuf), // a conflict candidate that does not parse or has an unsupported format version (any value, 0 included); left in place, emitted once per path and content (re-emitted when the bytes change; the same bytes re-delivered under a new mtime stay silent) until it parses, is absorbed or disappears, and again after lock/unlock or stop/start watching (bug hunt 2026-11-21 N1)
     CorruptOnDisk,
     ForeignVault,
     CloudUnavailable,

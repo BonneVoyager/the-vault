@@ -1467,6 +1467,20 @@ fn with_version(bytes: &[u8], v: u16) -> Vec<u8> {
     b
 }
 
+/// Write `bytes` at `dst` like [`plant`], with the file's mtime set to `mtime` before the
+/// rename, so the watcher never sees another mtime.
+fn plant_with_mtime(dst: &Path, bytes: &[u8], mtime: std::time::SystemTime) {
+    let tmp = dst.with_file_name(".planting.tmp");
+    fs::write(&tmp, bytes).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&tmp)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    fs::rename(&tmp, dst).unwrap();
+}
+
 /// Deterministic noise (xorshift), so no dev-dependency is needed for "random bytes".
 fn noise(len: usize) -> Vec<u8> {
     let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -1507,7 +1521,7 @@ fn unreadable_inner_copy_is_reported_once(make: impl FnOnce(&[u8]) -> Vec<u8>) {
         ea.pump();
         ea.count(&is_unreadable) == 1
     }));
-    // Same bytes again: a new event, but nothing new to report.
+    // Same bytes again (new inode and mtime): a new event, but nothing new to report.
     plant(&copy, &bytes);
     let drained = drain_for(&mut a, 5);
     ea.pump();
@@ -1727,4 +1741,39 @@ fn sibling_package_reported_again_after_its_vault_file_disappeared() {
         "{:?}",
         ea.seen
     );
+}
+
+/// An unreadable copy replaced by other unreadable bytes of the same length and the same
+/// mtime (a replacement within one timestamp tick) is reported again exactly once;
+/// re-delivering those bytes under a new mtime stays silent.
+#[test]
+fn unreadable_copy_replaced_by_other_bytes_is_reported_again_once() {
+    let (_dir, path, mut a, _b, _id) = two_devices();
+    let copy = path.parent().unwrap().join("vault 2.bin");
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+    let first = noise(512);
+    plant_until_reported(&mut a, &mut ea, &copy, &first, 1);
+
+    let mut second = first.clone();
+    second.reverse();
+    let mtime = fs::metadata(&copy).unwrap().modified().unwrap();
+    plant_with_mtime(&copy, &second, mtime);
+    assert!(wait_until(|| {
+        a.poll();
+        ea.pump();
+        ea.count(unreadable("vault 2.bin")) == 2
+    }));
+    drain_for(&mut a, 3);
+    ea.pump();
+    assert_eq!(ea.count(unreadable("vault 2.bin")), 2, "{:?}", ea.seen);
+
+    plant_with_mtime(&copy, &second, mtime + Duration::from_secs(2));
+    assert!(
+        drain_for(&mut a, 5) > 0,
+        "rewrite produced no watcher signal"
+    );
+    ea.pump();
+    assert_eq!(ea.count(unreadable("vault 2.bin")), 2, "{:?}", ea.seen);
+    assert_eq!(fs::read(&copy).unwrap(), second);
 }

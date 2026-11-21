@@ -161,11 +161,14 @@ pub struct SyncedVault {
     /// unlock), so a package still waiting after any of those is reported once more.
     waiting_for_blobs: HashMap<PathBuf, PathBuf>,
     /// Conflict candidates reported as [`SyncEvent::UnreadableConflict`]:
-    /// [`package::path_key`] -> path as received. An entry goes when the candidate is
-    /// absorbed, disappears or parses again; the whole map is cleared by `start_watching`,
-    /// `stop_watching` and `lock` (whose entries are re-checked at the next unlock), so a
-    /// candidate still unreadable after any of those is reported once more.
-    unreadable_conflicts: HashMap<PathBuf, PathBuf>,
+    /// [`package::path_key`] -> (path as received, blake3 of the vault file's bytes read).
+    /// A re-check that reads other bytes reports again and updates the entry; the same bytes
+    /// under a new mtime or inode stay silent. An entry
+    /// goes when the candidate is absorbed, disappears or parses again; the whole map is
+    /// cleared by `start_watching`, `stop_watching` and `lock` (whose entries are re-checked
+    /// at the next unlock), so a candidate still unreadable after any of those is reported
+    /// once more.
+    unreadable_conflicts: HashMap<PathBuf, (PathBuf, [u8; 32])>,
     /// The primary was found missing while unlocked ([`SyncEvent::PrimaryMissing`] emitted,
     /// vault marked dirty). Cleared when the primary is read or written again, and on lock.
     primary_missing: bool,
@@ -538,7 +541,11 @@ impl SyncedVault {
         // again) after the next unlock, even if no watcher event arrives for them meanwhile.
         let recheck = std::mem::take(&mut self.waiting_for_blobs)
             .into_iter()
-            .chain(std::mem::take(&mut self.unreadable_conflicts));
+            .chain(
+                std::mem::take(&mut self.unreadable_conflicts)
+                    .into_iter()
+                    .map(|(key, (path, _))| (key, path)),
+            );
         for (key, path) in recheck {
             if !self
                 .pending_conflicts
