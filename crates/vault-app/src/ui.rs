@@ -613,16 +613,18 @@ pub fn divider(cx: &App) -> Div {
     gpui::div().h(px(1.)).w_full().bg(cx.theme().border)
 }
 
-/// The rounded "toast" pill.
+/// The rounded "toast" pill. Drawn in the opposite appearance's elevated palette so it
+/// stands out (owner decision 2026-11-21, option A): dark pill in light mode and vice versa.
 pub fn pill(message: impl Into<SharedString>, cx: &App) -> Div {
-    let theme = cx.theme();
+    let inverse = crate::theme::VaultTheme::for_appearance(!cx.theme().is_dark());
     gpui::div()
         .px(px(14.))
         .py(px(6.))
         .rounded_full()
-        .bg(theme.popover)
+        .bg(inverse.bg_elevated)
         .border_1()
-        .border_color(theme.border)
+        .border_color(inverse.border)
+        .text_color(inverse.text)
         .shadow_md()
         .text_sm()
         .child(message.into())
@@ -1437,6 +1439,89 @@ fn only_the_main_window_is_blurred(cx: &mut gpui::TestAppContext) {
         assert_eq!(main_options(None, true, cx).window_background, Blurred);
         assert_eq!(main_window_options(None, cx).window_background, Opaque);
     });
+}
+
+#[cfg(test)]
+mod pill_tests {
+    use gpui::{Hsla, Styled as _, TestAppContext};
+    use gpui_component::{ActiveTheme as _, Theme, ThemeMode};
+
+    use super::{danger_pill, pill};
+    use crate::theme::VaultTheme;
+
+    /// (fill, border, text) as set on the built pill's style.
+    fn colours(mut el: gpui::Div) -> (Hsla, Hsla, Hsla) {
+        let style = el.style();
+        let fill = style
+            .background
+            .as_ref()
+            .and_then(|f| f.color())
+            .and_then(|b| b.as_solid())
+            .expect("solid fill");
+        let border = style.border_color.expect("border colour");
+        let text = style.text.color.expect("text colour");
+        (fill, border, text)
+    }
+
+    fn hex(value: u32) -> Hsla {
+        gpui::rgb(value).into()
+    }
+
+    fn set_mode(mode: ThemeMode, cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| Theme::change(mode, None, cx));
+    }
+
+    /// Owner decision 2026-11-21, option A: light mode draws the dark palette's pill.
+    #[gpui::test]
+    fn pill_uses_dark_palette_in_light_mode(cx: &mut TestAppContext) {
+        set_mode(ThemeMode::Light, cx);
+        let dark = VaultTheme::for_appearance(true);
+        cx.update(|cx| {
+            assert!(!cx.theme().is_dark());
+            let (fill, border, text) = colours(pill("Copied", cx));
+            assert_eq!(fill, dark.bg_elevated);
+            assert_eq!(border, dark.border);
+            assert_eq!(text, dark.text);
+            assert_eq!(
+                (fill, text, border),
+                (hex(0x2A2A2D), hex(0xF2F2F7), hex(0x38383B))
+            );
+        });
+    }
+
+    /// Dark mode draws the light palette's pill.
+    #[gpui::test]
+    fn pill_uses_light_palette_in_dark_mode(cx: &mut TestAppContext) {
+        set_mode(ThemeMode::Dark, cx);
+        let light = VaultTheme::for_appearance(false);
+        cx.update(|cx| {
+            assert!(cx.theme().is_dark());
+            let (fill, border, text) = colours(pill("Copied", cx));
+            assert_eq!(fill, light.bg_elevated);
+            assert_eq!(border, light.border);
+            assert_eq!(text, light.text);
+            assert_eq!(
+                (fill, text, border),
+                (hex(0xF7F7F8), hex(0x1D1D1F), hex(0xE5E5EA))
+            );
+        });
+    }
+
+    /// The danger pill inverts only its fill; border and text stay `theme.danger`.
+    #[gpui::test]
+    fn danger_pill_inverts_fill_only(cx: &mut TestAppContext) {
+        for (mode, dark) in [(ThemeMode::Light, false), (ThemeMode::Dark, true)] {
+            set_mode(mode, cx);
+            cx.update(|cx| {
+                let danger = cx.theme().danger;
+                let (fill, border, text) = colours(danger_pill("Not saved", cx));
+                assert_eq!(fill, VaultTheme::for_appearance(!dark).bg_elevated);
+                assert_eq!(border, danger);
+                assert_eq!(text, danger);
+            });
+        }
+    }
 }
 
 #[cfg(test)]

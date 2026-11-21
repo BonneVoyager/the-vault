@@ -105,6 +105,16 @@ Owner: "what else is off in the spec?" → four read-only agents checked ~300 cl
 ### 2026-11-20 — Label column fits the longest label (gpui-implementer, code-reviewer ×2)
 Owner: field titles sometimes wrapped; widen the label column until the item's longest title fits on one line when there is room. Done (05 §2.3): `detail::label_fit` shapes each named, non-section field label once per item render at `theme.font_size`, regular weight, plus the icon slot (1 rem + 8 px) when any field has an icon; `detail::label_width(fit, row) = max(base 26 % / 80–140 px, min(fit, 0.4 × row))` computed in Rust from the host's real row width (main detail column minus padding, also fed to the editor's `row_width`; item window minus border; backup viewer minus the 320 px list); labels past the cap still wrap. Editor measures the edit buffer's names, so the column grows while typing; read and edit widths stay equal. Short-labelled items unchanged except at the minimum detail width, where "Username" + icon (≈ 88 px) now gets its width instead of overflowing the 80 px base. Review FIX FIRST → fixed (measured at rem 16 px instead of the drawn 13 px; tests compared the code with itself; cap left to layout) → re-review SHIP. Tests: `short_labels_keep_the_base_column`, `login_labels_at_detail_min`, `long_label_fits_on_one_line_in_both_modes` (default + Larger text), `label_past_the_cap_wraps`, `long_label_caps_at_40_percent_of_the_item_window_row`. Not tested: read/edit equality when the cap applies; backup viewer row width.
 
+### 2026-11-21 — Toast pills in the opposite appearance's palette (gpui-implementer)
+Owner: "Copied — clears in 30 s" was hard to see; invert toast colours (dark pill in light mode, light pill in dark mode), same for every toast. Option A chosen: `ui::pill` takes `VaultTheme::for_appearance(!dark)` for fill, border and text; `danger_pill` keeps its danger border and text. Every toast goes through `pill` (root.rs window toasts, `detail_copy_feedback` in the detail column and item windows), so nothing else changed. Spec 05 §2.3 updated. Tests: `pill_uses_dark_palette_in_light_mode`, `pill_uses_light_palette_in_dark_mode`, `danger_pill_inverts_fill_only` (read off the built element's style).
+
+## CHECKPOINT — Toast colours 2026-11-21
+Committed: 35e1108 (label column). Uncommitted: crates/vault-app/src/ui.rs, specs/05-ui.md (one sentence), this file, gpui-implementer memory.
+Checks: fmt PASS, clippy PASS, vault-app 573 passed / 2 ignored (no non-app crate touched).
+Eye check passed 2026-11-21 (both appearances, copy pill, About toast, danger toast).
+Awaiting owner: commit.
+Bug hunt: not yet run for this wave.
+
 ## CHECKPOINT — Label column fit 2026-11-20
 Committed: c7af00a. Staged: specs 00–05 (audit). Unstaged: the 2026-11-19 UI wave (see below) plus this wave: detail.rs, editor.rs, main.rs, item_window.rs, backup.rs, editor_row_tests.rs, specs/05-ui.md (three sentences), this file.
 Checks: fmt PASS, clippy PASS, vault-app 570 passed / 2 ignored, workspace and ledger unchanged since the last full run (no non-app crate touched).
