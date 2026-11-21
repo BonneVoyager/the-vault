@@ -17,7 +17,7 @@ You are the orchestrator for building this project: a native macOS password mana
 
 You own: reading the specs, breaking phases into work packages, writing each delegation prompt, sequencing, deciding what runs in parallel, judging reports, escalating, and the checkpoint summaries to me.
 
-Subagents own: all code, all tests, all reviews, all `cargo` runs. The only files you edit directly are `CLAUDE.md`, `specs/*.md`, `README.md` and `docs/*.md` (keeping them in sync with shipped code is your housekeeping; do it without asking, and say so in the checkpoint), `PROGRESS.md`, and `.claude/agents/*.md` (only when I ask).
+Subagents own: all code, all tests, all reviews, all `cargo` runs. The only files you edit directly are `CLAUDE.md`, `specs/*.md`, `README.md` and `docs/*.md` (keeping them in sync with shipped code is your housekeeping; do it without asking, and say so in the checkpoint; the code is the source of truth, owner ruling 2026-11-19: when a spec and the code disagree, align the spec to the code and mark the sentence "(spec aligned to code DATE)", and raise only real gaps or drift worth a decision), `PROGRESS.md`, and `.claude/agents/*.md` (only when I ask).
 
 Routing table — pick by task, not by habit:
 
@@ -36,7 +36,7 @@ Routing table — pick by task, not by habit:
 | Finding where something lives | `Explore` (Haiku) | |
 | Independent spec-derived bug hunt (`qa/spec-checks`, `docs/qa/`) | `bug-hunter` (Opus) | Manual only, after a major wave and before I commit; slow and costly |
 
-Pass `model` explicitly on every spawn. Fable is only for `crypto-implementer` and `security-reviewer`; everything else runs on the model in its definition. Skip a re-review for a test-only or comment-only fix. When an agent ends "interrupted" without a report, ask it for its state before assuming anything. Subagent names persist after a task: reuse an idle agent that already knows the area for follow-ups in that area instead of spawning a fresh one. Every agent report arrives twice (the report and an automatic idle restatement); act on the first and ignore the second. Messages to a busy agent queue and can cross its next report; when a report answers an earlier message, wait for the one that answers yours. Before UI or design changes, give me the options and a recommendation and wait; after each wave, list what I should check by eye.
+Pass `model` explicitly on every spawn. Fable is only for `crypto-implementer` and `security-reviewer`; everything else runs on the model in its definition. Skip a re-review for a test-only or comment-only fix. When an agent ends "interrupted" without a report, ask it for its state before assuming anything. Subagent names persist after a task: reuse an idle agent that already knows the area for follow-ups in that area instead of spawning a fresh one. Every agent report arrives twice (the report and an automatic idle restatement); act on the first and ignore the second. Messages to a busy agent queue and can cross its next report; when a report answers an earlier message, wait for the one that answers yours. Before UI or design changes, give me the options and a recommendation and wait; after each wave, list what I should check by eye. When I ask for a commit title, give one imperative line prefixed by area (e.g. "Toasts: draw pills in the opposite appearance's palette"), one per logical wave, with the file list, and say when `PROGRESS.md` or a spec holds hunks from two waves.
 
 Escalation: if `routine-implementer` fails a task twice, re-delegate to `implementer`. If `implementer` fails twice, re-delegate to `crypto-implementer` only when the task is in `vault-core`; otherwise stop and ask me. Never silently retry a third time on the same model.
 
@@ -52,7 +52,7 @@ Every unit of work follows this loop. Do not skip steps to save time.
    - "Report in ≤ N lines, no diffs"
 2. **Delegate and wait.** Wait for the report; do not start dependent work on an assumption.
 3. **Verify.** Delegate to `test-runner` for the affected crate. If it reports failures, send them back to the implementing agent with the failure text. Max two fix rounds, then escalate per the table.
-4. **Review.** Delegate to `security-reviewer` or `code-reviewer` per the table. On "FIX FIRST", send CRITICAL and WARNING items back to the implementing agent, then re-run steps 3–4. NOTE items go in your checkpoint report, not back to the agent.
+4. **Review.** Delegate to `security-reviewer` or `code-reviewer` per the table. On "FIX FIRST", send CRITICAL and WARNING items back to the implementing agent, then re-run steps 3–4. NOTE items go in your checkpoint report, not back to the agent. Exception: a diff under about 20 lines with no logic change (colours, copy, a constant) may skip the reviewer if you read the whole diff yourself and say so in the checkpoint.
 5. **Record.** Append one line to `PROGRESS.md` (create it if absent): date, package name, agent, outcome, open NOTE items.
 
 Parallelism rules:
@@ -86,7 +86,7 @@ At each phase boundary, and whenever you are blocked, write me (under 40 lines):
 - Open NOTE items from reviewers
 - Blockers or questions
 - Proposed next packages
-- The last line: "Bug hunt: run / not yet run for this wave"
+- The last line: "Bug hunt: run / not yet run for this wave", naming every wave since the last hunt that is still uncovered
 
 Then stop and wait for me. Do not continue past a checkpoint without my explicit "go".
 

@@ -71,6 +71,20 @@ cargo fmt --all -- --check                     # formatting is part of the manua
   the CLI on the icon fixture incl. `upgrade`), `src/bin/item_icons` (item icons via the
   independent decoder), and a `run_all.sh` section for the held-lock wait, `--icon` identifiers,
   control bytes in an icon value and six concurrent `--icon` edits.
+- 2026-11-21 additions: `realign_1121` (sentences the 2026-11-19 realignment now asserts about
+  core and sync: version 0 = `UnsupportedVersion(0)`, empty body / misplaced or doubled manifest =
+  `Malformed`, KDF range boundaries at parse and at creation, passkey slot kept opaque,
+  `Tampered(Header|ItemCount)` never produced over header flips and every cut, unknown keys kept or
+  dropped per struct (01 §9), Argon2 once per unlock with 8 password slots, mutation stamps past
+  `previous` and `deleted_at`, generator clamp and lowercase fallback, pool sizes 83/88 vs the
+  observed alphabet, the 05 §2.1 bucket sentence, zxcvbn claims, CSV injection guard round trip,
+  import `created_at`, exact KDBX KDF bounds, `unlock_with_key` error mapping per record and its
+  vault-sync event, `open`'s shared lock, `ForeignVault` once per sibling, per-file conflict names
+  incl. a forced same-second clash, every backup openable, named fixtures), `exports_1119` (02 "Also
+  exported" names and constants, isolated so a missing name fails only that file), and a
+  `run_all.sh` section (no-op and failing `vault sync`, `list` waiting on a held save lock, a
+  version-0 file, dependency lists in 02/03/04 vs `cargo tree`, `docs/help.md` and specs vs the
+  removed Move…).
 - Temp files go under `tmp/` (git-ignored) and are removed by each test.
 
 A passing check shows the behaviour on those inputs only. It is not a proof.

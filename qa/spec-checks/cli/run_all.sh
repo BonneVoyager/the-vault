@@ -492,6 +492,85 @@ fails=0; for p in "${pids[@]}"; do wait "$p" || fails=$((fails+1)); done
 cur=$("$II" "$VAULT_FILE/vault.bin" "$MPW" | grep '^"Seed"')
 if [ $fails = 0 ] && echo "$cur" | grep -qE 'value="c-[1-6]"'; then ok "6 concurrent --icon edits: all succeed, one survives"; else bad "concurrent --icon" "fails=$fails $cur"; fi
 
+# ---- 2026-11-21: realigned spec sentences (00 phase 1 `sync`, 03 §2 shared open lock, deps) ----
+export VAULT_FILE="$T/r21.vault"
+v init --kdf-test-params >/dev/null 2>&1
+v add --title R21 >/dev/null 2>&1
+# 00 phase 1 (aligned 2026-11-19): `sync` "save only if something changed"
+h0=$(shasum "$VAULT_FILE/vault.bin"); m0=$(stat -f %m:%i "$VAULT_FILE/vault.bin")
+sleep 1.1
+v sync >"$T/o" 2>&1; rc=$?
+h1=$(shasum "$VAULT_FILE/vault.bin"); m1=$(stat -f %m:%i "$VAULT_FILE/vault.bin")
+if [ $rc = 0 ] && [ "$h0" = "$h1" ] && [ "$m0" = "$m1" ]; then ok "sync with nothing to do exits 0 and does not rewrite vault.bin"; else bad "no-op sync" "rc=$rc same-bytes=$([ "$h0" = "$h1" ] && echo y || echo n) same-mtime/inode=$([ "$m0" = "$m1" ] && echo y || echo n) $(cat "$T/o")"; fi
+# An unparseable per-file copy: 03 §6 does not say what happens; record it (2026-11-21 Note), never deleted
+head -c 3000 /dev/urandom >"$VAULT_FILE/vault 2.bin"
+v sync >"$T/o" 2>&1; rc=$?
+echo "INFO sync with an unparseable per-file copy: rc=$rc $(grep -v '^note: a different vault' "$T/o" | head -2 | tr '\n' ' ')"
+if [ -e "$VAULT_FILE/vault 2.bin" ] || ls "$VAULT_FILE/backups" 2>/dev/null | grep -q 'vault 2'; then ok "unparseable conflict copy is never deleted"; else bad "unparseable conflict copy vanished" "$(ls "$VAULT_FILE" "$VAULT_FILE/backups")"; fi
+rm -f "$VAULT_FILE/vault 2.bin"
+# ... "fails with "not converged" if any problem was reported": a per-file copy that parses but fails to merge
+python3 - "$VAULT_FILE/vault.bin" "$VAULT_FILE/vault 2.bin" <<'PY'
+import sys
+b = bytearray(open(sys.argv[1], 'rb').read())
+hl = int.from_bytes(b[6:10], 'big'); i = b.index(b'bct', 10 + hl)
+b[i + 40] ^= 1
+open(sys.argv[2], 'wb').write(b)
+PY
+v sync >"$T/o" 2>&1; rc=$?
+if [ $rc -ne 0 ] && [ $rc -ne 101 ] && grep -qi "not converged" "$T/o"; then ok "sync with a copy that fails to merge exits non-zero with 'not converged'"; else bad "sync failing merge -> not converged" "rc=$rc $(head -3 "$T/o")"; fi
+echo "INFO message for a per-file copy whose first item was altered: $(grep -v 'not converged\|^note:' "$T/o" | head -1 | sed "s|$T|<tmp>|")"
+[ -e "$VAULT_FILE/vault 2.bin" ] && ok "unmergeable conflict copy kept in place" || bad "unmergeable conflict copy vanished" "$(ls "$VAULT_FILE")"
+rm -f "$VAULT_FILE/vault 2.bin"
+# a foreign sibling package: report what `sync` says (03 §6 step 1 ForeignVault; problem or not is unspecified)
+OTHERF="$T/other-r21.vault"; "$V" --vault "$OTHERF" --password-env MPW init --kdf-test-params >/dev/null 2>&1
+cp -R "$OTHERF" "$T/r21 2.vault"
+v sync >"$T/o" 2>&1; rc=$?
+echo "INFO sync with only a foreign sibling: rc=$rc $(head -2 "$T/o" | tr '\n' ' ')"
+[ -e "$T/r21 2.vault/vault.bin" ] && ok "foreign sibling untouched by sync" || bad "foreign sibling touched" "$(ls "$T")"
+rm -rf "$T/r21 2.vault" "$OTHERF"
+# 03 §2 (aligned 2026-11-19): "`open` takes a shared lock around its read of `vault.bin`"
+perl -e 'use Fcntl ":flock"; open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; $|=1; print "L\n"; sleep 3;' "$VAULT_FILE/.lock" >"$T/perl.out" &
+PERLPID=$!
+for _ in $(seq 1 50); do grep -q L "$T/perl.out" 2>/dev/null && break; sleep 0.1; done
+s0=$(perl -MTime::HiRes=time -e 'printf "%.2f", time')
+v list >"$T/o" 2>&1; rc=$?
+s1=$(perl -MTime::HiRes=time -e 'printf "%.2f", time')
+wait $PERLPID 2>/dev/null
+el=$(echo "$s1 - $s0" | bc)
+if [ $rc = 0 ] && grep -q R21 "$T/o" && [ "$(echo "$el >= 2.0" | bc)" = 1 ]; then ok "list waits for a held exclusive save lock (${el}s), then reads"; else bad "open shared lock" "rc=$rc elapsed=${el}s $(head -2 "$T/o")"; fi
+# 01 §1 version 0 through the CLI: an error, no panic; message recorded (05 §2.2 maps UnsupportedVersion to "newer version" in the app)
+cp "$VAULT_FILE/vault.bin" "$T/v0.bin"
+printf '\x00\x00' | dd of="$VAULT_FILE/vault.bin" bs=1 seek=4 conv=notrunc 2>/dev/null
+v list >"$T/o" 2>&1; rc=$?
+if [ $rc -ne 0 ] && [ $rc -ne 101 ]; then ok "CLI refuses a version-0 file without panicking"; else bad "CLI version-0 file" "rc=$rc $(cat "$T/o")"; fi
+echo "INFO CLI message for a version-0 file: $(head -1 "$T/o")"
+cp "$T/v0.bin" "$VAULT_FILE/vault.bin"
+export VAULT_FILE="$T/main.vault"
+
+# Dependency lists that the 2026-11-19 realignment states as "aligned to code" (02, 03, 04)
+deps() { (cd "$ROOT" && cargo tree -q --offline -p "$1" -e "$2" --depth 1 --prefix none $3 2>/dev/null) | tail -n +2 | awk '{print $1}' | sort -u | tr '\n' ' '; }
+cmp_deps() { # name edge flags "spec list"
+  local got want miss extra
+  got=$(deps "$1" "$2" "$3"); want=$(echo "$4" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+  miss=$(comm -23 <(echo "$want" | tr ' ' '\n' | sed '/^$/d') <(echo "$got" | tr ' ' '\n' | sed '/^$/d') | tr '\n' ' ')
+  extra=$(comm -13 <(echo "$want" | tr ' ' '\n' | sed '/^$/d') <(echo "$got" | tr ' ' '\n' | sed '/^$/d') | tr '\n' ' ')
+  if [ -z "$miss$extra" ]; then ok "$1 $2 dependencies match the spec list"; else bad "$1 $2 dependencies vs spec" "in code, not in spec: ${extra:-none}" "in spec, not in code: ${miss:-none}"; fi
+}
+cmp_deps vault-core normal "--features kdbx" "argon2 chacha20poly1305 hkdf sha2 rand zeroize secrecy ciborium serde uuid totp-rs unicode-normalization thiserror csv zip serde_json zxcvbn keepass"
+cmp_deps vault-sync normal "" "vault-core notify notify-debouncer-full rustix blake3 crossbeam-channel rand unicode-normalization zeroize thiserror tracing"
+(cd "$ROOT" && cargo tree -q --offline -p vault-sync -e dev --depth 1 --prefix none 2>/dev/null) | grep -q '^tempfile' && ok "vault-sync: tempfile is a dev dependency" || bad "vault-sync tempfile dev-only" "not found in dev edges"
+# 04 line 5 as corrected 2026-11-21 (bug hunt L4)
+cmp_deps vault-macos normal "" "vault-core thiserror uuid dirs tracing secrecy ciborium rqrr objc2 objc2-foundation objc2-app-kit objc2-local-authentication objc2-security objc2-core-foundation objc2-core-graphics objc2-service-management libc zeroize"
+
+# User-facing help (bundled by include_str!, 05 §2.5 Help) vs the 2026-11-19 UI changes
+HELP="$ROOT/docs/help.md"
+if grep -n 'Move…\|Move\.\.\.' "$HELP" >"$T/o"; then bad "docs/help.md still mentions a Move… action (05 §2.5: no Move…, 2026-11-19)" "$(cat "$T/o")"; else ok "docs/help.md has no Move… action"; fi
+grep -qi 'recently created' "$HELP" && echo "INFO help.md mentions Recently Created" || echo "INFO help.md does not mention the Recently Created sort"
+grep -qi 'newer version' "$HELP" && echo "INFO help.md mentions the newer-version message" || echo "INFO help.md does not mention the newer-version message"
+# Cross-spec: the removed Move… must not be described as present anywhere in specs/
+grep -n 'Move…' "$ROOT"/specs/*.md | grep -v 'no "Move…"' >"$T/o"
+[ -s "$T/o" ] && bad "a spec still describes Move…" "$(cat "$T/o")" || ok "no spec describes a Move… action"
+
 echo
 echo "CLI checks: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]

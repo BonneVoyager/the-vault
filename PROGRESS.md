@@ -108,6 +108,15 @@ Owner: field titles sometimes wrapped; widen the label column until the item's l
 ### 2026-11-21 — Toast pills in the opposite appearance's palette (gpui-implementer)
 Owner: "Copied — clears in 30 s" was hard to see; invert toast colours (dark pill in light mode, light pill in dark mode), same for every toast. Option A chosen: `ui::pill` takes `VaultTheme::for_appearance(!dark)` for fill, border and text; `danger_pill` keeps its danger border and text. Every toast goes through `pill` (root.rs window toasts, `detail_copy_feedback` in the detail column and item windows), so nothing else changed. Spec 05 §2.3 updated. Tests: `pill_uses_dark_palette_in_light_mode`, `pill_uses_light_palette_in_dark_mode`, `danger_pill_inverts_fill_only` (read off the built element's style).
 
+### 2026-11-21 — Bug hunt for the waves since c7af00a (bug-hunter); ORCHESTRATOR_PROMPT.md updated
+`docs/qa/bug-hunt-2026-11-21.md`: 0 high, 0 medium, 4 low. L2 (05 §2.1 said a 4-word passphrase "reads Fair"; buckets and code say Good) and L4 (04 dependency list missing eight crates) fixed in the specs the same day. Open for the owner: L1 (on the cached-key path a tampered *first* item record is reported as `WrongPassword`, so vault-sync says `KeyMismatch` and the app asks for the password; later records give `Tampered`; the realigned 02 now contradicts its own guarantee 4) and L3 (the unlock card says "created by a newer version" for any `UnsupportedVersion`, including version 0, which 01 defines as damage). Ledger: +25 Rust checks (`realign_1121.rs`, `exports_1119.rs`), +13 CLI checks; all 267 + 113 earlier checks pass; workspace 1297 passed / 17 ignored, fmt and clippy clean. Nine notes recorded, not counted (unreadable conflict copies skipped silently; a newer file arriving while locked never shows the newer-version card; the name being edited is clipped in edit mode). ORCHESTRATOR_PROMPT.md: code-is-truth rule, commit-title convention, bug-hunt coverage line, small-diff review exception (owner "go" 2026-11-21).
+
+## CHECKPOINT — Bug hunt 2026-11-21
+Committed: d0b2a8a (toasts). Uncommitted: ORCHESTRATOR_PROMPT.md, specs/04-macos.md, specs/05-ui.md (one sentence each), docs/qa/bug-hunt-2026-11-21.md (new), qa/spec-checks (README, cli/run_all.sh, tests/realign_1121.rs, tests/exports_1119.rs), this file.
+Checks: fmt PASS, clippy PASS, workspace 1297 passed / 17 ignored; ledger see the entry above.
+Awaiting owner: decisions on L1 (fix core: try the manifest before reporting WrongPassword on the key path; or amend 02 guarantee 4 and 03 §8) and L3 (block with the "newer" text only for a version above FORMAT_VERSION; else the damaged-file message), commit.
+Bug hunt: run for this wave (covers 7a65429, f71b529, 35e1108, d0b2a8a); no wave is uncovered.
+
 ## CHECKPOINT — Toast colours 2026-11-21
 Committed: 35e1108 (label column). Uncommitted: crates/vault-app/src/ui.rs, specs/05-ui.md (one sentence), this file, gpui-implementer memory.
 Checks: fmt PASS, clippy PASS, vault-app 573 passed / 2 ignored (no non-app crate touched).
