@@ -779,9 +779,9 @@ mod tests {
             px(crate::screens::main::detail::FIELD_ROW_PAD_Y)
         );
         assert!(label.right() < content.left(), "label beside its value");
-        // Stored "user" and "pin": shown with a capital, like the main detail.
-        assert!(vcx.debug_bounds("field-label-text 0 User").is_some());
-        assert!(vcx.debug_bounds("field-label-text 1 Pin").is_some());
+        // Stored "user" and "pin": shown as stored, like the main detail.
+        assert!(vcx.debug_bounds("field-label-text 0 user").is_some());
+        assert!(vcx.debug_bounds("field-label-text 1 pin").is_some());
         // The field icon comes with the shared row (05 "Field icons").
         assert!(vcx.debug_bounds("field-row-icon 0 KeyRound").is_some());
         // A section heading renders through the shared heading row, without actions.

@@ -567,9 +567,23 @@ fn switching_items_and_edit_paint_at_once_without_a_fade(cx: &mut TestAppContext
 }
 
 #[gpui::test]
-fn labels_show_a_capital_but_stored_names_stay(cx: &mut TestAppContext) {
+fn labels_show_the_stored_name_as_typed(cx: &mut TestAppContext) {
+    // Owner 2026-11-22: no display-time capitalisation; a mixed-case name stays as is.
     let dir = tempfile::tempdir().unwrap();
-    let (state, ids, mut vcx) = open(dir.path(), &[("Alpha", STRONG)], cx);
+    let (state, ids, mut vcx) = open_items(
+        dir.path(),
+        |device| {
+            let mut item = login("Alpha", STRONG, device);
+            item.fields.push(Field::new(
+                "iCloud pIN",
+                FieldKind::Text,
+                SecretString::new("1".into()),
+                1,
+            ));
+            vec![item]
+        },
+        cx,
+    );
     select(&state, ids[0], &mut vcx);
     let names: Vec<String> = state.read_with(&vcx, |s, _| {
         s.selected_item()
@@ -580,9 +594,11 @@ fn labels_show_a_capital_but_stored_names_stay(cx: &mut TestAppContext) {
             .collect()
     });
     assert_eq!(names[0], "username", "the fixture stores lowercase names");
-    assert!(vcx.debug_bounds("field-label-text 0 Username").is_some());
-    assert!(vcx.debug_bounds("field-label-text 0 username").is_none());
-    // Display only: the item and the editor keep the stored spelling.
+    assert!(vcx.debug_bounds("field-label-text 0 username").is_some());
+    assert!(vcx.debug_bounds("field-label-text 0 Username").is_none());
+    assert!(vcx.debug_bounds("field-label-text 2 iCloud pIN").is_some());
+    assert!(vcx.debug_bounds("field-label-text 2 ICloud pIN").is_none());
+    // The item and the editor keep the stored spelling too.
     state.update(&mut vcx, |s, cx| s.begin_edit(cx));
     vcx.run_until_parked();
     state.read_with(&vcx, |s, _| {
@@ -748,8 +764,8 @@ fn same_name_fields_render_and_reveal_separately(cx: &mut TestAppContext) {
     );
     select(&state, ids[0], &mut vcx);
     for key in [
-        "field-label-text 0 Pin",
-        "field-label-text 1 Pin",
+        "field-label-text 0 pin",
+        "field-label-text 1 pin",
         "field-masked 0",
         "field-masked 1",
     ] {
@@ -1255,7 +1271,7 @@ fn field_icon_sits_left_of_the_label_only_on_its_row(cx: &mut TestAppContext) {
         .debug_bounds("field-row-icon 0 KeyRound")
         .expect("icon on row 0");
     let label = vcx.debug_bounds("field-label 0").unwrap();
-    let text = vcx.debug_bounds("field-label-text 0 Username").unwrap();
+    let text = vcx.debug_bounds("field-label-text 0 username").unwrap();
     assert_eq!(icon.size.width, px(16.), "16 px glyph box");
     assert_eq!(icon.left(), label.left(), "icon leads the label column");
     assert_eq!(text.left() - label.left(), px(16. + FIELD_ICON_GAP));
@@ -1263,7 +1279,7 @@ fn field_icon_sits_left_of_the_label_only_on_its_row(cx: &mut TestAppContext) {
     assert_eq!(icon.top(), text.top(), "on the label's first line");
     assert_eq!(icon.size.height, text.size.height, "one line tall");
     // No icon and an unknown name: the label starts at the column's edge, as before.
-    for (ix, shown) in [(1, "Password"), (2, "Pin")] {
+    for (ix, shown) in [(1, "password"), (2, "pin")] {
         let label = vcx.debug_bounds(leak(format!("field-label {ix}"))).unwrap();
         let text = vcx
             .debug_bounds(leak(format!("field-label-text {ix} {shown}")))
@@ -1317,7 +1333,7 @@ fn field_icon_tops_a_wrapping_label_at_the_largest_text_size(cx: &mut TestAppCon
         .expect("icon on row 2");
     let text = vcx
         .debug_bounds(
-            "field-label-text 2 Recovery passphrase for the offline backup drive kept in the safe",
+            "field-label-text 2 recovery passphrase for the offline backup drive kept in the safe",
         )
         .unwrap();
     assert!(

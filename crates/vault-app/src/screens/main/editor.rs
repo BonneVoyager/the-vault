@@ -38,7 +38,8 @@ enum ValueInput {
     None,
 }
 
-// `capitalize_first`: shared with the read-only field labels.
+// `capitalize_first`: only for a new field's first typed character (read-mode labels
+// show the stored name as typed since 2026-11-22).
 use crate::text::capitalize_first;
 
 struct Row {

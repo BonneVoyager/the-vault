@@ -212,7 +212,7 @@ pub(crate) fn rows_width(column: f32) -> Pixels {
 }
 
 /// The width the label column needs to show every displayed label of `fields` on one
-/// line (05 §2.3, owner 2026-11-20): the widest capitalised name (sections and empty
+/// line (05 §2.3, owner 2026-11-20): the widest name (sections and empty
 /// names ignored) shaped as read mode draws it (theme font at `theme.font_size`, which
 /// already carries the text-size scale; regular weight), plus the icon slot (`size_4`,
 /// 1 rem, and the gap) when any field draws an icon. Read mode and the editor both pass
@@ -232,7 +232,7 @@ pub(crate) fn label_fit<'a>(
             continue;
         }
         icon |= field.icon_name().and_then(crate::icon::symbol).is_some();
-        let shown = text::capitalize_first(&field.name).replace('\n', " ");
+        let shown = field.name.replace('\n', " ");
         if shown.trim().is_empty() {
             continue;
         }
@@ -305,15 +305,14 @@ pub(crate) fn field_row(
                             .child(div().w_0().overflow_hidden().child("\u{200b}")),
                     )
                 })
-                // Display only: the stored name keeps its spelling ("username" shows
-                // "Username"; the editor's name inputs show it as stored).
+                // The label shows the stored name exactly as typed (owner 2026-11-22:
+                // no display-time capitalisation).
                 .child({
-                    let shown = text::capitalize_first(&label);
-                    let selector = format!("field-label-text {ix} {shown}");
+                    let selector = format!("field-label-text {ix} {label}");
                     div()
                         .debug_selector(move || selector.clone())
                         .when(symbol.is_some(), |d| d.flex_1().min_w_0())
-                        .child(shown)
+                        .child(label)
                 }),
         )
         .child(
