@@ -1064,6 +1064,17 @@ impl SyncedVault {
         }
     }
 
+    /// Why saves are currently refused (03 §3 pre-write merge, §8 `SaveBlocked`): the primary
+    /// was written by a newer format version, or holds a different vault. Recorded when first
+    /// detected (by the watcher, a `save`'s pre-write read or an unlock's re-read) and kept
+    /// across `lock` and `unlock` while the file stays that way, so it is accurate right after
+    /// an unlock that opened the last readable copy, when no new [`SyncEvent::SaveBlocked`] is
+    /// emitted. Cleared when a valid file of this vault is read again (which a successful save
+    /// or a clean merge implies) and by a restore. `None` otherwise.
+    pub fn save_blocked(&self) -> Option<SaveBlocked> {
+        self.save_blocked
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }

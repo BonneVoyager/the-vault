@@ -107,6 +107,31 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// An untrusted name (a file name from disk) made safe for one line of UI text: control,
+/// bidi and invisible format characters (the CLI's `sanitize_line` set) become U+FFFD, then
+/// at most `max` characters with an ellipsis when cut.
+pub fn sanitize_line(s: &str, max: usize) -> String {
+    let clean: String = s
+        .chars()
+        .map(|c| match c {
+            '\u{0}'..='\u{1f}'
+            | '\u{7f}'
+            | '\u{80}'..='\u{9f}'
+            | '\u{61c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{206a}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}' => '\u{fffd}',
+            c => c,
+        })
+        .collect();
+    truncate(&clean, max)
+}
+
 /// First 8 hex digits of a device id.
 pub fn short_id(id: vault_core::Uuid) -> String {
     id.simple().to_string()[..8].to_owned()
@@ -186,6 +211,27 @@ mod tests {
         assert_eq!(mask_card("12"), DOTS);
         assert_eq!(truncate("abcdef", 3), "abc…");
         assert_eq!(truncate("abc", 3), "abc");
+    }
+
+    #[test]
+    fn sanitize_line_replaces_controls_and_truncates() {
+        assert_eq!(
+            sanitize_line("a\nb\tc\r", 60),
+            "a\u{fffd}b\u{fffd}c\u{fffd}"
+        );
+        assert_eq!(sanitize_line("\u{1b}[2J", 60), "\u{fffd}[2J");
+        assert_eq!(
+            sanitize_line("\u{85}x\u{202e}y\u{feff}", 60),
+            "\u{fffd}x\u{fffd}y\u{fffd}"
+        );
+        assert_eq!(
+            sanitize_line("Plain \u{e9} 2.bin", 60),
+            "Plain \u{e9} 2.bin"
+        );
+        assert_eq!(
+            sanitize_line(&"x".repeat(200), 60),
+            format!("{}…", "x".repeat(60))
+        );
         assert!(browser_url("  ").is_none());
     }
 

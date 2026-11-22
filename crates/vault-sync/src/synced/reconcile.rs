@@ -34,6 +34,11 @@ use crate::watch::{
     classify_inner,
 };
 
+/// The content key [`SyncedVault::report_unreadable`] records for a candidate that is a
+/// symlink or special file and is therefore never read (no blake3 output is all zeros in
+/// practice).
+const UNSAFE_ENTRY: [u8; 32] = [0; 32];
+
 /// Which report was last made for a sibling `*.vault` (see `report_sibling_once`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SiblingReport {
@@ -410,7 +415,10 @@ impl SyncedVault {
         };
         match fs::symlink_metadata(path) {
             Ok(m) if m.is_file() => {}
-            _ => {
+            // A symlink, FIFO or other special file (03 §2 D-1): never followed or opened, and
+            // never skipped silently.
+            Ok(_) => return self.report_unreadable(path, UNSAFE_ENTRY),
+            Err(_) => {
                 self.forget_sibling(path);
                 return;
             }
@@ -441,6 +449,9 @@ impl SyncedVault {
         };
         match fs::symlink_metadata(path) {
             Ok(m) if m.is_dir() => {}
+            // A symlink or special file where a package should be (03 §2 D-1): never followed,
+            // and never skipped silently.
+            Ok(m) if !m.is_file() => return self.report_unreadable(path, UNSAFE_ENTRY),
             // Gone (we or another device already moved it), or not a package (a plain file is
             // the unsupported single-file layout).
             _ => {
@@ -541,6 +552,12 @@ impl SyncedVault {
                 self.cloud_unavailable(inner, &e);
                 return None;
             }
+            // A package's `vault.bin` that is a symlink or special file, or a per-file copy
+            // swapped to one since the lstat (03 §2 D-1): refused unopened, reported once.
+            Err(SyncError::UnsafePackageEntry(_)) => {
+                self.report_unreadable(path, UNSAFE_ENTRY);
+                return None;
+            }
             Err(e) => {
                 self.emit_error(e);
                 return None;
@@ -558,14 +575,7 @@ impl SyncedVault {
             }
             Err(e) => {
                 tracing::debug!(path = %path.display(), error = %e, "leaving unreadable conflict candidate in place");
-                // Once per content: a replacement with other bytes is reported again (even
-                // within one mtime tick); the same bytes re-delivered are not.
-                let prev = self
-                    .unreadable_conflicts
-                    .insert(key, (path.to_owned(), hash));
-                if prev.is_none_or(|(_, h)| h != hash) {
-                    self.emit(SyncEvent::UnreadableConflict(path.to_owned()));
-                }
+                self.report_unreadable(path, hash);
                 return None;
             }
         };
@@ -634,6 +644,20 @@ impl SyncedVault {
             })
     }
 
+    /// [`SyncEvent::UnreadableConflict`] for candidate `path` once per content: a replacement
+    /// with other bytes (`hash`, or [`UNSAFE_ENTRY`] for an entry that is not opened) is
+    /// reported again, even within one mtime tick; the same bytes re-delivered are not.
+    fn report_unreadable(&mut self, path: &Path, hash: [u8; 32]) {
+        let key = package::path_key(path);
+        let prev = self
+            .unreadable_conflicts
+            .insert(key, (path.to_owned(), hash));
+        if prev.is_none_or(|(_, h)| h != hash) {
+            tracing::info!(path = %path.display(), "conflict candidate cannot be used; left in place");
+            self.emit(SyncEvent::UnreadableConflict(path.to_owned()));
+        }
+    }
+
     /// Emit `event` for `path` unless the same report was already made for the same bytes.
     fn report_sibling_once(
         &mut self,
@@ -665,6 +689,17 @@ impl SyncedVault {
         if std::mem::take(&mut self.rewrite_on_unlock) {
             self.dirty = true;
             self.dirty_from_corrupt = true;
+        }
+        // `lock` empties the unreadable-candidate memory, so every entry now was reported
+        // while locked, when the app may not have shown it: re-check and report each once more.
+        for (key, (path, _)) in std::mem::take(&mut self.unreadable_conflicts) {
+            if !self
+                .pending_conflicts
+                .iter()
+                .any(|p| package::path_key(p) == key)
+            {
+                self.pending_conflicts.push(path);
+            }
         }
         for path in std::mem::take(&mut self.pending_conflicts) {
             self.on_candidate_conflict(&path);

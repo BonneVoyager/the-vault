@@ -85,6 +85,21 @@ cargo fmt --all -- --check                     # formatting is part of the manua
   `run_all.sh` section (no-op and failing `vault sync`, `list` waiting on a held save lock, a
   version-0 file, dependency lists in 02/03/04 vs `cargo tree`, `docs/help.md` and specs vs the
   removed Move…).
+- 2026-11-21b additions: `conflicts_1121` (03 §6 step 1 and the §8 `UnreadableConflict` sentence
+  dated 2026-11-21: random-bytes, truncated, version 0/3/0xFFFF per-file copies and sibling
+  packages each reported once and left in place; same bytes under a new mtime silent, other bytes
+  reported again; reported again after absorption, disappearance, lock/unlock and stop/start
+  watching; two paths with the same bytes; non-candidate paths silent; a copy whose download
+  fails waits (`CloudUnavailable`); `ForeignVault`, `WaitingForBlobs` and `UnreadableConflict`
+  side by side; a sibling that is unreadable, then waiting, then absorbed; a sibling directory
+  before its `vault.bin`; restore with an unreadable copy present; 03 §3 version 0 vs newer
+  primary, unlocked and locked; 03 §8 `restore_from` over a version-0 and a version-3 primary;
+  oversize and symlinked copies recorded; 40 copies drain; D-1 symlink/FIFO per-file copies and
+  symlinked sibling packages not silent; `SaveBlocked` counts across lock/unlock; 05 §2.3 danger
+  pill contrast arithmetic; 01 §4 fixture stamp sentence), and a `run_all.sh` 2026-11-21b section
+  (`vault sync` with unreadable copies of both shapes and all versions: rc 1, named, kept,
+  primary untouched; readable beside unreadable; 20 copies; concurrent adds and syncs; symlink,
+  FIFO and symlinked-sibling copies; a 65 MiB copy; `docs/help.md` ⌥ sentence).
 - Temp files go under `tmp/` (git-ignored) and are removed by each test.
 
 A passing check shows the behaviour on those inputs only. It is not a proof.

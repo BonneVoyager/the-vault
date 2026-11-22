@@ -1,5 +1,6 @@
 //! 05 §2.3 "Edit-mode field rows" (owner 2026-11-15, option A): edit rows mirror read
-//! mode's `detail::field_row`, so pressing Edit moves nothing; ↑/↓ show on the hovered
+//! mode's `detail::field_row` (the label column is a fixed 140 px in edit mode, owner
+//! 2026-11-21, so a widened read column narrows on Edit); ↑/↓ show on the hovered
 //! or focused row only; the accent ring is drawn on the focused input, never the row.
 
 use gpui::{Bounds, Modifiers, Pixels, TestAppContext, VisualTestContext, point};
@@ -67,9 +68,9 @@ fn read_then_edit(
     (read, edit, keys)
 }
 
-/// Pressing Edit does not move or resize any row: same bounds in both modes.
+/// Pressing Edit keeps each row's outer bounds (the label column may change width).
 #[gpui::test]
-fn rows_do_not_move_between_read_and_edit(cx: &mut TestAppContext) {
+fn outer_row_bounds_unchanged_on_edit(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (state, _main, mut vcx) = open(dir.path(), cx);
     plain_item(&state, &mut vcx);
@@ -79,9 +80,10 @@ fn rows_do_not_move_between_read_and_edit(cx: &mut TestAppContext) {
     }
 }
 
-/// The label column has read mode's width and left edge, wide and narrow.
+/// The label column keeps read mode's left edge, wide and narrow (its width is the
+/// edit-mode rule, see `edit_mode_label_column_is_140px`).
 #[gpui::test]
-fn label_column_matches_read_mode(cx: &mut TestAppContext) {
+fn label_column_keeps_read_modes_left_edge(cx: &mut TestAppContext) {
     for width in [1200., 760.] {
         let dir = tempfile::tempdir().unwrap();
         let (state, _main, mut vcx) = open(dir.path(), cx);
@@ -90,12 +92,159 @@ fn label_column_matches_read_mode(cx: &mut TestAppContext) {
         let (read, edit, _) = read_then_edit(&state, &mut vcx);
         for (ix, ((_, r), (_, e))) in read.iter().zip(&edit).enumerate() {
             assert!(
-                (r.size.width - e.size.width).abs() < px(0.5)
-                    && (r.left() - e.left()).abs() < px(0.5),
+                (r.left() - e.left()).abs() < px(0.5),
                 "label {ix} at {width}: read {r:?} edit {e:?}"
             );
         }
     }
+}
+
+/// Owner decisions 2026-11-21: in edit mode the field-name input is a fixed 140 px box
+/// and the label column that plus the chrome left of it (grip, 4 px, icon button,
+/// 4 px) on rows at least 420 px plus that chrome wide, whatever read mode's width
+/// (short labels at the base, a long label fitted wider); on narrower rows the column
+/// is read mode's width, as before.
+#[gpui::test]
+fn edit_mode_name_input_is_140px(cx: &mut TestAppContext) {
+    let long = "Recovery passphrase for backup";
+    // Rows are about the window less 552 px here: 1040 gives ~488 px rows, 1000 ~448 px
+    // (either side of the 468 px threshold with a margin: it reads the laid-out row
+    // width, which can differ from the drawn, rounded one by a pixel).
+    for width in [1600., 1040., 1000., 760.] {
+        for names in [&["Username", "PIN"][..], &["Username", long][..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let (state, _main, mut vcx) = open(dir.path(), cx);
+            labelled(&state, &mut vcx, width, names, None);
+            let (read, edit, keys) = read_then_edit(&state, &mut vcx);
+            let rem = vcx.update(|window, _| window.rem_size());
+            let chrome = rem * 2.5 + px(8.);
+            let threshold = px(420.) + chrome;
+            for (ix, ((_, r), (row, e))) in read.iter().zip(&edit).enumerate() {
+                let wide = row.size.width >= threshold;
+                if width == 1040. || width == 1000. {
+                    assert_eq!(
+                        wide,
+                        width == 1040.,
+                        "either side of {threshold:?}: {row:?}"
+                    );
+                }
+                let expected = if wide {
+                    px(140.) + chrome
+                } else {
+                    r.size.width
+                };
+                assert!(
+                    (e.size.width - expected).abs() < px(0.5),
+                    "{width} {names:?} row {ix} ({:?} wide): column {:?}, expected {expected:?}",
+                    row.size.width,
+                    e.size.width
+                );
+                if wide {
+                    let name = bounds(&mut vcx, format!("edit-name {}", keys[ix]));
+                    assert!(
+                        (name.size.width - px(140.)).abs() <= px(1.),
+                        "{width} row {ix}: name input {:?}",
+                        name.size.width
+                    );
+                    assert!(
+                        (name.right() - e.right()).abs() < px(0.5),
+                        "ends the column"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// At the detail minimum (288 px rows) in edit mode, a weak password row's value
+/// input, trailing buttons, strength meter with Generate and notice strip, and a text
+/// row with a long value, all lie inside the row, side by side without overlap.
+#[gpui::test]
+fn narrow_edit_rows_fit_inside_the_row(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _main, mut vcx) = open(dir.path(), cx);
+    vcx.simulate_resize(gpui::size(px(760.), px(900.)));
+    let device = state.read_with(&vcx, |s, _| s.device_id());
+    let mut item = vault_core::Item::new("Narrow", device, 1);
+    let long = "a-long-value-".repeat(16);
+    item.fields = vec![
+        vault_core::Field::new(
+            "Password",
+            FieldKind::Password,
+            SecretString::new("123".into()),
+            1,
+        ),
+        vault_core::Field::new("Notes line", FieldKind::Text, SecretString::new(long), 1),
+    ];
+    insert_and_select(&state, item, &mut vcx);
+    let detail = bounds(&mut vcx, "detail-slot".into());
+    assert!((detail.size.width - px(320.)).abs() < px(1.), "{detail:?}");
+    state.update(&mut vcx, |s, cx| s.begin_edit(cx));
+    vcx.run_until_parked();
+    let (keys, pw) = state.read_with(&vcx, |s, _| {
+        let b = s.edit_buffer().unwrap();
+        (b.keys.clone(), b.field(b.keys[0]).unwrap().id)
+    });
+    let inside = |outer: Bounds<Pixels>, inner: Bounds<Pixels>, what: &str| {
+        let over = inner.right() - outer.right();
+        assert!(
+            inner.left() >= outer.left() - px(0.5) && over <= px(0.5),
+            "{what} {inner:?} past the row {outer:?} by {over:?}"
+        );
+    };
+    let apart = |a: Bounds<Pixels>, b: Bounds<Pixels>, what: &str| {
+        assert!(
+            a.right() <= b.left() + px(0.5),
+            "{what}: overlap of {:?}",
+            a.right() - b.left()
+        );
+    };
+    for (ix, &key) in keys.iter().enumerate() {
+        let row = bounds(&mut vcx, format!("edit-row {key}"));
+        assert!(
+            (row.size.width - px(288.)).abs() < px(1.),
+            "row {ix} at the minimum: {row:?}"
+        );
+        let label = bounds(&mut vcx, format!("edit-label {key}"));
+        let value = bounds(&mut vcx, format!("edit-value {key}"));
+        let trailing = bounds(&mut vcx, format!("edit-trailing {key}"));
+        let remove = bounds(&mut vcx, format!("remove-field {key}"));
+        for (b, what) in [
+            (label, "label"),
+            (value, "value"),
+            (trailing, "trailing"),
+            (remove, "trash"),
+        ] {
+            inside(row, b, &format!("row {ix} {what}"));
+        }
+        apart(label, value, &format!("row {ix} label/value"));
+        apart(value, trailing, &format!("row {ix} value/trailing"));
+        inside(trailing, remove, &format!("row {ix} trash in trailing"));
+    }
+    let row = bounds(&mut vcx, format!("edit-row {}", keys[0]));
+    let value = bounds(&mut vcx, format!("edit-value {}", keys[0]));
+    let meter = bounds(&mut vcx, format!("strength-meter {}", keys[0]));
+    let generate = bounds(&mut vcx, format!("generate-btn {}", keys[0]));
+    let strip = bounds(&mut vcx, format!("issue-strip {pw} Weak Password"));
+    for (b, what) in [(meter, "meter"), (generate, "generate"), (strip, "notice")] {
+        inside(row, b, what);
+        assert!(
+            b.top() >= value.bottom() - px(0.5),
+            "{what} under the value line"
+        );
+    }
+    apart(meter, generate, "meter/generate");
+    // Owner 2026-11-21 (option 1): read mode's narrow column leaves the password value
+    // its room (42 px measured at 288 px rows).
+    assert!(
+        value.size.width >= px(40.),
+        "password value input {:?}",
+        value.size.width
+    );
+    assert!(
+        strip.top() >= meter.bottom() - px(0.5),
+        "notice under the meter"
+    );
 }
 
 fn arrows_on(vcx: &mut VisualTestContext, keys: &[u64]) -> Vec<bool> {
@@ -738,8 +887,8 @@ fn login_labels_at_detail_min(cx: &mut TestAppContext) {
 }
 
 /// A 30-character label widens the column to the drawn label (plus the icon slot) and
-/// stays on one line, at the default and the Larger text size; read mode and the
-/// editor keep equal columns.
+/// stays on one line, at the default and the Larger text size; the editor keeps its
+/// fixed 140 px name input.
 #[gpui::test]
 fn long_label_fits_on_one_line_in_both_modes(cx: &mut TestAppContext) {
     let long = "Recovery passphrase for backup";
@@ -776,12 +925,14 @@ fn long_label_fits_on_one_line_in_both_modes(cx: &mut TestAppContext) {
             "one line: {text:?} vs {:?}",
             rows[0].2
         );
-        let (read, edit, _) = read_then_edit(&state, &mut vcx);
-        for (ix, ((_, r), (_, e))) in read.iter().zip(&edit).enumerate() {
+        // Edit mode: the fixed 140 px name input (owner 2026-11-21), not the fitted
+        // column; the chrome left of it grows with the text size.
+        let (_, edit, keys) = read_then_edit(&state, &mut vcx);
+        for (ix, (_, e)) in edit.iter().enumerate() {
+            let name = bounds(&mut vcx, format!("edit-name {}", keys[ix]));
             assert!(
-                (r.size.width - e.size.width).abs() < px(0.5)
-                    && (r.left() - e.left()).abs() < px(0.5),
-                "label {ix}: read {r:?} edit {e:?}"
+                (name.size.width - px(140.)).abs() <= px(1.),
+                "larger {larger} label {ix}: name input {name:?} in {e:?}"
             );
         }
     }

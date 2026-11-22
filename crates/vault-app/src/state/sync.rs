@@ -160,6 +160,26 @@ impl AppState {
     }
 
     /// Drops the save-blocked notice and, with it, the status line's copy of its text.
+    /// Strip, status line and stopped autosave for a refused save (03 §3).
+    fn raise_save_blocked(&mut self, blocked: SaveBlocked) {
+        let message = save_blocked_message(&blocked);
+        self.sync_status = SyncStatus::Error(message.into());
+        self.sync.save_failing = true;
+        self.sync.save_blocked = Some(SaveBlockedNotice {
+            message: message.into(),
+            offers_trash: false,
+        });
+    }
+
+    /// After an unlock: the file on disk may still refuse saves (the unlock opened the last
+    /// readable copy). vault-sync emits no new event then (03 §8), so ask it, and keep the
+    /// strip and status line up without a toast (bug hunt 2026-11-21b L2).
+    pub(super) fn reraise_save_blocked(&mut self) {
+        if let Some(blocked) = self.vault.as_ref().and_then(SyncedVault::save_blocked) {
+            self.raise_save_blocked(blocked);
+        }
+    }
+
     pub(super) fn clear_save_blocked(&mut self) {
         if self.sync.save_blocked.take().is_some() {
             self.sync_status = SyncStatus::Idle;
@@ -403,16 +423,10 @@ impl AppState {
             // through `record_save`, so only the first sighting toasts. The status line
             // keeps the reason until a save succeeds, and autosave stops retrying.
             SyncEvent::SaveBlocked(blocked) => {
-                let message = save_blocked_message(&blocked);
-                self.sync_status = SyncStatus::Error(message.into());
                 if !self.sync.save_failing {
-                    self.show_toast(message, cx);
+                    self.show_toast(save_blocked_message(&blocked), cx);
                 }
-                self.sync.save_failing = true;
-                self.sync.save_blocked = Some(SaveBlockedNotice {
-                    message: message.into(),
-                    offers_trash: false,
-                });
+                self.raise_save_blocked(blocked);
                 // Locked, a newer version's file would otherwise go unnoticed: the next
                 // unlock opens the last readable copy and the strip is cleared by it. The
                 // unlock card says so instead (05 §2.2); `unlocked` and a vault switch
@@ -724,12 +738,16 @@ impl AppState {
     }
 }
 
+/// Longest conflict-copy name shown in a toast, in characters.
+const CONFLICT_NAME_MAX: usize = 60;
+
 /// Toast for [`SyncEvent::UnreadableConflict`]: the copy's final path component only,
-/// never the full path.
+/// never the full path, with control characters replaced and cut to a pill-sized length.
 fn unreadable_conflict_message(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .map_or_else(|| "unnamed".into(), |n| n.to_string_lossy());
+    let name = path.file_name().map_or_else(
+        || "unnamed".into(),
+        |n| text::sanitize_line(&n.to_string_lossy(), CONFLICT_NAME_MAX),
+    );
     format!("Could not read the conflict copy \u{201c}{name}\u{201d}. It was left in place.")
 }
 
@@ -1816,6 +1834,47 @@ mod tests {
         });
     }
 
+    /// Bug hunt 2026-11-21b L2: a newer version's primary is still on disk after a lock
+    /// and an unlock, so the strip and status line come back with the unlock; a readable
+    /// file clears them as before.
+    #[gpui::test]
+    fn unlock_keeps_the_strip_while_the_file_still_refuses_saves(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        let file = dir.path().join("t.vault").join(vault_sync::VAULT_FILE_NAME);
+        let good = fs::read(&file).unwrap();
+        let mut newer = good.clone();
+        newer[4..6].copy_from_slice(&(vault_core::FORMAT_VERSION + 1).to_be_bytes());
+        let message = save_blocked_message(&SaveBlocked::NewerVersion(0));
+
+        for (bytes, blocked) in [(newer, true), (good, false)] {
+            fs::write(&file, bytes).unwrap();
+            state.update(cx, |s, cx| {
+                // As left by the event while unlocked.
+                s.raise_save_blocked(SaveBlocked::NewerVersion(99));
+                s.lock(cx);
+                // Keep the card out of it: only the unlock path is under test.
+                s.unlock_blocked = None;
+                s.unlock(secret(PW), cx);
+            });
+            cx.run_until_parked();
+            state.read_with(cx, |s, _| {
+                assert!(!s.locked, "unlocked");
+                let vault_says = s.vault.as_ref().unwrap().save_blocked();
+                assert_eq!(vault_says.is_some(), blocked);
+                if blocked {
+                    let notice = s.sync.save_blocked.as_ref().expect("strip kept");
+                    assert_eq!(notice.message.as_ref(), message);
+                    assert!(!notice.offers_trash && s.sync.save_failing);
+                    assert_eq!(s.sync_status, SyncStatus::Error(message.into()));
+                } else {
+                    assert!(s.sync.save_blocked.is_none() && !s.sync.save_failing);
+                    assert_eq!(s.sync_status, SyncStatus::Idle);
+                }
+            });
+        }
+    }
+
     /// An unreadable conflict copy toasts its file name (never the path) and changes
     /// nothing else: no strip, status line, danger or unlock block.
     #[gpui::test]
@@ -1848,6 +1907,21 @@ mod tests {
                 );
             });
         }
+        // A hostile name: newline, ANSI escape and 200 characters. One line, no escape
+        // byte, cut to 60 characters plus the ellipsis.
+        let hostile = format!("a\nb\u{1b}[31m{}", "x".repeat(200));
+        state.update(cx, |s, cx| {
+            s.handle_sync_event(SyncEvent::UnreadableConflict(dir.path().join(&hostile)), cx);
+            let message = s.toast.as_ref().unwrap().message.to_string();
+            let name = format!("a\u{fffd}b\u{fffd}[31m{}…", "x".repeat(52));
+            assert_eq!(
+                message,
+                format!(
+                    "Could not read the conflict copy \u{201c}{name}\u{201d}. It was left in place."
+                )
+            );
+            assert!(!message.chars().any(char::is_control));
+        });
     }
 
     /// A newer version's file seen while locked blocks the unlock card (05 §2.2, bug hunt

@@ -571,6 +571,96 @@ grep -qi 'newer version' "$HELP" && echo "INFO help.md mentions the newer-versio
 grep -n 'Move…' "$ROOT"/specs/*.md | grep -v 'no "Move…"' >"$T/o"
 [ -s "$T/o" ] && bad "a spec still describes Move…" "$(cat "$T/o")" || ok "no spec describes a Move… action"
 
+# ---- 2026-11-21b: unreadable conflict copies (03 §6 step 1, §8 UnreadableConflict; 00 phase 1 `sync`) ----
+# 03 §6 step 1 (2026-11-21): "if the candidate does not parse or carries an unsupported format version →
+# emit SyncEvent::UnreadableConflict(path) once and leave it in place (`vault sync` reports it and exits
+# "not converged" …)"; 00: `sync` "fails with "not converged" if any problem was reported".
+export VAULT_FILE="$T/u21.vault"
+v init --kdf-test-params >/dev/null 2>&1
+v add --title U21 >/dev/null 2>&1
+sync_rc() { v sync >"$T/o" 2>&1; echo $?; }
+setver() { cp "$VAULT_FILE/vault.bin" "$2"; printf "$1" | dd of="$2" bs=1 seek=4 conv=notrunc 2>/dev/null; }
+head -c 3000 /dev/urandom >"$T/g.bin"
+cp "$T/g.bin" "$VAULT_FILE/vault 2.bin"
+h0=$(shasum "$VAULT_FILE/vault.bin")
+for run in 1 2; do
+  rc=$(sync_rc)
+  if [ "$rc" = 1 ] && grep -q "not converged" "$T/o" && grep -q "vault 2.bin" "$T/o"; then ok "sync with a random-bytes per-file copy: rc 1, names the copy, 'not converged' (run $run)"; else bad "unreadable per-file copy (run $run)" "rc=$rc $(sed "s|$T|<tmp>|g" "$T/o" | head -3 | tr '\n' ' ')"; fi
+done
+cmp -s "$T/g.bin" "$VAULT_FILE/vault 2.bin" && ok "unreadable copy left in place byte-identical" || bad "unreadable copy changed or moved" "$(ls "$VAULT_FILE")"
+[ "$h0" = "$(shasum "$VAULT_FILE/vault.bin")" ] && ok "unreadable copy does not rewrite vault.bin" || bad "vault.bin rewritten by sync with only an unreadable copy"
+grep -q "$MPW" "$T/o" && bad "sync output contains the master password" || ok "sync output does not contain the master password"
+rm -f "$VAULT_FILE/vault 2.bin"
+# 03 §8: "unsupported format version (any value, 0 included)"
+for ver in '\x00\x00' '\x00\x03' '\xff\xff'; do
+  setver "$ver" "$VAULT_FILE/vault 3.bin"; cp "$VAULT_FILE/vault 3.bin" "$T/vc.bin"
+  rc=$(sync_rc)
+  if [ "$rc" = 1 ] && grep -q "not converged" "$T/o" && cmp -s "$T/vc.bin" "$VAULT_FILE/vault 3.bin"; then ok "per-file copy with version $ver: not converged, kept"; else bad "per-file copy with version $ver" "rc=$rc $(sed "s|$T|<tmp>|g" "$T/o" | head -2 | tr '\n' ' ')"; fi
+  rm -f "$VAULT_FILE/vault 3.bin"
+done
+# whole-package shape (03 §1 "Conflict copies come in two shapes")
+mkdir -p "$T/u21 2.vault"; cp "$T/g.bin" "$T/u21 2.vault/vault.bin"
+rc=$(sync_rc)
+if [ "$rc" = 1 ] && grep -q "not converged" "$T/o" && grep -q "u21 2.vault" "$T/o" && cmp -s "$T/g.bin" "$T/u21 2.vault/vault.bin"; then ok "unreadable sibling package: not converged, named, kept"; else bad "unreadable sibling package" "rc=$rc $(sed "s|$T|<tmp>|g" "$T/o" | head -2 | tr '\n' ' ')"; fi
+rm -rf "$T/u21 2.vault"
+# a readable copy next to an unreadable one: the readable one is absorbed, the run still fails
+cp -R "$VAULT_FILE" "$T/stage.vault"
+"$V" --vault "$T/stage.vault" --password-env MPW add --title FromCopy21 >/dev/null 2>&1
+cp "$T/stage.vault/vault.bin" "$VAULT_FILE/vault 4.bin"; rm -rf "$T/stage.vault"
+cp "$T/g.bin" "$VAULT_FILE/vault 5.bin"
+rc=$(sync_rc)
+v list >"$T/o2" 2>&1
+if [ "$rc" = 1 ] && grep -q "not converged" "$T/o" && grep -q FromCopy21 "$T/o2" && [ ! -e "$VAULT_FILE/vault 4.bin" ] && [ -e "$VAULT_FILE/vault 5.bin" ]; then ok "readable copy absorbed beside an unreadable one; run reports not converged"; else bad "readable + unreadable copies" "rc=$rc $(sed "s|$T|<tmp>|g" "$T/o" | head -3 | tr '\n' ' ') list: $(tr '\n' ' ' <"$T/o2")" "$(ls "$VAULT_FILE")"; fi
+rm -f "$VAULT_FILE/vault 5.bin"
+rc=$(sync_rc)
+[ "$rc" = 0 ] && ok "sync exits 0 once the unreadable copy is gone" || bad "sync after removing the unreadable copy" "rc=$rc $(head -2 "$T/o")"
+# 03 §2 watcher bounds: one-shot callers loop on poll() until 0 — 20 unreadable copies terminate
+for k in $(seq 10 29); do head -c 400 /dev/urandom >"$VAULT_FILE/vault $k.bin"; done
+s0=$(date +%s); rc=$(sync_rc); s1=$(date +%s)
+n=$(grep -c "unreadable\|vault [0-9]*\.bin" "$T/o")
+kept=$(ls "$VAULT_FILE" | grep -c '^vault [0-9]*\.bin$')
+if [ "$rc" = 1 ] && [ "$kept" = 20 ] && [ $((s1-s0)) -lt 60 ]; then ok "sync with 20 unreadable copies terminates ($((s1-s0)) s), rc 1, all kept"; else bad "20 unreadable copies" "rc=$rc kept=$kept $((s1-s0)) s"; fi
+[ "$n" -ge 20 ] && ok "each of 20 unreadable copies is named" || bad "20 unreadable copies named" "lines naming copies: $n"
+# concurrent writers while an unreadable copy sits in the package (00: concurrent CLI use, 03 §2 lock)
+for k in $(seq 10 29); do rm -f "$VAULT_FILE/vault $k.bin"; done
+cp "$T/g.bin" "$VAULT_FILE/vault 2.bin"
+pids=""
+for k in 1 2 3 4; do (v add --title "Conc21-$k" >"$T/ca$k" 2>&1; echo $? >"$T/ca$k.rc") & pids="$pids $!"; done
+for k in 1 2; do (v sync >"$T/cs$k" 2>&1; echo $? >"$T/cs$k.rc") & pids="$pids $!"; done
+wait $pids
+v list >"$T/o2" 2>&1
+okc=1; for k in 1 2 3 4; do grep -q "Conc21-$k" "$T/o2" || okc=0; [ "$(cat "$T/ca$k.rc")" = 0 ] || okc=0; done
+for k in 1 2; do [ "$(cat "$T/cs$k.rc")" = 1 ] || okc=0; done
+if [ $okc = 1 ] && cmp -s "$T/g.bin" "$VAULT_FILE/vault 2.bin"; then ok "4 concurrent adds + 2 syncs with an unreadable copy: all adds kept, syncs rc 1, copy kept"; else bad "concurrent writers with an unreadable copy" "adds rc: $(cat "$T"/ca?.rc | tr '\n' ' ') syncs rc: $(cat "$T"/cs?.rc | tr '\n' ' ')" "$(tr '\n' ' ' <"$T/o2")"; fi
+rm -f "$VAULT_FILE/vault 2.bin"
+# 03 §2 D-1: "every file the package opens (… conflict-copy sources) is opened with O_NOFOLLOW and must be a
+# regular file after fstat; a symlink or special file is `UnsafePackageEntry`, never a silent fallback"
+ln -s "$VAULT_FILE/vault.bin" "$VAULT_FILE/vault 6.bin"
+rc=$(sync_rc)
+if [ "$rc" != 0 ] && [ "$rc" != 101 ]; then ok "symlinked per-file copy is reported (rc $rc)"; else bad "symlinked per-file conflict copy skipped silently (rc $rc): $(head -1 "$T/o")"; fi
+rm -f "$VAULT_FILE/vault 6.bin"
+mkfifo "$VAULT_FILE/vault 7.bin"
+rc=$(sync_rc)
+if [ "$rc" != 0 ] && [ "$rc" != 101 ]; then ok "FIFO per-file copy is reported (rc $rc)"; else bad "FIFO per-file conflict copy skipped silently (rc $rc): $(head -1 "$T/o")"; fi
+rm -f "$VAULT_FILE/vault 7.bin"
+mkdir -p "$T/u21-else"; cp -R "$VAULT_FILE" "$T/u21-else/c.vault"; ln -s "$T/u21-else/c.vault" "$T/u21 4.vault"
+rc=$(sync_rc)
+if [ "$rc" != 0 ] && [ "$rc" != 101 ]; then ok "symlinked sibling package is reported (rc $rc)"; else bad "symlinked sibling package skipped silently (rc $rc): $(head -1 "$T/o")"; fi
+[ -e "$T/u21-else/c.vault/vault.bin" ] && ok "symlinked sibling package target untouched" || bad "symlinked sibling target moved"
+rm -rf "$T/u21 4.vault" "$T/u21-else"
+mkdir -p "$T/u21 3.vault"; ln -s "$VAULT_FILE/vault.bin" "$T/u21 3.vault/vault.bin"
+rc=$(sync_rc)
+if [ "$rc" != 0 ] && [ "$rc" != 101 ]; then ok "sibling package with a symlinked vault.bin is reported (rc $rc)"; else bad "sibling with symlinked vault.bin skipped silently (rc $rc)"; fi
+rm -rf "$T/u21 3.vault"
+mkfile -n 65m "$VAULT_FILE/vault 8.bin"
+rc=$(sync_rc)
+if [ "$rc" = 1 ] && [ -e "$VAULT_FILE/vault 8.bin" ]; then ok "65 MiB per-file copy: rc 1, kept"; else bad "oversize per-file copy" "rc=$rc $(head -1 "$T/o")"; fi
+rm -f "$VAULT_FILE/vault 8.bin"
+export VAULT_FILE="$T/main.vault"
+# docs/help.md ⌥ line vs 05 §2.3 "TOTP secret is still never shown" (bug hunt 2026-11-21 N9)
+grep -q 'Hold ⌥.*TOTP secret stays hidden' "$ROOT/docs/help.md" && ok "help.md: ⌥ keeps the TOTP secret hidden (05 §2.3)" || bad "help.md ⌥ sentence vs 05 §2.3" "$(grep -n '⌥' "$ROOT/docs/help.md")"
+grep -n 'Hold ⌥' "$ROOT/README.md" | sed 's/^/INFO README: /'
+
 echo
 echo "CLI checks: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]

@@ -1777,3 +1777,146 @@ fn unreadable_copy_replaced_by_other_bytes_is_reported_again_once() {
     assert_eq!(ea.count(unreadable("vault 2.bin")), 2, "{:?}", ea.seen);
     assert_eq!(fs::read(&copy).unwrap(), second);
 }
+
+/// 03 §2 D-1 for a conflict candidate that is not a regular file (or, for a package, not a
+/// real directory): `create` makes it at the returned path. Reported once as unreadable,
+/// never followed, opened, moved or absorbed.
+fn unsafe_candidate_is_reported_once(create: impl FnOnce(&Path, &Path, &[u8]) -> PathBuf) {
+    let (dir, path, mut a, mut b, _id) = two_devices();
+    let outside = tempfile::tempdir().unwrap();
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+    b.edit(|v| v.insert(Item::new("behind the link", Uuid::nil(), T0), T0))
+        .unwrap();
+    let candidate = create(dir.path(), outside.path(), &b.vault().unwrap().serialize());
+    let name = candidate.file_name().unwrap().to_str().unwrap().to_owned();
+
+    assert!(
+        wait_until(|| {
+            a.poll();
+            ea.pump();
+            ea.count(unreadable(&name)) == 1
+        }),
+        "{name}: {:?}",
+        ea.seen
+    );
+    drain_for(&mut a, 3);
+    ea.pump();
+    assert_eq!(ea.count(unreadable(&name)), 1, "{:?}", ea.seen);
+    assert!(fs::symlink_metadata(&candidate).is_ok(), "{name} was moved");
+    assert!(!ea.any(|e| matches!(e, SyncEvent::ConflictAbsorbed(_) | SyncEvent::Error(_))));
+    assert_eq!(titles(&a), ["mail"]);
+    assert!(!a.backups().unwrap().iter().any(|i| i.is_conflict()));
+    assert_eq!(on_disk(&path).unlock(&pw()).unwrap().items().count(), 1);
+}
+
+#[test]
+fn symlinked_per_file_copy_is_reported_unreadable_once() {
+    unsafe_candidate_is_reported_once(|dir, outside, valid| {
+        let target = outside.join("target.bin");
+        fs::write(&target, valid).unwrap();
+        let link = dir.join("test.vault").join("vault 2.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        link
+    });
+}
+
+const MKFIFO: &str = "/usr/bin/mkfifo";
+
+/// Whether the FIFO tests can run; prints why not when they cannot.
+fn have_mkfifo(test: &str) -> bool {
+    let ok = Path::new(MKFIFO).is_file();
+    if !ok {
+        eprintln!("skipping {test}: {MKFIFO} is missing");
+    }
+    ok
+}
+
+fn mkfifo(path: &Path) {
+    let status = std::process::Command::new(MKFIFO)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "mkfifo {}", path.display());
+}
+
+#[test]
+fn fifo_per_file_copy_is_reported_unreadable_once() {
+    if !have_mkfifo("fifo_per_file_copy_is_reported_unreadable_once") {
+        return;
+    }
+    unsafe_candidate_is_reported_once(|dir, _outside, _valid| {
+        let fifo = dir.join("test.vault").join("vault 2.bin");
+        mkfifo(&fifo);
+        fifo
+    });
+}
+
+/// A sibling package (a real directory) whose `vault.bin` is made by `make_inner`, staged
+/// under a hidden name and renamed into place.
+fn sibling_with_inner(dir: &Path, make_inner: impl FnOnce(&Path)) -> PathBuf {
+    let staging = dir.join(".staging-package");
+    fs::create_dir(&staging).unwrap();
+    make_inner(&staging.join(VAULT_FILE_NAME));
+    let package = dir.join("test 2.vault");
+    fs::rename(&staging, &package).unwrap();
+    package
+}
+
+#[test]
+fn sibling_package_with_symlinked_vault_file_is_reported_unreadable_once() {
+    unsafe_candidate_is_reported_once(|dir, outside, valid| {
+        let target = outside.join("target.bin");
+        fs::write(&target, valid).unwrap();
+        sibling_with_inner(dir, |inner| {
+            std::os::unix::fs::symlink(&target, inner).unwrap()
+        })
+    });
+}
+
+#[test]
+fn sibling_package_with_fifo_vault_file_is_reported_unreadable_once() {
+    if !have_mkfifo("sibling_package_with_fifo_vault_file_is_reported_unreadable_once") {
+        return;
+    }
+    unsafe_candidate_is_reported_once(|dir, _outside, _valid| sibling_with_inner(dir, mkfifo));
+}
+
+#[test]
+fn symlinked_sibling_package_is_reported_unreadable_once() {
+    unsafe_candidate_is_reported_once(|dir, outside, valid| {
+        let real = outside.join("real.vault");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join(VAULT_FILE_NAME), valid).unwrap();
+        let link = dir.join("test 2.vault");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        link
+    });
+}
+
+/// A candidate first reported while locked (the app may not show it then) is reported once
+/// more by the next unlock, and then behaves like any other entry.
+#[test]
+fn unreadable_copy_seen_while_locked_is_reported_again_at_unlock() {
+    let (_dir, path, mut a, _b, _id) = two_devices();
+    assert!(matches!(a.lock(), LockOutcome::Clean));
+    a.start_watching().unwrap();
+    let mut ea = Events::new(&a);
+    let copy = path.parent().unwrap().join("vault 2.bin");
+    plant_until_reported(&mut a, &mut ea, &copy, &noise(512), 1);
+    drain_for(&mut a, 3);
+    ea.pump();
+    assert_eq!(ea.count(unreadable("vault 2.bin")), 1);
+
+    a.unlock(&pw()).unwrap();
+    ea.pump();
+    assert_eq!(ea.count(unreadable("vault 2.bin")), 2, "{:?}", ea.seen);
+    plant(&copy, &noise(512));
+    assert!(
+        drain_for(&mut a, 5) > 0,
+        "rewrite produced no watcher signal"
+    );
+    ea.pump();
+    assert_eq!(ea.count(unreadable("vault 2.bin")), 2, "{:?}", ea.seen);
+    assert!(copy.exists());
+}

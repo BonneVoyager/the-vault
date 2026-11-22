@@ -78,7 +78,7 @@ struct DraggedRow {
     kind: &'static str,
     /// Row width at the last paint: the ghost is drawn at the row's width.
     width: Pixels,
-    /// The rows' label column width (`detail::label_width`), so the ghost's matches.
+    /// The rows' label column width ([`edit_label_width`]), so the ghost's matches.
     label_w: Option<Pixels>,
 }
 
@@ -112,7 +112,7 @@ impl Render for DragPreview {
             .child(
                 super::detail::label_column(ui::h_flex(), row.label_w)
                     .min_h(px(FIELD_LINE_MIN_H))
-                    .gap(px(4.))
+                    .gap(px(EDIT_LABEL_GAP))
                     .child(Icon::new(IconName::GripVertical).size_4().text_color(muted))
                     .when_some(row.icon, |r, icon| {
                         r.child(Icon::new(icon).size_4().text_color(muted))
@@ -307,7 +307,8 @@ pub struct Editor {
     drag: Rc<FieldDrag>,
     /// Width of the field rows at the last paint, for the drag ghost.
     row_width: Rc<Cell<Pixels>>,
-    /// This render's label column width (`detail::label_width`), shared by every row.
+    /// This render's label column width ([`edit_label_width`]; `None` = the base
+    /// rule), shared by every row.
     label_w: Cell<Option<Pixels>>,
     /// Focus of the open icon picker (arrow keys and Enter move and choose).
     icon_focus: gpui::FocusHandle,
@@ -807,6 +808,7 @@ impl Editor {
                 })
         };
         let trailing = ui::h_flex()
+            .debug_selector(move || format!("edit-trailing {key}"))
             .flex_none()
             .gap(px(4.))
             .child(Tag::secondary().small().child(kind_name(field.kind)))
@@ -1108,7 +1110,7 @@ impl Editor {
                 super::detail::label_column(ui::h_flex(), self.label_w.get())
                     .debug_selector(move || format!("edit-label {key}"))
                     .min_h(px(FIELD_LINE_MIN_H))
-                    .gap(px(4.))
+                    .gap(px(EDIT_LABEL_GAP))
                     .child(grip)
                     // Sections carry no icon (05 "Field icons").
                     .child(super::icon_view::field_icon_button(
@@ -1125,6 +1127,40 @@ impl Editor {
             .into_any_element()
     }
 }
+
+/// The edit-mode label column (owner decisions 2026-11-21). On rows at least
+/// [`EDIT_WIDE_ROW`] px plus the chrome wide, the field-name input is a fixed
+/// [`EDIT_NAME_W`] px box and the column is that plus [`edit_name_chrome`] (grip, gap,
+/// field-icon button, gap); rows may shift on Edit. On narrower rows it is read mode's
+/// rule (`detail::label_width` of `fit`, the read-mode fit), so a narrow pane keeps its
+/// value input room. `None` = the base rule. `rem` is the window's rem size.
+pub(crate) fn edit_label_width(
+    row: Pixels,
+    rem: Pixels,
+    fit: impl FnOnce() -> Option<Pixels>,
+) -> Option<Pixels> {
+    let chrome = edit_name_chrome(rem);
+    if row >= px(EDIT_WIDE_ROW) + chrome {
+        Some(px(EDIT_NAME_W) + chrome)
+    } else {
+        super::detail::label_width(fit(), row)
+    }
+}
+
+/// The editor label column's chrome left of the name input: the grip (`size_4`,
+/// 1 rem), a gap, the field-icon button (small icon-only `Button`, `size_6`, 1.5 rem)
+/// and a gap.
+pub(crate) fn edit_name_chrome(rem: Pixels) -> Pixels {
+    rem * 2.5 + px(2. * EDIT_LABEL_GAP)
+}
+
+/// The field-name input's fixed width on wide rows (padding and border included).
+const EDIT_NAME_W: f32 = 140.;
+/// Gap between the editor label column's grip, icon button and name input.
+const EDIT_LABEL_GAP: f32 = 4.;
+/// With the chrome added, the narrowest row that gets the fixed name width: the value
+/// input then keeps the width it had at 420 px rows with a 140 px column (~114 px).
+const EDIT_WIDE_ROW: f32 = 420.;
 
 /// A borderless, transparent field input (05 §2.3 "Edit-mode field rows"): it reads
 /// like read mode's text until focused, when gpui-component's accent ring is drawn on
@@ -1377,12 +1413,14 @@ impl Render for Editor {
             .then(|| self.drag.row.get())
             .flatten()
             .and_then(|k| self.rows.iter().position(|r| r.key == k));
-        // Measured from the buffer's live names, so the column grows as a name is typed.
+        // Below the wide threshold, read mode's fit from the buffer's live names (so
+        // the column grows as a name is typed); shaped only when it is needed.
+        let row_w = self.row_width.get();
         let live = buffer.keys.iter().filter_map(|&k| buffer.field(k));
-        self.label_w.set(super::detail::label_width(
-            super::detail::label_fit(live, window, cx),
-            self.row_width.get(),
-        ));
+        self.label_w
+            .set(edit_label_width(row_w, window.rem_size(), || {
+                super::detail::label_fit(live, window, cx)
+            }));
         let this = cx.entity().downgrade();
         for (ix, row) in self.rows.iter().enumerate() {
             rows.push(self.render_row(ix, row, dragged_ix, buffer, s, &this, window, cx));

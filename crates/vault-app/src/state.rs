@@ -1150,8 +1150,10 @@ impl AppState {
     fn unlocked(&mut self) -> usize {
         self.apply_backup_settings();
         self.sync.save_failing = false;
-        // The unlock re-read the file; a refusal from before the lock no longer applies.
+        // The unlock re-read the file; a refusal from before the lock no longer applies,
+        // unless the file on disk still refuses saves (05 §2.3).
         self.clear_save_blocked();
+        self.reraise_save_blocked();
         self.locked = false;
         self.error = None;
         self.unlock_blocked = None;

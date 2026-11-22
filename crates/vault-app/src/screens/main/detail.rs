@@ -181,8 +181,8 @@ const LABEL_MAX: f32 = 140.;
 /// Cap on a column widened to fit a long label, as a fraction of the row.
 const LABEL_FIT_CAP: f32 = 0.40;
 
-/// The label column's width rule, shared by read mode and the editor's rows (05 §2.3
-/// "Edit-mode field rows": same width in both, so pressing Edit moves nothing). `width`
+/// The label column's width rule, shared by read mode and the editor's rows (the editor
+/// passes `editor::edit_label_width`: 140 px on wide rows, owner 2026-11-21). `width`
 /// is [`label_width`]: `None` keeps the base rule (26 % of the row, 80 to 140 px)
 /// untouched; `Some` is the widened column for a long label.
 pub(crate) fn label_column<E: gpui::Styled>(el: E, width: Option<Pixels>) -> E {

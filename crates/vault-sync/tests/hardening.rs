@@ -610,3 +610,40 @@ fn lock_does_not_download_an_evicted_unsaved_copy() {
     assert_eq!(unsaved_files(&c).len(), 2);
     assert_eq!(hooks.0.load(Ordering::SeqCst), 0);
 }
+
+/// 03 §3/§8: a block detected while unlocked outlives `lock` + `unlock` (the unlock opens the
+/// last readable copy) and is visible through `save_blocked`, without lock or unlock emitting
+/// another `SaveBlocked`.
+#[test]
+fn save_blocked_survives_lock_and_unlock_without_a_new_event() {
+    let (_dir, path, mut a, _b) = two_devices();
+    let newer = newer_version(&fs::read(&path).unwrap());
+    plant(&path, &newer);
+    insert(&mut a, "from a");
+    assert!(matches!(a.save(), Err(SyncError::SaveBlocked(_))));
+    assert_eq!(a.save_blocked(), Some(SaveBlocked::NewerVersion(0xFFFF)));
+
+    let rx = a.subscribe();
+    let _ = a.lock();
+    assert_eq!(a.save_blocked(), Some(SaveBlocked::NewerVersion(0xFFFF)));
+    a.unlock(&pw()).unwrap();
+    assert_eq!(a.save_blocked(), Some(SaveBlocked::NewerVersion(0xFFFF)));
+    let seen = events(&rx);
+    assert!(
+        !seen.iter().any(|e| matches!(e, SyncEvent::SaveBlocked(_))),
+        "{seen:?}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), newer);
+}
+
+#[test]
+fn save_blocked_is_none_for_a_healthy_vault() {
+    let (_dir, _path, mut a, _b) = two_devices();
+    assert_eq!(a.save_blocked(), None);
+    insert(&mut a, "from a");
+    a.save().unwrap();
+    assert_eq!(a.save_blocked(), None);
+    let _ = a.lock();
+    a.unlock(&pw()).unwrap();
+    assert_eq!(a.save_blocked(), None);
+}
