@@ -604,6 +604,29 @@ fn open_synced(path: &Path, password: &SecretString) -> Result<SyncedVault> {
     Ok(sv)
 }
 
+/// Save, then print each [`vault_sync::SyncEvent::Error`] the save raised (a failed snapshot:
+/// symlinked `backups/`, full disk, oversized backup) to stderr as one sanitised
+/// `warning: …` line. The warnings do not change the exit code; only a failed save does.
+/// `sync` reports its own events and does not use this.
+fn save_and_warn(sv: &mut SyncedVault) -> Result<()> {
+    let rx = sv.subscribe();
+    let saved = sv.save().map_err(sync_err);
+    for line in sync_warnings(rx.try_iter()) {
+        eprintln!("{line}");
+    }
+    saved
+}
+
+/// The `warning: …` lines for the errors among `events`, each kept to one line.
+fn sync_warnings(events: impl Iterator<Item = vault_sync::SyncEvent>) -> Vec<String> {
+    events
+        .filter_map(|ev| match ev {
+            vault_sync::SyncEvent::Error(m) => Some(sanitize_line(&format!("warning: {m}"))),
+            _ => None,
+        })
+        .collect()
+}
+
 fn open_cli(cli: &Cli) -> Result<SyncedVault> {
     let path = vault_path(cli)?;
     open_synced(&path, &master_password(cli, false)?)
@@ -716,7 +739,7 @@ fn run_attach(cli: &Cli, cmd: &AttachCmd) -> Result<()> {
             let id = sv
                 .add_attachment(item, &name, file, meta.len(), now_millis())
                 .map_err(sync_err)?;
-            sv.save().map_err(sync_err)?;
+            save_and_warn(&mut sv)?;
             println!("{id}");
         }
         AttachCmd::List { item } => {
@@ -757,7 +780,7 @@ fn run_attach(cli: &Cli, cmd: &AttachCmd) -> Result<()> {
             let clears_icon = sv
                 .edit(|v| remove_attachment_and_icon(v, item, *attachment_id, now))
                 .map_err(sync_err)??;
-            sv.save().map_err(sync_err)?;
+            save_and_warn(&mut sv)?;
             println!("removed {attachment_id}");
             if clears_icon {
                 println!("this was the item's icon image; the icon was cleared");
@@ -911,7 +934,7 @@ fn run(cli: Cli) -> Result<()> {
                 push("totp", FieldKind::Totp, v);
             }
             let id = sv.edit(|v| v.insert(item, now)).map_err(sync_err)?;
-            sv.save().map_err(sync_err)?;
+            save_and_warn(&mut sv)?;
             println!("{id}");
         }
         Cmd::Get {
@@ -1008,7 +1031,7 @@ fn run(cli: Cli) -> Result<()> {
             let item = synced_item(&sv, &a.id_or_title)?;
             sv.edit(|v| edit::apply(v, item, &plan, now_millis()))
                 .map_err(sync_err)??;
-            sv.save().map_err(sync_err)?;
+            save_and_warn(&mut sv)?;
             println!("updated {item}");
         }
         Cmd::Sync => {
@@ -1059,7 +1082,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 sv.edit(|v| v.upgrade_format(&pw, now_millis()))
                     .map_err(sync_err)??;
-                sv.save().map_err(sync_err)?;
+                save_and_warn(&mut sv)?;
                 println!("upgraded to version {FORMAT_VERSION}");
                 println!("Non-password key slots were dropped; re-enable Touch ID in the app.");
             }
@@ -1070,7 +1093,7 @@ fn run(cli: Cli) -> Result<()> {
             sv.edit(|v| v.delete(id, now_millis()))
                 .map_err(sync_err)?
                 .map_err(anyhow::Error::from)?;
-            sv.save().map_err(sync_err)?;
+            save_and_warn(&mut sv)?;
             println!("deleted {id}");
         }
         Cmd::Totp { id_or_title } => {
@@ -1136,7 +1159,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
             })
             .map_err(sync_err)?;
-            sv.save().map_err(sync_err)?;
+            save_and_warn(&mut sv)?;
             println!("imported {count} items");
         }
     }
@@ -1192,6 +1215,20 @@ mod tests {
             sanitize_for_terminal("Plain \u{e9}\u{4e16}"),
             "Plain \u{e9}\u{4e16}"
         );
+    }
+
+    #[test]
+    fn sync_warnings_lists_only_errors_on_one_line_each() {
+        use vault_sync::SyncEvent;
+        let lines = sync_warnings(
+            vec![
+                SyncEvent::BackupTaken(PathBuf::from("/x/b.vault.bin")),
+                SyncEvent::Error("backup failed: disk\nerror: forged".to_owned()),
+                SyncEvent::AttachmentsPruned(2),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(lines, ["warning: backup failed: disk\\nerror: forged"]);
     }
 
     #[test]

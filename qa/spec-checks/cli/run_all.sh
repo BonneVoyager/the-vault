@@ -661,6 +661,67 @@ export VAULT_FILE="$T/main.vault"
 grep -q 'Hold ⌥.*TOTP secret stays hidden' "$ROOT/docs/help.md" && ok "help.md: ⌥ keeps the TOTP secret hidden (05 §2.3)" || bad "help.md ⌥ sentence vs 05 §2.3" "$(grep -n '⌥' "$ROOT/docs/help.md")"
 grep -n 'Hold ⌥' "$ROOT/README.md" | sed 's/^/INFO README: /'
 
+# ---- 2026-11-22: special conflict entries, backups under concurrent writers (03 §2 D-1, §4, §6) ----
+# 03 §6 step 1: "is not a regular file / directory (symlink, FIFO …) → emit SyncEvent::UnreadableConflict(path)
+# once … and leave it in place (`vault sync` reports it and exits "not converged" …)"
+export VAULT_FILE="$T/sp22.vault"
+v init --kdf-test-params >/dev/null 2>&1
+v add --title SP22 >/dev/null 2>&1
+lim() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+sp_sync() { lim 60 "$V" --password-env MPW sync >"$T/o" 2>&1; echo $?; }
+h0=$(shasum "$VAULT_FILE/vault.bin" | cut -d' ' -f1)
+sp_case() { # $1 label, $2 path that must stay
+  rc=$(sp_sync)
+  if [ "$rc" = 142 ]; then bad "sync hangs on $1"; return; fi
+  if [ "$rc" = 1 ] && grep -q "not converged" "$T/o" && [ -n "$(ls -d "$2" 2>/dev/null)$( [ -L "$2" ] && echo l)" ]; then ok "sync with $1: rc 1, not converged, left in place"; else bad "sync with $1" "rc=$rc $(sed "s|$T|<tmp>|g" "$T/o" | head -2 | tr '\n' ' ')"; fi
+  [ "$h0" = "$(shasum "$VAULT_FILE/vault.bin" | cut -d' ' -f1)" ] || bad "vault.bin rewritten by sync with $1"
+}
+python3 -I -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$VAULT_FILE/vault 2.bin"
+sp_case "a unix socket named vault 2.bin" "$VAULT_FILE/vault 2.bin"; rm -f "$VAULT_FILE/vault 2.bin"
+mkdir "$VAULT_FILE/vault 2.bin"; cp "$VAULT_FILE/vault.bin" "$VAULT_FILE/vault 2.bin/vault.bin"
+sp_case "a directory named vault 2.bin" "$VAULT_FILE/vault 2.bin"; rm -rf "$VAULT_FILE/vault 2.bin"
+ln -s "$T/nowhere" "$VAULT_FILE/vault 2.bin"
+sp_case "a dangling symlink vault 2.bin" "$VAULT_FILE/vault 2.bin"; rm -f "$VAULT_FILE/vault 2.bin"
+ln -s /dev/zero "$VAULT_FILE/vault 2.bin"
+sp_case "a symlink to /dev/zero" "$VAULT_FILE/vault 2.bin"; rm -f "$VAULT_FILE/vault 2.bin"
+mkfifo "$T/sp22 2.vault"
+sp_case "a FIFO sibling package" "$T/sp22 2.vault"; rm -f "$T/sp22 2.vault"
+mkdir -p "$T/sp22 3.vault"; mkfifo "$T/sp22 3.vault/vault.bin"
+sp_case "a sibling package whose vault.bin is a FIFO" "$T/sp22 3.vault/vault.bin"; rm -rf "$T/sp22 3.vault"
+# 03 §6 names whole-package copies as directories; a plain file is recorded only (Note, not a check)
+cp "$VAULT_FILE/vault.bin" "$T/sp22 4.vault"
+rc=$(sp_sync); echo "INFO sync with a plain file named like a sibling package: rc $rc $(sed "s|$T|<tmp>|g" "$T/o" | grep -v 'different vault' | head -1)"; rm -f "$T/sp22 4.vault"
+rc=$(sp_sync); [ "$rc" = 0 ] && ok "sync exits 0 after the special entries are gone" || bad "sync after cleanup" "rc=$rc $(head -2 "$T/o")"
+# 03 §2 V-02 lock + §4 snapshots under 10 concurrent writers: every backup is "a complete,
+# independently-openable vault file" (03 §1), no tmp file left behind, no item lost.
+pids=""
+for k in $(seq 1 10); do (v add --title "BK22-$k" >"$T/b$k" 2>&1; echo $? >"$T/b$k.rc") & pids="$pids $!"; done
+wait $pids
+v list >"$T/o2" 2>&1
+okc=1; for k in $(seq 1 10); do grep -q "BK22-$k\$\|BK22-$k " "$T/o2" || okc=0; [ "$(cat "$T/b$k.rc")" = 0 ] || okc=0; done
+[ $okc = 1 ] && ok "10 concurrent adds: all succeed and survive" || bad "10 concurrent adds" "rc: $(cat "$T"/b*.rc | tr '\n' ' ')" "$(tr '\n' ' ' <"$T/o2")"
+ls -a "$VAULT_FILE" | grep -q '\.tmp-' && bad "tmp file left in the package" "$(ls -a "$VAULT_FILE")" || ok "no tmp file left after concurrent writers"
+nb=0; nbad=0; badmode=""
+for f in "$VAULT_FILE"/backups/*; do
+  [ -f "$f" ] || continue; nb=$((nb+1))
+  rm -rf "$T/bkopen.vault"; mkdir "$T/bkopen.vault"; cp "$f" "$T/bkopen.vault/vault.bin"
+  "$V" --vault "$T/bkopen.vault" --password-env MPW list >/dev/null 2>&1 || nbad=$((nbad+1))
+  m=$(stat -f %Lp "$f"); [ "$m" = 600 ] || badmode="$badmode $(basename "$f"):$m"
+done
+rm -rf "$T/bkopen.vault"
+[ $nb -ge 1 ] && [ $nbad = 0 ] && ok "all $nb backups open with the master password" || bad "backups openable" "$nbad of $nb failed"
+[ -z "$badmode" ] && ok "backup files are mode 0600" || bad "backup file modes (vault.bin is 0600)" "$badmode"
+echo "INFO backups/ dir mode $(stat -f %Lp "$VAULT_FILE/backups"), package mode $(stat -f %Lp "$VAULT_FILE")"
+# 03 §2 D-1 "`backups/` … must not be symlinks": a save never writes a snapshot through a symlinked backups/.
+mkdir -p "$T/bk-elsewhere"; mv "$VAULT_FILE/backups" "$T/bk-real"; ln -s "$T/bk-elsewhere" "$VAULT_FILE/backups"
+lim 60 "$V" --password-env MPW add --title ThroughLink >"$T/o" 2>&1; rc=$?
+[ -z "$(ls -A "$T/bk-elsewhere")" ] && ok "no snapshot written through a symlinked backups/ (add rc $rc)" || bad "snapshot written through symlinked backups/" "$(ls "$T/bk-elsewhere")"
+# each CLI process is a "first save after unlock" (03 §4), so this add attempts a snapshot; the library
+# reports the refusal as an Error event (bk09); D-1 "never a silent fallback" — the CLI must pass it on
+grep -qi "backup" "$T/o" && ok "add reports the refused snapshot through a symlinked backups/" || bad "add with a symlinked backups/ skips the policy snapshot silently (rc $rc)" "output: $(sed "s|$T|<tmp>|g" "$T/o" | tr '\n' ' ')"
+rm -f "$VAULT_FILE/backups"; mv "$T/bk-real" "$VAULT_FILE/backups"; rm -rf "$T/bk-elsewhere"
+export VAULT_FILE="$T/main.vault"
+
 echo
 echo "CLI checks: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]

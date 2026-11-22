@@ -100,6 +100,21 @@ cargo fmt --all -- --check                     # formatting is part of the manua
   (`vault sync` with unreadable copies of both shapes and all versions: rc 1, named, kept,
   primary untouched; readable beside unreadable; 20 copies; concurrent adds and syncs; symlink,
   FIFO and symlinked-sibling copies; a 65 MiB copy; `docs/help.md` ⌥ sentence).
+- 2026-11-22 additions: `backups_1122` (03 §4 retention at 0.5/1/2/4x against the 05 Settings
+  days and hint, multiplier clamp/NaN/±inf/-0 equivalence, same-second `-N` suffixes, hostile and
+  future-dated snapshot names, the hourly policy, backups disabled vs `backup_now`/pre-restore/
+  Unsaved-on-lock, names and modes; `restore_from` on every listed kind, while dirty (INFO), a
+  cut-and-bit-flip sweep of the backup, special entries, three handles converging after a restore,
+  across a password change; 03 §1.1 trash expiry vs a restored snapshot with the app's sweep hook
+  and a peer; `save_blocked()` across lock/unlock for newer and foreign primaries, locked and
+  unlocked; 03 §6 special conflict entries (socket, directory, dangling/looping links, links to
+  /dev/zero and a FIFO, FIFO sibling, sibling whose vault.bin is a FIFO/directory/link) reported
+  once and left, replaced by a regular copy, re-reported after lock/unlock, a sibling with a
+  symlinked `attachments/`; `delete_backup` on links; `backups()` and the viewer's no-follow
+  reader with FIFOs and links; a symlinked `backups/` on the policy snapshot; a vault named
+  `conflict` (bk10/bk11, added after the source read)), and a `run_all.sh` 2026-11-22 section
+  (`vault sync` with each special entry, 10 concurrent adds vs backups openable and 0600, a
+  symlinked `backups/` reported by `add`).
 - Temp files go under `tmp/` (git-ignored) and are removed by each test.
 
 A passing check shows the behaviour on those inputs only. It is not a proof.

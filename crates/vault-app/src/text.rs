@@ -111,9 +111,21 @@ pub fn truncate(s: &str, max: usize) -> String {
 /// bidi and invisible format characters (the CLI's `sanitize_line` set) become U+FFFD, then
 /// at most `max` characters with an ellipsis when cut.
 pub fn sanitize_line(s: &str, max: usize) -> String {
+    sanitize(s, max, false)
+}
+
+/// [`sanitize_line`] for a field or section label: the same set becomes U+FFFD except
+/// the zero-width non-joiner and joiner (U+200C, U+200D), shaping characters that
+/// Persian, Indic and emoji names need and that cannot reorder or hide text.
+pub fn sanitize_label(s: &str, max: usize) -> String {
+    sanitize(s, max, true)
+}
+
+fn sanitize(s: &str, max: usize, keep_joiners: bool) -> String {
     let clean: String = s
         .chars()
         .map(|c| match c {
+            '\u{200c}' | '\u{200d}' if keep_joiners => c,
             '\u{0}'..='\u{1f}'
             | '\u{7f}'
             | '\u{80}'..='\u{9f}'
@@ -233,6 +245,22 @@ mod tests {
             format!("{}…", "x".repeat(60))
         );
         assert!(browser_url("  ").is_none());
+    }
+
+    #[test]
+    fn sanitize_label_keeps_only_the_joiners() {
+        assert_eq!(
+            sanitize_label("a\u{200c}b\u{200d}c", 60),
+            "a\u{200c}b\u{200d}c"
+        );
+        assert_eq!(
+            sanitize_line("a\u{200c}b\u{200d}c", 60),
+            "a\u{fffd}b\u{fffd}c"
+        );
+        assert_eq!(
+            sanitize_label("a\u{200b}b\u{202e}c\u{7}\u{2066}", 60),
+            "a\u{fffd}b\u{fffd}c\u{fffd}\u{fffd}"
+        );
     }
 
     #[test]

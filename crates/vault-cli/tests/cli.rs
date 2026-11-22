@@ -1136,3 +1136,49 @@ fn import_refuses_an_oversized_csv() {
     assert!(err.contains("larger than the 64 MiB limit"), "{err}");
     assert!(ok(&vault(&f, PW, &["list"])).trim().is_empty());
 }
+
+/// Bug hunt 2026-11-22 L2: a snapshot that fails after a successful save is a warning on
+/// stderr, not silence, and the exit code stays 0.
+#[test]
+fn add_warns_when_backup_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    let backups = f.join("backups");
+    if backups.exists() {
+        std::fs::remove_dir_all(&backups).unwrap();
+    }
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &backups).unwrap();
+
+    let o = vault(&f, PW, &["add", "--title", "Linked"]);
+    let id = ok(&o);
+    let id = id.trim();
+    assert!(
+        id.len() == 36 && id.chars().all(|c| c == '-' || c.is_ascii_hexdigit()),
+        "{id}"
+    );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.lines()
+            .any(|l| l.starts_with("warning: ") && l.contains("backups")),
+        "{err}"
+    );
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    assert!(ok(&vault(&f, PW, &["list"])).contains("Linked"));
+}
+
+#[test]
+fn add_without_problems_is_silent_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    let o = vault(&f, PW, &["add", "--title", "Plain"]);
+    ok(&o);
+    assert!(
+        o.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}

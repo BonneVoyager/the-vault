@@ -8,9 +8,10 @@ use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use tempfile::TempDir;
-use vault_core::{Item, KdfParams, SecretString, Uuid};
+use vault_core::{Item, KdfParams, LockedVault, SecretString, Uuid};
 use vault_sync::{
-    CloudError, CloudHooks, NoopHooks, SyncError, SyncEvent, SyncedVault, VAULT_FILE_NAME,
+    BackupKind, CloudError, CloudHooks, LockOutcome, NoopHooks, SyncError, SyncEvent, SyncedVault,
+    VAULT_FILE_NAME,
 };
 
 const NOW: u64 = 1_700_000_000_000;
@@ -20,8 +21,13 @@ fn pw() -> SecretString {
 }
 
 fn setup() -> (TempDir, PathBuf, SyncedVault) {
+    setup_named("test")
+}
+
+/// A fresh package `<name>.vault` in a new temp dir.
+fn setup_named(name: &str) -> (TempDir, PathBuf, SyncedVault) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("test.vault");
+    let path = dir.path().join(format!("{name}.vault"));
     let v = SyncedVault::create(
         &path,
         &pw(),
@@ -191,11 +197,22 @@ fn restore_replaces_primary_and_snapshots_old_state() {
     assert_eq!(titles(&v), ["a"]);
     assert!(!v.is_dirty());
     assert_eq!(v.vault().unwrap().device_id(), Uuid::from_u128(0xD0D0));
-    // Pre-restore snapshot of the on-disk state (a, b; not the unsaved edit).
+    // The unsaved edit went to an Unsaved backup first, then the pre-restore snapshot of the
+    // on-disk state (a, b).
     let taken = backups_taken(&rx);
-    assert_eq!(taken.len(), 1);
-    assert_eq!(fs::read(&taken[0]).unwrap(), before);
-    assert_eq!(v.backups().unwrap().len(), 2);
+    assert_eq!(taken.len(), 2);
+    let kind_of = |p: &Path| {
+        v.backups()
+            .unwrap()
+            .into_iter()
+            .find(|b| b.path == p)
+            .unwrap()
+            .kind
+    };
+    assert_eq!(kind_of(&taken[0]), BackupKind::Unsaved);
+    assert_eq!(kind_of(&taken[1]), BackupKind::Snapshot);
+    assert_eq!(fs::read(&taken[1]).unwrap(), before);
+    assert_eq!(v.backups().unwrap().len(), 3);
 
     // `last_written` tracks the restored bytes, and the state survives lock/unlock.
     let reopened = SyncedVault::open(&path, Uuid::nil(), Arc::new(NoopHooks)).unwrap();
@@ -598,4 +615,206 @@ fn delete_backup_refuses_a_symlink_to_another_backup() {
         .unwrap();
     assert!(!snap.exists());
     assert_eq!(deleted(&rx), std::slice::from_ref(&snap));
+}
+
+/// The titles in the backup file at `path`, opened with the test password.
+fn titles_in(path: &Path) -> Vec<String> {
+    let vault = LockedVault::parse(&fs::read(path).unwrap())
+        .unwrap()
+        .unlock(&pw())
+        .unwrap();
+    let mut t: Vec<String> = vault.items().map(|i| i.title.clone()).collect();
+    t.sort();
+    t
+}
+
+fn kinds(v: &SyncedVault) -> Vec<BackupKind> {
+    v.backups().unwrap().into_iter().map(|b| b.kind).collect()
+}
+
+/// Bug hunt 2026-11-22 L3: unsaved in-memory edits go to an Unsaved backup before a restore
+/// replaces them; the restored vault is the backup's.
+#[test]
+fn restore_keeps_unsaved_edits_in_an_unsaved_backup() {
+    let (_dir, path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let snap = v.backups().unwrap()[0].path.clone();
+    let snap_bytes = fs::read(&snap).unwrap();
+    insert_item(&mut v, "unsaved");
+    assert!(v.is_dirty());
+
+    v.restore_from(&snap, &pw()).unwrap();
+
+    assert_eq!(titles(&v), ["a"]);
+    assert!(!v.is_dirty());
+    assert_eq!(fs::read(bin(&path)).unwrap(), snap_bytes);
+    let unsaved: Vec<_> = v
+        .backups()
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.kind == BackupKind::Unsaved)
+        .collect();
+    assert_eq!(unsaved.len(), 1);
+    assert_eq!(titles_in(&unsaved[0].path), ["a", "unsaved"]);
+}
+
+/// An Unsaved backup that already holds the edits is not written again (as for `lock`); a
+/// failed restore writes none unless it got as far as keeping the edits.
+#[test]
+fn restore_reuses_a_covering_unsaved_backup() {
+    let (_dir, path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let snap = v.backups().unwrap()[0].path.clone();
+    insert_item(&mut v, "unsaved");
+    let unsaved_count = |v: &SyncedVault| {
+        kinds(v)
+            .iter()
+            .filter(|k| **k == BackupKind::Unsaved)
+            .count()
+    };
+    // Wrong password: refused before anything is written.
+    let wrong = SecretString::new("wrong".to_owned());
+    assert!(v.restore_from(&snap, &wrong).is_err());
+    assert_eq!(unsaved_count(&v), 0);
+
+    // A primary from a newer format: refused after the edits were kept.
+    let primary = fs::read(bin(&path)).unwrap();
+    let mut newer = primary.clone();
+    newer[4..6].copy_from_slice(&(vault_core::FORMAT_VERSION + 1).to_be_bytes());
+    fs::write(bin(&path), &newer).unwrap();
+    let err = v.restore_from(&snap, &pw()).unwrap_err();
+    assert!(matches!(err, SyncError::SaveBlocked(_)), "{err:?}");
+    assert_eq!(unsaved_count(&v), 1);
+    assert!(v.is_dirty());
+
+    // Same edits again: the existing Unsaved copy covers them.
+    fs::write(bin(&path), &primary).unwrap();
+    let rx = v.subscribe();
+    v.restore_from(&snap, &pw()).unwrap();
+    assert_eq!(titles(&v), ["a"]);
+    assert_eq!(unsaved_count(&v), 1);
+    assert_eq!(backups_taken(&rx).len(), 1, "only the pre-restore snapshot");
+}
+
+/// When the Unsaved write fails, the restore is refused and nothing changes: not the
+/// primary, not memory (still dirty), not the backups.
+#[test]
+fn restore_refuses_when_unsaved_edits_cannot_be_kept() {
+    let (dir, path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let snap = v.backups().unwrap()[0].path.clone();
+    insert_item(&mut v, "unsaved");
+    let primary = fs::read(bin(&path)).unwrap();
+    let b = backups_dir(dir.path());
+    let names = |d: &Path| {
+        let mut n: Vec<_> = fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        n.sort();
+        n
+    };
+    let listed = names(&b);
+    let rx = v.subscribe();
+
+    // A backups directory that refuses writes (listing and reading still work).
+    fs::set_permissions(&b, fs::Permissions::from_mode(0o500)).unwrap();
+    let err = v.restore_from(&snap, &pw()).unwrap_err();
+    fs::set_permissions(&b, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        err.to_string().contains("-unsaved"),
+        "the Unsaved write is what failed: {err}"
+    );
+    assert_eq!(fs::read(bin(&path)).unwrap(), primary);
+    assert_eq!(titles(&v), ["a", "unsaved"]);
+    assert!(v.is_dirty());
+    assert_eq!(names(&b), listed);
+    assert!(backups_taken(&rx).is_empty());
+
+    // A symlinked backups directory (03 §1) is refused too, before anything is written.
+    let outside = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real-backups");
+    fs::rename(&b, &real).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &b).unwrap();
+    let err = v
+        .restore_from(&real.join(snap.file_name().unwrap()), &pw())
+        .unwrap_err();
+    assert!(matches!(err, SyncError::UnsafePackageDir(_)), "{err:?}");
+    assert_eq!(fs::read(bin(&path)).unwrap(), primary);
+    assert_eq!(titles(&v), ["a", "unsaved"]);
+    assert!(v.is_dirty());
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+/// A clean vault writes no Unsaved backup on restore.
+#[test]
+fn restore_of_a_clean_vault_writes_no_unsaved_backup() {
+    let (_dir, _path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let snap = v.backups().unwrap()[0].path.clone();
+    insert_item(&mut v, "b");
+    v.save().unwrap();
+    assert!(!v.is_dirty());
+
+    v.restore_from(&snap, &pw()).unwrap();
+    assert_eq!(titles(&v), ["a"]);
+    assert!(!kinds(&v).contains(&BackupKind::Unsaved));
+}
+
+/// Bug hunt 2026-11-22 L1: a package named `conflict` (every backup name starts with
+/// `conflict-`) still lists its own snapshots, takes one per hour (not per save), prunes
+/// them, and still lists a real conflict copy as a conflict.
+#[test]
+fn a_vault_named_conflict_manages_its_snapshots() {
+    let (dir, _path, mut v) = setup_named("conflict");
+    let b = dir.path().join("conflict.vault").join("backups");
+    let rx = v.subscribe();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    insert_item(&mut v, "b");
+    v.save().unwrap();
+    insert_item(&mut v, "c");
+    v.save().unwrap();
+    // The 1 h rule holds: one snapshot from three saves.
+    assert_eq!(backups_taken(&rx).len(), 1);
+    assert_eq!(kinds(&v), [BackupKind::Snapshot]);
+
+    // An Unsaved copy lists as Unsaved.
+    insert_item(&mut v, "d");
+    assert!(matches!(v.lock(), LockOutcome::Snapshotted(_)));
+    let mut k = kinds(&v);
+    k.sort_by_key(|k| format!("{k:?}"));
+    assert_eq!(k, [BackupKind::Snapshot, BackupKind::Unsaved]);
+    let _ = backups_taken(&rx);
+
+    // Retention: two old snapshots in one month beyond the weekly window, a real conflict
+    // copy of this package, and a same-second `-2` snapshot.
+    let old_a = b.join("conflict-2020-01-05T00-00-00Z.vault.bin");
+    let old_b = b.join("conflict-2020-01-20T00-00-00Z.vault.bin");
+    let old_b2 = b.join("conflict-2020-01-20T00-00-00Z-2.vault.bin");
+    for p in [&old_a, &old_b, &old_b2] {
+        fs::write(p, b"x").unwrap();
+    }
+    let conflict = b.join("conflict-2020-01-05T00-00-00Z-conflict.vault");
+    fs::create_dir(&conflict).unwrap();
+    fs::write(bin(&conflict), b"x").unwrap();
+    let listed = v.backups().unwrap();
+    let kind = |p: &Path| listed.iter().find(|i| i.path == p).map(|i| i.kind);
+    assert_eq!(kind(&old_a), Some(BackupKind::Snapshot));
+    assert_eq!(kind(&old_b2), Some(BackupKind::Snapshot));
+    assert_eq!(kind(&conflict), Some(BackupKind::Conflict));
+
+    // First save after unlock snapshots and runs retention.
+    v.unlock(&pw()).unwrap();
+    insert_item(&mut v, "e");
+    v.save().unwrap();
+    assert_eq!(backups_taken(&rx).len(), 1);
+    assert!(!old_a.exists());
+    assert!(!old_b.exists(), "older of the same second");
+    assert!(old_b2.exists(), "newest of its month");
+    assert!(conflict.exists(), "conflict copies are never pruned");
 }

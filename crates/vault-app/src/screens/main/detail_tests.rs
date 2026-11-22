@@ -606,6 +606,62 @@ fn labels_show_the_stored_name_as_typed(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn labels_and_headings_replace_bidi_and_control_characters(cx: &mut TestAppContext) {
+    // Bug-hunt N8 (2026-11-22): an imported name's bidi override or control character
+    // shows as U+FFFD; the rest of the name, its case and the stored value are kept.
+    let dir = tempfile::tempdir().unwrap();
+    let (state, ids, mut vcx) = open_items(
+        dir.path(),
+        |device| {
+            let mut item = login("Alpha", STRONG, device);
+            item.fields.push(Field::new(
+                "user\u{202E}name",
+                FieldKind::Text,
+                SecretString::new("1".into()),
+                1,
+            ));
+            item.fields.push(Field::new(
+                "\u{646}\u{627}\u{645}\u{200C}\u{6A9}\u{627}\u{631}\u{628}\u{631}\u{6CC}",
+                FieldKind::Text,
+                SecretString::new("2".into()),
+                1,
+            ));
+            item.fields.push(Field::new(
+                "Ac\u{202E}count\u{7}",
+                FieldKind::Section,
+                SecretString::new(String::new()),
+                1,
+            ));
+            vec![item]
+        },
+        cx,
+    );
+    select(&state, ids[0], &mut vcx);
+    assert!(
+        vcx.debug_bounds("field-label-text 2 user\u{FFFD}name")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("field-label-text 2 user\u{202E}name")
+            .is_none()
+    );
+    assert!(
+        vcx.debug_bounds("section-row 4 AC\u{FFFD}COUNT\u{FFFD}")
+            .is_some()
+    );
+    // Zero-width joiners are shaping characters, kept as stored.
+    assert!(
+        vcx.debug_bounds("field-label-text 3 نام\u{200C}کاربری")
+            .is_some()
+    );
+    state.read_with(&vcx, |s, _| {
+        let fields = &s.selected_item().unwrap().fields;
+        assert_eq!(fields[2].name, "user\u{202E}name", "stored name unchanged");
+        assert_eq!(fields[4].name, "Ac\u{202E}count\u{7}");
+    });
+}
+
 #[test]
 fn footer_with_and_without_created_at() {
     let now = 1_700_000_000_000u64;

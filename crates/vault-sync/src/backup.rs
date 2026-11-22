@@ -194,18 +194,19 @@ fn snapshot_file_name(name: &str, stamp: &str, kind: BackupKind, seq: u32) -> St
 
 /// `(taken_at, same-second sequence, kind)` for a file we manage, `None` for anything else.
 /// `file` and `name` are compared in NFC: a provider may deliver either in NFD.
+///
+/// A name that reads both as one of our snapshots and as a conflict copy (possible only for a
+/// vault named `conflict`, or `conflict-<stamp>`) is the snapshot: that reading is the more
+/// specific match, and a vault whose snapshots read as conflicts would never see a snapshot
+/// (one per save) nor prune one.
 fn parse_file_name(file: &str, name: &str) -> Option<(SystemTime, u32, BackupKind)> {
     let (file, name) = (package::nfc(file), package::nfc(name));
     let (file, name) = (file.as_ref(), name.as_ref());
-    if let Some(rest) = file.strip_prefix(CONFLICT_PREFIX) {
-        let stamp = rest.get(..STAMP_LEN)?;
-        let orig = rest.get(STAMP_LEN..)?.strip_prefix('-')?;
-        if !orig.is_empty()
-            && let Some(t) = parse_stamp(stamp)
-        {
-            return Some((t, 0, BackupKind::Conflict));
-        }
-    }
+    parse_snapshot_name(file, name).or_else(|| parse_conflict_name(file))
+}
+
+/// `<name>-<stamp>[-unsaved][-N].vault.bin`.
+fn parse_snapshot_name(file: &str, name: &str) -> Option<(SystemTime, u32, BackupKind)> {
     let rest = file
         .strip_prefix(name)?
         .strip_prefix('-')?
@@ -218,6 +219,14 @@ fn parse_file_name(file: &str, name: &str) -> Option<(SystemTime, u32, BackupKin
     };
     let (t, seq) = parse_seq(t, tail)?;
     Some((t, seq, kind))
+}
+
+/// `conflict-<stamp>-<original name>` (03 §6), with a non-empty original name.
+fn parse_conflict_name(file: &str) -> Option<(SystemTime, u32, BackupKind)> {
+    let rest = file.strip_prefix(CONFLICT_PREFIX)?;
+    let t = parse_stamp(rest.get(..STAMP_LEN)?)?;
+    let orig = rest.get(STAMP_LEN..)?.strip_prefix('-')?;
+    (!orig.is_empty()).then_some((t, 0, BackupKind::Conflict))
 }
 
 /// `""` is sequence 1; `-N` is N.
@@ -632,6 +641,51 @@ mod tests {
         ] {
             assert_eq!(parse_file_name(bad, "test"), None, "{bad}");
         }
+    }
+
+    /// Bug hunt 2026-11-22 L1: for a vault named `conflict` (or `conflict-<stamp>`) every
+    /// snapshot name also starts with `conflict-<stamp>-`; it must still read as ours.
+    #[test]
+    fn a_vault_named_conflict_reads_its_own_snapshots() {
+        let t = at(1_793_196_191);
+        let stamp = "2026-10-28T14-03-11Z";
+        for kind in [BackupKind::Snapshot, BackupKind::Unsaved] {
+            for seq in [1, 2, 13] {
+                let f = snapshot_file_name("conflict", stamp, kind, seq);
+                assert_eq!(parse_file_name(&f, "conflict"), Some((t, seq, kind)), "{f}");
+            }
+        }
+        // Real conflict copies of the `conflict.vault` package still read as conflicts: a
+        // whole package, its `-N-` same-second form, and an absorbed per-file copy.
+        for f in [
+            format!("conflict-{stamp}-conflict.vault"),
+            format!("conflict-{stamp}-conflict 2.vault"),
+            format!("conflict-{stamp}-2-conflict.vault"),
+            format!("conflict-{stamp}-vault 2.vault.bin"),
+            format!("conflict-{stamp}-2-vault 2.vault.bin"),
+        ] {
+            assert_eq!(
+                parse_file_name(&f, "conflict"),
+                Some((t, 0, BackupKind::Conflict)),
+                "{f}"
+            );
+        }
+        // A vault named like a conflict prefix plus a stamp.
+        let name = format!("conflict-{stamp}");
+        let f = snapshot_file_name(&name, stamp, BackupKind::Snapshot, 1);
+        assert_eq!(
+            parse_file_name(&f, &name),
+            Some((t, 1, BackupKind::Snapshot))
+        );
+        // For any other vault those names are conflicts (never snapshots of `test`).
+        assert_eq!(
+            parse_file_name(&format!("conflict-{stamp}.vault.bin"), "test"),
+            None
+        );
+        assert_eq!(
+            parse_file_name(&format!("conflict-{stamp}-2.vault.bin"), "test"),
+            Some((t, 0, BackupKind::Conflict))
+        );
     }
 
     #[test]

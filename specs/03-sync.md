@@ -103,9 +103,9 @@ Policy, evaluated on every `save`:
   - keep one per week for 12 weeks
   - keep one per month forever (cap 36)
   - delete the rest
-- Settings expose: enable/disable, the retention multiplier (0.5×–4×, shown to the user as the daily tier in days: 15 / 30 / 60 / 120, 05 §Settings), and a "Back up now" button.
+- Settings expose: enable/disable, the retention multiplier (0.5×–4×, shown to the user as the daily tier in days: 15 / 30 / 60 / 120, 05 §Settings), and a "Back up now" button. The multiplier scales every tier: the keep-all window (24 h × m), the daily (30 d × m) and weekly (12 w × m) tiers and the monthly cap (round(36 × m)); it is a per-device setting applied over the shared `backups/` folder, so devices with different settings prune to the smaller one (2026-11-22, bug-hunt N1/N4).
 
-Restore (phase 2 UI): open a backup read-only in a second window with the same password (layout in 05 §2.3 "Backup viewer"); user can copy items across, or "Replace current vault with this backup" (which first snapshots the current one).
+Restore (phase 2 UI): open a backup read-only in a second window with the same password (layout in 05 §2.3 "Backup viewer"); user can copy items across, or "Replace current vault with this backup" (which first snapshots the current file and writes the in-memory vault, when it is dirty or its saved state is no longer on disk (key mismatch, save blocked, missing primary), to an `Unsaved` backup, as `lock` does; if that Unsaved write fails, the restore is refused and nothing changes). A restore is a local change: on a synced folder, other devices merge by the rules in §5, so anything changed after the backup was taken (edits, deletions) carries a newer stamp and wins again at the next merge; the restore only lastingly brings back what no device touched since (2026-11-22, bug-hunt N3).
 
 ## 5. Merge semantics (`vault_core::merge`)
 
@@ -251,7 +251,7 @@ pub const DEBOUNCE: Duration;             // 500 ms watcher debounce (§3)
 //   AttachmentTampered(Uuid)      blob failed authentication (corrupt, truncated, swapped); discard bytes already read
 ```
 
-Backups carry a kind: `Snapshot` (policy in §4), `Unsaved` (taken on lock or quit while edits could not be saved), `Conflict` (absorbed conflict copy, §6). Retention prunes `Snapshot` only; `Unsaved` and `Conflict` are never pruned. `restore_from` snapshots the current file first and works even when the primary no longer parses (a version-0 primary counts as unparseable and is kept as an `Unsaved` backup; only a version strictly above ours refuses the restore as `NewerVersion`, bug hunt 2026-11-21 L3).
+Backups carry a kind: `Snapshot` (policy in §4), `Unsaved` (taken on lock or quit while edits could not be saved), `Conflict` (absorbed conflict copy, §6). Retention prunes `Snapshot` only; `Unsaved` and `Conflict` are never pruned. `restore_from` snapshots the current file first, and before that writes the in-memory vault, when it is dirty or its saved state is no longer on disk (key mismatch, save blocked, missing primary), to an `Unsaved` backup, as `lock` does (skipped when the newest Unsaved backup already holds it; a failure there refuses the restore with that error and changes nothing, bug hunt 2026-11-22 L3); it works even when the primary no longer parses (a version-0 primary counts as unparseable and is kept as an `Unsaved` backup; only a version strictly above ours refuses the restore as `NewerVersion`, bug hunt 2026-11-21 L3).
 
 Autosave: the app calls `save()` 2 s after the last edit (debounced) and immediately on lock, quit, and window close. `vault-sync` does not have its own timer.
 

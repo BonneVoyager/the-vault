@@ -492,42 +492,19 @@ impl SyncedVault {
     /// whether that worked; on [`LockOutcome::Unpreserved`] the unsaved state is lost.
     #[must_use = "the app must not claim unsaved changes were kept on LockOutcome::Unpreserved"]
     pub fn lock(&mut self) -> LockOutcome {
-        // Without a watcher nothing may have noticed a deleted primary yet; a stat is cheap.
-        if self.unlocked.is_some()
-            && !self.primary_missing
-            && matches!(fs::symlink_metadata(&self.file), Err(e) if e.kind() == ErrorKind::NotFound)
-        {
-            self.note_primary_missing();
-        }
-        let preserve =
-            self.dirty || self.key_mismatch || self.save_blocked.is_some() || self.primary_missing;
+        let preserve = self.must_preserve();
         if preserve {
             self.run_before_write();
         }
         let outcome = match &self.unlocked {
-            Some(vault) if preserve => match self.newest_unsaved_covering(vault) {
-                Some(path) => LockOutcome::Snapshotted(path),
-                None => {
-                    let bytes = vault.serialize();
-                    match self.snapshot_unconfirmed(&bytes, SystemTime::now(), BackupKind::Unsaved)
-                    {
-                        Ok((path, Ok(()))) => LockOutcome::Snapshotted(path),
-                        Ok((path, Err(e))) => {
-                            tracing::warn!(path = %path.display(), error = %e, "unsaved backup written but not confirmed durable");
-                            self.emit(SyncEvent::Error(format!(
-                                "unsaved changes were written to {} but may not be durable: {e}",
-                                path.display()
-                            )));
-                            LockOutcome::Snapshotted(path)
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "could not preserve unsaved vault before locking");
-                            self.emit(SyncEvent::Error(format!(
-                                "unsaved changes could not be preserved: {e}"
-                            )));
-                            LockOutcome::Unpreserved(e)
-                        }
-                    }
+            Some(vault) if preserve => match self.preserve_unsaved(vault) {
+                Ok(path) => LockOutcome::Snapshotted(path),
+                Err(e) => {
+                    tracing::error!(error = %e, "could not preserve unsaved vault before locking");
+                    self.emit(SyncEvent::Error(format!(
+                        "unsaved changes could not be preserved: {e}"
+                    )));
+                    LockOutcome::Unpreserved(e)
                 }
             },
             _ => LockOutcome::Clean,
@@ -560,6 +537,41 @@ impl SyncedVault {
         self.key_mismatch = false;
         self.primary_missing = false;
         outcome
+    }
+
+    /// Whether the in-memory vault holds state that is not on disk: it is dirty, or our last
+    /// saved state is no longer there either (a key mismatch stands, saving is blocked, or the
+    /// primary is missing). `lock` and `restore_from` preserve it as an Unsaved backup then.
+    /// Stats the primary first: without a watcher nothing may have noticed a deleted primary
+    /// yet, and a stat is cheap.
+    fn must_preserve(&mut self) -> bool {
+        if self.unlocked.is_some()
+            && !self.primary_missing
+            && matches!(fs::symlink_metadata(&self.file), Err(e) if e.kind() == ErrorKind::NotFound)
+        {
+            self.note_primary_missing();
+        }
+        self.dirty || self.key_mismatch || self.save_blocked.is_some() || self.primary_missing
+    }
+
+    /// Write `vault`, encrypted, as a [`BackupKind::Unsaved`] backup unless the newest one
+    /// already holds all of it (then that one's path). A file written but not confirmed
+    /// durable counts as kept (it is there) and is reported as [`SyncEvent::Error`].
+    fn preserve_unsaved(&self, vault: &UnlockedVault) -> Result<PathBuf, SyncError> {
+        if let Some(path) = self.newest_unsaved_covering(vault) {
+            return Ok(path);
+        }
+        let bytes = vault.serialize();
+        let (path, durable) =
+            self.snapshot_unconfirmed(&bytes, SystemTime::now(), BackupKind::Unsaved)?;
+        if let Err(e) = durable {
+            tracing::warn!(path = %path.display(), error = %e, "unsaved backup written but not confirmed durable");
+            self.emit(SyncEvent::Error(format!(
+                "unsaved changes were written to {} but may not be durable: {e}",
+                path.display()
+            )));
+        }
+        Ok(path)
     }
 
     /// The newest [`BackupKind::Unsaved`] file if it already holds everything in `vault`
@@ -916,8 +928,21 @@ impl SyncedVault {
     /// the user must update the app first. Conflicted copies queued while locked are absorbed
     /// before this returns, as after `unlock`. Then the backup's exact
     /// bytes atomically replace the primary and the in-memory vault becomes the restored one,
-    /// unlocked and clean. Unsaved edits are discarded. On any error before the replace,
-    /// nothing changes.
+    /// unlocked and clean.
+    ///
+    /// The in-memory vault is kept first when [`lock`](SyncedVault::lock) would keep it: once
+    /// the backup has been read and unlocked, a vault that is dirty, or whose saved state is
+    /// no longer on disk (a key mismatch stands, saving is blocked, the primary is missing),
+    /// is written, encrypted, as a [`BackupKind::Unsaved`] backup (skipped when the newest
+    /// Unsaved file already holds all of it; [`SyncEvent::BackupTaken`]). If that write
+    /// fails, the restore is refused with its error and nothing changes: the state stays in
+    /// memory and locking can try to keep it again. Unlike `lock`, this does not run the
+    /// before-write hook.
+    ///
+    /// On any error before the replace, the primary and the in-memory vault are unchanged. A
+    /// failure after the Unsaved write (a newer-version primary, a lock timeout, a failed
+    /// pre-restore snapshot) leaves that Unsaved file behind: harmless, and it holds the
+    /// same state memory still does.
     ///
     /// The pre-restore snapshot runs retention, which may prune the very backup being restored
     /// from. That is harmless: its bytes are already in memory and written to the primary, and
@@ -948,6 +973,14 @@ impl SyncedVault {
         }
         let mut vault = locked.unlock(password)?;
         vault.set_device_id(self.device_id);
+
+        // Bug hunt 2026-11-22 L3: the restore replaces memory too, so keep what only memory
+        // holds first, exactly when `lock` would (03 §4, §8). A failure refuses the restore.
+        if self.must_preserve()
+            && let Some(current) = &self.unlocked
+        {
+            self.preserve_unsaved(current)?;
+        }
 
         // Like `save`: no other writer between our read of the current primary and the
         // replace. Released before `after_unlock`, whose conflict absorption saves (and locks).

@@ -252,7 +252,7 @@ pub(crate) fn label_fit<'a>(
             continue;
         }
         icon |= field.icon_name().and_then(crate::icon::symbol).is_some();
-        let shown = field.name.replace('\n', " ");
+        let shown = shown_name(&field.name);
         if shown.trim().is_empty() {
             continue;
         }
@@ -277,6 +277,20 @@ pub(crate) fn label_fit<'a>(
     };
     // 1 px against sub-pixel rounding in the wrap.
     widest.map(|w| (w + slot + px(1.)).ceil())
+}
+
+/// Longest field or section name read mode shows before cutting with an ellipsis: far
+/// past any name the editor accepts, so only a crafted import is ever cut.
+const SHOWN_NAME_MAX: usize = 200;
+
+/// A field or section name as every read-mode path draws it (05 §2.3; bug-hunt N8,
+/// 2026-11-22): the stored name as typed (no capitalisation) after
+/// [`text::sanitize_label`], so a control, bidi or invisible character from an import
+/// shows as U+FFFD instead of reordering or hiding the text around it (zero-width
+/// joiners are kept for Persian, Indic and emoji names). The stored value and the
+/// editor's input keep the name unchanged.
+pub(crate) fn shown_name(name: &str) -> String {
+    text::sanitize_label(name, SHOWN_NAME_MAX)
 }
 
 /// One field row, shared by the detail column, item windows and the backup viewer: the
@@ -328,6 +342,7 @@ pub(crate) fn field_row(
                 // The label shows the stored name exactly as typed (owner 2026-11-22:
                 // no display-time capitalisation).
                 .child({
+                    let label = shown_name(&label);
                     let selector = format!("field-label-text {ix} {label}");
                     div()
                         .debug_selector(move || selector.clone())
@@ -425,7 +440,7 @@ pub(crate) fn issue_strip(fi: &FieldIssue, cx: &App) -> gpui::Div {
 /// space above it; as the first row it sits under the tags rule like any first row.
 pub(crate) fn section_row(ix: usize, name: &str, cx: &App) -> gpui::Div {
     let theme = cx.theme();
-    let heading = name.trim().to_uppercase();
+    let heading = shown_name(name.trim()).to_uppercase();
     let selector = format!("section-row {ix} {heading}");
     let top = if ix == 0 {
         FIELD_ROW_PAD_Y

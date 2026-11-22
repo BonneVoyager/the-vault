@@ -43,4 +43,4 @@ With "Show Vault in Dock" turned off, Vault lives in the menu bar instead. Click
 
 ## If something goes wrong
 
-Settings ▸ Security ▸ "Copy diagnostics" puts a short technical summary on the clipboard with no secrets in it. Backups can be opened and restored from Settings ▸ Sync & Backup.
+Settings ▸ Security ▸ "Copy diagnostics" puts a short technical summary on the clipboard with no secrets in it. Backups can be opened and restored from Settings ▸ Sync & Backup. Restoring replaces this Mac's copy only: if another Mac changed or deleted an item after the backup was taken, that newer change wins again when the two sync.

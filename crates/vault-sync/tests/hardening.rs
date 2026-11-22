@@ -647,3 +647,55 @@ fn save_blocked_is_none_for_a_healthy_vault() {
     a.unlock(&pw()).unwrap();
     assert_eq!(a.save_blocked(), None);
 }
+
+/// Bug hunt 2026-11-22 L3 review: a CLEAN vault whose saved state was replaced on disk by a
+/// foreign vault (save blocked) is kept as an Unsaved backup before a restore, as `lock`
+/// keeps it; the restored vault is the backup's.
+#[test]
+fn restore_keeps_a_clean_vault_whose_saved_state_is_gone() {
+    let (_dir, path, mut a, _b) = two_devices();
+    let backup = a.backup_now().unwrap();
+    insert(&mut a, "later");
+    a.save().unwrap();
+    assert!(!a.is_dirty());
+
+    a.start_watching().unwrap();
+    let foreign = foreign_vault_bytes();
+    plant(&path, &foreign);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while a.save_blocked().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the foreign primary was never seen"
+        );
+        a.poll();
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(a.save_blocked(), Some(SaveBlocked::ForeignVault));
+    assert!(
+        !a.is_dirty(),
+        "the vault is clean; only the block says to keep it"
+    );
+    let unsaved = |a: &SyncedVault| {
+        a.backups()
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.kind == BackupKind::Unsaved)
+            .map(|b| b.path)
+            .collect::<Vec<_>>()
+    };
+    assert!(unsaved(&a).is_empty());
+
+    a.restore_from(&backup, &pw()).unwrap();
+
+    assert_eq!(titles(&a), ["mail"]);
+    assert_eq!(fs::read(&path).unwrap(), fs::read(&backup).unwrap());
+    assert_eq!(a.save_blocked(), None);
+    let kept = unsaved(&a);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    let preserved = LockedVault::parse(&fs::read(&kept[0]).unwrap())
+        .unwrap()
+        .unlock(&pw())
+        .unwrap();
+    assert_eq!(titles_of(&preserved), ["later", "mail"]);
+}
