@@ -90,6 +90,24 @@ pub(crate) struct ReadDetail<'a> {
     /// ⌥ is held (05 §2.3 "Hold ⌥ to reveal"): masked values render revealed without
     /// touching `revealed`. The reveal buttons keep showing the per-field toggle.
     pub peek: bool,
+    /// Where the item comes from (the open vault, or a backup in the backup viewer).
+    pub source: ItemSource<'a>,
+    /// Header buttons in place of Favorite / Delete / Edit, for standalone windows only
+    /// (the main detail column draws its own; both would duplicate the header buttons).
+    /// `None` shows none.
+    pub header_buttons: Option<AnyElement>,
+}
+
+/// The vault a [`ReadDetail`] item belongs to.
+#[derive(Clone, Copy)]
+pub(crate) enum ItemSource<'a> {
+    /// The open vault: notices from `AppState::listing`, custom icon images and
+    /// attachment states from the live session.
+    Live,
+    /// A decrypted backup (03 §4 "Restore"): password notices judged against the backup's
+    /// own items (`issues`), the automatic tile (backups hold no blobs), and attachments
+    /// listed as Missing (`attachments::backup_section`).
+    Backup(&'a crate::audit::Issues),
 }
 
 /// True when the selected item shows a TOTP code (the view then re-renders every second).
@@ -125,6 +143,8 @@ fn reveal_button(
     };
     let actions = actions.clone();
     ui::icon_button(("reveal", ix), icon, &format!("{verb} {what}"))
+        // Tests click the toggle by this key (no-op outside test builds).
+        .debug_selector(move || format!("field-reveal {ix}"))
         .on_click(move |_, _, cx| (actions.0)(DetailAction::Reveal(field), cx))
 }
 
@@ -607,6 +627,8 @@ impl MainScreen {
                 actions: DetailActions::main(self.state.clone()),
                 standalone: false,
                 rows_width,
+                source: ItemSource::Live,
+                header_buttons: None,
                 // Also checked against the window's live modifiers and the focus, so a
                 // key-up that went to another dispatch path cannot leave values revealed.
                 peek: s.option_reveal
@@ -714,7 +736,7 @@ impl MainScreen {
 
 impl ReadDetail<'_> {
     pub(crate) fn render_item(
-        &self,
+        mut self,
         item: &Item,
         s: &AppState,
         window: &Window,
@@ -730,6 +752,12 @@ impl ReadDetail<'_> {
         };
         // Recently Deleted: read-only, no header buttons; Recover / Delete in a card under the title.
         let trashed = item.is_deleted();
+        let backup = matches!(self.source, ItemSource::Backup(_));
+        debug_assert!(
+            self.standalone || self.header_buttons.is_none(),
+            "header_buttons is for standalone windows; the main column has its own"
+        );
+        let header_buttons = self.header_buttons.take();
 
         let favorite = ui::icon_button(
             "favorite",
@@ -750,7 +778,7 @@ impl ReadDetail<'_> {
         let header = ui::h_flex()
             .debug_selector(|| "detail-header".into())
             .gap(px(14.))
-            .child(item_tile(item, Some(s), 44., cx))
+            .child(item_tile(item, (!backup).then_some(s), 44., cx))
             .child(
                 ui::v_flex().flex_1().min_w_0().child(
                     div()
@@ -786,6 +814,15 @@ impl ReadDetail<'_> {
                                     window.dispatch_action(Box::new(EditItem), cx)
                                 }),
                         ),
+                )
+            })
+            .when_some(header_buttons, |header, buttons| {
+                header.child(
+                    ui::no_window_drag(ui::h_flex())
+                        .debug_selector(|| "detail-header-buttons".into())
+                        .flex_none()
+                        .gap(px(14.))
+                        .child(buttons),
                 )
             });
 
@@ -870,7 +907,9 @@ impl ReadDetail<'_> {
                     .child(ui::no_window_drag(ui::v_flex()).children(fields)),
             )
             .children(
-                (if self.standalone || trashed {
+                (if backup {
+                    attachments::backup_section(item, cx)
+                } else if self.standalone || trashed {
                     attachments::reference_section(s, item, cx)
                 } else {
                     attachments::section(s, self.state, item, false, cx)
@@ -998,11 +1037,15 @@ impl ReadDetail<'_> {
         } else {
             copy_on_click(ix, field.id, &field.name, shown, &self.actions, cx).into_any_element()
         };
-        let issues: Vec<FieldIssue> = self
-            .state
-            .read(cx)
-            .listing
-            .issues(item.id)
+        let live;
+        let all: &[FieldIssue] = match self.source {
+            ItemSource::Backup(issues) => issues.get(&item.id).map_or(&[], Vec::as_slice),
+            ItemSource::Live => {
+                live = self.state.read(cx);
+                live.listing.issues(item.id)
+            }
+        };
+        let issues: Vec<FieldIssue> = all
             .iter()
             .filter(|fi| fi.field == field.id)
             .copied()

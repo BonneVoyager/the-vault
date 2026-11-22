@@ -109,30 +109,43 @@ fn auto_lock_label(minutes: Option<u32>) -> SharedString {
     }
 }
 
+const BACKUP_HINT: &str = "Copies the vault into the package after changes, about once an hour.";
+
+/// A retention tab: the daily tier's length, `round(30 × m)` days (03 §4, vault-sync `retain`).
 fn retention_label(m: f32) -> String {
-    if m < 1.0 {
-        format!("{m}\u{d7}")
+    format!("{} days", (30.0 * m).round() as u32)
+}
+
+/// The retention hint for multiplier `m`: the monthly tier keeps `round(36 × m)` months,
+/// shown as months below two years and as whole years from there.
+fn retention_hint(m: f32) -> String {
+    let months = (36.0 * m).round() as u32;
+    let span = if months < 24 {
+        format!("{months} months")
     } else {
-        format!("{m:.0}\u{d7}")
-    }
+        format!("{} years", months / 12)
+    };
+    format!("Older copies thin out to weekly, then monthly for {span}.")
 }
 
 /// One labelled settings row: label left, control right. Its divider comes from
-/// [`section`].
+/// [`section`]. The label column may shrink below its text width (`min_w_0`) and the
+/// control never shrinks, so a wide control wraps the label instead of running past the
+/// pane's right edge.
 fn row(label: &'static str, control: impl IntoElement) -> gpui::Div {
     ui::h_flex()
         .py(px(10.))
         .gap(px(12.))
-        .child(div().flex_1().text_sm().child(label))
-        .child(control)
+        .child(div().flex_1().min_w_0().text_sm().child(label))
+        .child(div().flex_none().child(control))
 }
 
-/// A [`row`] whose label carries a one-line muted hint under it. `tag` names the hint's
-/// test selector `settings-{tag}-hint: {hint}` (gpui exposes no painted text to tests:
-/// the selector carries the string this element renders).
+/// A [`row`] whose label carries a muted hint under it (wrapping when the control is
+/// wide). `tag` names the hint's test selector `settings-{tag}-hint: {hint}` (gpui exposes
+/// no painted text to tests: the selector carries the string this element renders).
 fn hinted_row(
     label: &'static str,
-    hint: &'static str,
+    hint: impl Into<SharedString>,
     tag: &'static str,
     control: impl IntoElement,
     cx: &App,
@@ -140,18 +153,45 @@ fn hinted_row(
     ui::h_flex()
         .py(px(10.))
         .gap(px(12.))
+        .child(label_column(label, hint.into(), tag, cx).flex_1().min_w_0())
+        .child(div().flex_none().child(control))
+}
+
+/// A [`hinted_row`] for a control too wide to share a line: label and hint take the full
+/// width, the control sits on a second line, right-aligned to the other rows' controls
+/// (tagged `settings-{tag}-control`).
+fn stacked_hinted_row(
+    label: &'static str,
+    hint: impl Into<SharedString>,
+    tag: &'static str,
+    control: impl IntoElement,
+    cx: &App,
+) -> gpui::Div {
+    ui::v_flex()
+        .py(px(10.))
+        .gap(px(8.))
+        .child(label_column(label, hint.into(), tag, cx))
         .child(
-            ui::v_flex()
-                .flex_1()
-                .gap(px(2.))
-                .child(div().text_sm().child(label))
-                .child(
-                    ui::muted(hint, cx)
-                        .text_xs()
-                        .debug_selector(move || format!("settings-{tag}-hint: {hint}")),
-                ),
+            ui::h_flex().justify_end().child(
+                div()
+                    .flex_none()
+                    .debug_selector(move || format!("settings-{tag}-control"))
+                    .child(control),
+            ),
         )
-        .child(control)
+}
+
+/// Label over its muted hint, the hint tagged `settings-{tag}-hint: {hint}`.
+fn label_column(label: &'static str, hint: SharedString, tag: &'static str, cx: &App) -> gpui::Div {
+    let selector = format!("settings-{tag}-hint: {hint}");
+    ui::v_flex()
+        .gap(px(2.))
+        .child(div().text_sm().child(label))
+        .child(
+            ui::muted(hint, cx)
+                .text_xs()
+                .debug_selector(move || selector.clone()),
+        )
 }
 
 /// A settings row plus whatever hangs under it (an inline form), which sits below the
@@ -442,10 +482,14 @@ impl SettingsView {
             .segmented()
             .small()
             .selected_index(current)
-            .children(
-                Settings::RETENTION_CHOICES
-                    .map(|m| Tab::new().label(retention_label(m)).clickable()),
-            )
+            .children(Settings::RETENTION_CHOICES.map(|m| {
+                let label = retention_label(m);
+                let selector = format!("settings-retention-tab: {label}");
+                Tab::new()
+                    .label(label)
+                    .debug_selector(move || selector.clone())
+                    .clickable()
+            }))
             .on_click(move |ix: &usize, _, cx| {
                 if let Some(m) = Settings::RETENTION_CHOICES.get(*ix).copied() {
                     retention_state.update(cx, |s, cx| {
@@ -456,8 +500,10 @@ impl SettingsView {
 
         let rows = vec![
             location,
-            row(
+            hinted_row(
                 "Automatic backups",
+                BACKUP_HINT,
+                "backup-enabled",
                 Switch::new("backup-enabled")
                     .checked(settings.backup_enabled)
                     .accessibility_label("Automatic backups")
@@ -468,8 +514,15 @@ impl SettingsView {
                             s.update_settings(cx, |st| st.backup_enabled = on)
                         });
                     }),
+                cx,
             ),
-            row("Keep backups longer", retention),
+            stacked_hinted_row(
+                "Keep daily backups for",
+                retention_hint(Settings::RETENTION_CHOICES[current]),
+                "retention",
+                retention,
+                cx,
+            ),
             row(
                 "Backups",
                 state_button("backup-now", "Back up now", &self.state, |s, cx| {
@@ -763,6 +816,7 @@ impl Render for SettingsView {
         ui::v_flex()
             .gap(px(8.))
             .min_h(px(220.))
+            .debug_selector(|| "settings-pane".into())
             .child(tabs)
             .child(body)
     }
@@ -1023,5 +1077,176 @@ mod tests {
             &mut vcx
         ));
         assert!(!set_login(None, &mut vcx), "no row, no hint");
+    }
+
+    /// Sync & Backup: "Automatic backups" carries its hint; the retention tabs name the
+    /// daily tier in days and the hint under the row follows the selection.
+    #[gpui::test]
+    fn sync_backup_rows_show_days_and_hints(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = SyncedVault::create(
+            &dir.path().join("t.vault"),
+            &SecretString::new("pw".into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        cx.update(gpui_component::init);
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        let window = cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let view = cx.new(|cx| SettingsView::new(state.clone(), window, cx));
+            Root::new(view, window, cx)
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        state.update(&mut vcx, |s, cx| {
+            s.install_unlocked_for_tests(vault);
+            s.open_settings(true, cx);
+        });
+        show_tab(SYNC_TAB, &state, &mut vcx);
+
+        assert!(
+            vcx.debug_bounds(
+                "settings-backup-enabled-hint: Copies the vault into the package \
+                 after changes, about once an hour."
+            )
+            .is_some()
+        );
+        let tabs: Vec<_> = [
+            "settings-retention-tab: 15 days",
+            "settings-retention-tab: 30 days",
+            "settings-retention-tab: 60 days",
+            "settings-retention-tab: 120 days",
+        ]
+        .into_iter()
+        .map(|sel| vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel}")))
+        .collect();
+        assert!(
+            tabs.windows(2).all(|w| w[0].right() <= w[1].left()),
+            "tabs in order, left to right"
+        );
+
+        const THREE_YEARS: &str =
+            "settings-retention-hint: Older copies thin out to weekly, then monthly for 3 years.";
+        const EIGHTEEN_MONTHS: &str =
+            "settings-retention-hint: Older copies thin out to weekly, then monthly for 18 months.";
+        let hint = |vcx: &mut VisualTestContext, sel: &'static str| vcx.debug_bounds(sel).is_some();
+        assert_eq!(
+            state.read_with(&vcx, |s, _| s.settings.retention_multiplier),
+            1.0
+        );
+        assert!(hint(&mut vcx, THREE_YEARS));
+        vcx.simulate_click(tabs[0].center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        assert_eq!(
+            state.read_with(&vcx, |s, _| s.settings.retention_multiplier),
+            0.5
+        );
+        assert!(hint(&mut vcx, EIGHTEEN_MONTHS));
+        assert!(!hint(&mut vcx, THREE_YEARS));
+    }
+
+    #[test]
+    fn retention_labels_and_hints_per_choice() {
+        let labels = Settings::RETENTION_CHOICES.map(retention_label);
+        assert_eq!(labels, ["15 days", "30 days", "60 days", "120 days"]);
+        let spans = Settings::RETENTION_CHOICES.map(retention_hint);
+        let want = ["18 months", "3 years", "6 years", "12 years"]
+            .map(|s| format!("Older copies thin out to weekly, then monthly for {s}."));
+        assert_eq!(spans, want);
+    }
+
+    /// The owner saw the retention tabs run past the sheet's right edge: in the real
+    /// 560 px Settings sheet, at the default and the largest text size, every retention
+    /// tab and the Dock switch lie inside the settings pane.
+    #[gpui::test]
+    fn sync_rows_fit_the_settings_sheet(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = SyncedVault::create(
+            &dir.path().join("t.vault"),
+            &SecretString::new("pw".into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::actions::bind_keys(cx);
+            crate::actions::register(&state, cx);
+        });
+        let window = cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let view = cx.new(|cx| crate::root::VaultRoot::new(state.clone(), None, window, cx));
+            Root::new(view, window, cx)
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        state.update(&mut vcx, |s, _| s.install_unlocked_for_tests(vault));
+        vcx.run_until_parked();
+
+        for size in [TextSize::Default, TextSize::Larger] {
+            state.update(&mut vcx, |s, cx| {
+                s.update_settings(cx, |st| st.text_size = size);
+                s.settings_tab = SYNC_TAB;
+                s.open_settings(true, cx);
+            });
+            vcx.run_until_parked();
+            let pane = vcx
+                .debug_bounds("settings-pane")
+                .expect("Settings sheet open");
+            for sel in [
+                "settings-retention-tab: 15 days",
+                "settings-retention-tab: 30 days",
+                "settings-retention-tab: 60 days",
+                "settings-retention-tab: 120 days",
+            ] {
+                let tab = vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel}"));
+                assert!(
+                    tab.left() >= pane.left() && tab.right() <= pane.right() + px(0.5),
+                    "{size:?}: {sel} {tab:?} outside the pane {pane:?}"
+                );
+            }
+            // The hint spans the pane above the tabs; the tabs end at the controls' edge.
+            let hint = vcx
+                .debug_bounds(
+                    "settings-retention-hint: Older copies thin out to weekly, \
+                     then monthly for 3 years.",
+                )
+                .expect("retention hint");
+            let first = vcx.debug_bounds("settings-retention-tab: 15 days").unwrap();
+            let bar = vcx.debug_bounds("settings-retention-control").unwrap();
+            assert!(
+                hint.left() >= pane.left() && hint.right() <= pane.right() + px(0.5),
+                "{size:?}: hint {hint:?} outside the pane {pane:?}"
+            );
+            assert!(
+                hint.size.width >= pane.size.width * 0.6,
+                "{size:?}: hint squeezed to {:?} of {:?}",
+                hint.size.width,
+                pane.size.width
+            );
+            assert!(
+                hint.bottom() <= first.top(),
+                "{size:?}: tabs {first:?} not below the hint {hint:?}"
+            );
+            assert!(
+                (pane.right() - bar.right()).abs() < px(1.),
+                "{size:?}: tab bar ends at {:?}, pane at {:?}",
+                bar.right(),
+                pane.right()
+            );
+            state.update(&mut vcx, |s, cx| {
+                s.settings_tab = 0;
+                cx.notify();
+            });
+            vcx.run_until_parked();
+            let switch = vcx.debug_bounds("settings-dock-switch").unwrap();
+            assert!(
+                switch.right() <= pane.right() + px(0.5),
+                "{size:?}: Dock switch {switch:?} outside the pane {pane:?}"
+            );
+        }
     }
 }

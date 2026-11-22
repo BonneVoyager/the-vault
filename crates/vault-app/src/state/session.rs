@@ -18,7 +18,7 @@ use crate::text;
 /// 03 §8: save this long after the last edit.
 pub const AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 /// The "Copied" pill.
-const COPIED_TTL: Duration = Duration::from_secs(2);
+pub const COPIED_TTL: Duration = Duration::from_secs(2);
 
 /// Focus moves requested by global actions (⌘F, ⏎).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

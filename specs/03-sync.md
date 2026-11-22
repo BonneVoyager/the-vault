@@ -103,9 +103,9 @@ Policy, evaluated on every `save`:
   - keep one per week for 12 weeks
   - keep one per month forever (cap 36)
   - delete the rest
-- Settings expose: enable/disable, retention multiplier (0.5×–4×), and a "Back up now" button.
+- Settings expose: enable/disable, the retention multiplier (0.5×–4×, shown to the user as the daily tier in days: 15 / 30 / 60 / 120, 05 §Settings), and a "Back up now" button.
 
-Restore (phase 2 UI): open a backup read-only in a second window with the same password; user can copy items across, or "Replace current vault with this backup" (which first snapshots the current one).
+Restore (phase 2 UI): open a backup read-only in a second window with the same password (layout in 05 §2.3 "Backup viewer"); user can copy items across, or "Replace current vault with this backup" (which first snapshots the current one).
 
 ## 5. Merge semantics (`vault_core::merge`)
 

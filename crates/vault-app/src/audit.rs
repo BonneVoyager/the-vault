@@ -75,6 +75,7 @@ pub type Issues = HashMap<Uuid, Vec<FieldIssue>>;
 
 /// The issues of one password `value` held by item `item`: weak first, then reused
 /// (against the other live items of `vault`). Empty for an empty value.
+#[cfg(test)]
 pub fn value_issues(vault: &UnlockedVault, value: &str, item: Uuid) -> Vec<Issue> {
     scored_value_issues(vault, value, strength_bits(value), item)
 }

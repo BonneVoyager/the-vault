@@ -361,13 +361,12 @@ fn rule(hit: &Hit) -> Expect {
         "resizable-handle" => Expect::Exactly(CursorStyle::ResizeColumn),
         // Field reorder handle (drag, not click).
         "grip" => Expect::Exactly(CursorStyle::OpenHand),
-        // Window, column and section backgrounds; vault-root also holds the title-bar
-        // drag band, which keeps the arrow.
-        "<window>" | "root" | "vault-root" | "main-columns" | "resizable-panel"
-        | "sidebar-slot" | "sidebar-slide" | "list-header-slide" | "list-slot" | "detail-slot"
-        | "detail" | "dialog-instance" | "dialog" | "surface" | "dialog-title" => {
-            Expect::NotPointer
-        }
+        // Window, column and section backgrounds; vault-root and backup-window also hold
+        // the title-bar drag band, which keeps the arrow.
+        "<window>" | "root" | "vault-root" | "backup-window" | "main-columns"
+        | "resizable-panel" | "sidebar-slot" | "sidebar-slide" | "list-header-slide"
+        | "list-slot" | "detail-slot" | "detail" | "dialog-instance" | "dialog" | "surface"
+        | "dialog-title" => Expect::NotPointer,
         // Scroll containers and lists (the gaps between rows).
         "sidebar-sections" | "item-list" | "detail-scroll" | "detail-tags" | "editor-scroll"
         | "backups" | "backup-list" | "backup-detail" | "icon-grid" => Expect::NotPointer,

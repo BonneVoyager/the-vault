@@ -90,7 +90,7 @@ impl AppState {
                 self.vault_changed();
                 self.schedule_autosave(cx);
                 self.show_toast(
-                    format!("Copied \u{2018}{title}\u{2019} into this vault"),
+                    format!("Copied \u{2018}{title}\u{2019} into the current vault"),
                     cx,
                 );
                 Some(id)

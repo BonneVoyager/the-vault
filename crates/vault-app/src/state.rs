@@ -52,7 +52,7 @@ pub use kdbx::KdbxImportUi;
 pub use prefs::{LoginRow, set_dock_icon};
 pub use qr::QrScanner;
 pub use security::{SECURITY_TAB, SecurityForm, SecurityUi};
-pub use session::{CopyTarget, FocusTarget, parse_totp};
+pub use session::{COPIED_TTL, CopyTarget, FocusTarget, parse_totp};
 pub use sync::{RestorePrompt, SYNC_TAB, SyncUi, TRANSFER_TAB};
 pub use touch_id::{TouchAuto, TouchDenied, TouchIdPolicy, TouchUi};
 pub use trash::{DELETE_RECOVERABLE, NO_DELETED_ITEMS, PURGE_CONFIRM, TRASH_INFO, expiry_text};

@@ -1279,6 +1279,62 @@ pub fn copy_value_area(id: impl Into<gpui::ElementId>, what: &str, cx: &App) -> 
         .tooltip(|window, cx| Tooltip::new("Click to copy").build(window, cx))
 }
 
+/// Wrong-password shake of an unlock field (05 §2.2): main unlock screen and backup
+/// viewer.
+pub const SHAKE: std::time::Duration = std::time::Duration::from_millis(300);
+/// Peak horizontal displacement of the shake.
+pub const SHAKE_PX: f32 = 4.;
+
+/// Damped sine: two small swings that settle back to 0 at `t = 1`.
+pub fn shake_offset(t: f32) -> f32 {
+    (t * std::f32::consts::PI * 4.).sin() * SHAKE_PX * (1. - t)
+}
+
+/// `field` shaken once per wrong password: keyed on the `failures` counter, so each new
+/// failure replays it. Without a failure, or under Reduce Motion, `field` as it is (no
+/// wrapper). Tests find the wrapper as `selector`. Only the field moves; the card and
+/// buttons keep their positions.
+pub fn shake_field(
+    field: Div,
+    failures: u32,
+    reduce_motion: bool,
+    selector: &'static str,
+) -> AnyElement {
+    use gpui::AnimationExt as _;
+    if failures == 0 || reduce_motion {
+        return field.into_any_element();
+    }
+    gpui::div()
+        .w_full()
+        .debug_selector(move || selector.into())
+        .child(field.relative().with_animation(
+            ("shake", failures as usize),
+            gpui::Animation::new(SHAKE),
+            |field, t| field.left(px(shake_offset(t))),
+        ))
+        .into_any_element()
+}
+
+/// "Unlocking…" centred over an unlock card's hidden controls (05 §2.2). Put it in a
+/// `relative` container with the controls kept `invisible`, so the card keeps its size.
+/// `id` is its element id and test selector.
+pub fn unlocking_overlay(id: &'static str, cx: &App) -> gpui::Stateful<Div> {
+    v_flex()
+        .absolute()
+        .inset_0()
+        .items_center()
+        .justify_center()
+        .id(id)
+        .debug_selector(move || id.into())
+        .aria_label("Unlocking")
+        .child(
+            gpui::div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("Unlocking…"),
+        )
+}
+
 /// Transient copy feedback, positioned consistently over either detail host.
 pub fn detail_copy_feedback(message: impl Into<SharedString>, cx: &App) -> Div {
     h_flex()

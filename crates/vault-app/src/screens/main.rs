@@ -9,11 +9,10 @@ pub(crate) mod detail;
 mod editor;
 mod generator;
 pub mod icon_view;
-mod list;
+pub(crate) mod list;
 pub(crate) mod notes;
 #[cfg(test)]
 pub(crate) use editor::AllArrowsForTests;
-pub use icon_view::item_tile;
 #[cfg(test)]
 pub use {detail::detail_placeholder, list::list_placeholder};
 #[cfg(test)]
@@ -53,7 +52,7 @@ use crate::{text, ui};
 
 /// Default widths and ranges for the sidebar and item list (§1).
 const SIDEBAR: (f32, f32, f32) = (220., 180., 320.);
-const LIST: (f32, f32, f32) = (300., 240., 420.);
+pub(crate) const LIST: (f32, f32, f32) = (300., 240., 420.);
 /// The detail column never gets narrower than this (dragging, or restored widths in a
 /// narrower window).
 const DETAIL_MIN: f32 = 320.;
@@ -75,7 +74,7 @@ fn fit_widths([side, list]: [f32; 2], window: f32, sidebar: bool) -> [f32; 2] {
 
 /// Height of the list's search row, the band the save-blocked strip sits under: the
 /// title band, or taller once the text size grows the search field.
-fn header_height(cx: &App) -> gpui::Pixels {
+pub(crate) fn header_height(cx: &App) -> gpui::Pixels {
     let row = 2. * ui::SEARCH_TOP + crate::theme::scaled(ui::SEARCH_HEIGHT, cx).as_f32();
     px(ui::TOP_BAND_HEIGHT.max(row))
 }

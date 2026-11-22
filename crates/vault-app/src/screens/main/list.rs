@@ -7,9 +7,11 @@ use gpui::{
     Window, div, list, prelude::FluentBuilder as _, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::InputState;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
+use vault_core::Item;
 
 use super::MainScreen;
 use super::icon_view::item_tile;
@@ -83,6 +85,118 @@ fn issue_badge(ix: usize, issues: &[FieldIssue], cx: &App) -> AnyElement {
 /// (05 §6).
 const TOOLBAR_TAB_INDEX: isize = 1;
 
+/// An A–Z group header row of the item list.
+pub(crate) fn group_header(label: SharedString, cx: &App) -> AnyElement {
+    div()
+        .h(crate::theme::scaled(HEADER_HEIGHT, cx))
+        .px(px(20.))
+        .pt(px(8.))
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(cx.theme().muted_foreground)
+        .child(label)
+        .into_any_element()
+}
+
+/// The height of an item row at the current text size (an empty slot keeps it).
+pub(crate) fn item_row_height(cx: &App) -> gpui::Pixels {
+    crate::theme::scaled(ROW_HEIGHT, cx)
+}
+
+/// One item row of a list (05 §2.3), shared by the main list and the backup viewer: the
+/// 56 px slot, the 32 px tile, title and subtitle, favourite star, issue badge and the
+/// selection and hover fills. `selected` draws the selection, `active` its focused
+/// (accent) form; `images` resolves custom icon images (`None`: the automatic tile).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn item_row(
+    ix: usize,
+    item: &Item,
+    images: Option<&AppState>,
+    issues: &[FieldIssue],
+    selected: bool,
+    active: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let (title, subtitle, favorite) = (item.title.clone(), listing::subtitle(item), item.favorite);
+    let badge = (!issues.is_empty()).then(|| issue_badge(ix, issues, cx));
+    let (fg, muted) = if selected && active {
+        (
+            theme.primary_foreground,
+            theme.primary_foreground.opacity(0.8),
+        )
+    } else {
+        (theme.foreground, theme.muted_foreground)
+    };
+    div()
+        .h(item_row_height(cx))
+        .px(px(8.))
+        .py(px(2.))
+        .child(
+            ui::h_flex()
+                .id(("item-row", ix))
+                .debug_selector(move || format!("item-row {ix}"))
+                .size_full()
+                .px(px(8.))
+                .gap(px(10.))
+                .rounded(theme.radius_lg)
+                .clickable()
+                .map(|row| match (selected, active) {
+                    (true, true) => row.bg(theme.primary),
+                    (true, false) => row.bg(theme.primary.opacity(0.14)),
+                    _ => row.hover(|st| st.bg(theme.accent)),
+                })
+                .child(item_tile(item, images, AVATAR, cx))
+                .child(
+                    ui::v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg)
+                                .truncate()
+                                .child(if title.trim().is_empty() {
+                                    "Untitled".to_owned()
+                                } else {
+                                    title
+                                }),
+                        )
+                        .when(!subtitle.is_empty(), |col| {
+                            col.child(div().text_xs().text_color(muted).truncate().child(subtitle))
+                        }),
+                )
+                .when(favorite, |row| {
+                    row.child(Icon::new(IconName::StarFill).size_4().text_color(
+                        if selected && active {
+                            fg
+                        } else {
+                            theme.warning
+                        },
+                    ))
+                })
+                .children(badge)
+                .on_click(on_click),
+        )
+        .into_any_element()
+}
+
+/// The list's search field (05 §2.3), shared by the main list and the backup viewer:
+/// small, scaled with the text size, clear button, search glyph and the ⌘F hint.
+pub(crate) fn search_field(search: &Entity<InputState>, cx: &App) -> impl IntoElement {
+    let muted = cx.theme().muted_foreground;
+    // `Input::h` is an inherent multi-line-only setter that shadows `Styled::h`; call
+    // the trait method to size the single-line frame.
+    gpui::Styled::h(
+        ui::input(search).small(),
+        crate::theme::scaled(ui::SEARCH_HEIGHT, cx),
+    )
+    .cleanable(true)
+    .prefix(Icon::new(IconName::Search).size_4().text_color(muted))
+    .suffix(div().text_xs().text_color(muted).child("⌘F"))
+}
+
 fn render_row(
     rows: &[Row],
     ix: usize,
@@ -91,109 +205,40 @@ fn render_row(
     list_focused: bool,
     cx: &mut App,
 ) -> AnyElement {
-    let theme = cx.theme();
     match rows.get(ix) {
-        Some(Row::Header(label)) => div()
-            .h(crate::theme::scaled(HEADER_HEIGHT, cx))
-            .px(px(20.))
-            .pt(px(8.))
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(theme.muted_foreground)
-            .child(label.clone())
-            .into_any_element(),
+        Some(Row::Header(label)) => group_header(label.clone(), cx),
         Some(Row::Item(id)) => {
             let s = state.read(cx);
             let Some(item) = s.unlocked_vault().and_then(|v| v.get(*id)) else {
-                return div()
-                    .h(crate::theme::scaled(ROW_HEIGHT, cx))
-                    .into_any_element();
+                return div().h(item_row_height(cx)).into_any_element();
             };
             let selected = s.selection == Some(*id);
-            let (title, subtitle, favorite) =
-                (item.title.clone(), listing::subtitle(item), item.favorite);
             // A trashed item opens no item window (05 §2.3 "Recently Deleted").
             let trashed = item.is_deleted();
-            let issues = s.listing.issues(*id);
-            let badge = (!issues.is_empty()).then(|| issue_badge(ix, issues, cx));
-            let (fg, muted) = if selected && list_focused {
-                (
-                    theme.primary_foreground,
-                    theme.primary_foreground.opacity(0.8),
-                )
-            } else {
-                (theme.foreground, theme.muted_foreground)
+            let (id, state_c, focus) = (*id, state.clone(), focus.clone());
+            let on_click = move |event: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                let state = &state_c;
+                state.update(cx, |s, cx| s.select(id, cx));
+                window.focus(&focus, cx);
+                if event.click_count() == 2
+                    && !trashed
+                    && let Err(err) = crate::screens::open_item_window(state.clone(), id, cx)
+                {
+                    state.update(cx, |s, cx| {
+                        s.show_toast(format!("Could not open item: {err}"), cx)
+                    });
+                }
             };
-            let (id, state, focus) = (*id, state.clone(), focus.clone());
-            div()
-                .h(crate::theme::scaled(ROW_HEIGHT, cx))
-                .px(px(8.))
-                .py(px(2.))
-                .child(
-                    ui::h_flex()
-                        .id(("item-row", ix))
-                        .debug_selector(move || format!("item-row {ix}"))
-                        .size_full()
-                        .px(px(8.))
-                        .gap(px(10.))
-                        .rounded(theme.radius_lg)
-                        .clickable()
-                        .map(|row| match (selected, list_focused) {
-                            (true, true) => row.bg(theme.primary),
-                            (true, false) => row.bg(theme.primary.opacity(0.14)),
-                            _ => row.hover(|st| st.bg(theme.accent)),
-                        })
-                        .child(item_tile(item, Some(s), AVATAR, cx))
-                        .child(
-                            ui::v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .child(
-                                    div()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(fg)
-                                        .truncate()
-                                        .child(if title.trim().is_empty() {
-                                            "Untitled".to_owned()
-                                        } else {
-                                            title
-                                        }),
-                                )
-                                .when(!subtitle.is_empty(), |col| {
-                                    col.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(muted)
-                                            .truncate()
-                                            .child(subtitle),
-                                    )
-                                }),
-                        )
-                        .when(favorite, |row| {
-                            row.child(Icon::new(IconName::StarFill).size_4().text_color(
-                                if selected && list_focused {
-                                    fg
-                                } else {
-                                    theme.warning
-                                },
-                            ))
-                        })
-                        .children(badge)
-                        .on_click(move |event, window, cx| {
-                            state.update(cx, |s, cx| s.select(id, cx));
-                            window.focus(&focus, cx);
-                            if event.click_count() == 2
-                                && !trashed
-                                && let Err(err) =
-                                    crate::screens::open_item_window(state.clone(), id, cx)
-                            {
-                                state.update(cx, |s, cx| {
-                                    s.show_toast(format!("Could not open item: {err}"), cx)
-                                });
-                            }
-                        }),
-                )
-                .into_any_element()
+            item_row(
+                ix,
+                item,
+                Some(s),
+                s.listing.issues(id),
+                selected,
+                list_focused,
+                on_click,
+                cx,
+            )
         }
         None => div().into_any_element(),
     }
@@ -217,35 +262,53 @@ fn template_rows(state: &Entity<AppState>) -> Vec<ui::MenuRow> {
         .collect()
 }
 
-/// Sort menu rows, the current order checked.
-fn sort_rows(state: &Entity<AppState>, cx: &App) -> Vec<ui::MenuRow> {
-    let current = state.read(cx).sort;
-    let row = |id: &str, label: &str, sort: Sort, action: fn() -> Box<dyn gpui::Action>| {
-        let state = state.clone();
-        ui::menu_row(id.to_owned(), label.to_owned())
-            .checked(current == sort)
-            .on_click(move |_, window, cx| {
-                state.update(cx, |s, cx| s.close_sort_menu(cx));
-                window.dispatch_action(action(), cx);
-            })
-    };
-    vec![
-        row("sort-name", "Name", Sort::Alphabetical, || {
-            Box::new(SortAlphabetical)
-        }),
-        row(
-            "sort-modified",
-            "Recently Modified",
-            Sort::RecentlyModified,
-            || Box::new(SortRecentlyModified),
-        ),
-        row(
-            "sort-created",
-            "Recently Created",
-            Sort::RecentlyCreated,
-            || Box::new(SortRecentlyCreated),
-        ),
+/// Called with the order picked in the sort menu.
+pub(crate) type OnSort = std::rc::Rc<dyn Fn(Sort, &mut Window, &mut App)>;
+
+/// Sort menu rows, `current` checked; a pick runs `on_select`. Shared by the main list
+/// (which dispatches its sort actions) and the backup viewer (a window-local order).
+fn sort_rows(current: Sort, on_select: &OnSort) -> Vec<ui::MenuRow> {
+    [
+        ("sort-name", "Name", Sort::Alphabetical),
+        ("sort-modified", "Recently Modified", Sort::RecentlyModified),
+        ("sort-created", "Recently Created", Sort::RecentlyCreated),
     ]
+    .into_iter()
+    .map(|(id, label, sort)| {
+        let on_select = on_select.clone();
+        ui::menu_row(id, label)
+            .checked(current == sort)
+            .on_click(move |_, window, cx| on_select(sort, window, cx))
+    })
+    .collect()
+}
+
+/// The list's Sort button and its menu (05 §2.3), shared by the main list and the
+/// backup viewer. `on_toggle` opens or closes the menu (`open` is its state);
+/// `on_select` gets the picked order and must close the menu.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sort_menu(
+    focus: &FocusHandle,
+    open: bool,
+    current: Sort,
+    on_toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
+    on_select: OnSort,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui_component::popover::Popover {
+    ui::menu_popover(
+        "sort-menu",
+        ui::icon_button("sort", IconName::SortAscending, "Sort items")
+            .debug_selector(|| "sort".into())
+            .track_focus(focus)
+            .tab_index(TOOLBAR_TAB_INDEX),
+        Anchor::TopLeft,
+        open,
+        on_toggle,
+        move |_, _| sort_rows(current, &on_select),
+        window,
+        cx,
+    )
 }
 
 /// The list heading while the sidebar is collapsed: the active filter as the sidebar
@@ -418,18 +481,17 @@ impl MainScreen {
                 cx,
             )
         };
-        let sort_open = self.state.read(cx).sort_menu_open;
+        let (sort_open, sort) = {
+            let s = self.state.read(cx);
+            (s.sort_menu_open, s.sort)
+        };
         let sort_button = {
             let state = self.state.clone();
-            let rows_state = self.state.clone();
-            ui::menu_popover(
-                "sort-menu",
-                ui::icon_button("sort", IconName::SortAscending, "Sort items")
-                    .debug_selector(|| "sort".into())
-                    .track_focus(&self.sort_focus)
-                    .tab_index(TOOLBAR_TAB_INDEX),
-                Anchor::TopLeft,
+            let select_state = self.state.clone();
+            sort_menu(
+                &self.sort_focus,
                 sort_open,
+                sort,
                 move |open, _, cx| {
                     state.update(cx, |s, cx| {
                         if open {
@@ -439,7 +501,15 @@ impl MainScreen {
                         }
                     });
                 },
-                move |_, cx| sort_rows(&rows_state, cx),
+                std::rc::Rc::new(move |sort, window, cx| {
+                    select_state.update(cx, |s, cx| s.close_sort_menu(cx));
+                    let action: Box<dyn gpui::Action> = match sort {
+                        Sort::Alphabetical => Box::new(SortAlphabetical),
+                        Sort::RecentlyModified => Box::new(SortRecentlyModified),
+                        Sort::RecentlyCreated => Box::new(SortRecentlyCreated),
+                    };
+                    window.dispatch_action(action, cx);
+                }),
                 window,
                 cx,
             )
@@ -475,26 +545,7 @@ impl MainScreen {
                 ui::no_window_drag(div())
                     .flex_1()
                     .debug_selector(|| "list-search".into())
-                    .child(
-                        // `Input::h` is an inherent multi-line-only setter that shadows
-                        // `Styled::h`; call the trait method to size the single-line frame.
-                        gpui::Styled::h(
-                            ui::input(&self.search).small(),
-                            crate::theme::scaled(ui::SEARCH_HEIGHT, cx),
-                        )
-                        .cleanable(true)
-                        .prefix(
-                            Icon::new(IconName::Search)
-                                .size_4()
-                                .text_color(theme.muted_foreground),
-                        )
-                        .suffix(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("⌘F"),
-                        ),
-                    ),
+                    .child(search_field(&self.search, cx)),
             )
             .child(ui::no_window_drag(div()).flex_none().child(sort_button))
             .child(ui::no_window_drag(div()).flex_none().child({

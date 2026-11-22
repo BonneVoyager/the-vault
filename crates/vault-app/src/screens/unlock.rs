@@ -7,14 +7,13 @@
 //! Every frame comes from the original shaded SVG, so the resting frame is exact.
 
 use std::cell::Cell;
-use std::f32::consts::PI;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, Entity, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, Window, div, ease_out_quint, img, prelude::FluentBuilder as _, px, rgb,
+    IntoElement, ParentElement as _, Render, Styled as _, Subscription, Task, Window, div,
+    ease_out_quint, img, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::input::{InputEvent, InputState};
@@ -49,10 +48,6 @@ use crate::state::{
     AppState, Busy, ChooseIntent, NEWER_VERSION, Screen, TouchDenied, UnlockBlocked, UnlockFinish,
 };
 use crate::ui::{self, Clickable as _};
-
-const SHAKE: Duration = Duration::from_millis(300);
-/// Peak horizontal displacement of the shake.
-const SHAKE_PX: f32 = 4.;
 
 pub struct UnlockScreen {
     state: Entity<AppState>,
@@ -169,24 +164,6 @@ fn is_unlocking(s: &AppState) -> bool {
     matches!(s.busy, Some(Busy::Unlocking | Busy::TouchUnlocking)) || s.unlock_finish.is_some()
 }
 
-/// Status text centred over the hidden controls.
-fn unlocking_overlay(cx: &gpui::App) -> impl IntoElement {
-    ui::v_flex()
-        .absolute()
-        .inset_0()
-        .items_center()
-        .justify_center()
-        .id("unlocking")
-        .debug_selector(|| "unlocking".into())
-        .aria_label("Unlocking")
-        .child(
-            div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child("Unlocking…"),
-        )
-}
-
 /// All frames are in one decoded image; the first is pixel-identical to the icon.
 fn wheel_strip() -> gpui::Img {
     img(crate::assets::APP_ICON_WHEEL_STRIP)
@@ -250,11 +227,6 @@ fn keyhole_opacity(t: f32) -> f32 {
 
 fn frame_offset(t: f32) -> gpui::Pixels {
     px(-(wheel_frame(t) as f32) * APP_ICON_SIZE)
-}
-
-/// Damped sine: two small swings that settle back to 0 at `t = 1`.
-fn shake_offset(t: f32) -> f32 {
-    (t * PI * 4.).sin() * SHAKE_PX * (1. - t)
 }
 
 /// One complete turn with an exponentially decaying burst of speed. The linear
@@ -363,19 +335,12 @@ impl Render for UnlockScreen {
             .debug_selector(|| "unlock-password".into())
             .child(ui::input(&self.password).disabled(unlocking));
         // Animate only the input. The card and buttons keep their positions.
-        let password_field: AnyElement = if failures == 0 || reduce_motion {
-            password_field.into_any_element()
-        } else {
-            div()
-                .w_full()
-                .debug_selector(|| "unlock-input-shake".into())
-                .child(password_field.relative().with_animation(
-                    ("shake", failures),
-                    Animation::new(SHAKE),
-                    |field, t| field.left(px(shake_offset(t))),
-                ))
-                .into_any_element()
-        };
+        let password_field = ui::shake_field(
+            password_field,
+            failures,
+            reduce_motion,
+            "unlock-input-shake",
+        );
         let mut controls = ui::v_flex().w_full().gap(px(12.));
         // A vault this build cannot unlock: the reason replaces the field, the Unlock and
         // Touch ID buttons and the hint; "Open another vault…" stays.
@@ -498,7 +463,9 @@ impl Render for UnlockScreen {
                     .relative()
                     .w_full()
                     .child(controls)
-                    .when(unlocking, |area| area.child(unlocking_overlay(cx))),
+                    .when(unlocking, |area| {
+                        area.child(ui::unlocking_overlay("unlocking", cx))
+                    }),
             );
 
         ui::centered(cx).child(card)

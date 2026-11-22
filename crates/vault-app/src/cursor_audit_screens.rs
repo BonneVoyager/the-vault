@@ -772,12 +772,24 @@ fn backup_viewer(cx: &mut TestAppContext) {
         Case {
             label: "backup viewer",
             targets: &[
-                "backup-row",
-                "backup-copy",
-                "backup-reveal",
+                // The main list's rows and the shared detail's buttons.
+                "item-row",
+                "copy",
+                "reveal",
                 "backup-copy-item",
                 "backup-replace",
+                "sort",
             ],
+            disabled: &[],
+        },
+        &mut vcx,
+    );
+    // The shared sort menu, as in the main list.
+    click("sort", &mut vcx);
+    audit(
+        Case {
+            label: "backup sort menu",
+            targets: &["sort-name", "sort-modified", "sort-created"],
             disabled: &[],
         },
         &mut vcx,

@@ -15,7 +15,7 @@ use gpui::{
 use gpui_component::{ActiveTheme as _, Root};
 use vault_core::{ExposeSecret as _, FieldKind, SecretString, Uuid};
 
-use super::main::detail::{DetailAction, DetailActions, ReadDetail};
+use super::main::detail::{DetailAction, DetailActions, ItemSource, ReadDetail};
 use crate::state::{AppState, CopyTarget, parse_totp};
 use crate::{text, theme, ui};
 
@@ -347,6 +347,8 @@ impl Render for ItemWindow {
                         window.viewport_size().width.as_f32() - 2.,
                     ),
                     peek,
+                    source: ItemSource::Live,
+                    header_buttons: None,
                 }
                 .render_item(item, s, window, cx)
             });

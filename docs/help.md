@@ -16,7 +16,7 @@ Press ⌘N for a new item and pick a template. ⌘E edits the selected item, ⌘
 
 ## Sync between Macs
 
-Put the vault package in a folder that iCloud Drive, Dropbox or any other service syncs, then open the same package on the other Mac. Vault merges changes from both sides; when two Macs change the same field, the later change wins and the older password is kept in that field's history. Backups live inside the package (Settings ▸ Sync & Backup).
+Put the vault package in a folder that iCloud Drive, Dropbox or any other service syncs, then open the same package on the other Mac. Vault merges changes from both sides; when two Macs change the same field, the later change wins and the older password is kept in that field's history. Backups live inside the package (Settings ▸ Sync & Backup): a copy of the vault is taken after changes, about once an hour; everything from the last day is kept, then one copy a day for 30 days, one a week for 12 weeks and one a month for 3 years. "Keep daily backups for" scales all of that from 15 to 120 days.
 
 ## Menu bar padlock
 

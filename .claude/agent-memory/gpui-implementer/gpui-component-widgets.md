@@ -40,6 +40,8 @@ Verified in P2.7 (edit mode, generator, settings), compiled + clippy + headless 
 Verified in P3.4 (sync banners, Sync & Backup / Import-Export tabs), compiled + clippy + headless tests:
 - Alert: `gpui_component::alert::Alert::{error, warning, info, success}(id, message: impl Into<Text>)` (&str/String/SharedString work), `.small()`, `.title(..)`, `.banner()`, `.on_close(..)`. RenderOnce, Styled. Icons TriangleAlert/CircleX are in the default set.
 - `TabBar::new(id).segmented().small().selected_index(i).children([Tab::new().label(..)]).on_click(|&usize, w, cx|)` works as a segmented control (retention 0.5x/1x/2x/4x). `Tab::disabled(bool)` exists.
+- (2026-11-22) `Tab` implements InteractiveElement/Styled on its base div, so `Tab::new().label(l).debug_selector(move || sel.clone())` works: tests locate a segmented tab by label and `simulate_click` its center, and `on_click(&usize)` fires (verified with the retention tabs).
+- (2026-11-22) `TabBar` is Styled + Sizable only (NOT InteractiveElement): no `debug_selector`/`id` on the bar; wrap it in `div().flex_none().debug_selector(..)` to measure it. A `.segmented().small()` bar pads its tabs ~3 px inside its own edge, so assert alignment on the wrapper, not the last tab.
 - `Tag::warning()/info()/danger()` + `.small().child(text)`; Tag has no id, wrap in `div().id(..)` if you need one.
 - `Button::danger()` (needs `ButtonVariants`) for red confirms; `.loading(bool)` shows a spinner.
 
