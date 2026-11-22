@@ -753,17 +753,26 @@ fn backup_viewer(cx: &mut TestAppContext) {
         install(cx);
     });
     let handle = cx
-        .update(|cx| crate::screens::open_backup_window(state.clone(), backup, cx))
+        .update(|cx| {
+            crate::screens::open_backup_window(state.clone(), backup, None, String::new(), cx)
+        })
         .unwrap();
     let mut vcx = VisualTestContext::from_window(handle, cx);
     vcx.simulate_resize(size(px(1100.), px(900.)));
-    audit(
+    let hits = audit(
         Case {
             label: "backup prompt",
-            targets: &["backup-open", "toggle-mask"],
+            targets: &["backup-open"],
             disabled: &[],
         },
         &mut vcx,
+    );
+    // The unlock card: no reveal toggle on the field (05 §2.3 "Backup viewer"). The
+    // toggle is a gpui-component Button with only an element id, so the inspector's hit
+    // names are the one place it would show.
+    assert!(
+        !hits.iter().any(|h| h.matches("toggle-mask")),
+        "backup prompt shows a reveal toggle"
     );
     vcx.simulate_input(PW);
     vcx.simulate_keystrokes("enter");

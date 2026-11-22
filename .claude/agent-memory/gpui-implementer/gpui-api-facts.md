@@ -254,3 +254,11 @@ Test: `cx.key_bindings().borrow().bindings_for_action(&A)`; `binding.predicate()
 - Windowless style asserts (verified 2026-11-21, gpui-pre 0.3.10): `Styled::style(&mut el)` returns the built element's `StyleRefinement`; fill = `style.background.as_ref().and_then(|f| f.color()).and_then(|b| b.as_solid())` (`Fill::Color(Background)`), `style.border_color: Option<Hsla>`, text colour = `style.text.color`. Switch mode in a test with `cx.update(gpui_component::init)` then `Theme::change(ThemeMode::Dark, None, cx)`; no window needed (vault: `ui::pill_tests`).
 - (2026-11-22) Flex rows overflow like CSS: a `flex_1()` text column without `min_w_0()` keeps its one-line text width (min-width auto), so the sibling control runs past the parent's right edge; nothing clips it in a Dialog. Fix: label column `.flex_1().min_w_0()` (its text then wraps) + control in `div().flex_none()`. To test it, host the view in its real container (vault: VaultRoot's 560 px Settings sheet, pane = 526 px), not as a bare window root: a test window is wide enough to hide the overflow.
 - `cx.open_window` called from inside `entity.update(...)` (e.g. `AppState::open_backup`) builds the view AND draws its first frame synchronously, while that entity is still mid-update: any `entity.read(cx)` in the view's `new` or first `render` panics ("cannot read … while it is already being updated", entity_map.rs:156). Cache what render needs (set it in an `observe_in` callback or when an async task completes), never read it in `new`/first render (verified 2026-11-22, backup viewer sort + reduce_motion).
+
+## Shared column builders (verified 2026-11-22, gpui-pre 0.3.10)
+- `InteractiveElement::track_focus(self, &FocusHandle) -> Self` (div.rs:812), so an optional
+  handle composes: `.when_some(focus, |el, f| el.track_focus(f))` keeps the `Div` type.
+- Pattern for sharing a view's column between windows: a free fn taking a parts struct with
+  `Rc<dyn Fn(.., &mut Window, &mut App)>` callbacks (main wires to `AppState`, other window to
+  its own entity via `cx.entity().downgrade()`), e.g. `sidebar::sidebar_column`, `list::sort_menu`.
+  Clippy `type_complexity` fires on `Rc<dyn Fn(&mut Window, &mut App)>` as a struct field: use a type alias.

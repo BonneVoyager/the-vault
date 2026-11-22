@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, Entity, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, Styled as _, Subscription, Task, Window, div,
-    ease_out_quint, img, prelude::FluentBuilder as _, px, rgb,
+    ease_out_quint, img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::input::{InputEvent, InputState};
@@ -21,7 +21,7 @@ use gpui_component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 
 /// Side of the app icon on the unlock card, in points (the raster is 2x this).
-const APP_ICON_SIZE: f32 = 128.;
+const APP_ICON_SIZE: f32 = ui::UNLOCK_ICON_SIZE;
 const WHEEL_FRAMES: usize = 24;
 /// The wheel makes one quick turn, then continues at a steady pace.
 const WHEEL_START: Duration = Duration::from_millis(950);
@@ -67,7 +67,7 @@ pub struct UnlockScreen {
 
 impl UnlockScreen {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let password = ui::password_input("Enter master password", window, cx);
+        let password = ui::password_input(ui::MASTER_PASSWORD_PLACEHOLDER, window, cx);
         let subscriptions = vec![
             cx.observe_in(&state, window, |this, state, window, cx| {
                 let s = state.read(cx);
@@ -248,11 +248,6 @@ impl Render for UnlockScreen {
         let blocked = state.unlock_blocked;
         let reduce_motion = state.reduce_motion;
         let theme = cx.theme();
-        let vault_label_color = if theme.mode.is_dark() {
-            rgb(0xb8b8be).into()
-        } else {
-            theme.muted_foreground
-        };
         let spinning = unlocking && !reduce_motion;
         let settling = !spinning && !reduce_motion && self.settling_from.is_some();
         let finish = self
@@ -424,49 +419,20 @@ impl Render for UnlockScreen {
                                     .update(cx, |s, cx| s.switch_vault(ChooseIntent::Home, cx));
                             })),
                     ),
-            )
-            // Hidden, not removed: the card keeps its size and nothing jumps. A hidden
-            // div paints none of its children, so the field takes no clicks or keys.
-            .when(unlocking, |controls| controls.invisible());
-
-        let card = ui::card(cx)
-            .w(px(360.))
-            .gap(px(20.))
-            .items_center()
-            .debug_selector(|| "unlock-card".into())
-            // The app icon (its PNG already has the macOS squircle and shadow). The
-            // fixed box keeps the card size even before the image has decoded.
-            .child(
-                ui::v_flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .child(
-                        div()
-                            .size(px(APP_ICON_SIZE))
-                            .relative()
-                            .flex_shrink_0()
-                            .debug_selector(|| "unlock-icon".into())
-                            .child(icon),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(vault_label_color)
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .debug_selector(|| "unlock-vault-name".into())
-                            .child(name),
-                    ),
-            )
-            .child(
-                div()
-                    .relative()
-                    .w_full()
-                    .child(controls)
-                    .when(unlocking, |area| {
-                        area.child(ui::unlocking_overlay("unlocking", cx))
-                    }),
             );
+
+        let card = ui::unlock_card(
+            ui::UnlockCard {
+                prefix: "unlock",
+                icon: icon.into_any_element(),
+                badge: None,
+                name: name.into(),
+                subtitle: None,
+                controls,
+                unlocking: unlocking.then_some("unlocking"),
+            },
+            cx,
+        );
 
         ui::centered(cx).child(card)
     }

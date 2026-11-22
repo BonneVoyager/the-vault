@@ -18,7 +18,10 @@ impl AppState {
             return self.show_toast("Unlock the vault to open a backup", cx);
         }
         let state = cx.entity();
-        match crate::screens::open_backup_window(state, path, cx) {
+        // The card's kind and time line comes from the Settings backups list.
+        let info = self.sync.backups.iter().find(|b| b.path == path).cloned();
+        let name = self.vault_name();
+        match crate::screens::open_backup_window(state, path, info, name, cx) {
             Ok(handle) => {
                 // Forget viewers the user already closed, so the list cannot grow.
                 let live = cx.windows();

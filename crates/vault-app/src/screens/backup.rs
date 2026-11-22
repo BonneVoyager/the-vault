@@ -7,8 +7,8 @@
 //! current vault" (a clone with a fresh id) and "Replace current vault with this backup"
 //! (the existing restore flow). It looks like the main window in read mode (owner
 //! 2026-11-22): the main list's rows and search field (`list::item_row`, `search_field`)
-//! and the shared read-mode detail (`ReadDetail` with `ItemSource::Backup`), under one
-//! strip in the title-bar band. It closes, dropping the decrypted backup, as soon as the
+//! and the shared read-mode detail (`ReadDetail` with `ItemSource::Backup`), with the main
+//! sidebar column (`sidebar_column`) at its left, under one strip in the title-bar band. It closes, dropping the decrypted backup, as soon as the
 //! live vault locks.
 
 use std::collections::HashSet;
@@ -23,26 +23,30 @@ use gpui::{
     px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{InputEvent, InputState};
-use gpui_component::tag::Tag;
+use gpui_component::input::{InputEvent, InputState, MoveDown};
 use gpui_component::{ActiveTheme as _, Disableable as _, Root, Sizable as _};
 use gpui_kit_assets::IconName;
 use vault_core::{
     ExposeSecret as _, FieldKind, Item, LockedVault, SecretString, UnlockedVault, Uuid,
 };
-use vault_sync::SyncError;
+use vault_sync::{BackupInfo, BackupKind, SyncError};
 use zeroize::Zeroizing;
 
 use super::main::detail::{DetailAction, DetailActions, ItemSource, ReadDetail, rows_width};
 use super::main::list::{group_header, item_row, item_row_height, search_field, sort_menu};
-use crate::actions::Search;
-use crate::listing::{self, Listing, Row};
+use super::main::sidebar::{SidebarColumn, sidebar_column};
+use super::main::{LIST, SIDEBAR, fit_widths};
+use crate::actions::{CopyUsername, FocusDetail, LIST_CONTEXT, NextItem, PrevItem, Search};
+use crate::listing::{self, Counts, Listing, Row};
 use crate::state::{AppState, COPIED_TTL, CopyTarget, Filter, Sort, parse_totp};
 use crate::ui::Clickable as _;
 use crate::{audit, text, theme, ui};
 
 pub struct BackupWindow {
     state: Entity<AppState>,
+    /// The password card's name and second line (see [`open_backup_window`]).
+    vault_name: SharedString,
+    subtitle: SharedString,
     path: PathBuf,
     password: Entity<InputState>,
     /// The decrypted backup. Dropped (zeroized) with the window, or as soon as the live
@@ -64,6 +68,12 @@ pub struct BackupWindow {
     /// inside its own update, where reading the state panics).
     sort: Sort,
     sort_menu_open: bool,
+    /// The sidebar's filter and Tags state, local to this window (Tags starts as the main
+    /// window's when the backup is unlocked, read then for the reason `sort` is).
+    filter: Filter,
+    tags_open: bool,
+    /// The sidebar's counts over the backup's items, computed once when it opens.
+    counts: Counts,
     sort_focus: FocusHandle,
     selection: Option<Uuid>,
     /// Field ids of the selected item whose values are revealed.
@@ -89,6 +99,8 @@ pub struct BackupWindow {
     focus: FocusHandle,
     /// The list column: a focused list draws its selection active.
     list_focus: FocusHandle,
+    /// The detail column: ⏎ in the list moves here, as in the main window.
+    detail_focus: FocusHandle,
     /// Set when the backup opens: the next render moves focus from the (gone) password
     /// field to the list, so ⌥ and ⌘F reach this window.
     focus_list: bool,
@@ -131,6 +143,27 @@ fn read_backup(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
 /// 2026-11-22: the list header's 12 px gap read as cramped next to the name).
 const STRIP_PAD_LEFT: f32 = ui::TRAFFIC_LIGHTS_RIGHT + 24.;
 
+/// The prompt card's second line (05 §2.3 "Backup viewer"): the backup's kind and the
+/// time in its file name, worded and formatted like the Settings backups list; the file
+/// name when it is not one of ours (no timestamp parsed).
+fn backup_subtitle(info: Option<&BackupInfo>, path: &Path) -> String {
+    let Some(info) = info else {
+        return text::file_name(path);
+    };
+    let kind = match info.kind {
+        BackupKind::Snapshot => "Backup",
+        BackupKind::Conflict => "Conflict copy",
+        BackupKind::Unsaved => "Unsaved copy",
+    };
+    format!(
+        "{kind} from {} \u{b7} read-only",
+        text::date_time(info.taken_at)
+    )
+}
+
+/// The password card's button (05 §2.3 "Backup viewer").
+const OPEN_LABEL: &str = "Open read-only";
+
 /// "Backup — <file name>": the strip's title and the window title (Dock, Window menu).
 fn backup_title(path: &Path) -> String {
     format!("Backup \u{2014} {}", text::file_name(path))
@@ -138,9 +171,15 @@ fn backup_title(path: &Path) -> String {
 
 /// Opens the viewer for `path` in a new window: the main window's chrome (transparent
 /// title bar, traffic lights inline, moved only from the band).
+///
+/// `info` is the backups-list entry for `path` (its kind and time, `None` when unknown)
+/// and `vault_name` the open vault's name, both shown on the password card; passed in
+/// because `AppState` cannot be read while it opens this window.
 pub fn open_backup_window(
     state: Entity<AppState>,
     path: PathBuf,
+    info: Option<BackupInfo>,
+    vault_name: String,
     cx: &mut App,
 ) -> gpui::Result<gpui::AnyWindowHandle> {
     let title = backup_title(&path);
@@ -148,7 +187,8 @@ pub fn open_backup_window(
     let handle = cx.open_window(options, |window, cx| {
         window.set_window_title(&title);
         theme::apply(window, cx);
-        let view = cx.new(|cx| BackupWindow::new(state, path, window, cx));
+        let view =
+            cx.new(|cx| BackupWindow::new(state, path, info.as_ref(), vault_name, window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     })?;
     Ok(handle.into())
@@ -158,11 +198,23 @@ impl BackupWindow {
     pub fn new(
         state: Entity<AppState>,
         path: PathBuf,
+        info: Option<&BackupInfo>,
+        vault_name: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let password = ui::password_input("Master password of this backup", window, cx);
+        // The main unlock screen's placeholder (05 §2.2).
+        let password = ui::password_input(ui::MASTER_PASSWORD_PLACEHOLDER, window, cx);
+        let subtitle = backup_subtitle(info, &path).into();
+        let vault_name = if vault_name.is_empty() {
+            text::file_name(&path)
+        } else {
+            vault_name
+        }
+        .into();
         let search = ui::text_input("Search", window, cx);
+        // Esc in the search field clears it (and refilters through its Change event).
+        search.update(cx, |s, _| s.set_clean_on_escape(true));
         ui::focus_input(&password, window, cx);
         let focus = cx.focus_handle();
         let subscriptions = vec![
@@ -171,11 +223,16 @@ impl BackupWindow {
                     this.submit(window, cx);
                 }
             }),
-            cx.subscribe_in(&search, window, |this, _, ev: &InputEvent, _, cx| {
-                if let InputEvent::Change = ev {
-                    this.refilter(cx);
-                }
-            }),
+            cx.subscribe_in(
+                &search,
+                window,
+                |this, _, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::Change => this.refilter(cx),
+                    // As the main list: ⏎ in the search field moves to the list.
+                    InputEvent::PressEnter { .. } => window.focus(&this.list_focus, cx),
+                    _ => {}
+                },
+            ),
             // Never outlive the live session: drop the keys and close when it locks.
             cx.observe_in(&state, window, |this, state, window, cx| {
                 this.reduce_motion = state.read(cx).reduce_motion;
@@ -196,6 +253,8 @@ impl BackupWindow {
         ];
         Self {
             state,
+            vault_name,
+            subtitle,
             path,
             password,
             vault: None,
@@ -205,6 +264,9 @@ impl BackupWindow {
             search,
             sort: Sort::Alphabetical,
             sort_menu_open: false,
+            filter: Filter::All,
+            tags_open: true,
+            counts: Counts::default(),
             sort_focus: cx.focus_handle(),
             selection: None,
             revealed: HashSet::new(),
@@ -217,7 +279,8 @@ impl BackupWindow {
             busy: false,
             option_reveal: false,
             focus,
-            list_focus: cx.focus_handle(),
+            list_focus: cx.focus_handle().tab_stop(true),
+            detail_focus: cx.focus_handle(),
             focus_list: false,
             _ticker: cx.spawn(async move |this, cx| {
                 loop {
@@ -272,6 +335,7 @@ impl BackupWindow {
         self.vault = None;
         self.session = None;
         self.listing = Listing::default();
+        self.counts = Counts::default();
         self.list_state.reset(0);
         self.selection = None;
         self.revealed.clear();
@@ -329,16 +393,24 @@ impl BackupWindow {
     fn opened(&mut self, vault: UnlockedVault, session: (u64, u64), cx: &mut Context<Self>) {
         // Notices against the backup's own items (05 §2.3), once per open.
         let issues = Rc::new(audit::audit(&vault));
+        self.counts = listing::counts(&vault);
         self.vault = Some(vault);
         self.session = Some(session);
-        self.sort = self.state.read(cx).sort;
+        let state = self.state.read(cx);
+        (self.sort, self.tags_open) = (state.sort, state.tags_open);
         self.listing.issues = issues;
         self.refilter(cx);
         self.selection = self.listing.items.first().copied();
         self.focus_list = true;
     }
 
-    /// Recomputes the list for the current query and `sort` with the main list's matcher
+    /// A sidebar row: shows `filter` (selection rules as for a query).
+    fn set_filter(&mut self, filter: Filter, cx: &mut Context<Self>) {
+        self.filter = filter;
+        self.refilter(cx);
+    }
+
+    /// Recomputes the list for the current query, filter and `sort` with the main list's matcher
     /// and ordering. A selection the query hides moves to the first hit.
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let Some(vault) = self.vault.as_ref() else {
@@ -348,7 +420,7 @@ impl BackupWindow {
         self.listing = listing::compute(
             vault,
             &query,
-            &Filter::All,
+            &self.filter,
             self.sort,
             self.listing.issues.clone(),
         );
@@ -444,6 +516,8 @@ impl BackupWindow {
                 _ => Some(field.value.clone()),
             }),
             CopyTarget::History(ix) => item.history.get(ix).map(|h| h.value.clone()),
+            // ⌘C in the list, as in the main window.
+            CopyTarget::Username => listing::username_field(item).map(|f| f.value.clone()),
             _ => None,
         });
         let Some(value) = value else {
@@ -495,23 +569,22 @@ impl BackupWindow {
 }
 
 impl BackupWindow {
-    /// The password card, behaving like the main unlock screen (05 §2.2): a wrong password
-    /// shakes the field; while verifying, the controls are hidden (kept in the layout)
-    /// under "Unlocking…".
+    /// The password card: the main unlock screen's card (05 §2.3 "Backup viewer"), the
+    /// app icon with a read-only eye badge, the vault name and the backup's kind and time.
+    /// It behaves like the unlock screen: a wrong password shakes the field; while
+    /// verifying, the controls are hidden under "Unlocking…".
     fn render_prompt(&self, cx: &mut Context<Self>) -> AnyElement {
-        let reduce_motion = self.reduce_motion;
         let theme = cx.theme();
         let field = div()
             .w_full()
             .debug_selector(|| "backup-password".into())
-            .child(ui::input(&self.password).mask_toggle());
+            // No reveal toggle, as on the main unlock screen.
+            .child(ui::input(&self.password));
         let controls = ui::v_flex()
-            .w_full()
-            .gap(px(10.))
             .child(ui::shake_field(
                 field,
                 self.failures,
-                reduce_motion,
+                self.reduce_motion,
                 "backup-input-shake",
             ))
             .when_some(self.error.clone(), |col, e| {
@@ -519,40 +592,30 @@ impl BackupWindow {
             })
             .child(
                 Button::new("backup-open")
+                    .debug_selector(|| format!("backup-open {OPEN_LABEL}"))
                     .primary()
                     .w_full()
-                    .label("Open")
+                    .label(OPEN_LABEL)
                     .clickable_when(!self.busy)
                     .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-            )
-            // Hidden, not removed: the card keeps its size, and a hidden div paints none of
-            // its children, so the field takes no clicks or keys.
-            .when(self.busy, |controls| controls.invisible());
+            );
+        let card = ui::unlock_card(
+            ui::UnlockCard {
+                prefix: "backup",
+                icon: gpui::img(crate::assets::APP_ICON)
+                    .size_full()
+                    .into_any_element(),
+                badge: Some(IconName::Eye),
+                name: self.vault_name.clone(),
+                subtitle: Some(self.subtitle.clone()),
+                controls,
+                unlocking: self.busy.then_some("backup-unlocking"),
+            },
+            cx,
+        );
+        // The password is the card's only input: a revealed one is never copied out.
         ui::centered(cx)
-            .child(
-                // The password is the card's only input: a revealed one is never copied out.
-                ui::refuse_plain_copy(ui::card(cx))
-                    .debug_selector(|| "backup-card".into())
-                    .w(px(380.))
-                    .gap(px(10.))
-                    .child(ui::illustration(IconName::Inbox, Some(IconName::Eye), cx))
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Open backup read-only"),
-                    )
-                    .child(ui::muted(text::file_name(&self.path), cx).text_xs())
-                    .child(
-                        div()
-                            .relative()
-                            .w_full()
-                            .child(controls)
-                            .when(self.busy, |area| {
-                                area.child(ui::unlocking_overlay("backup-unlocking", cx))
-                            }),
-                    ),
-            )
+            .child(ui::refuse_plain_copy(card))
             .into_any_element()
     }
 
@@ -586,7 +649,7 @@ impl BackupWindow {
                     .flex_none()
                     .flex()
                     .items_center()
-                    .child(Tag::info().child("Read-only")),
+                    .child(ui::info_label("Read-only", cx)),
             )
             .child(div().flex_1())
             .child(
@@ -607,6 +670,28 @@ impl BackupWindow {
             .into_any_element()
     }
 
+    /// ↓ / ↑ in the list (`delta` rows of items, headers skipped), as the main list's
+    /// `AppState::select_offset`: no selection picks the first item; the row scrolls
+    /// into view.
+    fn select_offset(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let items = &self.listing.items;
+        if items.is_empty() {
+            return;
+        }
+        let next = match self
+            .selection
+            .and_then(|id| items.iter().position(|i| *i == id))
+        {
+            Some(ix) => ix.saturating_add_signed(delta).min(items.len() - 1),
+            None => 0,
+        };
+        let id = items[next];
+        self.select(id, cx);
+        if let Some(row) = self.listing.row_of(id) {
+            self.list_state.scroll_to_reveal_item(row);
+        }
+    }
+
     /// Picks the list order from the sort menu.
     fn set_sort(&mut self, sort: Sort, cx: &mut Context<Self>) {
         self.sort_menu_open = false;
@@ -615,6 +700,50 @@ impl BackupWindow {
             self.refilter(cx);
         }
         cx.notify();
+    }
+
+    /// `[sidebar, list]` widths: the defaults, fitted as the main window's so the detail
+    /// keeps `DETAIL_MIN` in a narrow window.
+    fn widths(window: &Window) -> [f32; 2] {
+        fit_widths(
+            [SIDEBAR.0, LIST.0],
+            window.viewport_size().width.as_f32(),
+            true,
+        )
+    }
+
+    /// The main window's sidebar column over the backup's counts, at the sidebar's default
+    /// width: no divider, no collapse. Its filter and Tags state are this window's own.
+    fn render_sidebar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let (pick, toggle) = (cx.entity().downgrade(), cx.entity().downgrade());
+        div()
+            .flex_none()
+            .w(px(Self::widths(window)[0]))
+            .h_full()
+            .child(sidebar_column(
+                SidebarColumn {
+                    name: self.vault_name.clone(),
+                    counts: &self.counts,
+                    filter: &self.filter,
+                    tags_open: self.tags_open,
+                    on_pick: Rc::new(move |filter, _, cx| {
+                        pick.update(cx, |this, cx| this.set_filter(filter, cx)).ok();
+                    }),
+                    on_toggle_tags: Rc::new(move |_, cx| {
+                        toggle
+                            .update(cx, |this, cx| {
+                                this.tags_open = !this.tags_open;
+                                cx.notify();
+                            })
+                            .ok();
+                    }),
+                    // The strip above already fills the title-bar band.
+                    top_pad: px(0.),
+                    focus: None,
+                },
+                cx,
+            ))
+            .into_any_element()
     }
 
     /// The list column: the main list's search field, sort menu and rows over the
@@ -645,10 +774,12 @@ impl BackupWindow {
         let theme = cx.theme();
         let active = self.list_focus.contains_focused(window, cx);
         let body = if self.listing.rows.is_empty() {
-            let message = if self.search.read(cx).value().trim().is_empty() {
+            let message = if !self.search.read(cx).value().trim().is_empty() {
+                crate::screens::main::list::NO_RESULTS
+            } else if self.filter == Filter::All {
                 "This backup has no items"
             } else {
-                crate::screens::main::list::NO_RESULTS
+                crate::screens::main::list::NO_ITEMS_HERE
             };
             ui::v_flex()
                 .size_full()
@@ -693,7 +824,7 @@ impl BackupWindow {
         };
         ui::v_flex()
             .id("backup-list")
-            .w(px(super::main::LIST.0))
+            .w(px(Self::widths(window)[1]))
             .flex_none()
             .h_full()
             .border_r_1()
@@ -703,11 +834,20 @@ impl BackupWindow {
                     .flex_none()
                     .h(super::main::header_height(cx))
                     .px(px(ui::COLUMN_PAD_X))
+                    // As the main list's search row with the sidebar shown.
+                    .pl(px(ui::list_header_pad_left(Self::widths(window)[0])))
                     .gap(px(4.))
                     .child(
                         div()
                             .flex_1()
                             .debug_selector(|| "list-search".into())
+                            // ↓ leaves the field for the list and moves the selection,
+                            // as ↓ in the list does (the input would swallow it).
+                            .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
+                                cx.stop_propagation();
+                                window.focus(&this.list_focus, cx);
+                                this.select_offset(1, cx);
+                            }))
                             .child(search_field(&self.search, cx)),
                     )
                     .child(div().flex_none().child(sort_button)),
@@ -717,6 +857,18 @@ impl BackupWindow {
                     .id("item-list")
                     .debug_selector(|| "item-list".into())
                     .track_focus(&self.list_focus)
+                    // The main list's key context and actions (↑ ↓ ⏎ ⌘C), handled here on
+                    // the backup's own selection; their global handlers serve only the
+                    // main window (`actions::on_main`).
+                    .key_context(LIST_CONTEXT)
+                    .on_action(cx.listener(|this, _: &NextItem, _, cx| this.select_offset(1, cx)))
+                    .on_action(cx.listener(|this, _: &PrevItem, _, cx| this.select_offset(-1, cx)))
+                    .on_action(cx.listener(|this, _: &FocusDetail, window, cx| {
+                        window.focus(&this.detail_focus, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &CopyUsername, _, cx| {
+                        this.copy(CopyTarget::Username, cx);
+                    }))
                     .flex_1()
                     .min_h_0()
                     .mx(px(2.))
@@ -751,7 +903,8 @@ impl BackupWindow {
             && ui::option_alone(&window.modifiers())
             && window.is_window_active()
             && self.focus.contains_focused(window, cx);
-        let column = window.viewport_size().width.as_f32() - super::main::LIST.0;
+        let [side, list] = Self::widths(window);
+        let column = window.viewport_size().width.as_f32() - side - list;
         let content = match self.selected_item(cx) {
             Some(item) => ReadDetail {
                 state: &self.state,
@@ -776,6 +929,7 @@ impl BackupWindow {
         ui::v_flex()
             .id("backup-detail")
             .debug_selector(|| "backup-detail".into())
+            .track_focus(&self.detail_focus)
             .flex_1()
             .min_w_0()
             .h_full()
@@ -816,6 +970,7 @@ impl Render for BackupWindow {
                     ui::h_flex()
                         .flex_1()
                         .min_h_0()
+                        .child(self.render_sidebar(window, cx))
                         .child(self.render_list(window, cx))
                         .child(self.render_detail(window, cx)),
                 )
@@ -892,16 +1047,42 @@ mod tests {
         (state, backup)
     }
 
+    /// The viewer for `backup`, with its entry from the live vault's backups list (as
+    /// Settings passes it) and the vault name "Personal".
     fn window(
         state: &Entity<AppState>,
         backup: &std::path::Path,
+        cx: &mut TestAppContext,
+    ) -> (Entity<BackupWindow>, VisualTestContext) {
+        let info = state.read_with(cx, |s, _| {
+            s.vault
+                .as_ref()
+                .and_then(|v| v.backups().ok())
+                .and_then(|list| list.into_iter().find(|b| b.path == backup))
+        });
+        window_with(state, backup, info, cx)
+    }
+
+    fn window_with(
+        state: &Entity<AppState>,
+        backup: &std::path::Path,
+        info: Option<BackupInfo>,
         cx: &mut TestAppContext,
     ) -> (Entity<BackupWindow>, VisualTestContext) {
         cx.update(gpui_component::init);
         let mut view = None;
         let window = cx.add_window(|window, cx| {
             theme::apply(window, cx);
-            let v = cx.new(|cx| BackupWindow::new(state.clone(), backup.to_owned(), window, cx));
+            let v = cx.new(|cx| {
+                BackupWindow::new(
+                    state.clone(),
+                    backup.to_owned(),
+                    info.as_ref(),
+                    "Personal".into(),
+                    window,
+                    cx,
+                )
+            });
             view = Some(v.clone());
             Root::new(v, window, cx)
         });
@@ -1433,7 +1614,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (state, backup) = setup(dir.path(), cx);
         let (_view, mut vcx, _) = opened(&state, &backup, cx);
-        for width in [None, Some(600.)] {
+        for width in [None, Some(820.), Some(600.)] {
             if let Some(width) = width {
                 vcx.simulate_resize(gpui::size(px(width), px(600.)));
                 vcx.run_until_parked();
@@ -1468,6 +1649,14 @@ mod tests {
                 tag.right() < replace.left(),
                 "tag, then Replace at {width:?}"
             );
+            // Above the window's minimum the columns fit like the main window's.
+            if width != Some(600.) {
+                let detail = bounds("backup-detail", &mut vcx);
+                assert!(
+                    detail.size.width >= px(super::super::main::DETAIL_MIN),
+                    "detail keeps its minimum at {width:?}"
+                );
+            }
             assert!(replace.right() <= window, "Replace inside at {width:?}");
             assert_eq!(
                 replace.right(),
@@ -1482,7 +1671,7 @@ mod tests {
 
         // Opened for real: the main window's chrome, titled after the backup.
         let handle = cx
-            .update(|cx| open_backup_window(state.clone(), backup.clone(), cx))
+            .update(|cx| open_backup_window(state.clone(), backup.clone(), None, String::new(), cx))
             .unwrap();
         let title = VisualTestContext::from_window(handle, cx).window_title();
         let name = text::file_name(&backup);
@@ -2002,5 +2191,371 @@ mod tests {
         vcx.run_until_parked();
         assert!(vcx.debug_bounds("backup-unlocking").is_none());
         assert_eq!(bounds("backup-password", &mut vcx), field, "back in place");
+    }
+
+    /// Owner 2026-11-22: the viewer's list takes the main list's keys. ↓ ↓ walks to the
+    /// third item (the detail follows), ↑ goes back, ⏎ moves to the detail; ⌘F then ↓
+    /// leaves the search for the list and moves on; Esc clears a query. The main
+    /// window's selection never moves.
+    #[gpui::test]
+    fn keyboard_navigates_the_backup_list(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = SyncedVault::create(
+            &dir.path().join("t.vault"),
+            &SecretString::new(PW.into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let device = vault.device_id();
+        let ids: Vec<Uuid> = vault
+            .edit(|v| {
+                ["Alpha", "Bravo", "Charlie"]
+                    .map(|t| {
+                        let mut item = Item::new(t, device, 1);
+                        item.fields.push(Field::new(
+                            "username",
+                            FieldKind::Text,
+                            SecretString::new(format!("{}-user", t.to_lowercase())),
+                            1,
+                        ));
+                        v.insert(item, 1)
+                    })
+                    .to_vec()
+            })
+            .unwrap();
+        vault.save().unwrap();
+        let backup = vault.backup_now().unwrap();
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        state.update(cx, |s, _| s.install_unlocked_for_tests(vault));
+        // The main window's handlers too: in tests they would serve any window, so an
+        // unhandled ↓ here would move the main selection.
+        cx.update(|cx| {
+            crate::actions::bind_keys(cx);
+            crate::actions::register(&state, cx);
+        });
+        state.update(cx, |s, cx| s.select(ids[0], cx));
+        let main_selection = state.read_with(cx, |s, _| s.selection);
+        assert_eq!(main_selection, Some(ids[0]));
+        let (view, mut vcx) = window(&state, &backup, cx);
+        view.update(&mut vcx, |w, cx| w.unlock(SecretString::new(PW.into()), cx));
+        vcx.run_until_parked();
+        let selected = |vcx: &mut VisualTestContext| view.read_with(vcx, |w, _| w.selection);
+        let list_focused = |vcx: &mut VisualTestContext| {
+            vcx.update(|window, cx| view.read(cx).list_focus.is_focused(window))
+        };
+        assert!(list_focused(&mut vcx), "the list has focus after unlock");
+        assert_eq!(selected(&mut vcx), Some(ids[0]));
+
+        vcx.simulate_keystrokes("down down");
+        vcx.run_until_parked();
+        assert_eq!(selected(&mut vcx), Some(ids[2]));
+        assert!(vcx.debug_bounds("detail-title Charlie").is_some());
+        vcx.simulate_keystrokes("down");
+        assert_eq!(selected(&mut vcx), Some(ids[2]), "stops at the last item");
+        vcx.simulate_keystrokes("up");
+        vcx.run_until_parked();
+        assert_eq!(selected(&mut vcx), Some(ids[1]));
+        assert!(vcx.debug_bounds("detail-title Bravo").is_some());
+        assert_eq!(state.read_with(&vcx, |s, _| s.selection), main_selection);
+
+        // ⌘C in the list copies the backup item's username, with this window's pill;
+        // the main window (Alpha selected there) copies nothing of its own.
+        let board = crate::clipboard::fake::FakePasteboard::default();
+        state.update(&mut vcx, |s, _| s.set_pasteboard(Box::new(board.clone())));
+        vcx.simulate_keystrokes("cmd-c");
+        vcx.run_until_parked();
+        assert_eq!(board.contents().as_deref(), Some("bravo-user"));
+        assert!(vcx.debug_bounds("detail-copy-feedback").is_some());
+        assert_eq!(state.read_with(&vcx, |s, _| s.selection), main_selection);
+
+        // ⏎ moves to the detail column, as in the main window.
+        vcx.simulate_keystrokes("enter");
+        assert!(vcx.update(|window, cx| view.read(cx).detail_focus.is_focused(window)));
+
+        // ⌘F, then ↓: focus back in the list, one item further.
+        vcx.simulate_keystrokes("cmd-f");
+        assert!(!list_focused(&mut vcx));
+        vcx.simulate_keystrokes("down");
+        vcx.run_until_parked();
+        assert!(list_focused(&mut vcx), "↓ leaves the search");
+        assert_eq!(selected(&mut vcx), Some(ids[2]));
+
+        // Esc clears a query in the search field.
+        vcx.simulate_keystrokes("cmd-f");
+        vcx.simulate_input("zz");
+        vcx.run_until_parked();
+        assert!(view.read_with(&vcx, |w, _| w.item_ids().is_empty()));
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        view.read_with(&vcx, |w, cx| {
+            assert!(ui::input_is_empty(&w.search, cx));
+            assert_eq!(w.item_ids().len(), 3);
+        });
+        assert_eq!(state.read_with(&vcx, |s, _| s.selection), main_selection);
+
+        // Locked: ⌘C through the list's key context copies nothing (the window's close
+        // is deferred, so the action can still arrive).
+        view.update(&mut vcx, |w, cx| {
+            w.select(ids[1], cx);
+            w.status = None;
+        });
+        board.set("from another app");
+        vcx.update(|window, cx| {
+            let list = view.read(cx).list_focus.clone();
+            window.focus(&list, cx);
+            state.update(cx, |s, cx| s.lock(cx));
+            list.dispatch_action(&CopyUsername, window, cx);
+            assert!(view.read(cx).status.is_none(), "no pill after lock");
+        });
+        assert_ne!(board.contents().as_deref(), Some("bravo-user"));
+    }
+
+    /// The password card is the unlock screen's (05 §2.3 "Backup viewer"): the app icon
+    /// with the eye badge at its lower right, the vault name, "Backup from <time> ·
+    /// read-only" from the backups list, the unlock placeholder, "Open read-only".
+    #[gpui::test]
+    fn prompt_is_the_unlock_card_with_badge_and_backup_line(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, backup) = setup(dir.path(), cx);
+        let (view, mut vcx) = window(&state, &backup, cx);
+        vcx.run_until_parked();
+        let icon = bounds("backup-icon", &mut vcx);
+        let badge = bounds("backup-badge", &mut vcx);
+        assert!(icon.contains(&badge.center()), "on the icon");
+        assert!(
+            badge.center().x > icon.center().x && badge.center().y > icon.center().y,
+            "lower right"
+        );
+        assert_eq!(icon.size.width, px(ui::UNLOCK_ICON_SIZE));
+        // Owner decision 2026-11-22: 32 px, centre 6 px inside the box's corner.
+        assert_eq!(badge.size.width, px(32.));
+        assert_eq!(badge.size.height, px(32.));
+        let name = bounds("backup-vault-name", &mut vcx);
+        assert!(name.top() > icon.bottom());
+        assert_eq!(
+            view.read_with(&vcx, |w, _| w.vault_name.clone()),
+            "Personal"
+        );
+        let line = view.read_with(&vcx, |w, _| w.subtitle.to_string());
+        assert!(line.starts_with("Backup from "), "{line}");
+        assert!(line.ends_with(" UTC \u{b7} read-only"), "{line}");
+        let key: &'static str = Box::leak(format!("backup-subtitle {line}").into_boxed_str());
+        let sub = bounds(key, &mut vcx);
+        assert!(
+            sub.top() >= name.bottom() && sub.bottom() < bounds("backup-password", &mut vcx).top()
+        );
+        assert!(vcx.debug_bounds("backup-open Open read-only").is_some());
+        // The main unlock card's frame: same width.
+        assert_eq!(bounds("backup-card", &mut vcx).size.width, px(360.));
+    }
+
+    /// The kind and time line: "Conflict copy from …" / "Unsaved copy from …" for those
+    /// kinds, the bare file name when no timestamp parsed (not in the backups list).
+    #[gpui::test]
+    fn prompt_line_names_the_kind_or_falls_back_to_the_file_name(cx: &mut TestAppContext) {
+        let path = std::path::Path::new("/x/backups/conflict-2023-11-14T22-13-20Z-t 2.vault");
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let info = |kind| BackupInfo {
+            path: path.to_owned(),
+            taken_at: at,
+            size: 0,
+            seq: 0,
+            kind,
+        };
+        assert_eq!(
+            backup_subtitle(Some(&info(BackupKind::Conflict)), path),
+            "Conflict copy from 2023-11-14 22:13 UTC \u{b7} read-only"
+        );
+        assert_eq!(
+            backup_subtitle(Some(&info(BackupKind::Unsaved)), path),
+            "Unsaved copy from 2023-11-14 22:13 UTC \u{b7} read-only"
+        );
+        assert_eq!(
+            backup_subtitle(Some(&info(BackupKind::Snapshot)), path),
+            "Backup from 2023-11-14 22:13 UTC \u{b7} read-only"
+        );
+
+        // Not in the list (a file outside `backups/`): its name, drawn on the card.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = setup(dir.path(), cx);
+        let odd = dir.path().join("odd name.vault.bin");
+        std::fs::write(&odd, b"x").unwrap();
+        let (view, mut vcx) = window_with(&state, &odd, None, cx);
+        vcx.run_until_parked();
+        assert_eq!(
+            view.read_with(&vcx, |w, _| w.subtitle.clone()),
+            "odd name.vault.bin"
+        );
+        assert!(
+            vcx.debug_bounds("backup-subtitle odd name.vault.bin")
+                .is_some()
+        );
+        // A conflict entry passed in from the list words it as a conflict copy.
+        let (view, vcx) = window_with(&state, &odd, Some(info(BackupKind::Conflict)), cx);
+        vcx.run_until_parked();
+        assert!(view.read_with(&vcx, |w, _| w.subtitle.starts_with("Conflict copy from ")));
+    }
+
+    /// Opened from Settings (`AppState::open_backup`): the card's line comes from the
+    /// backups list entry and its name is the open vault's.
+    #[gpui::test]
+    fn open_backup_passes_the_list_entry_and_vault_name(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, backup) = setup(dir.path(), cx);
+        cx.update(gpui_component::init);
+        state.update(cx, |s, _| {
+            s.sync.backups = s.vault.as_ref().unwrap().backups().unwrap();
+            // `install_unlocked_for_tests` sets no path: give the vault a known name.
+            s.vault_path = Some(dir.path().join("Family.vault"));
+        });
+        let name = state.read_with(cx, |s, _| s.vault_name());
+        assert!(!name.is_empty());
+        state.update(cx, |s, cx| s.open_backup(backup.clone(), cx));
+        cx.run_until_parked();
+        let handle = state.read_with(cx, |s, _| s.backup_windows[0]);
+        let root = handle.downcast::<Root>().unwrap();
+        let (vault_name, line) = cx.update(|cx| {
+            let view = root.read(cx).unwrap().view().clone();
+            let w = view.downcast::<BackupWindow>().unwrap().read(cx);
+            (w.vault_name.to_string(), w.subtitle.to_string())
+        });
+        assert!(line.starts_with("Backup from "), "{line}");
+        assert_eq!(vault_name, name, "the open vault's name");
+        assert_ne!(vault_name, text::file_name(&backup), "not the fallback");
+    }
+
+    fn click(key: &'static str, vcx: &mut VisualTestContext) {
+        let at = bounds(key, vcx).center();
+        vcx.simulate_click(at, gpui::Modifiers::default());
+        vcx.run_until_parked();
+    }
+
+    /// Owner 2026-11-22: the main sidebar column, left of the list at the sidebar's
+    /// default width, with the backup's counts and the Tags section.
+    #[gpui::test]
+    fn sidebar_shows_the_backups_counts_and_tags(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, backup) = setup(dir.path(), cx);
+        let (_view, mut vcx, _) = opened(&state, &backup, cx);
+        let column = bounds("sidebar-column", &mut vcx);
+        assert_eq!(column.size.width, px(SIDEBAR.0));
+        assert!(column.right() <= bounds("list-search", &mut vcx).left());
+        assert!(column.top() >= bounds("backup-strip", &mut vcx).bottom());
+        bounds("nav All Items icon=LayoutList", &mut vcx);
+        bounds("nav-count All Items 2", &mut vcx);
+        bounds("nav-count Favorites 0", &mut vcx);
+        bounds("nav Tags icon=ChevronDown", &mut vcx);
+        bounds("nav-count #work 1", &mut vcx);
+        bounds("sidebar-name Personal", &mut vcx);
+        assert!(
+            vcx.debug_bounds("nav Recently Deleted icon=Trash")
+                .is_none(),
+            "hidden with an empty trash"
+        );
+    }
+
+    /// A tag row filters the backup's list; the selection moves to the first hit and the
+    /// main window's filter is untouched.
+    #[gpui::test]
+    fn tag_row_filters_the_backup_only(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, backup) = setup(dir.path(), cx);
+        let (view, mut vcx, github) = opened(&state, &backup, cx);
+        let alarm = view.read_with(&vcx, |w, _| w.item_ids()[0]);
+        view.update(&mut vcx, |w, cx| w.select(alarm, cx));
+        click("nav #work icon=Tag", &mut vcx);
+        view.read_with(&vcx, |w, _| {
+            assert_eq!(w.filter, Filter::Tag("work".into()));
+            assert_eq!(w.item_ids(), &[github]);
+            assert_eq!(w.selection, Some(github));
+        });
+        assert_eq!(state.read_with(&vcx, |s, _| s.filter.clone()), Filter::All);
+        click("nav All Items icon=LayoutList", &mut vcx);
+        assert_eq!(view.read_with(&vcx, |w, _| w.item_ids().len()), 2);
+    }
+
+    /// Recently Deleted lists the backup's own trash, with its count; the trashed item
+    /// renders in the shared read view without the live trash's actions.
+    #[gpui::test]
+    fn recently_deleted_lists_the_backups_trash(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = SyncedVault::create(
+            &dir.path().join("t.vault"),
+            &SecretString::new(PW.into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        let device = vault.device_id();
+        let gone = vault
+            .edit(|v| {
+                let mut kept = Item::new("Kept", device, 1);
+                kept.favorite = true;
+                v.insert(kept, 1);
+                let gone = v.insert(Item::new("Gone", device, 1), 1);
+                v.delete(gone, text::now_millis()).unwrap();
+                gone
+            })
+            .unwrap();
+        vault.save().unwrap();
+        let backup = vault.backup_now().unwrap();
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        state.update(cx, |s, _| s.install_unlocked_for_tests(vault));
+        let (view, mut vcx) = window(&state, &backup, cx);
+        view.update(&mut vcx, |w, cx| w.unlock(SecretString::new(PW.into()), cx));
+        vcx.run_until_parked();
+        assert_eq!(view.read_with(&vcx, |w, _| w.item_ids().len()), 1);
+        bounds("nav-count All Items 1", &mut vcx);
+        bounds("nav-count Recently Deleted 1", &mut vcx);
+        click("nav Recently Deleted icon=Trash", &mut vcx);
+        view.read_with(&vcx, |w, _| {
+            assert_eq!(w.item_ids(), &[gone]);
+            assert_eq!(w.selection, Some(gone));
+        });
+        bounds("detail-title Gone", &mut vcx);
+        bounds("backup-copy-item", &mut vcx);
+        // Copied across, the trashed item arrives live: under All Items, not in the trash.
+        let copy = view
+            .update(&mut vcx, |w, cx| w.copy_to_current(cx))
+            .expect("copied");
+        state.read_with(&vcx, |s, _| {
+            let v = s.unlocked_vault().unwrap();
+            assert_eq!(v.get(copy).unwrap().deleted_at, None);
+            assert!(v.items().any(|i| i.id == copy));
+            assert!(v.deleted_items().all(|i| i.id != copy));
+        });
+        assert_eq!(state.read_with(&vcx, |s, _| s.filter.clone()), Filter::All);
+        click("nav Favorites icon=Star", &mut vcx);
+        let kept = view.read_with(&vcx, |w, _| {
+            assert_eq!(w.item_ids().len(), 1);
+            w.item_ids()[0]
+        });
+        assert_eq!(
+            view.read_with(&vcx, |w, cx| w.item(kept, cx).unwrap().title.clone()),
+            "Kept"
+        );
+    }
+
+    /// Tags starts as the main window's at unlock time and toggles in this window only.
+    #[gpui::test]
+    fn tags_toggle_is_local_and_starts_as_main(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, backup) = setup(dir.path(), cx);
+        let (view, mut vcx) = window(&state, &backup, cx);
+        state.update(&mut vcx, |s, cx| s.toggle_tags(cx));
+        view.update(&mut vcx, |w, cx| w.unlock(SecretString::new(PW.into()), cx));
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("nav #work icon=Tag").is_none());
+        click("nav Tags icon=ChevronRight", &mut vcx);
+        bounds("nav #work icon=Tag", &mut vcx);
+        click("nav Tags icon=ChevronDown", &mut vcx);
+        assert!(vcx.debug_bounds("nav #work icon=Tag").is_none());
+        assert!(!view.read_with(&vcx, |w, _| w.tags_open));
+        click("nav Tags icon=ChevronRight", &mut vcx);
+        assert!(view.read_with(&vcx, |w, _| w.tags_open));
+        assert!(!state.read_with(&vcx, |s, _| s.tags_open), "main untouched");
     }
 }

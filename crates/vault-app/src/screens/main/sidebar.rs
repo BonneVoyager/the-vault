@@ -7,15 +7,18 @@
 //! `theme.tokens` (which our theme overrides do not reach), has no dividers between
 //! menus, and its rows are not Tab stops.
 
+use std::rc::Rc;
+
 use gpui::{
-    App, Context, ElementId, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
-    prelude::FluentBuilder as _, px,
+    App, Context, Div, ElementId, FocusHandle, InteractiveElement as _, IntoElement,
+    ParentElement as _, Pixels, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
+    div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{ActiveTheme as _, Icon};
 use gpui_kit_assets::IconName;
 
 use super::MainScreen;
+use crate::listing::Counts;
 use crate::state::Filter;
 use crate::ui::{self, Clickable as _};
 
@@ -76,127 +79,173 @@ fn nav_row(
         .on_click(move |_, window, cx| on_click(window, cx))
 }
 
+/// Picks a sidebar filter (a row click).
+pub(crate) type OnPick = Rc<dyn Fn(Filter, &mut Window, &mut App)>;
+/// Opens or closes the Tags section.
+pub(crate) type OnToggle = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// What [`sidebar_column`] draws and where its clicks go: the main window wires it to
+/// `AppState`, the backup viewer to its own window-local filter.
+pub(crate) struct SidebarColumn<'a> {
+    /// The header line: the vault's name.
+    pub name: SharedString,
+    pub counts: &'a Counts,
+    /// The selected row.
+    pub filter: &'a Filter,
+    pub tags_open: bool,
+    pub on_pick: OnPick,
+    pub on_toggle_tags: OnToggle,
+    /// Space above the header: the title-bar band when the column runs under it.
+    pub top_pad: Pixels,
+    /// Tracked on the column (the main screen sees a Tab-focused row when collapsing).
+    pub focus: Option<&'a FocusHandle>,
+}
+
+/// The sidebar column (05 §2.3), shared by the main window and the backup viewer: header,
+/// All Items, Favorites, Recently Deleted (hidden while empty), then the Tags section.
+pub(crate) fn sidebar_column(parts: SidebarColumn, cx: &App) -> Div {
+    let SidebarColumn {
+        name,
+        counts,
+        filter,
+        tags_open,
+        on_pick,
+        on_toggle_tags,
+        top_pad,
+        focus,
+    } = parts;
+    let theme = cx.theme();
+    // Light mode: a translucent tint over the blurred window (05 §5).
+    let fill = crate::theme::sidebar_fill(theme.is_dark());
+    let pick = |f: Filter| {
+        let on_pick = on_pick.clone();
+        move |window: &mut Window, cx: &mut App| on_pick(f.clone(), window, cx)
+    };
+    let tags = counts.tags.iter().enumerate().map(|(i, (tag, n))| {
+        nav_row(
+            ("nav-tag", i),
+            crate::templates::tag_icon(tag),
+            format!("#{tag}"),
+            Some(*n),
+            matches!(filter, Filter::Tag(t) if crate::templates::tag_matches(t, tag)),
+            pick(Filter::Tag(tag.clone())),
+            cx,
+        )
+    });
+
+    ui::v_flex()
+        .size_full()
+        .debug_selector(|| "sidebar-column".into())
+        .when_some(focus, |col, focus| col.track_focus(focus))
+        .bg(fill)
+        .border_r_1()
+        .border_color(theme.sidebar_border)
+        .pt(top_pad)
+        .child(
+            div()
+                .debug_selector({
+                    let name = name.clone();
+                    move || format!("sidebar-name {name}")
+                })
+                .px(px(16.))
+                .pb(px(8.))
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.muted_foreground)
+                .truncate()
+                .child(name),
+        )
+        .child(
+            ui::v_flex()
+                .id("sidebar-sections")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px(px(8.))
+                .gap(px(1.))
+                .child(nav_row(
+                    "nav-all",
+                    IconName::LayoutList,
+                    "All Items",
+                    Some(counts.all),
+                    *filter == Filter::All,
+                    pick(Filter::All),
+                    cx,
+                ))
+                .child(nav_row(
+                    "nav-favorites",
+                    IconName::Star,
+                    "Favorites",
+                    Some(counts.favorites),
+                    *filter == Filter::Favorites,
+                    pick(Filter::Favorites),
+                    cx,
+                ))
+                // Hidden while the trash is empty (05 §2.3).
+                .when(counts.deleted > 0, |col| {
+                    col.child(nav_row(
+                        "nav-deleted",
+                        IconName::Trash,
+                        "Recently Deleted",
+                        Some(counts.deleted),
+                        *filter == Filter::RecentlyDeleted,
+                        pick(Filter::RecentlyDeleted),
+                        cx,
+                    ))
+                })
+                .child(ui::divider(cx).my(px(6.)))
+                .child(nav_row(
+                    "nav-tags",
+                    if tags_open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    },
+                    "Tags",
+                    None,
+                    false,
+                    move |window, cx| on_toggle_tags(window, cx),
+                    cx,
+                ))
+                .when(tags_open, |col| {
+                    col.when(counts.tags.is_empty(), |col| {
+                        col.child(
+                            div()
+                                .px(px(32.))
+                                .py(px(4.))
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("No tags"),
+                        )
+                    })
+                    .children(tags)
+                }),
+        )
+}
+
 impl MainScreen {
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let s = self.state.read(cx);
-        let theme = cx.theme();
-        // Light mode: a translucent tint over the blurred window (05 §5).
-        let fill = crate::theme::sidebar_fill(theme.is_dark());
-        let filter = s.filter.clone();
-        let counts = s.counts.clone();
-        let tags_open = s.tags_open;
-        let name = s.vault_name();
-
-        let pick = |f: Filter| {
-            let state = self.state.clone();
-            move |_: &mut Window, cx: &mut App| {
-                state.update(cx, |s, cx| s.set_filter(f.clone(), cx));
-            }
-        };
-
-        let tags_toggle = {
-            let state = self.state.clone();
-            move |_: &mut Window, cx: &mut App| state.update(cx, |s, cx| s.toggle_tags(cx))
-        };
-        let tags = counts.tags.iter().enumerate().map(|(i, (tag, n))| {
-            nav_row(
-                ("nav-tag", i),
-                crate::templates::tag_icon(tag),
-                format!("#{tag}"),
-                Some(*n),
-                matches!(&filter, Filter::Tag(t) if crate::templates::tag_matches(t, tag)),
-                pick(Filter::Tag(tag.clone())),
-                cx,
-            )
-        });
-
-        ui::v_flex()
-            .size_full()
-            .debug_selector(|| "sidebar-column".into())
-            // Lets the main screen see focus inside (a Tab-focused row) when collapsing.
-            .track_focus(&self.sidebar_focus)
-            .bg(fill)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
-            // The sidebar extends under the transparent titlebar; keep clear of the lights.
-            .pt(px(ui::TITLEBAR_HEIGHT))
-            .child(
-                div()
-                    .px(px(16.))
-                    .pb(px(8.))
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.muted_foreground)
-                    .truncate()
-                    .child(name),
-            )
-            .child(
-                ui::v_flex()
-                    .id("sidebar-sections")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px(px(8.))
-                    .gap(px(1.))
-                    .child(nav_row(
-                        "nav-all",
-                        IconName::LayoutList,
-                        "All Items",
-                        Some(counts.all),
-                        filter == Filter::All,
-                        pick(Filter::All),
-                        cx,
-                    ))
-                    .child(nav_row(
-                        "nav-favorites",
-                        IconName::Star,
-                        "Favorites",
-                        Some(counts.favorites),
-                        filter == Filter::Favorites,
-                        pick(Filter::Favorites),
-                        cx,
-                    ))
-                    // Hidden while the trash is empty (05 §2.3).
-                    .when(counts.deleted > 0, |col| {
-                        col.child(nav_row(
-                            "nav-deleted",
-                            IconName::Trash,
-                            "Recently Deleted",
-                            Some(counts.deleted),
-                            filter == Filter::RecentlyDeleted,
-                            pick(Filter::RecentlyDeleted),
-                            cx,
-                        ))
-                    })
-                    .child(ui::divider(cx).my(px(6.)))
-                    .child(nav_row(
-                        "nav-tags",
-                        if tags_open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        },
-                        "Tags",
-                        None,
-                        false,
-                        tags_toggle,
-                        cx,
-                    ))
-                    .when(tags_open, |col| {
-                        col.when(counts.tags.is_empty(), |col| {
-                            col.child(
-                                div()
-                                    .px(px(32.))
-                                    .py(px(4.))
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("No tags"),
-                            )
-                        })
-                        .children(tags)
-                    }),
-            )
-            .into_any_element()
+        let (pick_state, toggle_state) = (self.state.clone(), self.state.clone());
+        sidebar_column(
+            SidebarColumn {
+                name: s.vault_name().into(),
+                counts: &s.counts,
+                filter: &s.filter,
+                tags_open: s.tags_open,
+                on_pick: Rc::new(move |f, _, cx| {
+                    pick_state.update(cx, |s, cx| s.set_filter(f, cx));
+                }),
+                on_toggle_tags: Rc::new(move |_, cx| {
+                    toggle_state.update(cx, |s, cx| s.toggle_tags(cx));
+                }),
+                // The sidebar extends under the transparent titlebar; keep clear of the lights.
+                top_pad: px(ui::TITLEBAR_HEIGHT),
+                focus: Some(&self.sidebar_focus),
+            },
+            cx,
+        )
+        .into_any_element()
     }
 }
 

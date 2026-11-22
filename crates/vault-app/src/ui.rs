@@ -287,6 +287,9 @@ pub fn text_input<T>(
     cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
 }
 
+/// The unlock card's password placeholder (main unlock screen and backup viewer).
+pub const MASTER_PASSWORD_PLACEHOLDER: &str = "Enter master password";
+
 /// A masked password input state.
 pub fn password_input<T>(
     placeholder: &str,
@@ -1367,23 +1370,164 @@ pub fn illustration(icon: IconName, badge: Option<IconName>, cx: &App) -> Div {
         );
     let mut art = gpui::div().relative().size(px(88.)).child(disc);
     if let Some(badge) = badge {
-        art = art.child(
-            gpui::div()
-                .absolute()
-                .right(px(-2.))
-                .bottom(px(-2.))
-                .size(px(32.))
-                .rounded_full()
-                .bg(theme.muted)
-                .border_2()
-                .border_color(theme.background)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(Icon::new(badge).size_4().text_color(theme.muted_foreground)),
-        );
+        art = art.child(badge_bubble(badge, 32., cx).right(px(-2.)).bottom(px(-2.)));
     }
     art
+}
+
+/// The round badge of [`illustration`] and the unlock card (05 §2.3 "Backup viewer"),
+/// both 32 px today: `icon` at half the bubble's `side`, in a 2 px ring of the
+/// background colour. Absolute; the caller places it.
+fn badge_bubble(icon: IconName, side: f32, cx: &App) -> Div {
+    let theme = cx.theme();
+    gpui::div()
+        .absolute()
+        .size(px(side))
+        .rounded_full()
+        .bg(theme.muted)
+        .border_2()
+        .border_color(theme.background)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            Icon::new(icon)
+                .size(px(side / 2.))
+                .text_color(theme.muted_foreground),
+        )
+}
+
+/// A static info-coloured tag with no hover, for labels that are not buttons; black text
+/// in dark mode (owner decision 2026-11-22). Matches `Tag::info()` at the default size,
+/// whose render adds an opacity hover that `refine_style` cannot remove.
+pub fn info_label(text: impl Into<SharedString>, cx: &App) -> Div {
+    let theme = cx.theme();
+    let fg = if theme.mode.is_dark() {
+        gpui::black()
+    } else {
+        theme.info_foreground
+    };
+    gpui::div()
+        .flex()
+        .items_center()
+        .border_1()
+        .line_height(relative(1.25))
+        .text_xs()
+        .px_2p5()
+        .py_1()
+        .bg(theme.info)
+        .border_color(theme.info)
+        .rounded(theme.radius)
+        .text_color(fg)
+        .child(text.into())
+}
+
+/// Side of the app icon on the unlock card, in points (the raster is 2x this).
+pub const UNLOCK_ICON_SIZE: f32 = 128.;
+
+/// Side of the unlock card's badge bubble (the backup viewer's read-only eye), in points.
+pub const UNLOCK_BADGE_SIZE: f32 = 32.;
+
+/// The unlock screen's card (05 §2.2), shared by the main unlock screen and the backup
+/// viewer's password prompt (05 §2.3 "Backup viewer").
+pub struct UnlockCard {
+    /// Test selector prefix: `<prefix>-card`, `-icon`, `-badge`, `-vault-name`,
+    /// `-subtitle`.
+    pub prefix: &'static str,
+    /// What fills the 128 pt icon box (the main screen's animated wheel, or the still
+    /// app icon). The fixed box keeps the card size before the image decodes.
+    pub icon: AnyElement,
+    /// A badge at the icon's lower right (the viewer's read-only eye), 32 px.
+    pub badge: Option<IconName>,
+    pub name: SharedString,
+    /// A second, smaller muted line under the name.
+    pub subtitle: Option<SharedString>,
+    /// The field, buttons and links, top to bottom (12 px apart).
+    pub controls: Div,
+    /// `Some(overlay id)` while verifying: the controls are hidden (kept in the layout,
+    /// so the card does not change size) under [`unlocking_overlay`].
+    pub unlocking: Option<&'static str>,
+}
+
+pub fn unlock_card(parts: UnlockCard, cx: &App) -> Div {
+    let UnlockCard {
+        prefix,
+        icon,
+        badge,
+        name,
+        subtitle,
+        controls,
+        unlocking,
+    } = parts;
+    let theme = cx.theme();
+    let name_color = if theme.mode.is_dark() {
+        gpui::rgb(0xb8b8be).into()
+    } else {
+        theme.muted_foreground
+    };
+    let icon_box = gpui::div()
+        .size(px(UNLOCK_ICON_SIZE))
+        .relative()
+        .flex_shrink_0()
+        .debug_selector(move || format!("{prefix}-icon"))
+        .child(icon)
+        .children(badge.map(|badge| {
+            // Over the squircle's lower-right corner (the PNG has a transparent margin of
+            // about 12 pt): 10 pt past the icon box, so the centre sits 6 pt inside it.
+            badge_bubble(badge, UNLOCK_BADGE_SIZE, cx)
+                .right(px(-10.))
+                .bottom(px(-10.))
+                .debug_selector(move || format!("{prefix}-badge"))
+        }));
+    let names = v_flex()
+        .items_center()
+        .gap(px(2.))
+        .max_w_full()
+        .child(
+            gpui::div()
+                .text_sm()
+                .text_color(name_color)
+                .overflow_hidden()
+                .text_ellipsis()
+                .debug_selector(move || format!("{prefix}-vault-name"))
+                .child(name),
+        )
+        .children(subtitle.map(|line| {
+            let text = line.clone();
+            gpui::div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .overflow_hidden()
+                .text_ellipsis()
+                // Tests read the line from its key (no painted-text API).
+                .debug_selector(move || format!("{prefix}-subtitle {text}"))
+                .child(line)
+        }));
+    let controls = controls
+        .w_full()
+        .gap(px(12.))
+        // Hidden, not removed: the card keeps its size and nothing jumps. A hidden div
+        // paints none of its children, so the field takes no clicks or keys.
+        .when(unlocking.is_some(), |controls| controls.invisible());
+    card(cx)
+        .w(px(360.))
+        .gap(px(20.))
+        .items_center()
+        .debug_selector(move || format!("{prefix}-card"))
+        .child(
+            v_flex()
+                .items_center()
+                .gap(px(10.))
+                .child(icon_box)
+                .child(names),
+        )
+        .child(
+            gpui::div()
+                .relative()
+                .w_full()
+                .child(controls)
+                .children(unlocking.map(|id| unlocking_overlay(id, cx))),
+        )
 }
 
 /// A zero-sized [`probe::Probe`] in test builds; nothing otherwise.

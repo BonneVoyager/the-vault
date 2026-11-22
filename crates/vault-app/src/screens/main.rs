@@ -23,7 +23,7 @@ mod save_blocked;
 #[cfg(test)]
 #[path = "main/save_blocked_tests.rs"]
 mod save_blocked_tests;
-mod sidebar;
+pub(crate) mod sidebar;
 mod sync_banners;
 #[cfg(test)]
 #[path = "main/tab_order_tests.rs"]
@@ -51,16 +51,16 @@ use crate::state::{AppState, FocusTarget};
 use crate::{text, ui};
 
 /// Default widths and ranges for the sidebar and item list (§1).
-const SIDEBAR: (f32, f32, f32) = (220., 180., 320.);
+pub(crate) const SIDEBAR: (f32, f32, f32) = (220., 180., 320.);
 pub(crate) const LIST: (f32, f32, f32) = (300., 240., 420.);
 /// The detail column never gets narrower than this (dragging, or restored widths in a
 /// narrower window).
-const DETAIL_MIN: f32 = 320.;
+pub(crate) const DETAIL_MIN: f32 = 320.;
 
 /// `[sidebar, list]` widths that leave the detail column at least `DETAIL_MIN` in a
 /// window `window` px wide: the list gives way first, then the sidebar, neither below
 /// its own minimum. `sidebar` says whether the sidebar takes room.
-fn fit_widths([side, list]: [f32; 2], window: f32, sidebar: bool) -> [f32; 2] {
+pub(crate) fn fit_widths([side, list]: [f32; 2], window: f32, sidebar: bool) -> [f32; 2] {
     let room = window - DETAIL_MIN;
     let taken = if sidebar { side } else { 0. };
     let list = list.min(room - taken).max(LIST.1);
