@@ -4,15 +4,15 @@
 //! `AppState` as a `SecretString`. Rows are keyed by the buffer's stable row keys, so
 //! adding, removing or reordering fields keeps the other inputs (and their cursors).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    Anchor, AnimationExt as _, AnyElement, App, AppContext as _, Context, Entity, FocusHandle,
-    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Anchor, AnimationExt as _, AnyElement, App, AppContext as _, Bounds, Context, Entity,
+    FocusHandle, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+    Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
     WeakEntity, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -68,7 +68,7 @@ impl Row {
     }
 }
 
-/// What is dragged when a row's grip is pulled.
+/// What is dragged when a row's grip is pulled; also the ghost's content.
 #[derive(Clone)]
 struct DraggedRow {
     key: u64,
@@ -77,53 +77,96 @@ struct DraggedRow {
     placeholder: &'static str,
     icon: Option<IconName>,
     kind: &'static str,
-    /// Row width at the last paint: the ghost is drawn at the row's width.
-    width: Pixels,
-    /// The rows' label column width ([`edit_label_width`]), so the ghost's matches.
-    label_w: Option<Pixels>,
+    /// Extra space above the row's header line (a section's gap), so the ghost keeps
+    /// the grip under the pointer.
+    header_dy: Pixels,
 }
 
-/// The ghost under the pointer while dragging: the row's value line at the row's width,
-/// in the row's geometry (label column with grip, icon and name; kind chip trailing).
-/// The value is not drawn (it may be a secret; the dragged row hides it too).
-struct DragPreview(DraggedRow);
+/// gpui's drag preview, drawn at the pointer: nothing. The ghost is drawn inside the
+/// rows container instead, clamped to it (05 §2.3, owner 2026-11-23).
+struct NoPreview;
 
-impl Render for DragPreview {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let row = &self.0;
-        let muted = theme.muted_foreground;
-        let name = if row.name.is_empty() {
-            div().text_color(muted).child(row.placeholder)
-        } else {
-            div()
-                .font_weight(FontWeight::MEDIUM)
-                .child(row.name.clone())
-        };
-        ui::h_flex()
-            .w(row.width)
-            .py(px(FIELD_ROW_PAD_Y))
-            .gap(px(FIELD_ROW_GAP))
-            .rounded(theme.radius)
-            .bg(theme.popover)
-            .border_1()
-            .border_color(theme.border)
-            .shadow_md()
-            .opacity(0.95)
-            .child(
-                super::detail::label_column(ui::h_flex(), row.label_w)
-                    .min_h(px(FIELD_LINE_MIN_H))
-                    .gap(px(EDIT_LABEL_GAP))
-                    .child(Icon::new(IconName::GripVertical).size_4().text_color(muted))
-                    .when_some(row.icon, |r, icon| {
-                        r.child(Icon::new(icon).size_4().text_color(muted))
-                    })
-                    .child(name.min_w_0().truncate().text_sm()),
-            )
-            .child(div().flex_1())
-            .child(Tag::secondary().small().child(row.kind))
-            .pr(px(4.))
+impl Render for NoPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
     }
+}
+
+/// Height of the ghost and of the gap opened for it: the collapsed row's header line.
+const GHOST_H: Pixels = px(2. * FIELD_ROW_PAD_Y + FIELD_LINE_MIN_H + 1.);
+/// Edge auto-scroll during a field drag (05 §2.3 "Edit mode", owner 2026-11-23): the
+/// band at either edge of the editor's viewport, and the speed in px/s from its inner
+/// side to the edge (and beyond); one constant speed under Reduce Motion. Time-based,
+/// so 60 and 120 Hz displays scroll alike; a frame's time is capped at 1/30 s.
+const SCROLL_BAND: f32 = 24.;
+const SCROLL_RATE_MIN: f32 = 120.;
+const SCROLL_RATE_MAX: f32 = 720.;
+const SCROLL_RATE_REDUCED: f32 = 360.;
+const SCROLL_DT_MAX: f32 = 1. / 30.;
+
+/// Scroll step for `dt` seconds with the pointer at `y` over a viewport from `top` to
+/// `bottom`: negative towards the top, positive towards the bottom, zero outside the
+/// bands. Beyond the viewport (above or below it) counts as the edge itself.
+fn auto_scroll_step(y: Pixels, top: Pixels, bottom: Pixels, reduce_motion: bool, dt: f32) -> f32 {
+    let band = SCROLL_BAND.min((bottom - top).as_f32() / 2.);
+    let (depth, sign) = if y < top + px(band) {
+        ((top + px(band) - y).as_f32(), -1.)
+    } else if y > bottom - px(band) {
+        ((y - (bottom - px(band))).as_f32(), 1.)
+    } else {
+        return 0.;
+    };
+    let rate = if reduce_motion {
+        SCROLL_RATE_REDUCED
+    } else {
+        let t = (depth / band).min(1.);
+        SCROLL_RATE_MIN + (SCROLL_RATE_MAX - SCROLL_RATE_MIN) * t
+    };
+    sign * rate * dt.min(SCROLL_DT_MAX)
+}
+
+/// The gap's open/close motion (05 §2.3 "Edit mode").
+const GAP_MOTION: Duration = Duration::from_millis(150);
+
+/// The ghost: the row's header line at the rows' width, in the row's geometry (label
+/// column with grip, icon and name; kind chip trailing). The value is never drawn (it
+/// may be a secret; the dragged row hides it too).
+fn drag_ghost(row: &DraggedRow, label_w: Option<Pixels>, cx: &App) -> gpui::Div {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let name = if row.name.is_empty() {
+        div().text_color(muted).child(row.placeholder)
+    } else {
+        div()
+            .font_weight(FontWeight::MEDIUM)
+            .child(row.name.clone())
+    };
+    ui::h_flex()
+        .debug_selector(|| "drag-ghost".into())
+        .absolute()
+        .left_0()
+        .w_full()
+        .h(GHOST_H)
+        .gap(px(FIELD_ROW_GAP))
+        .rounded(theme.radius)
+        .bg(theme.popover)
+        .border_1()
+        .border_color(theme.border)
+        .shadow_md()
+        .opacity(0.95)
+        .child(
+            super::detail::label_column(ui::h_flex(), label_w)
+                .min_h(px(FIELD_LINE_MIN_H))
+                .gap(px(EDIT_LABEL_GAP))
+                .child(Icon::new(IconName::GripVertical).size_4().text_color(muted))
+                .when_some(row.icon, |r, icon| {
+                    r.child(Icon::new(icon).size_4().text_color(muted))
+                })
+                .child(name.min_w_0().truncate().text_sm()),
+        )
+        .child(div().flex_1())
+        .child(Tag::secondary().small().child(row.kind))
+        .pr(px(4.))
 }
 
 /// Move flash (05 "Edit-mode field rows", owner 2026-11-16): the accent at 18 % under a
@@ -143,6 +186,32 @@ struct Flash {
     reduce_motion: bool,
 }
 
+/// A child of the rows container, as recorded at prepaint for the drag geometry.
+#[derive(Clone, Copy, PartialEq)]
+enum Child {
+    Row(u64),
+    /// A history block, by the key of the row it belongs to.
+    History(u64),
+    /// The gaps, the ghost and the dragged row: outside the projected flow.
+    Other,
+}
+
+/// A gap closing after the ghost left its slot.
+struct ClosingGap {
+    slot: usize,
+    /// Open fraction when it started closing.
+    from: f32,
+    started: Instant,
+}
+
+/// Eased open fraction of a gap that started opening at `started` (`None`: instant).
+fn opened(started: Option<Instant>, now: Instant) -> f32 {
+    started.map_or(1., |t| {
+        let p = now.saturating_duration_since(t).as_secs_f32() / GAP_MOTION.as_secs_f32();
+        gpui::ease_out_quint()(p.min(1.))
+    })
+}
+
 /// Field drag in progress, shared with the element listeners. Only meaningful while
 /// `row` is set: it is set when a grip drag starts and cleared on every mouse-up, Esc
 /// and when editing ends, so another kind of drag (a column resize) never reads it.
@@ -150,35 +219,182 @@ struct Flash {
 struct FieldDrag {
     /// Key of the row being dragged.
     row: Cell<Option<u64>>,
-    /// Row under the pointer and whether the pointer is in its lower half. Kept while
-    /// the pointer is between rows; cleared when it leaves the rows.
-    target: Cell<Option<(usize, bool)>>,
+    /// The ghost's content.
+    ghost: RefCell<Option<DraggedRow>>,
+    /// Pointer y at the grip press; then the pointer's offset from the ghost's top.
+    press_y: Cell<Pixels>,
+    grab_dy: Cell<Pixels>,
+    /// The gap's slot: index among the rows other than the dragged one.
+    slot: Cell<usize>,
+    /// When the gap at `slot` started opening (`None`: open).
+    opening: Cell<Option<Instant>>,
+    closing: RefCell<Vec<ClosingGap>>,
+    /// The rows' top the last frame was computed with; a prepaint finding them moved
+    /// (a scroll during the drag) asks for another frame.
+    used_top: Cell<Pixels>,
+    /// When the last auto-scroll step ran (`None`: not scrolling).
+    last_scroll: Cell<Option<Instant>>,
+    /// Tests: the frame time auto-scroll uses, in place of the measured one.
+    #[cfg(test)]
+    test_dt: Cell<Option<f32>>,
+    /// The rows container's children at the last prepaint (kept across drags).
+    layout: RefCell<Vec<(Child, Bounds<Pixels>)>>,
 }
 
 impl FieldDrag {
     fn clear(&self) {
         self.row.set(None);
-        self.target.set(None);
+        self.ghost.take();
+        self.opening.set(None);
+        self.closing.borrow_mut().clear();
+    }
+
+    /// Starts a drag of `row`: the gap opens at once at the row's own slot.
+    fn start(&self, row: &DraggedRow, from: usize) {
+        let top = self
+            .layout
+            .borrow()
+            .iter()
+            .find(|(c, _)| *c == Child::Row(row.key))
+            .map(|(_, b)| b.top());
+        let dy = top.map_or(px(0.), |top| self.press_y.get() - top - row.header_dy);
+        self.grab_dy.set(dy.clamp(px(0.), GHOST_H));
+        self.row.set(Some(row.key));
+        self.ghost.replace(Some(row.clone()));
+        self.slot.set(from);
+        self.last_scroll.set(None);
+        self.opening.set(None);
+        self.closing.borrow_mut().clear();
+    }
+
+    /// One drag frame for the pointer at `pointer_y`: moves the gap to the ghost's
+    /// projected slot and returns the ghost's top relative to the rows container.
+    fn frame(&self, pointer_y: Pixels, reduce_motion: bool, now: Instant) -> Pixels {
+        let Some(key) = self.row.get() else {
+            return px(0.);
+        };
+        let layout = self.layout.borrow();
+        let group_top = layout.first().map_or(px(0.), |(_, b)| b.top());
+        self.used_top.set(group_top);
+        let flow: Vec<(bool, Pixels)> = layout
+            .iter()
+            .filter_map(|&(c, b)| match c {
+                Child::Row(k) if k != key => Some((true, b.size.height)),
+                Child::History(k) if k != key => Some((false, b.size.height)),
+                _ => None,
+            })
+            .collect();
+        let total: Pixels = flow.iter().map(|f| f.1).sum::<Pixels>() + GHOST_H;
+        let top = (pointer_y - group_top - self.grab_dy.get()).clamp(px(0.), total - GHOST_H);
+        let slot = self.slot.get();
+        let to = project_slot(&flow, top + GHOST_H / 2.);
+        if to != slot {
+            let mut closing = self.closing.borrow_mut();
+            closing.retain(|g| opened(Some(g.started), now) < 1.);
+            if !reduce_motion {
+                closing.push(ClosingGap {
+                    slot,
+                    from: opened(self.opening.get(), now),
+                    started: now,
+                });
+            }
+            self.slot.set(to);
+            self.opening.set((!reduce_motion).then_some(now));
+        }
+        top
+    }
+
+    /// The gaps to draw before row slot `slot` (or at the end): (height, selector).
+    fn gaps_at(&self, slot: usize, now: Instant) -> Vec<(Pixels, &'static str)> {
+        let mut gaps: Vec<_> = self
+            .closing
+            .borrow()
+            .iter()
+            .filter(|g| g.slot == slot)
+            .map(|g| {
+                let h = GHOST_H * (g.from * (1. - opened(Some(g.started), now)));
+                (h, "drop-gap-closing")
+            })
+            .collect();
+        if self.slot.get() == slot {
+            gaps.push((GHOST_H * opened(self.opening.get(), now), "drop-gap"));
+        }
+        gaps
+    }
+
+    /// Whether a gap is still moving (the editor asks for another frame).
+    fn animating(&self, now: Instant) -> bool {
+        opened(self.opening.get(), now) < 1.
+            || self
+                .closing
+                .borrow()
+                .iter()
+                .any(|g| opened(Some(g.started), now) < 1.)
     }
 }
 
-/// Offset of the drop line from a row's top or bottom edge: centred on the 1 px separator.
-const LINE_INSET: f32 = -1.5;
+/// The gap's slot for a ghost centred at `centre` (from the rows' top): the slot before
+/// the first other row whose centre is below the ghost's, each row's centre taken
+/// midway between its two places (gap above it, gap below it). Against the rows as
+/// shifted, a ghost clamped at an end sits exactly on an equal-height end row's centre
+/// (an end slot unreachable); against the rows closed up, a drag would swap with its
+/// neighbour on the first pixel. The midway centres avoid both and do not depend on
+/// where the gap is now, so the gap cannot flicker. `flow`: the other rows and history
+/// blocks in order, as (is a row, height).
+fn project_slot(flow: &[(bool, Pixels)], centre: Pixels) -> usize {
+    let (mut y, mut r) = (px(0.), 0);
+    for &(row, h) in flow {
+        if row {
+            if y + (GHOST_H + h) / 2. > centre {
+                return r;
+            }
+            r += 1;
+        }
+        y += h;
+    }
+    r
+}
 
-/// Mouse-up listener clearing the field drag once the event (and any drop) is handled.
-fn defer_clear(drag: Rc<FieldDrag>) -> impl Fn(&gpui::MouseUpEvent, &mut Window, &mut App) {
-    move |_, _, cx| {
-        let drag = drag.clone();
-        cx.defer(move |_| drag.clear());
+/// A gap in the rows: blank, with one hairline at its bottom like a row's rule, so the
+/// slot reads as an empty row (the rule above it is the previous row's).
+fn drop_gap(h: Pixels, selector: &'static str, cx: &App) -> AnyElement {
+    ui::v_flex()
+        .debug_selector(move || selector.into())
+        .flex_none()
+        .w_full()
+        .h(h)
+        .overflow_hidden()
+        .justify_end()
+        .child(div().flex_none().h(px(1.)).bg(cx.theme().border))
+        .into_any_element()
+}
+
+/// Ends a field drag on a release anywhere: the row lands in the gap's slot.
+fn finish_drag(
+    drag: &FieldDrag,
+    state: &Entity<AppState>,
+    this: &WeakEntity<Editor>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(key) = drag.row.get() else { return };
+    let slot = drag.slot.get();
+    drag.clear();
+    this.update(cx, |e, cx| e.refocus_row(key, window, cx)).ok();
+    let from = state.read(cx).edit_buffer().and_then(|b| b.index(key));
+    if let Some(to) = from.and_then(|from| drop_index(from, slot)) {
+        state.update(cx, |s, cx| s.edit(cx, |b| b.move_field(key, to)));
+        this.update(cx, |e, cx| e.start_flash(key, cx)).ok();
+    } else {
+        this.update(cx, |_, cx| cx.notify()).ok();
     }
 }
 
-/// `move_field` destination for a row dragged from `from` and dropped on the upper
-/// (`lower == false`) or lower half of row `target`; `None` when it would land where it
-/// already is (no line, no move). `move_field` removes first, then inserts at the index.
-fn drop_index(from: usize, target: usize, lower: bool) -> Option<usize> {
-    let gap = target + usize::from(lower);
-    (gap != from && gap != from + 1).then(|| if gap > from { gap - 1 } else { gap })
+/// `move_field` destination for a row dragged from `from` and dropped in the gap at
+/// `slot` (an index among the other rows); `None` at its own place (no edit). As
+/// `move_field` removes first and then inserts, the destination is the slot itself.
+fn drop_index(from: usize, slot: usize) -> Option<usize> {
+    (slot != from).then_some(slot)
 }
 
 /// Strength and live notices of one password row (05 §2.3 "Password notices").
@@ -306,6 +522,8 @@ pub struct Editor {
     rows: Vec<Row>,
     /// The field drag in progress, if any.
     drag: Rc<FieldDrag>,
+    /// Focus during a field drag (the dragged row, and its inputs, are not drawn).
+    drag_focus: FocusHandle,
     /// Width of the field rows at the last paint, for the drag ghost.
     row_width: Rc<Cell<Pixels>>,
     /// This render's label column width ([`edit_label_width`]; `None` = the base
@@ -403,6 +621,7 @@ impl Editor {
             scroll: ScrollHandle::new(),
             rows: Vec::new(),
             drag: Rc::default(),
+            drag_focus: cx.focus_handle(),
             row_width: Rc::new(Cell::new(px(280.))),
             label_w: Cell::new(None),
             icon_focus: cx.focus_handle(),
@@ -632,6 +851,13 @@ impl Editor {
         }
     }
 
+    /// Focus back to row `key`'s name input after its drag ends (the grip put it there).
+    fn refocus_row(&self, key: u64, window: &mut Window, cx: &mut App) {
+        if let Some(row) = self.rows.iter().find(|r| r.key == key) {
+            ui::focus_input(&row.name, window, cx);
+        }
+    }
+
     /// Flashes row `key` after a click-move or drop, replacing any flash (05 "Move flash").
     fn start_flash(&mut self, key: u64, cx: &mut Context<Self>) {
         self.flash_generation += 1;
@@ -660,36 +886,35 @@ impl Editor {
         cx.notify();
     }
 
-    /// The field rows: the one drop target for field drags, so a release between rows
-    /// (or over the history block) lands where the line showed.
-    fn rows_container(&self, rows: Vec<AnyElement>, this: &WeakEntity<Self>) -> impl IntoElement {
-        let this = this.clone();
+    /// The field rows. `kinds` names each child, recorded with its bounds at prepaint
+    /// for the drag geometry (and the ghost's width). Relative: the ghost and the
+    /// dragged row are placed inside it.
+    /// `drawn`: a dragged row is drawn this frame (its key still in the buffer).
+    fn rows_container(
+        &self,
+        rows: Vec<AnyElement>,
+        kinds: Vec<Child>,
+        drawn: bool,
+    ) -> impl IntoElement {
         let width = self.row_width.clone();
-        let (leave, drag, state) = (self.drag.clone(), self.drag.clone(), self.state.clone());
+        let drag = self.drag.clone();
+        let dragging = drag.row.get().is_some();
         ui::v_flex()
-            .on_children_prepainted(move |bounds, _, _| {
+            .relative()
+            // While dragging, focus sits here (the dragged row is not drawn), so Esc and
+            // ⌘S still reach the editor and nothing types into the dragged row.
+            .when(dragging, |rows| {
+                rows.key_context(crate::actions::FIELD_DRAG_CONTEXT)
+                    .track_focus(&self.drag_focus)
+            })
+            .on_children_prepainted(move |bounds, window, _| {
                 if let Some(b) = bounds.first() {
                     width.set(b.size.width);
+                    if drawn && b.top() != drag.used_top.get() {
+                        window.request_animation_frame();
+                    }
                 }
-            })
-            .on_drag_move::<DraggedRow>(move |ev, _, _| {
-                if !ev.bounds.contains(&ev.event.position) {
-                    leave.target.set(None);
-                }
-            })
-            .on_drop(move |dragged: &DraggedRow, _, cx| {
-                let target = drag.target.take();
-                drag.clear();
-                // From the row's index now, as the line used, not the index at drag start.
-                let key = dragged.key;
-                let from = state.read(cx).edit_buffer().and_then(|b| b.index(key));
-                let to = from
-                    .zip(target)
-                    .and_then(|(from, (t, lower))| drop_index(from, t, lower));
-                if let Some(to) = to {
-                    state.update(cx, |s, cx| s.edit(cx, |b| b.move_field(key, to)));
-                    this.update(cx, |e, cx| e.start_flash(key, cx)).ok();
-                }
+                *drag.layout.borrow_mut() = kinds.iter().copied().zip(bounds).collect();
             })
             .children(rows)
     }
@@ -718,7 +943,6 @@ impl Editor {
         let key = row.key;
         let count = buffer.keys.len();
         let section = field.kind == FieldKind::Section;
-        let is_ghost = dragged_ix == Some(ix);
         let name_focus = gpui::Focusable::focus_handle(&row.name, cx);
         let value_focus = row.value_focus(cx);
         let value_focused = value_focus.as_ref().is_some_and(|h| h.is_focused(window));
@@ -729,10 +953,8 @@ impl Editor {
         // old rule lit a moved row away from the pointer); none during a field drag.
         let arrow_focused =
             (row.up.is_focused(window) || row.down.is_focused(window)) && ui::focus_ring_allowed();
-        let show_arrows = !is_ghost
-            && (all_arrows()
-                || (dragged_ix.is_none() && self.hovered == Some(key))
-                || arrow_focused);
+        let show_arrows =
+            all_arrows() || (dragged_ix.is_none() && self.hovered == Some(key)) || arrow_focused;
 
         let mover = |id: &'static str, icon: IconName, label: &str, to: Option<usize>, focus| {
             let state = self.state.clone();
@@ -817,13 +1039,7 @@ impl Editor {
             .child(remove);
 
         let drag = self.drag.clone();
-        // The accent line between rows: at this row's top (insert before) or bottom.
-        let line = match (dragged_ix, self.drag.target.get()) {
-            (Some(from), Some((target, lower))) if target == ix => {
-                drop_index(from, ix, lower).map(|_| lower)
-            }
-            _ => None,
-        };
+        let drag_focus = self.drag_focus.clone();
         let grip_focus = row.name.clone();
         let grip = div()
             .flex_none()
@@ -835,9 +1051,13 @@ impl Editor {
             // Pressing the grip focuses the row's name input rather than letting the
             // detail column take focus: the input stays drawn while the row is collapsed
             // and Esc then reaches the editor's drag cancel (not the edit cancel).
-            .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
-                window.prevent_default();
-                ui::focus_input(&grip_focus, window, cx);
+            .on_mouse_down(gpui::MouseButton::Left, {
+                let drag = drag.clone();
+                move |ev, window, cx| {
+                    window.prevent_default();
+                    drag.press_y.set(ev.position.y);
+                    ui::focus_input(&grip_focus, window, cx);
+                }
             })
             .on_drag(
                 DraggedRow {
@@ -849,13 +1069,16 @@ impl Editor {
                         .filter(|_| !section)
                         .and_then(crate::icon::symbol),
                     kind: kind_name(field.kind),
-                    width: self.row_width.get(),
-                    label_w: self.label_w.get(),
+                    header_dy: if section && ix > 0 {
+                        px(super::detail::SECTION_GAP)
+                    } else {
+                        px(0.)
+                    },
                 },
-                move |dragged, _, _, cx| {
-                    drag.row.set(Some(dragged.key));
-                    drag.target.set(None);
-                    cx.new(|_| DragPreview(dragged.clone()))
+                move |dragged, _, window, cx| {
+                    drag.start(dragged, ix);
+                    window.focus(&drag_focus, cx);
+                    cx.new(|_| NoPreview)
                 },
             );
         let name = div()
@@ -874,8 +1097,6 @@ impl Editor {
             .relative()
             .w_full()
             .border_color(theme.border)
-            // The row being dragged collapses to its header line at 40 % opacity.
-            .when(is_ghost, |row| row.opacity(0.4))
             // First child: painted under the row's content, inside its border, so the
             // inputs' text and the hairline rule are untouched.
             .children(
@@ -901,31 +1122,6 @@ impl Editor {
                     })
                     .ok();
                 }
-            })
-            // Which half of this row the pointer is over (the line follows the pointer).
-            .on_drag_move::<DraggedRow>({
-                let drag = self.drag.clone();
-                move |ev, _, _| {
-                    let pos = ev.event.position;
-                    if ev.bounds.contains(&pos) {
-                        drag.target.set(Some((ix, pos.y >= ev.bounds.center().y)));
-                    }
-                }
-            })
-            // Drop indicator: one 2 px accent line over the separator, no layout shift.
-            .when_some(line, |row, lower| {
-                let bar = div()
-                    .debug_selector(|| "drop-line".into())
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .h(px(2.))
-                    .bg(theme.primary);
-                row.child(if lower {
-                    bar.bottom(px(LINE_INSET))
-                } else {
-                    bar.top(px(LINE_INSET))
-                })
             });
 
         // A section: read mode's heading geometry (extra space above unless first, 2 px
@@ -979,9 +1175,7 @@ impl Editor {
                     .into_any_element(),
             ),
             ValueInput::None => None,
-        }
-        // The dragged row collapses to its header line.
-        .filter(|_| !is_ghost);
+        };
         let notes = matches!(row.value, ValueInput::Area(_));
         // A revealed secret copies through the concealed, auto-clearing pasteboard path.
         let sensitive_input = match &row.value {
@@ -1076,31 +1270,29 @@ impl Editor {
             .min_w_0()
             .gap(px(super::detail::ISSUE_STRIP_GAP))
             .child(content)
-            .when(!is_ghost, |col| {
-                col.when(buffer.remote_fields.contains(&key), |col| {
-                    col.child(remote_badge(("remote", key)))
-                })
-                .when(buffer.row_limited(key), |col| {
-                    col.child(limit_note(
-                        ("field-limit", key),
-                        format!("field-limit {key}"),
-                        cx,
-                    ))
-                })
-                .children(totp_line)
-                .children(meter_line)
-                // Password notices follow the typed value; reuse is checked against the
-                // saved items other than this one (05 §2.3 "Password notices").
-                .children(issues.iter().map(|&issue| {
-                    super::detail::issue_strip(
-                        &FieldIssue {
-                            field: field.id,
-                            issue,
-                        },
-                        cx,
-                    )
-                }))
-            });
+            .when(buffer.remote_fields.contains(&key), |col| {
+                col.child(remote_badge(("remote", key)))
+            })
+            .when(buffer.row_limited(key), |col| {
+                col.child(limit_note(
+                    ("field-limit", key),
+                    format!("field-limit {key}"),
+                    cx,
+                ))
+            })
+            .children(totp_line)
+            .children(meter_line)
+            // Password notices follow the typed value; reuse is checked against the
+            // saved items other than this one (05 §2.3 "Password notices").
+            .children(issues.iter().map(|&issue| {
+                super::detail::issue_strip(
+                    &FieldIssue {
+                        field: field.id,
+                        issue,
+                    },
+                    cx,
+                )
+            }));
 
         row_el
             .items_start()
@@ -1423,8 +1615,52 @@ impl Render for Editor {
                 super::detail::label_fit(live, window, cx)
             }));
         let this = cx.entity().downgrade();
+        // A field drag: the ghost's top this frame; the gap follows its projected slot.
+        let now = Instant::now();
+        let ghost_top = dragged_ix.map(|_| {
+            let pointer = window.mouse_position().y;
+            // Edge auto-scroll first, so the ghost and the slot below use the rows'
+            // positions after this frame's scroll (the layout is the last prepaint's).
+            let drag = &self.drag;
+            let dt = drag
+                .last_scroll
+                .get()
+                .map_or(1. / 60., |t| now.saturating_duration_since(t).as_secs_f32());
+            #[cfg(test)]
+            let dt = drag.test_dt.get().unwrap_or(dt);
+            let view = self.scroll.bounds();
+            let step = auto_scroll_step(pointer, view.top(), view.bottom(), s.reduce_motion, dt);
+            drag.last_scroll.set((step != 0.).then_some(now));
+            let offset = self.scroll.offset();
+            let max = self.scroll.max_offset().y.max(px(0.));
+            let y = (offset.y - px(step)).clamp(-max, px(0.));
+            if y != offset.y {
+                self.scroll.set_offset(gpui::point(offset.x, y));
+            }
+            // The rows move by `y - offset.y`: the pointer, relative to them, the other way.
+            let top = drag.frame(pointer - (y - offset.y), s.reduce_motion, now);
+            if step != 0. || drag.animating(now) {
+                window.request_animation_frame();
+            }
+            top
+        });
+        let mut kinds: Vec<Child> = Vec::with_capacity(self.rows.len() + 4);
+        let mut slot = 0;
         for (ix, row) in self.rows.iter().enumerate() {
+            let dragged = dragged_ix == Some(ix);
+            if dragged_ix.is_some() && !dragged {
+                for (h, selector) in self.drag.gaps_at(slot, now) {
+                    rows.push(drop_gap(h, selector, cx));
+                    kinds.push(Child::Other);
+                }
+                slot += 1;
+            }
+            // The dragged row leaves the flow, with its history; the ghost stands in.
+            if dragged {
+                continue;
+            }
             rows.push(self.render_row(ix, row, dragged_ix, buffer, s, &this, window, cx));
+            kinds.push(Child::Row(row.key));
             // The row's field index, by key (not by assuming row order).
             let at = if buffer.keys.get(ix) == Some(&row.key) {
                 Some(ix)
@@ -1450,6 +1686,7 @@ impl Render for Editor {
                 .iter()
                 .filter(|t| owned.iter().any(|h| h.replaced_at == **t))
                 .count();
+            kinds.push(Child::History(row.key));
             rows.push(history_disclosure(
                 super::detail::History {
                     entries: &history,
@@ -1462,6 +1699,18 @@ impl Render for Editor {
                 text::now_millis(),
                 cx,
             ));
+        }
+
+        if let Some(top) = ghost_top {
+            for (h, selector) in self.drag.gaps_at(slot, now) {
+                rows.push(drop_gap(h, selector, cx));
+                kinds.push(Child::Other);
+            }
+            if let Some(ghost) = self.drag.ghost.borrow().as_ref() {
+                let ghost = drag_ghost(ghost, self.label_w.get(), cx).top(top);
+                rows.push(ghost.into_any_element());
+                kinds.push(Child::Other);
+            }
         }
 
         let header = ui::h_flex()
@@ -1559,24 +1808,35 @@ impl Render for Editor {
             .when(rows.is_empty(), |col| {
                 col.child(ui::muted("No fields. Add one below.", cx))
             })
-            .child(self.rows_container(rows, &this))
+            .child(self.rows_container(rows, kinds, dragged_ix.is_some()))
             .child(ui::h_flex().child(add_field));
 
         ui::v_flex()
             // Esc during a field drag cancels the drag, not the edit.
             .capture_action({
-                let drag = self.drag.clone();
+                let (drag, this) = (self.drag.clone(), this.clone());
                 move |_: &CancelEdit, window, cx| {
-                    if drag.row.get().is_some() && cx.has_active_drag() {
+                    if let Some(key) = drag.row.get().filter(|_| cx.has_active_drag()) {
                         drag.clear();
+                        this.update(cx, |e, cx| e.refocus_row(key, window, cx)).ok();
                         cx.stop_active_drag(window);
                         cx.stop_propagation();
                     }
                 }
             })
-            // Any release ends a field drag; after the drop listener has run.
-            .capture_any_mouse_up(defer_clear(self.drag.clone()))
-            .on_mouse_up_out(gpui::MouseButton::Left, defer_clear(self.drag.clone()))
+            // A release anywhere (in or out of the editor) drops at the gap's slot.
+            .capture_any_mouse_up({
+                let (drag, state, this) = (self.drag.clone(), self.state.clone(), this.clone());
+                move |ev, window, cx| {
+                    if ev.button == gpui::MouseButton::Left {
+                        finish_drag(&drag, &state, &this, window, cx);
+                    }
+                }
+            })
+            .on_mouse_up_out(gpui::MouseButton::Left, {
+                let (drag, state) = (self.drag.clone(), self.state.clone());
+                move |_, window, cx| finish_drag(&drag, &state, &this, window, cx)
+            })
             .size_full()
             .child(pinned)
             .child(scroll)
@@ -1609,30 +1869,24 @@ mod drag_tests {
 
     use super::*;
 
-    /// Every (from, target, half) for up to 5 rows: the line shows exactly when the drop
-    /// changes the order, and `move_field`'s remove-then-insert lands the row in the gap
-    /// the line marked (the gap before `target`, or after it for the lower half).
+    /// Every (from, slot) for up to 5 rows: no move exactly when the drop leaves the
+    /// order as it was, and `move_field`'s remove-then-insert lands the row in the gap,
+    /// i.e. at `slot` among the other rows.
     #[test]
     fn drop_index_matches_remove_then_insert() {
         for n in 1..=5 {
             for from in 0..n {
-                for target in 0..n {
-                    for lower in [false, true] {
-                        let gap = target + usize::from(lower);
-                        let mut want: Vec<usize> = (0..n).collect();
-                        want.insert(gap, usize::MAX);
-                        want.retain(|&r| r != from);
-                        let at = want.iter().position(|&r| r == usize::MAX).unwrap();
-                        want[at] = from;
-                        let unchanged = want == (0..n).collect::<Vec<_>>();
-                        let got = drop_index(from, target, lower);
-                        assert_eq!(got.is_none(), unchanged, "n={n} {from}->{target} {lower}");
-                        if let Some(to) = got {
-                            let mut v: Vec<usize> = (0..n).collect();
-                            let x = v.remove(from);
-                            v.insert(to.min(n - 1), x);
-                            assert_eq!(v, want, "n={n} {from}->{target} {lower}");
-                        }
+                for slot in 0..n {
+                    let mut want: Vec<usize> = (0..n).filter(|&r| r != from).collect();
+                    want.insert(slot, from);
+                    let unchanged = want == (0..n).collect::<Vec<_>>();
+                    let got = drop_index(from, slot);
+                    assert_eq!(got.is_none(), unchanged, "n={n} {from}->{slot}");
+                    if let Some(to) = got {
+                        let mut v: Vec<usize> = (0..n).collect();
+                        let x = v.remove(from);
+                        v.insert(to, x);
+                        assert_eq!(v, want, "n={n} {from}->{slot}");
                     }
                 }
             }
@@ -1643,13 +1897,26 @@ mod drag_tests {
         vcx.debug_bounds(Box::leak(selector.into_boxed_str()))
     }
 
-    /// Real drag through the editor: the line follows the pointer half and marks one
-    /// gap from either side, Esc ends the drag but not the edit, a release drops.
-    #[gpui::test]
-    fn field_drag_line_esc_and_drop(cx: &mut TestAppContext) {
+    fn near(a: Pixels, b: Pixels) -> bool {
+        (a - b).abs() < px(0.5)
+    }
+
+    struct Rig {
+        state: Entity<AppState>,
+        main: Entity<crate::screens::main::MainScreen>,
+        vcx: VisualTestContext,
+        keys: Vec<u64>,
+        /// The rows' top before any drag (the group's top).
+        top: Pixels,
+        _dir: tempfile::TempDir,
+    }
+
+    /// An item with text fields a, b, c in edit mode; `reduce` sets Reduce Motion.
+    fn rig(cx: &mut TestAppContext, reduce: bool) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let (state, main, mut vcx) = super::tests::open(dir.path(), cx);
         state.update(&mut vcx, |s, cx| {
+            s.set_reduce_motion(reduce, cx);
             let device = s.device_id();
             let mut it = vault_core::Item::new("Drag", device, 10);
             it.fields = ["a", "b", "c"]
@@ -1669,99 +1936,510 @@ mod drag_tests {
         });
         vcx.run_until_parked();
         let keys = state.read_with(&vcx, |s, _| s.edit_buffer().unwrap().keys.clone());
-        let names = |vcx: &mut VisualTestContext| {
-            state.read_with(vcx, |s, _| {
-                let b = s.edit_buffer().unwrap();
-                b.item
-                    .fields
-                    .iter()
-                    .map(|f| f.name.clone())
-                    .collect::<Vec<_>>()
-            })
-        };
-        let row = |vcx: &mut VisualTestContext, i: usize| {
-            bounds(vcx, format!("edit-row {}", keys[i])).unwrap()
-        };
-        let none = Modifiers::none();
-        let start_drag = |vcx: &mut VisualTestContext| {
-            let grip = bounds(vcx, format!("grip {}", keys[0])).unwrap().center();
-            vcx.simulate_mouse_down(grip, MouseButton::Left, none);
-            vcx.simulate_mouse_move(grip + point(px(0.), px(6.)), MouseButton::Left, none);
-            vcx.run_until_parked();
-        };
-        let hover = |vcx: &mut VisualTestContext, i: usize, frac: f32| {
-            let b = row(vcx, i);
-            let p = point(b.center().x, b.top() + b.size.height * frac);
-            vcx.simulate_mouse_move(p, MouseButton::Left, none);
-            vcx.run_until_parked();
-            bounds(vcx, "drop-line".into())
-        };
-
-        // Pressing the grip moves focus from the value input (hidden while dragged) to
-        // the row's name input, not to the detail column.
-        let value = super::tests::value_input(&main, keys[0], &mut vcx);
-        vcx.update(|window, cx| ui::focus_input(&value, window, cx));
-        let full = row(&mut vcx, 0).size.height;
-        let value_h = |vcx: &mut VisualTestContext| {
-            bounds(vcx, format!("edit-value {}", keys[0]))
-                .unwrap()
-                .size
-                .height
-        };
-        assert!(value_h(&mut vcx) > px(0.), "value input drawn");
-        start_drag(&mut vcx);
-        // One line already: the dragged row keeps its height and hides its value.
-        assert_eq!(value_h(&mut vcx), px(0.), "dragged row hides its value");
-        assert!(row(&mut vcx, 0).size.height <= full);
-        vcx.update(|window, cx| {
-            let editor = main.read(cx).editor.read(cx);
-            let name = gpui::Focusable::focus_handle(&editor.rows[0].name, cx);
-            assert!(name.is_focused(window), "focus kept in the row");
-        });
-        assert_eq!(hover(&mut vcx, 0, 0.75), None, "own row");
-        assert_eq!(hover(&mut vcx, 1, 0.25), None, "own slot");
-        let below_b = hover(&mut vcx, 1, 0.75).expect("line under b");
-        let above_c = hover(&mut vcx, 2, 0.25).expect("line over c");
-        // Crossed rows are not hovered: no ↑/↓ beside the drop line.
-        for k in &keys {
-            let up = bounds(&mut vcx, format!("move-up {k}"));
-            assert!(up.is_none(), "arrows on row {k} during the drag");
+        let top = bounds(&mut vcx, format!("edit-row {}", keys[0]))
+            .unwrap()
+            .top();
+        Rig {
+            state,
+            main,
+            vcx,
+            keys,
+            top,
+            _dir: dir,
         }
-        assert_eq!(below_b, above_c, "one gap, one line position");
-        assert!((below_b.size.height - px(2.)).abs() < px(0.01));
+    }
 
-        vcx.simulate_keystrokes("escape");
+    impl Rig {
+        fn names(&mut self) -> Vec<String> {
+            self.state.read_with(&self.vcx, |s, _| {
+                let b = s.edit_buffer().unwrap();
+                b.item.fields.iter().map(|f| f.name.clone()).collect()
+            })
+        }
+        fn row(&mut self, i: usize) -> Bounds<Pixels> {
+            bounds(&mut self.vcx, format!("edit-row {}", self.keys[i])).unwrap()
+        }
+        fn get(&mut self, selector: &str) -> Option<Bounds<Pixels>> {
+            bounds(&mut self.vcx, selector.into())
+        }
+        /// Presses row 0's grip and pulls it 6 px down: the drag starts.
+        fn start(&mut self) {
+            let grip = bounds(&mut self.vcx, format!("grip {}", self.keys[0]))
+                .unwrap()
+                .center();
+            let none = Modifiers::none();
+            self.vcx.simulate_mouse_down(grip, MouseButton::Left, none);
+            let to = grip + point(px(0.), px(6.));
+            self.vcx.simulate_mouse_move(to, MouseButton::Left, none);
+            self.vcx.run_until_parked();
+        }
+        fn to(&mut self, p: gpui::Point<Pixels>) {
+            self.vcx
+                .simulate_mouse_move(p, MouseButton::Left, Modifiers::none());
+            self.vcx.run_until_parked();
+        }
+        /// Moves the pointer so the ghost's centre lands at `y`.
+        fn centre_at(&mut self, y: Pixels) {
+            let ghost = self.get("drag-ghost").unwrap();
+            let p = self.vcx.update(|w, _| w.mouse_position());
+            self.to(point(p.x, p.y + y - ghost.center().y));
+        }
+        fn release(&mut self, p: gpui::Point<Pixels>) {
+            self.vcx
+                .simulate_mouse_up(p, MouseButton::Left, Modifiers::none());
+            self.vcx.run_until_parked();
+        }
+        fn dragging(&mut self) -> bool {
+            self.main.read_with(&self.vcx, |m, cx| {
+                m.editor.read(cx).drag.row.get().is_some()
+            })
+        }
+        /// (rows container's drag focus, row 0's name input) focused.
+        fn focus(&mut self) -> (bool, bool) {
+            let (main, key) = (self.main.clone(), self.keys[0]);
+            self.vcx.update(|window, cx| {
+                let editor = main.read(cx).editor.read(cx);
+                let row = editor.rows.iter().find(|r| r.key == key).unwrap();
+                let name = gpui::Focusable::focus_handle(&row.name, cx);
+                (
+                    editor.drag_focus.is_focused(window),
+                    name.is_focused(window),
+                )
+            })
+        }
+        fn idle(&mut self) -> bool {
+            !self.dragging() && self.get("drop-gap").is_none() && self.get("drag-ghost").is_none()
+        }
+        fn changed(&mut self) -> bool {
+            self.state
+                .read_with(&self.vcx, |s, _| s.edit_buffer().unwrap().has_changes())
+        }
+    }
+
+    /// The ghost moves only vertically and never leaves the rows group, wherever the
+    /// pointer goes; the dragged row leaves the flow, its gap holds its slot, the value
+    /// is never drawn and focus stays in the row (05 §2.3, owner 2026-11-23).
+    #[gpui::test]
+    fn ghost_is_clamped_to_the_rows_and_vertical_only(cx: &mut TestAppContext) {
+        let mut r = rig(cx, true);
+        let value = super::tests::value_input(&r.main, r.keys[0], &mut r.vcx);
+        r.vcx
+            .update(|window, cx| ui::focus_input(&value, window, cx));
+        let bottom = r.row(2).bottom();
+        r.start();
+        assert!(r.get("drop-line").is_none());
+        let ghost = r.get("drag-ghost").expect("ghost drawn");
+        let gap = r.get("drop-gap").expect("gap at the row's slot");
+        assert!(near(gap.top(), r.top) && near(gap.size.height, GHOST_H));
+        assert!(near(ghost.size.height, GHOST_H));
+        assert!(near(r.row(1).top(), gap.bottom()), "b under the gap");
+        let dragged = format!("edit-row {}", r.keys[0]);
         assert!(
-            state.read_with(&vcx, |s, _| s.is_editing()),
+            bounds(&mut r.vcx, dragged).is_none(),
+            "dragged row not drawn"
+        );
+        assert!(
+            r.focus() == (true, false),
+            "focus on the rows while dragging"
+        );
+
+        let header = r.vcx.debug_bounds("editor-header").unwrap();
+        r.to(point(ghost.center().x, header.top() - px(200.)));
+        let up = r.get("drag-ghost").unwrap();
+        assert!(near(up.top(), r.top), "clamped at the top: {up:?}");
+        r.to(point(ghost.center().x, bottom + px(2000.)));
+        let down = r.get("drag-ghost").unwrap();
+        assert!(
+            near(down.bottom(), bottom),
+            "clamped at the bottom: {down:?}"
+        );
+        let gap = r.get("drop-gap").unwrap();
+        assert!(near(gap.bottom(), bottom) && near(r.row(2).bottom(), gap.top()));
+        let y = down.center().y;
+        for x in [px(-500.), px(5000.)] {
+            r.to(point(x, y + px(30.)));
+            let side = r.get("drag-ghost").unwrap();
+            assert_eq!(
+                (side.left(), side.size.width),
+                (ghost.left(), ghost.size.width)
+            );
+        }
+    }
+
+    /// The gap follows the ghost's centre against the other rows' midway centres, and
+    /// the rows shift around it; Reduce Motion shows the final gap on the first frame.
+    #[gpui::test]
+    fn gap_follows_the_ghost_centre(cx: &mut TestAppContext) {
+        let mut r = rig(cx, true);
+        r.start();
+        assert!(
+            near(r.get("drop-gap").unwrap().top(), r.top),
+            "own slot after 6 px"
+        );
+        // b's midway centre: half a gap plus half of b below the rows' top.
+        let (hb, hc) = (r.row(1).size.height, r.row(2).size.height);
+        let mid_b = r.top + (GHOST_H + hb) / 2.;
+        r.centre_at(mid_b - px(2.));
+        assert!(
+            near(r.get("drop-gap").unwrap().top(), r.top),
+            "still before b"
+        );
+        r.centre_at(mid_b + px(2.));
+        let (gap, b, c) = (r.get("drop-gap").unwrap(), r.row(1), r.row(2));
+        assert!(near(b.top(), r.top), "b slid up");
+        assert!(near(gap.top(), b.bottom()) && near(c.top(), gap.bottom()));
+        assert!(
+            near(gap.size.height, GHOST_H),
+            "full gap on the first frame"
+        );
+        assert!(r.get("drop-gap-closing").is_none(), "no closing gap");
+        let mid_c = r.top + hb + (GHOST_H + hc) / 2.;
+        r.centre_at(mid_c + px(2.));
+        let (gap, c) = (r.get("drop-gap").unwrap(), r.row(2));
+        assert!(
+            near(c.top(), r.top + hb) && near(gap.top(), c.bottom()),
+            "after c"
+        );
+        r.centre_at(mid_c - px(2.));
+        let (gap, c) = (r.get("drop-gap").unwrap(), r.row(2));
+        assert!(
+            near(gap.top(), r.top + hb) && near(c.top(), gap.bottom()),
+            "back"
+        );
+        r.centre_at(mid_b - px(2.));
+        let gap = r.get("drop-gap").unwrap();
+        assert!(
+            near(gap.top(), r.top) && near(r.row(1).top(), gap.bottom()),
+            "top"
+        );
+    }
+
+    /// With motion the old gap closes while the new one opens, then settles.
+    #[gpui::test]
+    fn gap_moves_with_motion(cx: &mut TestAppContext) {
+        let mut r = rig(cx, false);
+        r.start();
+        let hb = r.row(1).size.height;
+        r.centre_at(r.top + (GHOST_H + hb) / 2. + px(2.));
+        assert!(r.get("drop-gap-closing").is_some(), "old slot closing");
+        std::thread::sleep(GAP_MOTION + Duration::from_millis(30));
+        r.vcx.update(|w, _| w.refresh());
+        r.vcx.run_until_parked();
+        let gap = r.get("drop-gap").unwrap();
+        assert!(near(gap.size.height, GHOST_H), "settled: {gap:?}");
+        assert!(near(gap.top(), r.row(1).bottom()));
+    }
+
+    /// A release anywhere drops at the gap; at the row's own slot nothing changes; Esc
+    /// cancels the drag (not the edit) and restores the rows.
+    #[gpui::test]
+    fn release_anywhere_drops_at_the_gap(cx: &mut TestAppContext) {
+        let mut r = rig(cx, true);
+        let full = r.row(0);
+        let header = r.vcx.debug_bounds("editor-header").unwrap().center();
+
+        r.start();
+        let hb = r.row(1).size.height;
+        r.centre_at(r.top + (GHOST_H + hb) / 2. - px(2.));
+        r.release(point(px(-300.), header.y));
+        assert_eq!(r.names(), ["a", "b", "c"]);
+        assert!(!r.changed(), "own slot: no edit");
+        assert!(!r.dragging() && r.get("drop-gap").is_none());
+
+        r.start();
+        let y = r.row(2).center().y;
+        r.centre_at(y + px(2.));
+        r.vcx.simulate_keystrokes("escape");
+        r.vcx.run_until_parked();
+        assert!(
+            r.state.read_with(&r.vcx, |s, _| s.is_editing()),
             "still editing"
         );
-        assert!(main.read_with(&vcx, |m, cx| m.editor.read(cx).drag.row.get().is_none()));
-        assert!(bounds(&mut vcx, "drop-line".into()).is_none());
-        assert_eq!(row(&mut vcx, 0).size.height, full, "row restored");
-        let at = row(&mut vcx, 2).center();
-        vcx.simulate_mouse_up(at, MouseButton::Left, none);
-        assert_eq!(names(&mut vcx), ["a", "b", "c"], "Esc dropped nothing");
+        assert!(r.idle());
+        assert_eq!(r.row(0), full, "row restored");
+        assert_eq!(r.focus(), (false, true), "focus back in the row");
+        let at = r.row(2).center();
+        r.release(at);
+        assert_eq!(r.names(), ["a", "b", "c"], "Esc dropped nothing");
+        assert!(!r.changed());
 
-        start_drag(&mut vcx);
-        hover(&mut vcx, 2, 0.75).expect("line under c");
-        let at = row(&mut vcx, 2).center();
-        vcx.simulate_mouse_up(at + point(px(0.), px(1.)), MouseButton::Left, none);
-        vcx.run_until_parked();
-        assert_eq!(names(&mut vcx), ["b", "c", "a"]);
-        assert!(main.read_with(&vcx, |m, cx| m.editor.read(cx).drag.target.get().is_none()));
+        // Released far below the window, sideways: lands in the gap after c.
+        r.start();
+        let below = r.row(2).bottom() + px(2000.);
+        r.to(point(px(5000.), below));
+        r.release(point(px(5000.), below));
+        assert_eq!(r.names(), ["b", "c", "a"]);
+        assert!(r.changed());
+        assert!(r.idle());
+        assert_eq!(r.focus(), (false, true), "focus back in the dropped row");
+    }
 
-        // A release outside the rows (over the title) moves nothing and leaves no state.
-        start_drag(&mut vcx);
-        hover(&mut vcx, 1, 0.25).expect("line over b");
-        let header = vcx.debug_bounds("editor-header").unwrap().center();
-        vcx.simulate_mouse_move(header, MouseButton::Left, none);
-        vcx.simulate_mouse_up(header, MouseButton::Left, none);
-        vcx.run_until_parked();
-        assert_eq!(names(&mut vcx), ["b", "c", "a"]);
-        main.read_with(&vcx, |m, cx| {
-            let drag = &m.editor.read(cx).drag;
-            assert!(drag.row.get().is_none() && drag.target.get().is_none());
+    /// Keys typed during a drag reach no input of the dragged row.
+    #[gpui::test]
+    fn typing_during_a_drag_edits_nothing(cx: &mut TestAppContext) {
+        let mut r = rig(cx, true);
+        r.start();
+        r.vcx.simulate_input("xyz");
+        r.vcx.simulate_keystrokes("tab x shift-tab y");
+        r.vcx.run_until_parked();
+        assert_eq!(r.focus(), (true, false), "Tab keeps focus on the drag");
+        assert!(r.dragging());
+        let at = r.vcx.update(|w, _| w.mouse_position());
+        r.release(at);
+        assert_eq!(r.names(), ["a", "b", "c"]);
+        assert!(!r.changed(), "no edit");
+    }
+
+    /// ⌘S or leaving edit mode during a drag ends it with no gap or ghost left.
+    #[gpui::test]
+    fn save_or_cancel_during_a_drag_clears_it(cx: &mut TestAppContext) {
+        for save in [true, false] {
+            let mut r = rig(cx, true);
+            r.start();
+            let hb = r.row(1).size.height;
+            r.centre_at(r.top + (GHOST_H + hb) / 2. + px(2.));
+            if save {
+                r.vcx.simulate_keystrokes("cmd-s");
+            } else {
+                r.state.update(&mut r.vcx, |s, cx| s.cancel_edit(cx));
+            }
+            r.vcx.run_until_parked();
+            assert!(
+                !r.state.read_with(&r.vcx, |s, _| s.is_editing()),
+                "save={save}"
+            );
+            assert!(r.idle(), "save={save}");
+            let at = r.vcx.update(|w, _| w.mouse_position());
+            r.release(at);
+            assert!(r.idle(), "save={save}");
+        }
+    }
+
+    /// A scroll during a drag (pointer still) keeps the ghost under the pointer.
+    #[gpui::test]
+    fn scroll_during_a_drag_keeps_the_ghost_under_the_pointer(cx: &mut TestAppContext) {
+        let mut r = rig(cx, true);
+        let (state, vcx) = (r.state.clone(), &mut r.vcx);
+        state.update(vcx, |s, cx| {
+            s.edit(cx, |b| {
+                for _ in 0..12 {
+                    b.add_field(FieldKind::Text);
+                }
+            })
         });
+        vcx.simulate_resize(gpui::size(px(1000.), px(420.)));
+        vcx.run_until_parked();
+        r.start();
+        let ghost = r.get("drag-ghost").unwrap();
+        let b = r.row(1);
+        let at = r.vcx.update(|w, _| w.mouse_position());
+        r.vcx.simulate_event(gpui::ScrollEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-30.))),
+            ..Default::default()
+        });
+        r.vcx.run_until_parked();
+        assert!(near(r.row(1).top(), b.top() - px(30.)), "rows scrolled");
+        // The scroll frame drew the ghost from the old rows' top; it asked for the next
+        // frame (tests have no frame loop, so deliver it).
+        let next = r.vcx.update(|w, cx| w.simulate_next_frame(cx));
+        assert!(next > 0, "another frame requested");
+        r.vcx.run_until_parked();
+        assert!(
+            near(r.get("drag-ghost").unwrap().top(), ghost.top()),
+            "ghost stayed"
+        );
+    }
+
+    /// A section's ghost keeps the grip under the pointer: the section's extra space
+    /// above its header line does not shift it.
+    #[gpui::test]
+    fn section_ghost_keeps_the_grip_under_the_pointer(cx: &mut TestAppContext) {
+        let mut r = rig(cx, true);
+        let (state, vcx) = (r.state.clone(), &mut r.vcx);
+        let key = state.update(vcx, |s, cx| {
+            let mut key = 0;
+            s.edit(cx, |b| {
+                key = b.add_field(FieldKind::Section);
+                b.move_field(key, 1);
+            });
+            key
+        });
+        vcx.run_until_parked();
+        let grip = bounds(vcx, format!("grip {key}")).unwrap().center();
+        let none = Modifiers::none();
+        vcx.simulate_mouse_down(grip, MouseButton::Left, none);
+        vcx.simulate_mouse_move(grip + point(px(0.), px(6.)), MouseButton::Left, none);
+        vcx.run_until_parked();
+        let ghost = r.get("drag-ghost").unwrap();
+        // Its header line stays under the pointer (within the section's 24 px name
+        // line against the ghost's 28 px one; 12 px off before the section offset).
+        let off = ghost.center().y - (grip.y + px(6.));
+        assert!(off.abs() <= px(3.), "{ghost:?} vs {grip:?}");
+    }
+
+    /// Speed: zero at the band's inner side, growing from 120 to 720 px/s at the edge
+    /// and beyond it; a constant 360 px/s under Reduce Motion (steps for 1/60 s); a
+    /// frame's time is capped at 1/30 s.
+    #[test]
+    fn auto_scroll_step_values() {
+        let (top, bottom) = (px(100.), px(500.));
+        let step = |y: f32, rm| auto_scroll_step(px(y), top, bottom, rm, 1. / 60.);
+        let long = |y: f32, rm| auto_scroll_step(px(y), top, bottom, rm, 1.);
+        let eq = |a: f32, b: f32| assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+        eq(long(100., false), -24.);
+        eq(long(500., true), 12.);
+        eq(step(300., false), 0.);
+        eq(step(124., false), 0.);
+        eq(step(476., false), 0.);
+        eq(step(112., false), -7.);
+        eq(step(100., false), -12.);
+        eq(step(-400., false), -12.);
+        eq(step(488., false), 7.);
+        eq(step(2000., false), 12.);
+        eq(step(120., true), -6.);
+        eq(step(90., true), -6.);
+        eq(step(480., true), 6.);
+        eq(step(900., true), 6.);
+    }
+
+    /// A long item in a small window: auto-scroll at the edge bands, none in the middle,
+    /// constant under Reduce Motion, stopping at the bounds and when the drag ends.
+    #[gpui::test]
+    fn drag_auto_scrolls_at_the_edges(cx: &mut TestAppContext) {
+        for reduce in [false, true] {
+            let mut r = rig(cx, reduce);
+            let (state, vcx) = (r.state.clone(), &mut r.vcx);
+            state.update(vcx, |s, cx| {
+                s.edit(cx, |b| {
+                    for _ in 0..16 {
+                        b.add_field(FieldKind::Text);
+                    }
+                })
+            });
+            vcx.simulate_resize(gpui::size(px(1000.), px(420.)));
+            vcx.run_until_parked();
+            let main = r.main.clone();
+            let offset = move |vcx: &mut VisualTestContext| {
+                main.read_with(vcx, |m, cx| m.editor.read(cx).scroll.offset().y)
+            };
+            let frame = |vcx: &mut VisualTestContext| {
+                vcx.update(|w, cx| w.simulate_next_frame(cx));
+                vcx.run_until_parked();
+            };
+            let view = r.get("editor-scroll").unwrap();
+            // A fixed frame time (1/60 s): steps independent of the test machine's pace.
+            r.main.read_with(&r.vcx, |m, cx| {
+                m.editor.read(cx).drag.test_dt.set(Some(1. / 60.))
+            });
+            r.start();
+            let x = view.center().x;
+            assert_eq!(offset(&mut r.vcx), px(0.));
+
+            // Middle: no scroll.
+            r.to(point(x, view.center().y));
+            frame(&mut r.vcx);
+            assert_eq!(offset(&mut r.vcx), px(0.), "middle, reduce={reduce}");
+
+            // Bottom band, 20 px deep: (120 + 600 * 20/24) / 60 px per frame (360 / 60
+            // under Reduce Motion).
+            r.to(point(x, view.bottom() - px(4.)));
+            let want = if reduce { 6. } else { 2. + 10. * 20. / 24. };
+            let before = offset(&mut r.vcx);
+            frame(&mut r.vcx);
+            let d = (before - offset(&mut r.vcx)).as_f32();
+            assert!((d - want).abs() < 0.01, "step {d}, reduce={reduce}");
+            let max = r
+                .main
+                .read_with(&r.vcx, |m, cx| m.editor.read(cx).scroll.max_offset().y);
+            assert!(max > px(100.), "long item scrolls: {max:?}");
+            // The ghost stays under the still pointer across an auto-scroll frame.
+            let (ghost, before) = (r.get("drag-ghost").unwrap(), offset(&mut r.vcx));
+            frame(&mut r.vcx);
+            assert!(offset(&mut r.vcx) < before, "scrolled");
+            let now = r.get("drag-ghost").unwrap();
+            // Within one device pixel (layout snaps a fractional scroll to 0.5 px).
+            let lag = (now.top() - ghost.top()).abs();
+            assert!(lag <= px(0.5), "{now:?} vs {ghost:?}");
+            for _ in 0..400 {
+                frame(&mut r.vcx);
+            }
+            // Gaps settled (frames here outrun their 150 ms), then two frames so the
+            // clamp uses the settled bound.
+            std::thread::sleep(GAP_MOTION + Duration::from_millis(20));
+            let editor =
+                |vcx: &mut VisualTestContext| r.main.read_with(vcx, |m, _| m.editor.clone());
+            let editor = editor(&mut r.vcx);
+            for _ in 0..20 {
+                let busy = editor.read_with(&r.vcx, |e, _| e.drag.animating(Instant::now()));
+                if !busy {
+                    break;
+                }
+                frame(&mut r.vcx);
+            }
+            frame(&mut r.vcx);
+            frame(&mut r.vcx);
+            let max = r
+                .main
+                .read_with(&r.vcx, |m, cx| m.editor.read(cx).scroll.max_offset().y);
+            assert_eq!(offset(&mut r.vcx), -max, "stops at the bottom");
+
+            // Above the viewport (beyond the top band): back up to the top.
+            r.to(point(x, view.top() - px(50.)));
+            for _ in 0..400 {
+                frame(&mut r.vcx);
+            }
+            assert_eq!(offset(&mut r.vcx), px(0.), "stops at the top");
+
+            // The drag ends in the bottom band: no more scrolling.
+            r.to(point(x, view.bottom() - px(2.)));
+            let at = r.vcx.update(|w, _| w.mouse_position());
+            r.release(at);
+            let after = offset(&mut r.vcx);
+            for _ in 0..5 {
+                frame(&mut r.vcx);
+            }
+            assert_eq!(offset(&mut r.vcx), after, "stopped with the drag");
+        }
+    }
+
+    /// `project_slot` over mixed heights: a section row (12 px gap, 2 px rule), a tall
+    /// password row with a history block under it, a notes row, a plain row; and a
+    /// single row. Each slot flips across the row's midway centre, ends included.
+    #[test]
+    fn project_slot_over_mixed_heights() {
+        let h = GHOST_H.as_f32(); // 43
+        // (is a row, height): section 56, password 90 + history 30, notes 120, text 43.
+        let flow = [
+            (true, 56.),
+            (true, 90.),
+            (false, 30.),
+            (true, 120.),
+            (true, 43.),
+        ]
+        .map(|(row, ht)| (row, px(ht)));
+        // Row tops closed up: 0, 56, (history 146), 176, 296; total 339.
+        // Midway centres: top + (43 + h) / 2.
+        let mids = [
+            (0. + (h + 56.) / 2.),
+            56. + (h + 90.) / 2.,
+            176. + (h + 120.) / 2.,
+            296. + (h + 43.) / 2.,
+        ];
+        assert_eq!(mids, [49.5, 122.5, 257.5, 339.]);
+        assert_eq!(project_slot(&flow, px(h / 2.)), 0, "top end");
+        assert_eq!(project_slot(&flow, px(339. + h / 2.)), 4, "bottom end");
+        for (r, m) in mids.into_iter().enumerate() {
+            assert_eq!(project_slot(&flow, px(m - 1.)), r, "above row {r}");
+            assert_eq!(project_slot(&flow, px(m + 1.)), r + 1, "below row {r}");
+        }
+        let one = [(true, px(43.))];
+        assert_eq!(project_slot(&one, px(h / 2.)), 0, "single row, top");
+        assert_eq!(
+            project_slot(&one, px(43. + h / 2.)),
+            1,
+            "single row, bottom"
+        );
     }
 }
 

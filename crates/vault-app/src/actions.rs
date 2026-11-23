@@ -124,6 +124,9 @@ pub fn sidebar_menu_title(sidebar_visible: bool) -> &'static str {
 pub const LIST_CONTEXT: &str = "ItemList";
 /// Key context of the focused detail column (Esc).
 pub const DETAIL_CONTEXT: &str = "ItemDetail";
+/// The editor's rows while a field is dragged: Tab and Shift-Tab do nothing there, so
+/// focus stays in the editor and Esc still cancels the drag (05 §2.3).
+pub const FIELD_DRAG_CONTEXT: &str = "FieldDrag";
 
 pub fn bind_keys(cx: &mut App) {
     let list = Some(LIST_CONTEXT);
@@ -140,6 +143,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-e", EditItem, None),
         KeyBinding::new("cmd-s", SaveItem, None),
         KeyBinding::new("escape", CancelEdit, Some(DETAIL_CONTEXT)),
+        KeyBinding::new("tab", gpui::NoAction, Some(FIELD_DRAG_CONTEXT)),
+        KeyBinding::new("shift-tab", gpui::NoAction, Some(FIELD_DRAG_CONTEXT)),
         KeyBinding::new("cmd-c", CopyUsername, list),
         KeyBinding::new("cmd-shift-u", CopyUsername, None),
         KeyBinding::new("cmd-shift-c", CopyPassword, None),
