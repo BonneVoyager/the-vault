@@ -140,9 +140,11 @@ fn row(label: &'static str, control: impl IntoElement) -> gpui::Div {
         .child(div().flex_none().child(control))
 }
 
-/// A [`row`] whose label carries a muted hint under it (wrapping when the control is
-/// wide). `tag` names the hint's test selector `settings-{tag}-hint: {hint}` (gpui exposes
-/// no painted text to tests: the selector carries the string this element renders).
+/// A [`row`] with a muted hint under it: the label shares the first line with the
+/// control, the hint runs under both at the full row width. `tag` names the hint's test
+/// selector `settings-{tag}-hint: {hint}` (gpui exposes no painted text to tests: the
+/// selector carries the string this element renders), the label `settings-{tag}-label`
+/// and the control wrapper `settings-{tag}-control`.
 fn hinted_row(
     label: &'static str,
     hint: impl Into<SharedString>,
@@ -150,43 +152,30 @@ fn hinted_row(
     control: impl IntoElement,
     cx: &App,
 ) -> gpui::Div {
-    ui::h_flex()
-        .py(px(10.))
-        .gap(px(12.))
-        .child(label_column(label, hint.into(), tag, cx).flex_1().min_w_0())
-        .child(div().flex_none().child(control))
-}
-
-/// A [`hinted_row`] for a control too wide to share a line: label and hint take the full
-/// width, the control sits on a second line, right-aligned to the other rows' controls
-/// (tagged `settings-{tag}-control`).
-fn stacked_hinted_row(
-    label: &'static str,
-    hint: impl Into<SharedString>,
-    tag: &'static str,
-    control: impl IntoElement,
-    cx: &App,
-) -> gpui::Div {
-    ui::v_flex()
-        .py(px(10.))
-        .gap(px(8.))
-        .child(label_column(label, hint.into(), tag, cx))
-        .child(
-            ui::h_flex().justify_end().child(
-                div()
-                    .flex_none()
-                    .debug_selector(move || format!("settings-{tag}-control"))
-                    .child(control),
-            ),
-        )
-}
-
-/// Label over its muted hint, the hint tagged `settings-{tag}-hint: {hint}`.
-fn label_column(label: &'static str, hint: SharedString, tag: &'static str, cx: &App) -> gpui::Div {
+    let hint = hint.into();
     let selector = format!("settings-{tag}-hint: {hint}");
     ui::v_flex()
+        .py(px(10.))
         .gap(px(2.))
-        .child(div().text_sm().child(label))
+        .child(
+            ui::h_flex()
+                .gap(px(12.))
+                .items_center()
+                .child(
+                    div()
+                        .debug_selector(move || format!("settings-{tag}-label"))
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .debug_selector(move || format!("settings-{tag}-control"))
+                        .child(control),
+                ),
+        )
         .child(
             ui::muted(hint, cx)
                 .text_xs()
@@ -446,26 +435,37 @@ impl SettingsView {
         };
 
         let reveal_path = path.clone();
+        // Heading and button share the first line; path, status and error run under
+        // them at the full row width, like the other rows' hints.
         let location = ui::v_flex()
             .py(px(10.))
             .gap(px(6.))
-            .child(div().text_sm().child("Vault package"))
+            .child(
+                ui::h_flex()
+                    .gap(px(12.))
+                    .items_center()
+                    .child(div().flex_1().min_w_0().text_sm().child("Vault package"))
+                    .child(
+                        div()
+                            .flex_none()
+                            .debug_selector(|| "settings-reveal-vault".into())
+                            .child(
+                                Button::new("reveal-vault")
+                                    .small()
+                                    .label("Reveal in Finder")
+                                    .clickable()
+                                    .on_click(move |_, _, cx| cx.reveal_path(&reveal_path)),
+                            ),
+                    ),
+            )
             .child(
                 div()
+                    .debug_selector(|| "settings-vault-path".into())
                     .text_xs()
                     .font_family(theme.mono_font_family.clone())
                     .text_color(theme.muted_foreground)
                     .truncate()
                     .child(path.display().to_string()),
-            )
-            .child(
-                ui::h_flex().gap(px(8.)).child(
-                    Button::new("reveal-vault")
-                        .small()
-                        .label("Reveal in Finder")
-                        .clickable()
-                        .on_click(move |_, _, cx| cx.reveal_path(&reveal_path)),
-                ),
             )
             .child(ui::muted(status, cx))
             .when_some(sync_error, |col, e| {
@@ -516,7 +516,7 @@ impl SettingsView {
                     }),
                 cx,
             ),
-            stacked_hinted_row(
+            hinted_row(
                 "Keep daily backups for",
                 retention_hint(Settings::RETENTION_CHOICES[current]),
                 "retention",
@@ -1163,8 +1163,14 @@ mod tests {
     #[gpui::test]
     fn sync_rows_fit_the_settings_sheet(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
+        // A long path, so the Vault package row must truncate it beside its button.
+        let long = dir
+            .path()
+            .join("a-folder-name-long-enough-to-overflow-the-settings-sheet-on-its-own")
+            .join("and-another-one-just-as-long-to-be-sure-it-never-fits-on-one-line");
+        std::fs::create_dir_all(&long).unwrap();
         let vault = SyncedVault::create(
-            &dir.path().join("t.vault"),
+            &long.join("t.vault"),
             &SecretString::new("pw".into()),
             KdfParams::for_tests(),
             Uuid::new_v4(),
@@ -1208,34 +1214,60 @@ mod tests {
                     "{size:?}: {sel} {tab:?} outside the pane {pane:?}"
                 );
             }
-            // The hint spans the pane above the tabs; the tabs end at the controls' edge.
+            // The tabs sit on the heading line at the controls' edge; the hint runs
+            // under them at the full pane width.
             let hint = vcx
                 .debug_bounds(
                     "settings-retention-hint: Older copies thin out to weekly, \
                      then monthly for 3 years.",
                 )
                 .expect("retention hint");
-            let first = vcx.debug_bounds("settings-retention-tab: 15 days").unwrap();
             let bar = vcx.debug_bounds("settings-retention-control").unwrap();
+            let row = vcx
+                .debug_bounds("settings-row sync 2")
+                .expect("retention row");
             assert!(
-                hint.left() >= pane.left() && hint.right() <= pane.right() + px(0.5),
-                "{size:?}: hint {hint:?} outside the pane {pane:?}"
+                (hint.left() - pane.left()).abs() < px(1.),
+                "{size:?}: hint {hint:?} does not start at the pane's left {pane:?}"
             );
             assert!(
-                hint.size.width >= pane.size.width * 0.6,
-                "{size:?}: hint squeezed to {:?} of {:?}",
-                hint.size.width,
-                pane.size.width
+                hint.top() >= bar.bottom(),
+                "{size:?}: hint {hint:?} not under the tabs {bar:?}"
             );
+            // The label wraps beside the 4-segment bar; the bar is centred on it and
+            // starts no higher than the row's 10 px top padding.
+            let label = vcx.debug_bounds("settings-retention-label").unwrap();
             assert!(
-                hint.bottom() <= first.top(),
-                "{size:?}: tabs {first:?} not below the hint {hint:?}"
+                (bar.center().y - label.center().y).abs() < px(1.5)
+                    && bar.top() >= row.top() + px(9.5),
+                "{size:?}: tabs {bar:?} not on the heading line {label:?} of {row:?}"
             );
             assert!(
                 (pane.right() - bar.right()).abs() < px(1.),
                 "{size:?}: tab bar ends at {:?}, pane at {:?}",
                 bar.right(),
                 pane.right()
+            );
+            // The long path truncates at the full row width; Reveal in Finder stays on
+            // the heading line.
+            let path = vcx.debug_bounds("settings-vault-path").unwrap();
+            assert!(
+                (pane.right() - path.right()).abs() < px(1.),
+                "{size:?}: path ends at {:?}, pane at {:?}",
+                path.right(),
+                pane.right()
+            );
+            let reveal = vcx.debug_bounds("settings-reveal-vault").unwrap();
+            let package = vcx
+                .debug_bounds("settings-row sync 0")
+                .expect("package row");
+            assert!(
+                reveal.left() >= pane.left() && reveal.right() <= pane.right() + px(0.5),
+                "{size:?}: Reveal in Finder {reveal:?} outside the pane {pane:?}"
+            );
+            assert!(
+                (reveal.top() - package.top() - px(10.)).abs() < px(3.),
+                "{size:?}: Reveal in Finder {reveal:?} not on the heading line of {package:?}"
             );
             state.update(&mut vcx, |s, cx| {
                 s.settings_tab = 0;
