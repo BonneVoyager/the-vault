@@ -20,7 +20,7 @@ Put the vault package in a folder that iCloud Drive, Dropbox or any other servic
 
 ## Menu bar padlock
 
-With "Show Vault in Dock" turned off, Vault lives in the menu bar instead. Click the padlock to open the window; right-click it to lock, unlock or quit. With "Launch at login" on, Vault starts there silently.
+With "Show Vault in Dock" turned off, Vault lives in the menu bar instead. Click the padlock to open the window; right-click it to hide the window, lock, unlock or quit. With "Launch at login" on, Vault starts there silently.
 
 ## Keyboard shortcuts
 

@@ -605,8 +605,10 @@ impl BackupWindow {
                 icon: gpui::img(crate::assets::APP_ICON)
                     .size_full()
                     .into_any_element(),
+                icon_size: ui::UNLOCK_ICON_SIZE,
                 badge: Some(IconName::Eye),
                 name: self.vault_name.clone(),
+                title: false,
                 subtitle: Some(self.subtitle.clone()),
                 controls,
                 unlocking: self.busy.then_some("backup-unlocking"),

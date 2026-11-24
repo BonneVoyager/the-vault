@@ -139,15 +139,16 @@ Launch Services puts the Dock icon back whenever a bundle without `LSUIElement` 
 Shown only while Settings ▸ General "Show Vault in Dock" is off (05 §2.5), so the app is never running with neither a Dock icon nor a menu bar icon.
 
 ```rust
-pub struct StatusItemCallbacks { pub open: Box<dyn Fn()>, pub lock_or_unlock: Box<dyn Fn()>, pub quit: Box<dyn Fn()> }
+pub struct StatusItemCallbacks { pub open: Box<dyn Fn()>, pub hide: Box<dyn Fn()>, pub lock_or_unlock: Box<dyn Fn()>, pub quit: Box<dyn Fn()> }
 pub struct StatusItem;                                     // NSStatusBar.systemStatusBar item, square length; removed on drop
 impl StatusItem {
-    pub fn install(locked: bool, cb: StatusItemCallbacks) -> Result<StatusItem, MacError>;
+    pub fn install(locked: bool, window_shown: bool, cb: StatusItemCallbacks) -> Result<StatusItem, MacError>;
     pub fn set_locked(&self, locked: bool);                // swaps the glyph and the menu title
+    pub fn set_window_shown(&self, shown: bool);           // "Hide Vault" (runs `hide`) / "Open Vault" (runs `open`)
 }
 ```
 
-Main thread only; callbacks run on the main thread. Button image: a template (monochrome, follows the menu bar colour) padlock glyph, closed when locked and open when unlocked, 18 pt, SF Symbols `lock.fill` / `lock.open.fill` via `NSImage::imageWithSystemSymbolName`, with a padlock drawn in code (18 × 18, template) as the fallback when the symbol is unavailable; the accessibility description "Vault, locked" / "Vault, unlocked" is set on the image. Left click runs `open`. Right click or Control-click pops a native `NSMenu`: "Open Vault", then "Lock" (unlocked) or "Unlock…" (locked), a separator, "Quit Vault"; the menu is attached only for the duration of the click so the left click keeps its action. Non-macOS stubs: `install` returns `Err(MacError::NotAvailable)`, `set_locked` is a no-op.
+Main thread only; callbacks run on the main thread. Button image: a template (monochrome, follows the menu bar colour) padlock glyph, closed when locked and open when unlocked, 18 pt, SF Symbols `lock.fill` / `lock.open.fill` via `NSImage::imageWithSystemSymbolName`, with a padlock drawn in code (18 × 18, template) as the fallback when the symbol is unavailable; the accessibility description "Vault, locked" / "Vault, unlocked" is set on the image. Left click runs `open`. Right click or Control-click pops a native `NSMenu`: "Open Vault" (runs `open`) or, while the app reports its main window shown (`window_shown` at install, then `set_window_shown`), "Hide Vault" (runs `hide`; owner decision 2026-11-24, option A), then "Lock" (unlocked) or "Unlock…" (locked), a separator, "Quit Vault"; the menu is attached only for the duration of the click so the left click keeps its action (always `open`). Non-macOS stubs: `install` returns `Err(MacError::NotAvailable)`, `set_locked` and `set_window_shown` are no-ops.
 
 ### 5d. Login-item launch detection (2026-11-10)
 

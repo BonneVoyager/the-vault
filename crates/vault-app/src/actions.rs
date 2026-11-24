@@ -349,6 +349,36 @@ pub fn main_window(cx: &App) -> Option<gpui::AnyWindowHandle> {
     cx.windows().into_iter().find(|w| w.window_id() == main)
 }
 
+/// Closes `handle` as ⌘W does. The main window first runs the close button's hook
+/// (`VaultRoot::prepare_to_close`: save geometry, close the help sheet, lock), or just
+/// locks if its view is gone. Must not run inside that window's own update.
+pub fn close_window(handle: gpui::AnyWindowHandle, state: &Entity<AppState>, cx: &mut App) {
+    let main = cx
+        .try_global::<MainWindow>()
+        .map(|main| (main.0, main.1.clone()));
+    handle
+        .update(cx, |_, window, cx| {
+            if let Some((id, root)) = &main
+                && handle.window_id() == *id
+                && root
+                    .update(cx, |root, cx| root.prepare_to_close(window, cx))
+                    .is_err()
+            {
+                state.update(cx, |s, cx| s.lock(cx));
+            }
+            window.remove_window();
+        })
+        .ok();
+}
+
+/// Closes the main window, if open, through [`close_window`] (the status item's "Hide
+/// Vault", 05 §2.5). Vault keeps running; other windows follow the lock as on ⌘W.
+pub fn close_main_window(state: &Entity<AppState>, cx: &mut App) {
+    if let Some(handle) = main_window(cx) {
+        close_window(handle, state, cx);
+    }
+}
+
 /// Whether item actions may run: the main window (or no window) is active. In the
 /// backup viewer, ⌘D, ⌘⇧C, ⌘E, ↑/↓... would otherwise act on the live vault.
 pub fn in_main_window(cx: &App) -> bool {
@@ -418,27 +448,10 @@ pub fn register(state: &Entity<AppState>, cx: &mut App) {
         let Some(handle) = cx.active_window() else {
             return;
         };
-        let main = cx
-            .try_global::<MainWindow>()
-            .map(|main| (main.0, main.1.clone()));
         let state = close_state.clone();
         // Actions run inside the active window's dispatch. Defer the update until
         // that window is available again, as for Minimize and Zoom.
-        cx.defer(move |cx| {
-            handle
-                .update(cx, |_, window, cx| {
-                    if let Some((id, root)) = &main
-                        && handle.window_id() == *id
-                        && root
-                            .update(cx, |root, cx| root.prepare_to_close(window, cx))
-                            .is_err()
-                    {
-                        state.update(cx, |s, cx| s.lock(cx));
-                    }
-                    window.remove_window();
-                })
-                .ok();
-        });
+        cx.defer(move |cx| close_window(handle, &state, cx));
     });
 
     on_main::<Search>(state, cx, |s, cx| s.request_focus(FocusTarget::Search, cx));

@@ -3,20 +3,30 @@
 use std::path::PathBuf;
 
 use gpui::{
-    Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render,
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::spinner::Spinner;
-use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme as _, Disableable as _};
 
 use crate::cloud;
 use crate::persist;
 use crate::state::{AppState, Busy, ChooseIntent, LEGACY_LAYOUT};
 use crate::ui::{self, Clickable as _};
+
+/// The welcome card's subtitle with recent vaults listed, and without.
+const WELCOME_WITH_RECENTS: &str = "Open a recent vault, create a new one, or open a file.";
+const WELCOME_NO_RECENTS: &str = "Create a new vault or open one you already have.";
+
+/// The create form's icon (the unlock card's, at half size) and subtitle.
+const CREATE_ICON_SIZE: f32 = 64.;
+const CREATE_SUBTITLE: &str = "Choose a name, a folder and a master password.";
+
+/// Side of the still app icon at the left of a recent-vault row, in points.
+const RECENT_ICON_SIZE: f32 = 28.;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -79,9 +89,17 @@ impl ChooseScreen {
     /// `AppState::choose_request` is set while it is visible.
     pub fn appear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let request = self.state.update(cx, |s, _| s.choose_request.take());
+        // ⌘O on the Home step: the file panel, as the "Open existing vault…" link.
+        if request == Some(ChooseIntent::OpenFile)
+            && self.step == Step::Home
+            && self.state.read(cx).busy.is_none()
+        {
+            self.open_existing(cx);
+            return;
+        }
         self.step = match request {
             Some(ChooseIntent::Create) => Step::Create,
-            Some(ChooseIntent::Home) | None => Step::Home,
+            Some(ChooseIntent::Home | ChooseIntent::OpenFile) | None => Step::Home,
         };
         self.problem = None;
         // Never leave a typed password behind in a hidden form.
@@ -197,6 +215,9 @@ impl ChooseScreen {
             .update(cx, |s, cx| s.create_vault(path, password, cx));
     }
 
+    /// The welcome card (05 §2.1): the unlock card (05 §2.2) with the still app icon, a
+    /// title and a subtitle, then the recent vaults, the primary Create button and the
+    /// quiet Open link (owner decision 2026-11-24, option B).
     fn render_home(&self, cx: &mut Context<Self>) -> gpui::Div {
         let state = self.state.read(cx);
         let busy = state.busy;
@@ -204,41 +225,12 @@ impl ChooseScreen {
         let recent = state.recent_vaults.clone();
         let legacy = state.legacy_recents.clone();
         let theme = cx.theme();
-        let mut card = ui::card(cx)
-            .child(
-                div()
-                    .text_xl()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Welcome to Vault"),
-            )
-            .child(ui::muted(
-                "Create a new vault or open one you already have.",
-                cx,
-            ))
-            .child(
-                Button::new("create")
-                    .primary()
-                    .label("Create new vault")
-                    .disabled(busy.is_some())
-                    .clickable_when(busy.is_none())
-                    .on_click(cx.listener(|this, _, window, cx| this.start_create(window, cx))),
-            )
-            .child(
-                Button::new("open")
-                    .label("Open existing vault…")
-                    .disabled(busy.is_some())
-                    .clickable_when(busy.is_none())
-                    .on_click(cx.listener(|this, _, _, cx| this.open_existing(cx))),
-            );
-        if busy == Some(Busy::Opening) {
-            card = card.child(busy_row("Opening vault…", cx));
-        }
-        if busy == Some(Busy::Calibrating) {
-            card = card.child(busy_row("Calibrating encryption for this Mac…", cx));
-        }
-        if let Some(error) = error {
-            card = card.child(div().text_sm().text_color(theme.danger).child(error));
-        }
+        let subtitle = if recent.is_empty() {
+            WELCOME_NO_RECENTS
+        } else {
+            WELCOME_WITH_RECENTS
+        };
+        let mut controls = ui::v_flex();
         if !recent.is_empty() {
             let rows = recent.into_iter().enumerate().map(|(ix, path)| {
                 let name = persist::vault_name(&path);
@@ -247,50 +239,119 @@ impl ChooseScreen {
                 let legacy = legacy.contains(&path);
                 let openable = busy.is_none() && !legacy;
                 let state = self.state.clone();
-                div()
+                ui::h_flex()
                     .id(("recent", ix))
                     .debug_selector(move || {
                         format!("recent {ix} {}", if legacy { "legacy" } else { "openable" })
                     })
+                    .w_full()
+                    .gap(px(10.))
                     .px(px(10.))
                     .py(px(6.))
-                    .rounded(cx.theme().radius)
+                    .rounded(theme.radius)
                     .clickable_when(openable)
                     .when(openable, |row| {
-                        row.hover(|s| s.bg(cx.theme().accent))
-                            .on_click(move |_, _, cx| {
-                                let path = path.clone();
-                                state.update(cx, |s, cx| s.open_vault(path, cx));
-                            })
+                        row.hover(|s| s.bg(theme.accent)).on_click(move |_, _, cx| {
+                            let path = path.clone();
+                            state.update(cx, |s, cx| s.open_vault(path, cx));
+                        })
                     })
                     .child(
-                        div()
-                            .when(legacy, |d| d.text_color(cx.theme().muted_foreground))
-                            .child(name),
+                        gpui::img(crate::assets::APP_ICON)
+                            .size(px(RECENT_ICON_SIZE))
+                            .flex_shrink_0(),
                     )
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(shown),
+                        ui::v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .when(legacy, |d| d.text_color(theme.muted_foreground))
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(shown),
+                            )
+                            .when(legacy, |col| {
+                                col.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.danger)
+                                        .child(LEGACY_LAYOUT),
+                                )
+                            }),
                     )
-                    .when(legacy, |row| {
-                        row.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().danger)
-                                .child(LEGACY_LAYOUT),
+            });
+            controls = controls.child(ui::v_flex().w_full().gap(px(2.)).children(rows));
+        }
+        if busy == Some(Busy::Opening) {
+            controls = controls.child(busy_row("Opening vault…", cx));
+        }
+        if busy == Some(Busy::Calibrating) {
+            controls = controls.child(busy_row("Calibrating encryption for this Mac…", cx));
+        }
+        if let Some(error) = error {
+            controls = controls.child(div().text_sm().text_color(theme.danger).child(error));
+        }
+        let controls = controls
+            .child(
+                Button::new("create")
+                    .primary()
+                    .w_full()
+                    .label("Create new vault")
+                    .disabled(busy.is_some())
+                    .clickable_when(busy.is_none())
+                    .on_click(cx.listener(|this, _, window, cx| this.start_create(window, cx))),
+            )
+            .child(
+                // Styled as the unlock screen's "Open another vault…" link.
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .debug_selector(move || {
+                        format!(
+                            "choose-open {}",
+                            if busy.is_some() { "busy" } else { "ready" }
                         )
                     })
-            });
-            card = card
-                .child(div().h(px(1.)).bg(cx.theme().border))
-                .child(ui::muted("Recent vaults", cx))
-                .child(ui::v_flex().gap(px(2.)).children(rows));
-        }
-        card
+                    .child(
+                        ui::quiet_link(
+                            "open",
+                            "Open existing vault…",
+                            "Open existing vault…",
+                            "⌘O",
+                            busy.is_none(),
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.open_existing(cx))),
+                    ),
+            );
+        ui::unlock_card(
+            ui::UnlockCard {
+                prefix: "choose",
+                icon: gpui::img(crate::assets::APP_ICON)
+                    .size_full()
+                    .into_any_element(),
+                icon_size: ui::UNLOCK_ICON_SIZE,
+                badge: None,
+                name: "Welcome to Vault".into(),
+                title: true,
+                subtitle: Some(subtitle.into()),
+                controls,
+                unlocking: None,
+            },
+            cx,
+        )
     }
 
     fn render_create(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -306,18 +367,11 @@ impl ChooseScreen {
             .unwrap_or_else(|| "No folder chosen".into());
         let provider = self.folder.as_deref().and_then(cloud::provider_label);
 
-        let mut card = ui::card(cx)
-            .child(
-                div()
-                    .text_xl()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Create a new vault"),
-            )
-            .child(field_label("Name", cx))
+        let mut controls = ui::v_flex()
             .child(ui::input(&self.name))
-            .child(field_label("Location", cx))
             .child(
                 ui::h_flex()
+                    .w_full()
                     .gap(px(8.))
                     .child(
                         div()
@@ -335,12 +389,12 @@ impl ChooseScreen {
                             .on_click(cx.listener(|this, _, _, cx| this.choose_folder(cx))),
                     ),
             )
-            .when_some(provider, |card, provider| {
-                card.child(ui::h_flex().child(
-                    Tag::info().child(format!("In {provider}: syncs to your other devices")),
-                ))
+            .when_some(provider, |col, provider| {
+                col.child(ui::h_flex().w_full().child(ui::info_label(
+                    format!("In {provider}: syncs to your other devices"),
+                    cx,
+                )))
             })
-            .child(field_label("Master password", cx))
             // A revealed (or suggested) master password is never copied out.
             .child(ui::refuse_plain_copy(
                 div()
@@ -355,28 +409,19 @@ impl ChooseScreen {
             ))
             .child(ui::input(&self.confirm));
         if busy == Some(Busy::Calibrating) {
-            card = card.child(busy_row("Calibrating encryption for this Mac…", cx));
+            controls = controls.child(busy_row("Calibrating encryption for this Mac…", cx));
         }
         if let Some(error) = error {
-            card = card.child(div().text_sm().text_color(theme.danger).child(error));
+            controls = controls.child(div().text_sm().text_color(theme.danger).child(error));
         }
-        card.child(
-            ui::h_flex()
-                .justify_end()
-                .gap(px(8.))
-                .child(
-                    Button::new("back")
-                        .ghost()
-                        .label("Back")
-                        .disabled(busy.is_some())
-                        .clickable_when(busy.is_none())
-                        .on_click(cx.listener(|this, _, window, cx| this.back(window, cx))),
-                )
-                .child(ui::submit_gate(
+        let controls = controls
+            .child(
+                ui::submit_gate(
                     "create-submit",
                     ready && busy.is_none(),
                     Button::new("do-create")
                         .primary()
+                        .w_full()
                         .label("Create vault")
                         .loading(busy == Some(Busy::Calibrating))
                         .disabled(busy.is_some() || !ready)
@@ -384,17 +429,54 @@ impl ChooseScreen {
                         .on_click(
                             cx.listener(|this, _, window, cx| this.submit_create(window, cx)),
                         ),
-                )),
+                )
+                .w_full(),
+            )
+            .child(
+                // The welcome card's Open link style; Esc does the same.
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .debug_selector(move || {
+                        format!(
+                            "create-back {}",
+                            if busy.is_some() { "busy" } else { "ready" }
+                        )
+                    })
+                    .child(
+                        ui::quiet_link("back", "Back", "Back", "esc", busy.is_none(), cx)
+                            .on_click(cx.listener(|this, _, window, cx| this.back(window, cx))),
+                    ),
+            );
+        ui::unlock_card(
+            ui::UnlockCard {
+                prefix: "create",
+                icon: gpui::img(crate::assets::APP_ICON)
+                    .size_full()
+                    .into_any_element(),
+                icon_size: CREATE_ICON_SIZE,
+                badge: None,
+                name: "Create a new vault".into(),
+                title: true,
+                subtitle: Some(CREATE_SUBTITLE.into()),
+                controls,
+                unlocking: None,
+            },
+            cx,
         )
+        // Esc goes back, as the Back link. A focused field passes Esc on (its own
+        // `input::Escape` propagates when it has nothing to dismiss), so this sees it
+        // after the field; with a button focused no binding matches and it lands here.
+        .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+            if ev.keystroke.key == "escape" && !ev.keystroke.modifiers.modified() {
+                cx.stop_propagation();
+                if this.state.read(cx).busy.is_none() {
+                    this.back(window, cx);
+                }
+            }
+        }))
     }
-}
-
-fn field_label(text: &'static str, cx: &gpui::App) -> gpui::Div {
-    div()
-        .text_xs()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(cx.theme().muted_foreground)
-        .child(text)
 }
 
 fn busy_row(text: &'static str, cx: &gpui::App) -> gpui::Div {
@@ -551,6 +633,125 @@ mod tests {
             assert!(ui::input_is_empty(&password, cx));
             assert!(ui::input_is_empty(&confirm, cx));
         });
+    }
+
+    fn subtitle_key(text: &str) -> &'static str {
+        Box::leak(format!("choose-subtitle {text}").into_boxed_str())
+    }
+
+    /// The welcome is the unlock card: the 128 pt still icon, and the subtitle for a
+    /// first run without recent vaults.
+    #[gpui::test]
+    fn home_is_the_unlock_card(cx: &mut TestAppContext) {
+        let (_state, _view, mut vcx) = window(cx);
+        vcx.run_until_parked();
+        assert!(shown("choose-card", &mut vcx));
+        assert!(shown("choose-vault-name", &mut vcx));
+        let icon = vcx.debug_bounds("choose-icon").unwrap();
+        assert_eq!(icon.size.width, px(ui::UNLOCK_ICON_SIZE));
+        assert_eq!(icon.size.height, px(ui::UNLOCK_ICON_SIZE));
+        assert!(shown(subtitle_key(WELCOME_NO_RECENTS), &mut vcx));
+        assert!(!shown(subtitle_key(WELCOME_WITH_RECENTS), &mut vcx));
+        // Create and the Open link sit below the icon.
+        let open = vcx.debug_bounds("choose-open ready").unwrap();
+        assert!(open.top() > icon.bottom());
+    }
+
+    /// With recent vaults the subtitle points at them, and the rows come before the
+    /// Create button and the Open link.
+    #[gpui::test]
+    fn home_subtitle_follows_the_recents(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("New.vault");
+        std::fs::create_dir(&package).unwrap();
+        let (_state, _view, mut vcx) = window_with_recents(vec![package], cx);
+        vcx.run_until_parked();
+        assert!(shown(subtitle_key(WELCOME_WITH_RECENTS), &mut vcx));
+        assert!(!shown(subtitle_key(WELCOME_NO_RECENTS), &mut vcx));
+        let row = vcx.debug_bounds("recent 0 openable").unwrap();
+        let open = vcx.debug_bounds("choose-open ready").unwrap();
+        assert!(row.bottom() <= open.top(), "recents first");
+    }
+
+    /// While a vault is opening the Open link is disabled: a click shows no file panel.
+    #[gpui::test]
+    fn open_link_is_disabled_while_busy(cx: &mut TestAppContext) {
+        let (state, _view, mut vcx) = window(cx);
+        state.update(&mut vcx, |s, cx| {
+            s.busy = Some(Busy::Opening);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert!(!shown("choose-open ready", &mut vcx));
+        let open = vcx.debug_bounds("choose-open busy").unwrap();
+        vcx.simulate_click(open.center(), Modifiers::none());
+        vcx.run_until_parked();
+        assert!(!vcx.did_prompt_for_paths(), "busy: no file panel");
+
+        state.update(&mut vcx, |s, cx| {
+            s.busy = None;
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        let open = vcx.debug_bounds("choose-open ready").unwrap();
+        vcx.simulate_click(open.center(), Modifiers::none());
+        vcx.run_until_parked();
+        assert!(vcx.did_prompt_for_paths(), "idle: the file panel opens");
+    }
+
+    fn open_create(view: &Entity<ChooseScreen>, vcx: &mut VisualTestContext) {
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.start_create(window, cx)));
+        vcx.run_until_parked();
+    }
+
+    /// The create form is the unlock card with a 64 pt icon, its title and subtitle.
+    #[gpui::test]
+    fn create_is_the_unlock_card_with_a_small_icon(cx: &mut TestAppContext) {
+        let (_state, view, mut vcx) = window(cx);
+        open_create(&view, &mut vcx);
+        assert!(shown("create-card", &mut vcx));
+        assert!(!shown("choose-card", &mut vcx));
+        let icon = vcx.debug_bounds("create-icon").unwrap();
+        assert_eq!(icon.size.width, px(CREATE_ICON_SIZE));
+        assert_eq!(icon.size.height, px(CREATE_ICON_SIZE));
+        assert!(shown(
+            Box::leak(format!("create-subtitle {CREATE_SUBTITLE}").into_boxed_str()),
+            &mut vcx
+        ));
+        // Create above the Back link.
+        let create = vcx.debug_bounds("create-submit blocked").unwrap();
+        let back = vcx.debug_bounds("create-back ready").unwrap();
+        assert!(create.bottom() <= back.top());
+    }
+
+    /// While calibrating, the Back link and Esc do nothing; idle, Esc in a field goes
+    /// back to the welcome card.
+    #[gpui::test]
+    fn back_is_disabled_while_calibrating_and_esc_goes_back(cx: &mut TestAppContext) {
+        let (state, view, mut vcx) = window(cx);
+        open_create(&view, &mut vcx);
+        state.update(&mut vcx, |s, cx| {
+            s.busy = Some(Busy::Calibrating);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert!(!shown("create-back ready", &mut vcx));
+        let back = vcx.debug_bounds("create-back busy").unwrap();
+        vcx.simulate_click(back.center(), Modifiers::none());
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        view.read_with(&vcx, |v, _| assert_eq!(v.step, Step::Create, "busy: stays"));
+
+        state.update(&mut vcx, |s, cx| {
+            s.busy = None;
+            cx.notify();
+        });
+        let name = view.read_with(&vcx, |v, _| v.name.clone());
+        vcx.update(|window, cx| ui::focus_input(&name, window, cx));
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        view.read_with(&vcx, |v, _| assert_eq!(v.step, Step::Home, "Esc: back"));
+        assert!(shown("choose-card", &mut vcx));
     }
 
     /// A recent vault in the old single-file layout is listed with the explanation and

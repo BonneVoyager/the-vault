@@ -186,6 +186,9 @@ impl Busy {
 pub enum ChooseIntent {
     Home,
     Create,
+    /// ⌘O while the choose screen is already showing in the open main window and idle:
+    /// its Home step opens the file panel, its Create step goes back to Home (05 §2.1).
+    OpenFile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1261,6 +1264,18 @@ impl AppState {
         if !self.guard(Navigation::SwitchVault(intent), cx) {
             return;
         }
+        // ⌘O on the idle choose screen itself makes its "⌘O" hint true (05 §2.1).
+        // Only with the main window open: a request stored while it is closed would pop
+        // the file panel when the next window appears.
+        let intent = if intent == ChooseIntent::Home
+            && self.screen == Screen::Choose
+            && self.busy.is_none()
+            && crate::actions::main_window(cx).is_some()
+        {
+            ChooseIntent::OpenFile
+        } else {
+            intent
+        };
         self.close_vault(cx);
         self.choose_request = Some(intent);
         cx.notify();

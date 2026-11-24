@@ -10,9 +10,10 @@ use vault_macos::{MacError, StatusItem, StatusItemCallbacks};
 
 fn recorder() -> (Rc<RefCell<Vec<&'static str>>>, StatusItemCallbacks) {
     let log = Rc::new(RefCell::new(Vec::new()));
-    let (a, b, c) = (log.clone(), log.clone(), log.clone());
+    let (a, b, c, d) = (log.clone(), log.clone(), log.clone(), log.clone());
     let cb = StatusItemCallbacks {
         open: Box::new(move || a.borrow_mut().push("open")),
+        hide: Box::new(move || d.borrow_mut().push("hide")),
         lock_or_unlock: Box::new(move || b.borrow_mut().push("lock_or_unlock")),
         quit: Box::new(move || c.borrow_mut().push("quit")),
     };
@@ -23,7 +24,7 @@ fn recorder() -> (Rc<RefCell<Vec<&'static str>>>, StatusItemCallbacks) {
 fn main() {
     let (_log, cb) = recorder();
     assert!(matches!(
-        StatusItem::install(true, cb),
+        StatusItem::install(true, false, cb),
         Err(MacError::NotAvailable)
     ));
     println!("status_item: ok (stub)");
@@ -40,14 +41,17 @@ fn main() {
     // Off the main thread: refused.
     let off = std::thread::spawn(|| {
         let (_log, cb) = recorder();
-        matches!(StatusItem::install(false, cb), Err(MacError::NotAvailable))
+        matches!(
+            StatusItem::install(false, false, cb),
+            Err(MacError::NotAvailable)
+        )
     })
     .join()
     .unwrap();
     assert!(off, "install off the main thread must be NotAvailable");
 
     let (log, cb) = recorder();
-    let item = StatusItem::install(true, cb).expect("install on the main thread");
+    let item = StatusItem::install(true, false, cb).expect("install on the main thread");
     assert_eq!(
         item.test_menu_titles(),
         ["Open Vault", "Unlock\u{2026}", "-", "Quit Vault"]
@@ -76,6 +80,54 @@ fn main() {
     item.test_menu_action(1);
     item.test_menu_action(3);
     assert_eq!(*log.borrow(), ["open", "open", "lock_or_unlock", "quit"]);
+    log.borrow_mut().clear();
+
+    // Main window shown: the first item reads "Hide Vault" and runs `hide`;
+    // the left click still runs `open`. Back to "Open Vault" when hidden.
+    item.set_window_shown(true);
+    assert_eq!(
+        item.test_menu_titles(),
+        ["Hide Vault", "Unlock\u{2026}", "-", "Quit Vault"]
+    );
+    item.test_menu_action(0);
+    item.test_click();
+    item.set_window_shown(false);
+    assert_eq!(item.test_menu_titles()[0], "Open Vault");
+    item.test_menu_action(0);
+    assert_eq!(*log.borrow(), ["hide", "open", "open"]);
+
+    // Installed with the window shown: starts as "Hide Vault".
+    let (slog, scb) = recorder();
+    let shown = StatusItem::install(false, true, scb).unwrap();
+    assert_eq!(
+        shown.test_menu_titles(),
+        ["Hide Vault", "Lock", "-", "Quit Vault"]
+    );
+    shown.test_menu_action(0);
+    assert_eq!(*slog.borrow(), ["hide"]);
+    drop(shown);
+
+    // A `hide` callback may flip the title on its own item (vault-app
+    // updates it once the window has closed).
+    let flip: Rc<RefCell<Option<StatusItem>>> = Rc::new(RefCell::new(None));
+    let f = flip.clone();
+    let flipping = StatusItemCallbacks {
+        open: Box::new(|| {}),
+        hide: Box::new(move || {
+            if let Some(it) = f.borrow().as_ref() {
+                it.set_window_shown(false);
+            }
+        }),
+        lock_or_unlock: Box::new(|| {}),
+        quit: Box::new(|| {}),
+    };
+    *flip.borrow_mut() = Some(StatusItem::install(false, true, flipping).unwrap());
+    flip.borrow().as_ref().unwrap().test_menu_action(0);
+    assert_eq!(
+        flip.borrow().as_ref().unwrap().test_menu_titles()[0],
+        "Open Vault"
+    );
+    drop(flip.borrow_mut().take());
 
     // A callback may call back into the item (vault-app's lock_or_unlock
     // will call set_locked) without a RefCell double borrow.
@@ -83,6 +135,7 @@ fn main() {
     let s = shared.clone();
     let reentrant = StatusItemCallbacks {
         open: Box::new(|| {}),
+        hide: Box::new(|| {}),
         lock_or_unlock: Box::new(move || {
             if let Some(it) = s.borrow().as_ref() {
                 it.set_locked(false);
@@ -90,7 +143,7 @@ fn main() {
         }),
         quit: Box::new(|| {}),
     };
-    *shared.borrow_mut() = Some(StatusItem::install(true, reentrant).unwrap());
+    *shared.borrow_mut() = Some(StatusItem::install(true, false, reentrant).unwrap());
     shared.borrow().as_ref().unwrap().test_menu_action(1);
     assert_eq!(
         shared.borrow().as_ref().unwrap().test_menu_titles()[1],
@@ -105,6 +158,7 @@ fn main() {
     let (h, d) = (holder.clone(), dropped.clone());
     let self_dropping = StatusItemCallbacks {
         open: Box::new(|| {}),
+        hide: Box::new(|| {}),
         lock_or_unlock: Box::new(|| {}),
         quit: Box::new(move || {
             let it = h.borrow_mut().take();
@@ -112,7 +166,7 @@ fn main() {
             drop(it);
         }),
     };
-    let it = StatusItem::install(false, self_dropping).unwrap();
+    let it = StatusItem::install(false, false, self_dropping).unwrap();
     // Trigger through the menu alone, so no borrow of the item is held while
     // `quit` drops it (as when AppKit calls the target).
     let trigger = it.test_menu_trigger();
@@ -127,7 +181,7 @@ fn main() {
     // A panicking callback does not propagate; later clicks still work.
     let (plog, mut pcb) = recorder();
     pcb.lock_or_unlock = Box::new(|| panic!("test panic in lock_or_unlock"));
-    let pitem = StatusItem::install(false, pcb).unwrap();
+    let pitem = StatusItem::install(false, false, pcb).unwrap();
     pitem.test_menu_action(1);
     pitem.test_menu_action(1);
     pitem.test_click();

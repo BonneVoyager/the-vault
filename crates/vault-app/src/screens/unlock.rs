@@ -15,9 +15,9 @@ use gpui::{
     IntoElement, ParentElement as _, Render, Styled as _, Subscription, Task, Window, div,
     ease_out_quint, img, prelude::FluentBuilder as _, px,
 };
-use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{InputEvent, InputState};
-use gpui_component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _};
+use gpui_component::{ActiveTheme as _, Disableable as _, Icon};
 use gpui_kit_assets::IconName;
 
 /// Side of the app icon on the unlock card, in points (the raster is 2x this).
@@ -403,21 +403,18 @@ impl Render for UnlockScreen {
                     .justify_center()
                     .debug_selector(|| "unlock-switch".into())
                     .child(
-                        Button::new("switch")
-                            .custom(
-                                ButtonCustomVariant::new(cx)
-                                    .foreground(theme.foreground.opacity(0.8)),
-                            )
-                            .small()
-                            .accessibility_label("Open another vault")
-                            .child("Open another vault…")
-                            .child(div().text_color(theme.muted_foreground).child("⌘O"))
-                            .disabled(unlocking)
-                            .clickable_when(!unlocking)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state
-                                    .update(cx, |s, cx| s.switch_vault(ChooseIntent::Home, cx));
-                            })),
+                        ui::quiet_link(
+                            "switch",
+                            "Open another vault…",
+                            "Open another vault",
+                            "⌘O",
+                            !unlocking,
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.state
+                                .update(cx, |s, cx| s.switch_vault(ChooseIntent::Home, cx));
+                        })),
                     ),
             );
 
@@ -425,8 +422,10 @@ impl Render for UnlockScreen {
             ui::UnlockCard {
                 prefix: "unlock",
                 icon: icon.into_any_element(),
+                icon_size: ui::UNLOCK_ICON_SIZE,
                 badge: None,
                 name: name.into(),
+                title: false,
                 subtitle: None,
                 controls,
                 unlocking: unlocking.then_some("unlocking"),

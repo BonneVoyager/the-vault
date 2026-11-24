@@ -1096,3 +1096,80 @@ fn light_list_and_detail_columns_paint_opaque_background(cx: &mut TestAppContext
         );
     }
 }
+
+/// ⌘O (`OpenVault`) on the choose screen: from Create it goes back to Home and shows no
+/// file panel; from Home it shows the file panel, as the "Open existing vault…" link.
+#[gpui::test]
+fn open_vault_on_the_choose_screen_follows_its_step(cx: &mut TestAppContext) {
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        actions::bind_keys(cx);
+        actions::register(&state, cx);
+    });
+    let window = cx.add_window(|window, cx| {
+        theme::apply(window, cx);
+        let view = cx.new(|cx| VaultRoot::new(state.clone(), None, window, cx));
+        Root::new(view, window, cx)
+    });
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    vcx.run_until_parked();
+    let home = |vcx: &mut VisualTestContext| vcx.debug_bounds("choose-card").is_some();
+    assert!(home(&mut vcx));
+
+    // File > New Vault, then ⌘O: back to Home, no panel.
+    vcx.dispatch_action(actions::NewVault);
+    vcx.run_until_parked();
+    assert!(!home(&mut vcx), "the create form");
+    vcx.simulate_keystrokes("cmd-o");
+    vcx.run_until_parked();
+    assert!(home(&mut vcx));
+    assert!(!vcx.did_prompt_for_paths(), "Create: back to Home only");
+
+    // ⌘O on Home: the file panel, and the card stays.
+    vcx.simulate_keystrokes("cmd-o");
+    vcx.run_until_parked();
+    assert!(vcx.did_prompt_for_paths(), "Home: the file panel");
+    assert!(home(&mut vcx));
+    vcx.simulate_path_prompt_response(|_| None);
+    vcx.run_until_parked();
+}
+
+/// File ▸ Open Vault… with the main window closed stores the plain Home request, not the
+/// file-panel one: the next main window shows the welcome card and no panel.
+#[gpui::test]
+fn open_vault_without_a_main_window_shows_no_panel_later(cx: &mut TestAppContext) {
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        actions::bind_keys(cx);
+        actions::register(&state, cx);
+    });
+    let open = |cx: &mut TestAppContext| {
+        cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let view = cx.new(|cx| VaultRoot::new(state.clone(), None, window, cx));
+            Root::new(view, window, cx)
+        })
+    };
+    // A main window that was open once and closed: the global outlives it.
+    let first = open(cx);
+    cx.run_until_parked();
+    first
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    assert!(cx.update(|cx| actions::main_window(cx).is_none()));
+
+    cx.update(|cx| cx.dispatch_action(&actions::OpenVault));
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| {
+        assert_eq!(s.choose_request, Some(crate::state::ChooseIntent::Home));
+    });
+
+    let second = open(cx);
+    let mut vcx = VisualTestContext::from_window(second.into(), cx);
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("choose-card").is_some());
+    assert!(!vcx.did_prompt_for_paths(), "no panel on the next window");
+}

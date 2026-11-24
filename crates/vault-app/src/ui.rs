@@ -14,11 +14,11 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, Task, TitlebarOptions, Window, WindowBounds,
     WindowHandle, WindowOptions, point, prelude::FluentBuilder as _, px, relative, size,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::input::{Input, InputState, TextareaState};
 use gpui_component::popover::Popover;
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{ActiveTheme as _, Icon, Root, Selectable, Sizable as _};
+use gpui_component::{ActiveTheme as _, Disableable as _, Icon, Root, Selectable, Sizable as _};
 use gpui_kit_assets::IconName;
 use vault_core::{ExposeSecret as _, PassphraseSpec, SecretString, passphrase, strength_bits};
 
@@ -863,6 +863,28 @@ pub fn master_password_feedback(
         })
 }
 
+/// The unlock card's quiet secondary action ("Open another vault…  ⌘O"): small, no
+/// background, foreground at 80 %, with a muted shortcut `hint`. The caller centres it
+/// and adds `on_click`. `label` is what VoiceOver reads.
+pub fn quiet_link(
+    id: &'static str,
+    text: &'static str,
+    label: &'static str,
+    hint: &'static str,
+    enabled: bool,
+    cx: &App,
+) -> Button {
+    let theme = cx.theme();
+    Button::new(id)
+        .custom(ButtonCustomVariant::new(cx).foreground(theme.foreground.opacity(0.8)))
+        .small()
+        .accessibility_label(label)
+        .child(text)
+        .child(gpui::div().text_color(theme.muted_foreground).child(hint))
+        .disabled(!enabled)
+        .clickable_when(enabled)
+}
+
 /// Wraps a form's primary button so headless tests can see whether it is enabled
 /// (`"<name> ready"` or `"<name> blocked"`).
 pub fn submit_gate(name: &'static str, ready: bool, button: impl IntoElement) -> Div {
@@ -1428,18 +1450,23 @@ pub const UNLOCK_ICON_SIZE: f32 = 128.;
 /// Side of the unlock card's badge bubble (the backup viewer's read-only eye), in points.
 pub const UNLOCK_BADGE_SIZE: f32 = 32.;
 
-/// The unlock screen's card (05 §2.2), shared by the main unlock screen and the backup
-/// viewer's password prompt (05 §2.3 "Backup viewer").
+/// The unlock screen's card (05 §2.2), shared by the main unlock screen, the backup
+/// viewer's password prompt (05 §2.3 "Backup viewer") and the welcome card (05 §2.1).
 pub struct UnlockCard {
     /// Test selector prefix: `<prefix>-card`, `-icon`, `-badge`, `-vault-name`,
     /// `-subtitle`.
     pub prefix: &'static str,
-    /// What fills the 128 pt icon box (the main screen's animated wheel, or the still
-    /// app icon). The fixed box keeps the card size before the image decodes.
+    /// What fills the icon box (the main screen's animated wheel, or the still app
+    /// icon). The fixed box keeps the card size before the image decodes.
     pub icon: AnyElement,
+    /// Side of the icon box: [`UNLOCK_ICON_SIZE`], or 64 on the create form.
+    pub icon_size: f32,
     /// A badge at the icon's lower right (the viewer's read-only eye), 32 px.
     pub badge: Option<IconName>,
     pub name: SharedString,
+    /// Draw the name as a semibold title in the foreground colour (the welcome card)
+    /// instead of the small muted vault name.
+    pub title: bool,
     /// A second, smaller muted line under the name.
     pub subtitle: Option<SharedString>,
     /// The field, buttons and links, top to bottom (12 px apart).
@@ -1453,20 +1480,24 @@ pub fn unlock_card(parts: UnlockCard, cx: &App) -> Div {
     let UnlockCard {
         prefix,
         icon,
+        icon_size,
         badge,
         name,
+        title,
         subtitle,
         controls,
         unlocking,
     } = parts;
     let theme = cx.theme();
-    let name_color = if theme.mode.is_dark() {
+    let name_color = if title {
+        theme.foreground
+    } else if theme.mode.is_dark() {
         gpui::rgb(0xb8b8be).into()
     } else {
         theme.muted_foreground
     };
     let icon_box = gpui::div()
-        .size(px(UNLOCK_ICON_SIZE))
+        .size(px(icon_size))
         .relative()
         .flex_shrink_0()
         .debug_selector(move || format!("{prefix}-icon"))
@@ -1485,7 +1516,13 @@ pub fn unlock_card(parts: UnlockCard, cx: &App) -> Div {
         .max_w_full()
         .child(
             gpui::div()
-                .text_sm()
+                .map(|line| {
+                    if title {
+                        line.text_lg().font_weight(gpui::FontWeight::SEMIBOLD)
+                    } else {
+                        line.text_sm()
+                    }
+                })
                 .text_color(name_color)
                 .overflow_hidden()
                 .text_ellipsis()

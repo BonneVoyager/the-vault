@@ -2,9 +2,10 @@
 //! status bar, shown while the Dock icon is hidden (§5b).
 //!
 //! Left click runs `open`. Right click or Control-click pops a native menu:
-//! "Open Vault", "Lock" / "Unlock…", a separator, "Quit Vault". The menu is
-//! attached to the status item only for the duration of that click, so the
-//! left click keeps its action.
+//! "Open Vault" (no main window) or "Hide Vault" (main window shown, see
+//! [`StatusItem::set_window_shown`]), "Lock" / "Unlock…", a separator,
+//! "Quit Vault". The menu is attached to the status item only for the
+//! duration of that click, so the left click keeps its action.
 //!
 //! Main thread only; callbacks run on the main thread. [`StatusItem`] is
 //! `!Send`, so it is also dropped on the main thread.
@@ -15,6 +16,9 @@ use crate::MacError;
 pub struct StatusItemCallbacks {
     /// Left click and "Open Vault".
     pub open: Box<dyn Fn()>,
+    /// "Hide Vault" (shown instead of "Open Vault" while the main window
+    /// exists).
+    pub hide: Box<dyn Fn()>,
     /// "Lock" (while unlocked) and "Unlock…" (while locked).
     pub lock_or_unlock: Box<dyn Fn()>,
     /// "Quit Vault".
@@ -33,6 +37,7 @@ const GLYPH_HEIGHT: f64 = 18.0;
 const DESC_LOCKED: &str = "Vault, locked";
 const DESC_UNLOCKED: &str = "Vault, unlocked";
 const TITLE_OPEN: &str = "Open Vault";
+const TITLE_HIDE: &str = "Hide Vault";
 const TITLE_LOCK: &str = "Lock";
 const TITLE_UNLOCK: &str = "Unlock\u{2026}";
 const TITLE_QUIT: &str = "Quit Vault";
@@ -45,6 +50,10 @@ fn lock_title(locked: bool) -> &'static str {
     if locked { TITLE_UNLOCK } else { TITLE_LOCK }
 }
 
+fn window_title(window_shown: bool) -> &'static str {
+    if window_shown { TITLE_HIDE } else { TITLE_OPEN }
+}
+
 impl StatusItem {
     /// Adds the item to the system status bar.
     ///
@@ -54,14 +63,28 @@ impl StatusItem {
     ///
     /// Each call adds another, independent item to the menu bar; keep a
     /// single `Option<StatusItem>` and drop the old one before reinstalling.
-    pub fn install(locked: bool, cb: StatusItemCallbacks) -> Result<StatusItem, MacError> {
-        imp::Inner::install(locked, cb).map(|inner| StatusItem { inner })
+    ///
+    /// `window_shown` is the initial state of the first menu item, as for
+    /// [`Self::set_window_shown`].
+    pub fn install(
+        locked: bool,
+        window_shown: bool,
+        cb: StatusItemCallbacks,
+    ) -> Result<StatusItem, MacError> {
+        imp::Inner::install(locked, window_shown, cb).map(|inner| StatusItem { inner })
     }
 
     /// Swaps the glyph (closed / open padlock), its accessibility description
     /// and the "Lock" / "Unlock…" menu title.
     pub fn set_locked(&self, locked: bool) {
         self.inner.set_locked(locked);
+    }
+
+    /// Whether the main window exists: the first menu item reads "Hide Vault"
+    /// and runs `hide` when true, "Open Vault" and `open` when false. The
+    /// left click always runs `open`.
+    pub fn set_window_shown(&self, shown: bool) {
+        self.inner.set_window_shown(shown);
     }
 
     /// Test support: the menu item titles in order (separator as `"-"`).
@@ -128,8 +151,8 @@ mod imp {
     use objc2_foundation::NSString;
 
     use super::{
-        GLYPH_HEIGHT, StatusItemCallbacks, TITLE_OPEN, TITLE_QUIT, accessibility_description,
-        lock_title,
+        GLYPH_HEIGHT, StatusItemCallbacks, TITLE_QUIT, accessibility_description, lock_title,
+        window_title,
     };
     use crate::MacError;
 
@@ -146,6 +169,8 @@ mod imp {
         /// True while `pop_menu` is tracking the menu; a nested pop is
         /// ignored.
         popping: Cell<bool>,
+        /// The first menu item runs `hide` when true, `open` otherwise.
+        window_shown: Cell<bool>,
     }
 
     define_class!(
@@ -170,9 +195,13 @@ mod imp {
             }
 
             // SAFETY: as above.
-            #[unsafe(method(openClicked:))]
-            fn open_clicked(&self, _sender: Option<&AnyObject>) {
-                self.run(|cb| &cb.open);
+            #[unsafe(method(windowClicked:))]
+            fn window_clicked(&self, _sender: Option<&AnyObject>) {
+                if self.ivars().window_shown.get() {
+                    self.run(|cb| &cb.hide);
+                } else {
+                    self.run(|cb| &cb.open);
+                }
             }
 
             // SAFETY: as above.
@@ -190,10 +219,11 @@ mod imp {
     );
 
     impl Target {
-        fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        fn new(mtm: MainThreadMarker, window_shown: bool) -> Retained<Self> {
             let this = Self::alloc(mtm).set_ivars(TargetIvars {
                 live: RefCell::new(None),
                 popping: Cell::new(false),
+                window_shown: Cell::new(window_shown),
             });
             // SAFETY: `init` is NSObject's designated initializer and the
             // ivars were set above.
@@ -288,6 +318,7 @@ mod imp {
         item: Retained<NSStatusItem>,
         button: Retained<NSStatusBarButton>,
         menu: Retained<NSMenu>,
+        window_item: Retained<NSMenuItem>,
         lock_item: Retained<NSMenuItem>,
     }
 
@@ -314,7 +345,11 @@ mod imp {
     }
 
     impl Inner {
-        pub fn install(locked: bool, cb: StatusItemCallbacks) -> Result<Self, MacError> {
+        pub fn install(
+            locked: bool,
+            window_shown: bool,
+            cb: StatusItemCallbacks,
+        ) -> Result<Self, MacError> {
             let mtm = MainThreadMarker::new().ok_or(MacError::NotAvailable)?;
             let item =
                 NSStatusBar::systemStatusBar().statusItemWithLength(NSSquareStatusItemLength);
@@ -322,10 +357,16 @@ mod imp {
                 NSStatusBar::systemStatusBar().removeStatusItem(&item);
                 return Err(MacError::Other("status item has no button".into()));
             };
-            let target = Target::new(mtm);
+            let target = Target::new(mtm, window_shown);
 
             let menu = NSMenu::new(mtm);
-            menu.addItem(&menu_item(mtm, TITLE_OPEN, sel!(openClicked:), &target));
+            let window_item = menu_item(
+                mtm,
+                window_title(window_shown),
+                sel!(windowClicked:),
+                &target,
+            );
+            menu.addItem(&window_item);
             let lock_item = menu_item(mtm, lock_title(locked), sel!(lockClicked:), &target);
             menu.addItem(&lock_item);
             menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -351,6 +392,7 @@ mod imp {
                 item,
                 button,
                 menu,
+                window_item,
                 lock_item,
             };
             inner.set_locked(locked);
@@ -363,6 +405,12 @@ mod imp {
                 .setImage(Some(&padlock(self.mtm, locked, &desc)));
             self.lock_item
                 .setTitle(&NSString::from_str(lock_title(locked)));
+        }
+
+        pub fn set_window_shown(&self, shown: bool) {
+            self.target.ivars().window_shown.set(shown);
+            self.window_item
+                .setTitle(&NSString::from_str(window_title(shown)));
         }
 
         pub fn menu_titles(&self) -> Vec<String> {
@@ -525,10 +573,15 @@ mod imp {
     pub struct Inner(PhantomData<*const ()>);
 
     impl Inner {
-        pub fn install(_locked: bool, _cb: StatusItemCallbacks) -> Result<Self, MacError> {
+        pub fn install(
+            _locked: bool,
+            _window_shown: bool,
+            _cb: StatusItemCallbacks,
+        ) -> Result<Self, MacError> {
             Err(MacError::NotAvailable)
         }
         pub fn set_locked(&self, _locked: bool) {}
+        pub fn set_window_shown(&self, _shown: bool) {}
         pub fn menu_titles(&self) -> Vec<String> {
             Vec::new()
         }
@@ -554,9 +607,10 @@ mod tests {
     use std::rc::Rc;
 
     fn callbacks(hits: &Rc<Cell<u32>>) -> StatusItemCallbacks {
-        let (a, b, c) = (hits.clone(), hits.clone(), hits.clone());
+        let (a, b, c, d) = (hits.clone(), hits.clone(), hits.clone(), hits.clone());
         StatusItemCallbacks {
             open: Box::new(move || a.set(a.get() + 1)),
+            hide: Box::new(move || d.set(d.get() + 1)),
             lock_or_unlock: Box::new(move || b.set(b.get() + 1)),
             quit: Box::new(move || c.set(c.get() + 1)),
         }
@@ -567,7 +621,7 @@ mod tests {
     #[test]
     fn install_off_main_thread_is_not_available() {
         let hits = Rc::new(Cell::new(0));
-        let r = StatusItem::install(true, callbacks(&hits));
+        let r = StatusItem::install(true, false, callbacks(&hits));
         assert!(matches!(r, Err(MacError::NotAvailable)));
         assert_eq!(hits.get(), 0, "no callback ran");
         assert_eq!(test_fallback_glyph_size(true), None);
@@ -575,8 +629,10 @@ mod tests {
 
     #[test]
     fn api_shape() {
-        let _: fn(bool, StatusItemCallbacks) -> Result<StatusItem, MacError> = StatusItem::install;
+        let _: fn(bool, bool, StatusItemCallbacks) -> Result<StatusItem, MacError> =
+            StatusItem::install;
         let _: fn(&StatusItem, bool) = StatusItem::set_locked;
+        let _: fn(&StatusItem, bool) = StatusItem::set_window_shown;
     }
 
     #[test]
@@ -585,5 +641,7 @@ mod tests {
         assert_eq!(lock_title(false), "Lock");
         assert_eq!(accessibility_description(true), "Vault, locked");
         assert_eq!(accessibility_description(false), "Vault, unlocked");
+        assert_eq!(window_title(false), "Open Vault");
+        assert_eq!(window_title(true), "Hide Vault");
     }
 }
