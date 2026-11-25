@@ -252,17 +252,11 @@ fn segmented(
     selected: usize,
     state: &Entity<AppState>,
     apply: fn(&mut Settings, usize),
-) -> impl IntoElement {
+) -> ui::Segmented {
     let state = state.clone();
-    TabBar::new(id)
-        .segmented()
-        .small()
-        .selected_index(selected)
-        .children(labels.iter().map(|l| Tab::new().label(*l).clickable()))
-        .on_click(move |ix: &usize, _, cx| {
-            let ix = *ix;
-            state.update(cx, |s, cx| s.update_settings(cx, |st| apply(st, ix)));
-        })
+    ui::segmented(id, labels.iter().copied(), selected).on_select(move |ix, _, cx| {
+        state.update(cx, |s, cx| s.update_settings(cx, |st| apply(st, ix)));
+    })
 }
 
 /// A button that calls `f` on the app state.
@@ -331,7 +325,8 @@ impl SettingsView {
                         .unwrap_or(0),
                     &self.state,
                     |st, ix| st.appearance = Appearance::ALL[ix],
-                ),
+                )
+                .aria_label("Appearance"),
             ),
             row(
                 "Text size",
@@ -344,7 +339,8 @@ impl SettingsView {
                         .unwrap_or(0),
                     &self.state,
                     |st, ix| st.text_size = TextSize::ALL[ix],
-                ),
+                )
+                .aria_label("Text size"),
             ),
         ];
         let rows = rows
@@ -478,25 +474,20 @@ impl SettingsView {
             .iter()
             .position(|m| *m == settings.retention_multiplier)
             .unwrap_or(1);
-        let retention = TabBar::new("retention")
-            .segmented()
-            .small()
-            .selected_index(current)
-            .children(Settings::RETENTION_CHOICES.map(|m| {
-                let label = retention_label(m);
-                let selector = format!("settings-retention-tab: {label}");
-                Tab::new()
-                    .label(label)
-                    .debug_selector(move || selector.clone())
-                    .clickable()
-            }))
-            .on_click(move |ix: &usize, _, cx| {
-                if let Some(m) = Settings::RETENTION_CHOICES.get(*ix).copied() {
-                    retention_state.update(cx, |s, cx| {
-                        s.update_settings(cx, |st| st.retention_multiplier = m)
-                    });
-                }
-            });
+        let retention = ui::segmented(
+            "retention",
+            Settings::RETENTION_CHOICES.map(retention_label),
+            current,
+        )
+        .selector("settings-retention-tab")
+        .aria_label("Keep daily backups for")
+        .on_select(move |ix, _, cx| {
+            if let Some(m) = Settings::RETENTION_CHOICES.get(ix).copied() {
+                retention_state.update(cx, |s, cx| {
+                    s.update_settings(cx, |st| st.retention_multiplier = m)
+                });
+            }
+        });
 
         let rows = vec![
             location,

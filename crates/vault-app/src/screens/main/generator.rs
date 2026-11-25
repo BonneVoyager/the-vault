@@ -12,7 +12,6 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
-use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{ActiveTheme as _, Icon, Selectable as _, Sizable as _};
 use gpui_kit_assets::IconName;
 use vault_core::ExposeSecret as _;
@@ -121,26 +120,26 @@ impl Render for GeneratorView {
         let tab = g.tab;
         let state = self.state.clone();
 
-        let tabs = TabBar::new("generator-tabs")
-            .segmented()
-            .small()
-            .selected_index(match tab {
+        let tabs = ui::segmented(
+            "generator-tabs",
+            ["Password", "Passphrase"],
+            match tab {
                 GenTab::Password => 0,
                 GenTab::Passphrase => 1,
-            })
-            .child(Tab::new().label("Password").clickable())
-            .child(Tab::new().label("Passphrase").clickable())
-            .on_click({
-                let state = state.clone();
-                move |ix, _, cx| {
-                    let tab = if *ix == 0 {
-                        GenTab::Password
-                    } else {
-                        GenTab::Passphrase
-                    };
-                    state.update(cx, |s, cx| s.update_generator(cx, |g| g.set_tab(tab)));
-                }
-            });
+            },
+        )
+        .aria_label("Generator mode")
+        .on_select({
+            let state = state.clone();
+            move |ix, _, cx| {
+                let tab = if ix == 0 {
+                    GenTab::Password
+                } else {
+                    GenTab::Passphrase
+                };
+                state.update(cx, |s, cx| s.update_generator(cx, |g| g.set_tab(tab)));
+            }
+        });
 
         let preview_box = div()
             .p(px(10.))

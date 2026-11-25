@@ -352,8 +352,8 @@ fn main_generator_password(cx: &mut TestAppContext) {
         Case {
             label: "generator",
             targets: &[
-                "tabs-inner.0",
-                "tabs-inner.1",
+                "generator-tabs.segmented.segment-0",
+                "generator-tabs.segmented.segment-1",
                 "slider",
                 "gen-lower",
                 "gen-upper",
@@ -379,7 +379,13 @@ fn main_generator_passphrase(cx: &mut TestAppContext) {
     audit(
         Case {
             label: "passphrase",
-            targets: &["slider", "gen-sep", "gen-capitalize", "gen-number"],
+            targets: &[
+                "generator-tabs.segmented.segment-1",
+                "slider",
+                "gen-sep",
+                "gen-capitalize",
+                "gen-number",
+            ],
             disabled: &[],
         },
         &mut vcx,
@@ -618,7 +624,17 @@ const SETTINGS: &[&str] = &[
 fn settings_general(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let (_, mut vcx) = settings(0, dir.path(), cx);
-    let targets = [SETTINGS, &["auto-lock", "clipboard-clear", "lock-on-sleep"]].concat();
+    let targets = [
+        SETTINGS,
+        &[
+            "auto-lock",
+            "clipboard-clear",
+            "lock-on-sleep",
+            "appearance.segmented.segment-0",
+            "text-size.segmented.segment-0",
+        ],
+    ]
+    .concat();
     let hits = audit(
         Case {
             label: "settings general",

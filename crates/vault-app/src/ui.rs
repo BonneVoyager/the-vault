@@ -1283,6 +1283,167 @@ pub fn focus_ring<E: gpui::InteractiveElement + gpui::Styled>(el: E, cx: &App) -
     }
 }
 
+/// Segmented track height at text scale 1 (a `.small()` Button's `h_6` at rem 16).
+pub const SEGMENT_TRACK_H: f32 = 24.;
+/// Selected pill height at text scale 1.
+pub const SEGMENT_PILL_H: f32 = 18.;
+
+/// The selected segment's lift: gpui-component's `raised_shadow` (pub(crate) there).
+fn segment_shadow() -> Vec<gpui::BoxShadow> {
+    let ink = gpui::hsla(0., 0., 0., 0.1);
+    vec![
+        gpui::BoxShadow::new(px(0.), px(1.), ink).blur_radius(px(1.5)),
+        gpui::BoxShadow::new(px(0.), px(1.), ink)
+            .blur_radius(px(1.))
+            .spread_radius(px(-1.)),
+    ]
+}
+
+/// Our segmented control (settings Appearance / Text size / retention, generator
+/// tabs). gpui-component's segmented `TabBar` paints its track and selected pill from
+/// library defaults that vanish on vault's dark window, so this draws its own: a
+/// `bg_elevated` track with a 1 px border and a lighter raised pill for the selection,
+/// the height of a `.small()` Button.
+///
+/// The track is one Tab stop; ←/→ move the selection while it has focus. A click
+/// selects without taking focus (like a Button). Re-clicking the selected segment does
+/// nothing.
+pub fn segmented<L: Into<SharedString>>(
+    id: impl Into<SharedString>,
+    labels: impl IntoIterator<Item = L>,
+    selected: usize,
+) -> Segmented {
+    Segmented {
+        id: id.into(),
+        labels: labels.into_iter().map(Into::into).collect(),
+        selected,
+        on_select: None,
+        selector: None,
+        name: None,
+    }
+}
+
+/// [`Segmented::on_select`]'s callback.
+type OnSelect = dyn Fn(usize, &mut Window, &mut App);
+
+/// Builder returned by [`segmented`].
+#[derive(gpui::IntoElement)]
+pub struct Segmented {
+    id: SharedString,
+    labels: Vec<SharedString>,
+    selected: usize,
+    on_select: Option<Rc<OnSelect>>,
+    selector: Option<&'static str>,
+    name: Option<SharedString>,
+}
+
+impl Segmented {
+    /// Called with the newly chosen index (click or ←/→).
+    pub fn on_select(mut self, f: impl Fn(usize, &mut Window, &mut App) + 'static) -> Self {
+        self.on_select = Some(Rc::new(f));
+        self
+    }
+
+    /// Gives each segment the debug selector `"{prefix}: {label}"` and the track
+    /// `"{prefix}-track"` (tests).
+    pub fn selector(mut self, prefix: &'static str) -> Self {
+        self.selector = Some(prefix);
+        self
+    }
+
+    /// The control's VoiceOver name (usually its row label).
+    pub fn aria_label(mut self, name: impl Into<SharedString>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+}
+
+impl gpui::RenderOnce for Segmented {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.theme();
+        let (normal, strong) = (theme.muted_foreground, theme.foreground);
+        let pill = crate::theme::VaultTheme::for_appearance(theme.is_dark()).segment_selected;
+        let ring = theme.ring;
+        // Every size follows the text size, like the small Button beside it (24 px).
+        let size = |v: f32| crate::theme::scaled(v, cx);
+        let count = self.labels.len();
+        let selected = self.selected.min(count.saturating_sub(1));
+        let on_select = self.on_select;
+
+        let keys = on_select.clone();
+        let track = h_flex()
+            .id("segmented")
+            .tab_index(0)
+            .when_some(self.name, |el, name| el.aria_label(name))
+            .when_some(self.selector, |el, p| {
+                el.debug_selector(move || format!("{p}-track"))
+            })
+            .h(size(SEGMENT_TRACK_H))
+            .px(size(3.))
+            .gap(size(2.))
+            .items_center()
+            .bg(theme.secondary)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(theme.radius)
+            .when(RING_ALLOWED.get(), |el| {
+                el.focus(move |s| s.border_color(ring))
+            })
+            // A click (segment, padding or gap) leaves focus where it was, like a Button.
+            .capture_any_mouse_down(|_, window, _| window.prevent_default())
+            .on_key_down(move |ev: &gpui::KeyDownEvent, window, cx| {
+                if ev.keystroke.modifiers.modified() || count == 0 {
+                    return;
+                }
+                let next = match ev.keystroke.key.as_str() {
+                    "left" => selected.checked_sub(1),
+                    "right" => Some(selected + 1).filter(|n| *n < count),
+                    _ => return,
+                };
+                cx.stop_propagation();
+                if let (Some(next), Some(f)) = (next, keys.as_ref()) {
+                    f(next, window, cx);
+                }
+            });
+
+        let segments = self.labels.into_iter().enumerate().map(|(ix, label)| {
+            let on = ix == selected;
+            let click = on_select.clone();
+            let selector = self.selector.map(|p| format!("{p}: {label}"));
+            gpui::div()
+                .id((SharedString::new_static("segment"), ix))
+                .aria_label(label.clone())
+                .aria_selected(on)
+                .h(size(SEGMENT_PILL_H))
+                .px(size(9.))
+                .flex()
+                .items_center()
+                .rounded(size(4.))
+                .text_sm()
+                .when_some(selector, |el, s| el.debug_selector(move || s.clone()))
+                // Every segment shows the pointer, like the TabBar it replaced.
+                .clickable()
+                .when(on, |el| {
+                    el.bg(pill).shadow(segment_shadow()).text_color(strong)
+                })
+                .when(!on, |el| {
+                    el.text_color(normal).hover(move |s| s.text_color(strong))
+                })
+                .on_click(move |_, window, cx| {
+                    if let (false, Some(f)) = (on, click.as_ref()) {
+                        f(ix, window, cx);
+                    }
+                })
+                .child(label)
+        });
+
+        gpui::div()
+            .id(gpui::ElementId::Name(self.id))
+            .flex_none()
+            .child(track.children(segments))
+    }
+}
+
 /// Shared copyable value area for the main detail view and item windows.
 /// Callers supply the value and copy handler; Tab, Enter and Space work like a button.
 pub fn copy_value_area(id: impl Into<gpui::ElementId>, what: &str, cx: &App) -> Stateful<Div> {
@@ -1687,6 +1848,10 @@ pub mod probe {
 #[cfg(test)]
 #[path = "ui_menu_tests.rs"]
 mod menu_tests;
+
+#[cfg(test)]
+#[path = "ui_segmented_tests.rs"]
+mod segmented_tests;
 
 /// Only the main window is blurred (05 §5); the backup viewer's options stay opaque.
 #[cfg(test)]

@@ -86,6 +86,9 @@ pub struct VaultTheme {
     /// (see [`sidebar_fill`]).
     pub bg_sidebar: Hsla,
     pub bg_elevated: Hsla,
+    /// The selected segment of `ui::segmented`, a step lighter than its `bg_elevated`
+    /// track (owner decision 2026-11-25: the control is app-owned).
+    pub segment_selected: Hsla,
     pub border: Hsla,
     pub text: Hsla,
     pub text_muted: Hsla,
@@ -183,12 +186,13 @@ fn current_accent(cx: &App) -> Option<Hsla> {
 
 impl VaultTheme {
     pub fn for_appearance(dark: bool) -> Self {
-        let shared = |accent, bg, bg_sidebar, bg_elevated, border, text, muted| Self {
+        let shared = |accent, bg, bg_sidebar, bg_elevated, segment, border, text, muted| Self {
             accent: hex(accent),
             accent_text: hex(LIGHT_ACCENT_TEXT),
             bg: hex(bg),
             bg_sidebar: hex(bg_sidebar),
             bg_elevated: hex(bg_elevated),
+            segment_selected: hex(segment),
             border: hex(border),
             text: hex(text),
             text_muted: hex(muted),
@@ -201,11 +205,11 @@ impl VaultTheme {
         };
         if dark {
             shared(
-                0x5B8CFF, 0x1C1C1E, 0x232326, 0x2A2A2D, 0x38383B, 0xF2F2F7, 0x98989D,
+                0x5B8CFF, 0x1C1C1E, 0x232326, 0x2A2A2D, 0x3A3A3E, 0x38383B, 0xF2F2F7, 0x98989D,
             )
         } else {
             shared(
-                0x3B6CF0, 0xFFFFFF, 0xF5F5F7, 0xF7F7F8, 0xE5E5EA, 0x1D1D1F, 0x6E6E73,
+                0x3B6CF0, 0xFFFFFF, 0xF5F5F7, 0xF7F7F8, 0xFFFFFF, 0xE5E5EA, 0x1D1D1F, 0x6E6E73,
             )
         }
     }
