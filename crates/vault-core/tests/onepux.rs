@@ -505,3 +505,72 @@ fn declared_entry_count_over_the_cap_is_refused_before_any_entry_is_read() {
         Err(ImportError::Malformed(_))
     ));
 }
+
+/// Security review 2026-11-26 L-14. zip 9.6.1 searches 65 572 bytes back from the end for
+/// the End of Central Directory signature (its in-memory record struct is 32 bytes, not the
+/// 22-byte on-disk record); the 2026-11-06 guard searched 65 562. A real record placed in
+/// that 10-byte gap, with a decoy record inside its own comment, passed the guard (which
+/// saw only the decoy's small count) while zip, failing to read a directory from the decoy,
+/// fell back to the real record and opened an archive over the entry cap. The guard now
+/// scans past zip's window and the count zip resolved is checked again after opening.
+#[test]
+fn eocd_hidden_in_the_gap_behind_a_decoy_comment_is_still_counted() {
+    const SIG: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
+    // A genuine archive with one entry over the cap. `files/` entries are never opened by
+    // the importer, so if the archive is accepted the import succeeds with no items.
+    let data = export(vec![]).to_string();
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    w.start_file("export.data", opts).unwrap();
+    w.write_all(data.as_bytes()).unwrap();
+    for i in 0..10_000 {
+        w.start_file(format!("files/{i}"), opts).unwrap();
+    }
+    // The real record must sit 65 570 bytes from the end: inside zip's window, outside the
+    // old guard's. A comment is at most 65 535 bytes (22 + 65 535 = 65 557, inside the old
+    // window), so the remaining 13 bytes are unclaimed junk after the comment; zip finds
+    // records by signature and tolerates that.
+    const REAL_FROM_END: usize = 65_570;
+    const JUNK: usize = REAL_FROM_END - 22 - u16::MAX as usize;
+    let comment_len = usize::from(u16::MAX);
+    let mut comment = vec![0u8; comment_len];
+    // The decoy, 100 bytes from the end of the file: declares one entry, an empty directory
+    // at offset 0 and a 78-byte comment, so it ends exactly at the end of the file and the
+    // guard treats it as a plausible record.
+    let decoy_at = comment_len + JUNK - 100;
+    comment[decoy_at..decoy_at + 4].copy_from_slice(&SIG);
+    comment[decoy_at + 8..decoy_at + 10].copy_from_slice(&1u16.to_le_bytes());
+    comment[decoy_at + 10..decoy_at + 12].copy_from_slice(&1u16.to_le_bytes());
+    comment[decoy_at + 20..decoy_at + 22].copy_from_slice(&78u16.to_le_bytes());
+    w.set_raw_comment(comment.into_boxed_slice()).unwrap();
+    let mut z = w.finish().unwrap().into_inner();
+    z.extend_from_slice(&[0u8; JUNK]);
+
+    // Sanity: the real record is where the attack needs it and declares 10 001 entries.
+    let real = z.len() - REAL_FROM_END;
+    assert_eq!(z[real..real + 4], SIG);
+    assert_eq!(
+        u16::from_le_bytes([z[real + 10], z[real + 11]]),
+        10_001,
+        "real entry count"
+    );
+    assert_eq!(z[z.len() - 100..z.len() - 96], SIG, "decoy in the comment");
+
+    match import_1pux(&z, Uuid::nil(), NOW) {
+        Err(ImportError::TooLarge(m)) => assert!(m.contains("more than 10000 entries"), "{m}"),
+        Err(other) => panic!("expected TooLarge, got {other:?}"),
+        Ok(items) => panic!("archive over the cap was accepted ({} items)", items.len()),
+    }
+
+    // A bare record exactly at zip's own bound (65 572 bytes from the end) is counted.
+    let mut far = SIG.to_vec();
+    far.extend_from_slice(&[0; 18]);
+    far[8..10].copy_from_slice(&60_000u16.to_le_bytes());
+    far[10..12].copy_from_slice(&60_000u16.to_le_bytes());
+    far.extend_from_slice(&[0; 65_572 - 22]);
+    assert!(matches!(
+        import_1pux(&far, Uuid::nil(), NOW),
+        Err(ImportError::TooLarge(_))
+    ));
+}

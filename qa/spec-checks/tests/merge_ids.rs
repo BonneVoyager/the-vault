@@ -304,9 +304,12 @@ fn mi05_removed_fields_union_cap() {
 }
 
 /// 01 §4 created_at: "a merge keeps the minimum of the two known values, or whichever side has
-/// one, and a differing created_at alone is not a change and never bumps modified_at".
+/// one", and 02 guarantee 6 (2026-11-26, security review M-01): a differing `created_at` alone
+/// is not a change of *content*, but adopting the minimum changes the persisted record, so the
+/// merge restamps it `max(ours, theirs) + 1` (at an equal stamp too: our own pre-merge record
+/// used that pair) and reports `updated`; the peer then adopts the restamped record verbatim.
 #[test]
-fn mi06_created_at_minimum_not_a_change() {
+fn mi06_created_at_minimum_is_kept_and_restamps_as_a_record_change() {
     let mut n = Net::new(2);
     let (id, _, _) = seeded(&mut n, 100);
     let ma = n.devs[0].get(id).unwrap().modified_at;
@@ -336,26 +339,47 @@ fn mi06_created_at_minimum_not_a_change() {
             .unlock_with_key(&n.devs[from].export_vault_key(), Uuid::new_v4())
             .unwrap()
     };
-    let older = mk(&n, 1, Some(50));
+    // Equal stamps, only created_at differs: the minimum is adopted and the record restamped.
+    let mut older = mk(&n, 1, Some(50));
     let r = n.devs[0].merge_from(&older).unwrap();
     let it = n.devs[0].get(id).unwrap();
     assert_eq!(it.created_at, Some(50), "minimum kept");
     assert_eq!(
-        it.modified_at, ma,
-        "created_at alone never bumps modified_at"
+        it.modified_at,
+        ma + 1,
+        "an equal-stamp created_at carry restamps past both inputs"
     );
     assert_eq!(
         (r.added, r.updated, r.deleted),
-        (0, 0, 0),
-        "not a change: {r:?}"
+        (0, 1, 0),
+        "a record change: {r:?}"
     );
+    assert!(r.changed());
+    // The peer adopts the restamped record verbatim on its next merge; then both are settled.
+    let r = older.merge_from(&n.devs[0]).unwrap();
+    assert_eq!(r.updated, 1);
+    let it = older.get(id).unwrap();
+    assert_eq!((it.created_at, it.modified_at), (Some(50), ma + 1));
+    assert!(!older.merge_from(&n.devs[0]).unwrap().changed());
+    assert!(!n.devs[0].merge_from(&older).unwrap().changed());
     let newer = mk(&n, 1, Some(10_000));
-    n.devs[0].merge_from(&newer).unwrap();
+    let r = n.devs[0].merge_from(&newer).unwrap();
     assert_eq!(
         n.devs[0].get(id).unwrap().created_at,
         Some(50),
         "a larger value never replaces the minimum"
     );
+    assert!(!r.changed(), "nothing to adopt: our record stands");
+    assert_eq!(n.devs[0].get(id).unwrap().modified_at, ma + 1);
+    // Our stamp ahead of the peer's (content-free update), peer carries a smaller created_at:
+    // the result is our content with the peer's created_at, a record neither side wrote.
+    n.devs[0].update(id, ma + 500, |_| {}).unwrap();
+    assert_eq!(n.devs[0].get(id).unwrap().modified_at, ma + 500);
+    let smaller = mk(&n, 1, Some(20));
+    let r = n.devs[0].merge_from(&smaller).unwrap();
+    let it = n.devs[0].get(id).unwrap();
+    assert_eq!((it.created_at, it.modified_at), (Some(20), ma + 501));
+    assert_eq!((r.added, r.updated, r.deleted), (0, 1, 0));
     // one side unknown -> the known one
     let mut m = Net::new(2);
     let (id2, _, _) = seeded(&mut m, 100);

@@ -212,18 +212,33 @@ const MAX_ZIP_ENTRIES: u64 = 10_000;
 /// The fixed part of the EOCD record; a comment of up to `u16::MAX` bytes may follow it.
 const EOCD_LEN: usize = 22;
 const EOCD_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
-/// How far back from the end zip 9.6 looks for the EOCD signature (`get_metadata`:
-/// fixed record + magic + `1 << 16`). Must not be narrower than zip's, or a record zip
-/// would fall back to could escape the count check.
-const EOCD_SEARCH_WINDOW: usize = EOCD_LEN + 4 + (1 << 16);
+/// How far back from the end zip 9.6.1 looks for the EOCD signature (`get_metadata`:
+/// `size_of::<Zip32CentralDirectoryEnd>() + size_of::<Magic>() + (1 << 16)`). The struct
+/// size is the *in-memory* one, 16 bytes of fields plus a 16-byte `Box<[u8]>` for the
+/// comment = 32, not the 22-byte on-disk record, so zip's window is 65 572 bytes.
+const ZIP_EOCD_SEARCH_WINDOW: usize = 32 + 4 + (1 << 16);
+/// The window this guard scans. It must never be narrower than zip's, or a record zip
+/// falls back to after a decoy fails can escape the count check: the 2026-11-06 guard used
+/// the on-disk size (65 562 bytes) and a real EOCD in the 10-byte gap behind a decoy
+/// placed inside its comment went unchecked (security review 2026-11-26 L-14). A 1 KiB
+/// margin absorbs a future change of zip's constant; the post-open check in
+/// [`import_1pux`] catches whatever this scan cannot see.
+const EOCD_SEARCH_WINDOW: usize = ZIP_EOCD_SEARCH_WINDOW + 1024;
+// The two numbers the L-14 fix rests on: zip 9.6.1's window is 65 572 bytes (bump
+// `ZIP_EOCD_SEARCH_WINDOW` when zip changes it) and this scan always reaches past it.
+const _: () = assert!(ZIP_EOCD_SEARCH_WINDOW == 65_572);
+const _: () = assert!(EOCD_SEARCH_WINDOW >= ZIP_EOCD_SEARCH_WINDOW + 1024);
 
 /// Refuse an archive whose End of Central Directory record declares more than
 /// [`MAX_ZIP_ENTRIES`] entries, before the zip reader builds its directory.
 ///
 /// Mirrors how zip 9.6 finds the record: the signature is searched backwards from the end
-/// over the last [`EOCD_SEARCH_WINDOW`] bytes (the record, the signature again and 64 KiB of
-/// comment, zip's own bound). Every candidate whose comment fits in the file is checked, not
-/// just the last, so a fake record appended behind a real one cannot hide the real count;
+/// over the last [`EOCD_SEARCH_WINDOW`] bytes (zip's own bound plus a margin; see
+/// [`ZIP_EOCD_SEARCH_WINDOW`]). Every candidate whose comment fits in the file is checked,
+/// not just the last, so a fake record appended behind a real one cannot hide the real
+/// count, and a real record hidden behind a decoy placed inside its own comment is checked
+/// too, as long as it lies within the window. This is the cheap first line; the count zip
+/// actually built is checked again in [`import_1pux`] once the archive is open;
 /// zip 9.6 reads the zip32 count from the "entries on this disk" field, so both count fields
 /// are bounded.
 /// An EOCD with any of the three ZIP64 markers zip 9.6's `may_be_zip64` checks (`u16::MAX`
@@ -268,6 +283,37 @@ fn check_zip_entry_count(bytes: &[u8]) -> Result<(), ImportError> {
         return Err(malformed("not a valid zip archive"));
     }
     Ok(())
+}
+
+/// Second line behind [`check_zip_entry_count`] (security review 2026-11-26 L-14): the
+/// number of entries the zip reader actually resolved is the authoritative count. The
+/// pre-open scan is the cheap guard that stops the reader materialising a huge directory in
+/// the first place; this catches an archive whose real record that scan could not see (a
+/// zip search window wider than the one mirrored there). Same bound, same error kind.
+fn check_opened_entry_count(entries: usize) -> Result<(), ImportError> {
+    if u64::try_from(entries).unwrap_or(u64::MAX) > MAX_ZIP_ENTRIES {
+        return Err(too_large("1PUX archive holds more than 10000 entries"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod entry_count_tests {
+    use super::*;
+
+    #[test]
+    fn opened_entry_count_is_bounded_at_the_same_cap() {
+        assert!(check_opened_entry_count(0).is_ok());
+        assert!(check_opened_entry_count(10_000).is_ok());
+        assert!(matches!(
+            check_opened_entry_count(10_001),
+            Err(ImportError::TooLarge(m)) if m.contains("more than 10000 entries")
+        ));
+        assert!(matches!(
+            check_opened_entry_count(usize::MAX),
+            Err(ImportError::TooLarge(_))
+        ));
+    }
 }
 
 fn str_of<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
@@ -519,6 +565,7 @@ pub fn import_1pux(bytes: &[u8], device_id: Uuid, now: Millis) -> Result<Vec<Ite
     check_zip_entry_count(bytes)?;
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|_| malformed("not a valid zip archive"))?;
+    check_opened_entry_count(zip.len())?;
     let index = zip
         .index_for_name("export.data")
         .ok_or_else(|| malformed("missing export.data"))?;

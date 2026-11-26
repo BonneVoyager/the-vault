@@ -483,10 +483,12 @@ fn format_hint(v: &UnlockedVault) -> Option<&'static str> {
 /// What `get` prints for a field: secrets are masked unless `reveal` is set.
 fn display_value(item: &Item, f: &Field, reveal: bool) -> String {
     let raw = f.value.expose_secret();
-    // Only notes are multi-line; any other value with a line break would forge a line.
+    // Only notes are multi-line; any other value with a line break would forge a line. Notes
+    // continuation lines are indented by two spaces so they cannot pass for a `label: value`
+    // line (a script reading `vault get` output keys on the line start).
     let shown = |raw: &str| {
         if f.kind == FieldKind::Notes {
-            sanitize_for_terminal(raw)
+            sanitize_for_terminal(raw).replace('\n', "\n  ")
         } else {
             sanitize_line(raw)
         }
@@ -497,9 +499,17 @@ fn display_value(item: &Item, f: &Field, reveal: bool) -> String {
     if f.name.eq_ignore_ascii_case("number")
         && item.tags.iter().any(|t| t.eq_ignore_ascii_case("card"))
     {
-        let digits: Vec<char> = raw.chars().filter(|c| !c.is_whitespace()).collect();
-        if digits.len() >= 4 {
-            let last4: String = digits[digits.len() - 4..].iter().collect();
+        // The last four are shown only when they are all ASCII digits (an imported value can
+        // carry anything); they still pass through the line sanitiser like every other output.
+        let mut last4: Vec<char> = raw
+            .chars()
+            .rev()
+            .filter(|c| !c.is_whitespace())
+            .take(4)
+            .collect();
+        last4.reverse();
+        if last4.len() == 4 && last4.iter().all(char::is_ascii_digit) {
+            let last4 = sanitize_line(&last4.iter().collect::<String>());
             return format!(
                 "\u{2022}\u{2022}\u{2022}\u{2022} \u{2022}\u{2022}\u{2022}\u{2022} \u{2022}\u{2022}\u{2022}\u{2022} {last4}"
             );
@@ -1297,14 +1307,17 @@ mod tests {
         let line = field_line(&i, &i.fields[0], false, false);
         assert_eq!(line, "evil\\nforged: line: v");
         assert_eq!(field_line(&i, &i.fields[1], false, false), "SEC\\nX");
-        // Notes stay multi-line where intended.
+        // Notes stay multi-line where intended; continuation lines are indented.
         i.fields.push(Field::new(
             "notes",
             FieldKind::Notes,
             SecretString::new("one\ntwo".into()),
             0,
         ));
-        assert_eq!(field_line(&i, &i.fields[2], true, false), "notes: one\ntwo");
+        assert_eq!(
+            field_line(&i, &i.fields[2], true, false),
+            "notes: one\n  two"
+        );
     }
 
     fn item(card: bool, fname: &str, fkind: FieldKind, v: &str) -> Item {
@@ -1336,6 +1349,17 @@ mod tests {
             "{masked}"
         );
         assert_eq!(display_value(&i, &i.fields[0], true), "4111 1111 1111 1234");
+        for v in [
+            "4111 1111 1111 1\u{1b}[2J",
+            "4111 1111 1111 12\u{1b}4",
+            "4111 1111 1111 \u{0663}234",
+        ] {
+            let hostile = item(true, "number", FieldKind::Text, v);
+            assert_eq!(
+                display_value(&hostile, &hostile.fields[0], false),
+                "********"
+            );
+        }
         let short = item(true, "number", FieldKind::Text, "12");
         assert_eq!(display_value(&short, &short.fields[0], false), "********");
     }

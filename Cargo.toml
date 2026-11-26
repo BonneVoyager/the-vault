@@ -20,6 +20,8 @@ codegen-units = 1
 debug = "line-tables-only"
 split-debuginfo = "packed"
 strip = "symbols"
+# Parsers handle attacker-controlled lengths; a panic is better than a silently wrapped value.
+overflow-checks = true
 # panic stays "unwind": catch_unwind boundaries (KDBX parser, background tasks) need it.
 
 # Dev profile: deps at opt-level 1 so Argon2, gpui and friends are usable in tests; our crates stay at 0.

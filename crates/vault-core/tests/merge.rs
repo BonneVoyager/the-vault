@@ -122,15 +122,16 @@ fn field_level_merge_is_commutative() {
     assert_eq!(ra.updated, 1);
     assert_eq!(rb.updated, 1);
     assert_eq!(ra.unchanged, 1);
-    // Content is identical after one round; B's record timestamp moved to 11001 because its
-    // content changed while max(modified_at) was already its own 11000.
-    assert_eq!(a.get(id).unwrap().modified_at, 11_000);
+    // The merged item is a record neither side had written, so both sides stamp it
+    // `max(10_000, 11_000) + 1` (security review 2026-11-26 M-01: before the symmetric rule
+    // A kept B's 11_000 with content B never wrote, and B's pre-merge record could be
+    // spliced over it). Records are identical after one round; a second exchange is a no-op.
+    assert_eq!(a.get(id).unwrap().modified_at, 11_001);
     assert_eq!(b.get(id).unwrap().modified_at, 11_001);
     let b_round2 = unlock(&b.serialize()).unwrap();
-    assert_eq!(
-        a.merge_from(&b_round2).unwrap().updated,
-        1,
-        "A picks up the bump"
+    assert!(
+        !a.merge_from(&b_round2).unwrap().changed(),
+        "both sides computed the same record"
     );
 
     assert_item_eq(a.get(id).unwrap(), b.get(id).unwrap());

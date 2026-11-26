@@ -383,7 +383,10 @@ pub struct Item {
     pub title: String,
     /// Tombstone when `Some`.
     pub deleted_at: Option<Millis>,
-    /// Device that made the latest change.
+    /// Device that made the latest change. After a merge restamp
+    /// (`UnlockedVault::merge_from`, 2026-11-26) it is the metadata *winner's* device id,
+    /// not necessarily the device that wrote the merged record: the merging device may save
+    /// an item stamped `max + 1` under the peer's id.
     pub device_id: Uuid,
     pub favorite: bool,
     pub tags: Vec<String>,
@@ -393,9 +396,11 @@ pub struct Item {
     /// When the item was created (unix millis; v1.3, optional, no version bump).
     /// [`Item::new`] sets `Some(now)`; every file written before the key existed reads as
     /// `None`, and the writer emits the key only when `Some`. Immutable metadata: a merge
-    /// keeps the minimum of the two sides (or whichever is `Some`), and a differing
-    /// `created_at` alone is not a change (it never bumps `modified_at`). Importers set it
-    /// from the source's creation time when it has one, else `now`.
+    /// keeps the minimum of the two sides (or whichever is `Some`). A differing `created_at`
+    /// alone is not a change of content (`merge::item_eq` ignores it), but a merge that
+    /// adopts the peer's earlier value changes the persisted record, so that side restamps
+    /// and reports `updated` like any other merge result (security review 2026-11-26 M-01).
+    /// Importers set it from the source's creation time when it has one, else `now`.
     pub created_at: Option<Millis>,
     /// Per-attribute stamps (01 §4, 2026-10-31, optional keys, no bump): unix millis of the
     /// last change to `title`, `favorite`, `tags` (as one set) and `icon`, so that concurrent
@@ -499,14 +504,16 @@ impl Item {
     ///   stripped tombstone always has `modified_at > deleted_at`. A strip is the only local
     ///   mutation that advances a content-less tombstone without re-deleting it.
     /// - A merge takes a tombstone whole, so the relation between its two stamps travels
-    ///   with it. The one exception is the 03 §5 "+1 bump" on an equal-stamp tie: whenever a
-    ///   merge replaces our item with a peer's tombstone whose `modified_at` equals ours
-    ///   (two devices deleting at the same stamp, or a delete against an edit at the same
-    ///   stamp), the merged copy is stamped one past `deleted_at` and a title-only tombstone
-    ///   then reads as stripped on that device (its title and tags are still on the shell,
-    ///   nothing else was ever there). A tombstone with content is unaffected: the first half
-    ///   of the rule keeps it in the trash however its stamps moved (that bump, or an
-    ///   attachment added to a tombstone).
+    ///   with it. The one exception is the merge restamp (03 §5 "+1 bump", symmetric since
+    ///   2026-11-26): whenever a merge replaces our item with a peer's tombstone whose
+    ///   `modified_at` equals ours (two devices deleting at the same stamp, or a delete
+    ///   against an edit at the same stamp), or with a merged tombstone that is neither
+    ///   input record (e.g. the peer's tombstone carrying our earlier `created_at`), the
+    ///   merged copy is stamped one past `deleted_at` and a title-only tombstone then reads
+    ///   as stripped on that device (its title and tags are still on the shell, nothing
+    ///   else was ever there). A tombstone with content is unaffected: the first half of the
+    ///   rule keeps it in the trash however its stamps moved (that bump, or an attachment
+    ///   added to a tombstone).
     ///
     /// A tombstone written before 2026-11-03 (fields emptied at delete time, both stamps
     /// equal) therefore counts as trashed until the first `expire_deleted` sweep restamps it.

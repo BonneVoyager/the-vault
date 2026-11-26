@@ -34,10 +34,29 @@ device id and bump again).
   is user-visible: `items()` hides tombstones, 02 has no restore API, and a resurrection
   takes the live side wholesale so tombstone attributes never surface.
 
-**Optional tightening (not implemented, needs a 03 §5 sentence, no format bump):** stamp a
-true merge (content differs from BOTH inputs) at `max(ours, theirs) + 1` on both sides, which
-makes those merges exactly commutative and shortens cascades; tie cases where the merged
-content equals one side's (tombstone vs same-stamp edit) stay one-sided regardless.
+**Tightening IMPLEMENTED 2026-11-26** (security review M-01, see
+[[symmetric-restamp-decisions]]): a true merge (record differs from BOTH inputs, `created_at`
+included) is stamped `max(ours, theirs) + 1` on both sides, making those merges exactly
+commutative; the peer's record at an EQUAL stamp also restamps (our own record used the
+pair); only the peer's record at a strictly greater stamp is adopted verbatim, so ties
+stay one-sided and converge next round (`same_but_bump` |delta| <= 1 still right). **Marker-cap bound settled 2026-11-26:** `devices_converge_in_n_plus_one_or_n_plus_two_rounds_when_the_marker_cap_fires`
+asserts N+1 for two devices and N+2 for three and four (`n in 2..=4`, rounds reuse the four
+generated orders cyclically, every device must end <= FIELD_TOMBSTONE_CAP). GOTCHA: `ordered`
+zips `pairs(n)` with the key list, so the inner key vec must have >= n*(n-1) entries (12 for
+n=4) or pairs are silently skipped and a device is never merged into (looked like a bound
+failure: one device still at modified_at 10). The n=3 N+2 case is pinned deterministically
+in `replay_marker_cap_three_devices_need_n_plus_two` (strategy changes cannot lose it); the
+`proptest-regressions` file keeps its two seeds (tracked). Ledger `mi06` in
+qa/spec-checks/tests/merge_ids.rs re-expected to the restamp rule (renamed
+`mi06_created_at_minimum_is_kept_and_restamps_as_a_record_change`).
+Mechanism (replayed from the seed, 70 markers owned 66/3/1): the cap's "absent on both input
+sides" predicate lets a pair drop a marker while the third device still holds the field;
+it resurrects at the next contact and the marker is re-learnt from a peer that kept it —
+NOT a stamp cascade. Measured ~12k random cases (uniform + skewed ownership, n=3,4): max
+N+1; only the seed needs N+2. Capping to the newest 64 unconditionally would be provably
+tight but resurrects fields with two devices (merge_hunt L1), so the algorithm was kept.
+All 7 laws pass at 4000 cases. A scratch measurement test (`tests/scratch_cap.rs`) was used
+and deleted; rebuild it if the bound is questioned again.
 
 **Why:** the owner wants the proptest file to assert laws the spec actually promises before
 it becomes a gate; both 2026-10-31 bug-hunt H-findings were real law violations, so the

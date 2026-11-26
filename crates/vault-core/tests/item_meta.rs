@@ -303,25 +303,55 @@ fn merge_keeps_the_minimum_created_at_and_never_counts_it_as_a_change() {
         "only created_at differs"
     );
 
-    let before = va.get(id).unwrap().modified_at;
+    // A `created_at` carry is a change of the *record*, not of content (`item_eq` still
+    // ignores `created_at`): it reports `updated`, asks for a save and restamps (security
+    // review 2026-11-26 M-01; before that the minimum was carried silently, which left new
+    // bytes under an old `(id, modified_at)` pair). The merged record is the peer's, but at
+    // a stamp our own pre-merge record used with other bytes, so it is stamped past both.
     let r = va.merge_from(&peer).unwrap();
-    assert_eq!((r.added, r.updated, r.deleted), (0, 0, 0), "not an update");
-    assert_eq!(r.unchanged, 1);
-    assert!(
-        !r.changed(),
-        "a created_at-only difference does not ask for a save"
-    );
-    assert_eq!(va.get(id).unwrap().modified_at, before, "no restamp");
+    assert_eq!((r.added, r.updated, r.deleted), (0, 1, 0), "an update");
+    assert_eq!(r.unchanged, 0);
+    assert!(r.changed(), "a created_at carry asks for a save");
+    assert_eq!(va.get(id).unwrap().modified_at, stamp + 1, "restamped");
     assert_eq!(
         va.get(id).unwrap().created_at,
         Some(100),
-        "but the minimum is carried"
+        "the minimum is carried"
     );
-    // The other direction: the peer already holds the minimum, nothing moves.
+    // The other direction: the peer already holds the minimum and adopts our restamped
+    // record verbatim (same content, strictly later stamp); then both sides are equal.
     let r = peer.merge_from(&va).unwrap();
-    assert_eq!(r.unchanged, 1);
+    assert_eq!(r.updated, 1);
     assert_eq!(peer.get(id).unwrap().created_at, Some(100));
-    assert_eq!(peer.get(id).unwrap().modified_at, stamp);
+    assert_eq!(peer.get(id).unwrap().modified_at, stamp + 1);
+    assert!(!va.merge_from(&peer).unwrap().changed());
+    assert!(!peer.merge_from(&va).unwrap().changed());
+
+    // With our stamp ahead of the peer's (a content-free `update` at 2_000), the merged
+    // record (our content and stamp, the peer's `created_at`) is neither input's, so it is
+    // restamped past both; the peer then adopts it verbatim and both sides are equal.
+    let mut va2 = new_vault();
+    va2.set_device_id(Uuid::from_u128(0xAAAA));
+    let mut item2 = sample_item(9, 1_000);
+    item2.created_at = Some(900);
+    let id2 = va2.insert(item2, 1_000);
+    let mut copy2 = va2.get(id2).unwrap().clone();
+    copy2.created_at = Some(100);
+    let mut peer2 = emptied_twin(&va2);
+    peer2.set_device_id(Uuid::from_u128(0xAAAA));
+    peer2.insert(copy2, 1_000);
+    peer2.set_device_id(Uuid::from_u128(0xBBBB));
+    va2.update(id2, 2_000, |_| {}).unwrap();
+    assert_eq!(va2.get(id2).unwrap().modified_at, 2_000);
+    let r = va2.merge_from(&peer2).unwrap();
+    assert_eq!(r.updated, 1);
+    assert_eq!(va2.get(id2).unwrap().created_at, Some(100));
+    assert_eq!(va2.get(id2).unwrap().modified_at, 2_001, "restamped");
+    let r = peer2.merge_from(&va2).unwrap();
+    assert_eq!(r.updated, 1);
+    assert_eq!(peer2.get(id2).unwrap().modified_at, 2_001);
+    assert!(!va2.merge_from(&peer2).unwrap().changed());
+    assert!(!peer2.merge_from(&va2).unwrap().changed());
 
     // A merge that *does* change content stamps as usual and still carries the minimum.
     peer.set_field_named(id, "username", secret("edited"), 5_000)

@@ -94,22 +94,39 @@ pub fn decode_qr_from_gray(width: usize, height: usize, pixels: &[u8]) -> Vec<Se
     out
 }
 
+/// Runs a decode and maps a panic inside it to "no code found" (an empty list).
+///
+/// `rqrr` 0.11.0 has release-mode assertions (e.g. `geometry.rs:55`, `x <= i32::MAX as
+/// f64`) that fire on some malformed images. The scans run on background executors that do
+/// not catch unwinds, so an uncaught panic would abort the app (security review 2026-11-26,
+/// L-07). The process panic hook still prints the panic message and location to stderr; the
+/// messages in `rqrr` are static text or indices, never pixel data or payloads, so nothing
+/// secret reaches the log. Payloads decoded before the panic are `SecretString`s and are
+/// zeroized as the unwind drops them.
+fn no_code_on_panic<T>(decode: impl FnOnce() -> Vec<T>) -> Vec<T> {
+    // AssertUnwindSafe: the closure only reads borrowed pixels and builds a fresh Vec, so
+    // no state shared with the caller can be left half-updated.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(decode)).unwrap_or_default()
+}
+
 /// Decode `pixels` and append payloads not already in `out`.
 fn decode_into(width: usize, height: usize, pixels: &[u8], out: &mut Vec<SecretString>) {
     if width == 0 || height == 0 || width.checked_mul(height) != Some(pixels.len()) {
         return;
     }
-    let mut img =
-        rqrr::PreparedImage::prepare_from_greyscale(width, height, |x, y| pixels[y * width + x]);
-    let mut found: Vec<((i32, i32), SecretString)> = img
-        .detect_grids()
-        .into_iter()
-        .filter_map(|grid| {
-            let top_left = grid.bounds[0];
-            let (_, content) = grid.decode().ok()?;
-            Some(((top_left.y, top_left.x), SecretString::new(content)))
-        })
-        .collect();
+    let mut found: Vec<((i32, i32), SecretString)> = no_code_on_panic(|| {
+        let mut img = rqrr::PreparedImage::prepare_from_greyscale(width, height, |x, y| {
+            pixels[y * width + x]
+        });
+        img.detect_grids()
+            .into_iter()
+            .filter_map(|grid| {
+                let top_left = grid.bounds[0];
+                let (_, content) = grid.decode().ok()?;
+                Some(((top_left.y, top_left.x), SecretString::new(content)))
+            })
+            .collect()
+    });
     found.sort_by_key(|(pos, _)| *pos);
     for (_, payload) in found {
         if !out
@@ -118,6 +135,23 @@ fn decode_into(width: usize, height: usize, pixels: &[u8], out: &mut Vec<SecretS
         {
             out.push(payload);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panicking_decode_is_no_code() {
+        let found: Vec<SecretString> = no_code_on_panic(|| panic!("decoder assertion"));
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn non_panicking_decode_passes_through() {
+        let found = no_code_on_panic(|| vec![1, 2]);
+        assert_eq!(found, vec![1, 2]);
     }
 }
 

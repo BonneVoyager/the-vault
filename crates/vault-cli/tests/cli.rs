@@ -636,7 +636,7 @@ fn terminal_control_characters_are_escaped() {
         &["add", "--title", "Notes", "--notes", "line1\nline2\rX"],
     ));
     let notes = ok(&vault(&f, PW, &["get", "--reveal", "Notes"]));
-    assert!(notes.contains("notes: line1\nline2\\u{d}X"), "{notes}");
+    assert!(notes.contains("notes: line1\n  line2\\u{d}X"), "{notes}");
     let miss = vault(&f, PW, &["get", "no\u{1b}[2Jmatch"]);
     let err = String::from_utf8_lossy(&miss.stderr);
     assert!(!err.contains('\u{1b}') && err.contains("\\u{1b}"), "{err}");
@@ -1181,4 +1181,75 @@ fn add_without_problems_is_silent_on_stderr() {
         "{}",
         String::from_utf8_lossy(&o.stderr)
     );
+}
+
+#[test]
+fn card_number_last_four_never_prints_escapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("c.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    ok(&vault(
+        &f,
+        PW,
+        &["add", "--template", "card", "--title", "Evil"],
+    ));
+    ok(&vault(
+        &f,
+        PW,
+        &[
+            "edit",
+            "Evil",
+            "--add",
+            "text:number=4111 1111 1111 1\u{1b}[2J",
+        ],
+    ));
+    ok(&vault(
+        &f,
+        PW,
+        &["add", "--template", "card", "--title", "Good"],
+    ));
+    ok(&vault(
+        &f,
+        PW,
+        &["edit", "Good", "--add", "text:number=4111 1111 1111 1234"],
+    ));
+    let evil = ok(&vault(&f, PW, &["get", "Evil"]));
+    assert!(!evil.contains('\u{1b}'), "{evil}");
+    assert!(evil.contains("number: ********"), "{evil}");
+    let good = ok(&vault(&f, PW, &["get", "Good"]));
+    assert!(
+        good.lines()
+            .any(|l| l.starts_with("number: ") && l.ends_with(" 1234")),
+        "{good}"
+    );
+    assert!(!good.contains("4111"), "{good}");
+}
+
+#[test]
+fn notes_cannot_forge_labelled_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("n.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    ok(&vault(
+        &f,
+        PW,
+        &[
+            "add",
+            "--title",
+            "Site",
+            "--password-field",
+            "--notes",
+            "first\npassword: forged\n\nlast",
+        ],
+    ));
+    for args in [&["get", "Site"][..], &["get", "--reveal", "Site"][..]] {
+        let out = ok(&vault(&f, PW, args));
+        let pw_lines: Vec<&str> = out.lines().filter(|l| l.starts_with("password:")).collect();
+        assert_eq!(pw_lines.len(), 1, "{out}");
+        assert!(!pw_lines[0].contains("forged"), "{out}");
+        assert!(
+            out.contains("notes: first\n  password: forged\n  \n  last"),
+            "{out}"
+        );
+    }
 }

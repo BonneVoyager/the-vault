@@ -4,7 +4,7 @@
 //! when Touch ID was enabled, the last master-password unlock and the failed Touch ID
 //! attempts since. Touch ID is offered only while the policy allows it:
 //! - the Mac has not restarted since the last master-password unlock (`boot_time`),
-//! - that unlock is less than 7 days old,
+//! - that unlock is less than 7 days old and not more than [`FUTURE_SKEW`] in the future,
 //! - fewer than 5 Touch ID attempts failed since,
 //! - the enrollment is not stale (fingerprints changed, slot gone).
 //!
@@ -29,6 +29,11 @@ use crate::biometric::Biometrics;
 pub const PASSWORD_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Master password required again after this many failed Touch ID attempts.
 pub const MAX_TOUCH_FAILURES: u32 = 5;
+/// How far in the future `last_password_unlock_at` may lie (clock skew, e.g. an NTP step
+/// back right after a password unlock) before the policy treats it as tampered or bogus and
+/// requires the master password. Without this bound a future timestamp would pass the
+/// reboot rule and have age 0 forever (security review 2026-11-26, M-03).
+pub const FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
 
 /// Toast when a merge took away this Mac's enclave slot.
 pub const SLOT_GONE: &str = "Another device changed this vault's keys, so Touch ID must be set up \
@@ -198,7 +203,13 @@ impl AppState {
         if self.boot_time == UNIX_EPOCH || policy.last_password_unlock_at < unix(self.boot_time) {
             return Err(TouchDenied::Rebooted);
         }
-        let age = unix(SystemTime::now()).saturating_sub(policy.last_password_unlock_at);
+        let now = unix(SystemTime::now());
+        // A password unlock "in the future" beyond the skew allowance is an edited
+        // settings.json or a clock that was ahead and has been corrected: fail closed.
+        if policy.last_password_unlock_at > now.saturating_add(FUTURE_SKEW.as_secs()) {
+            return Err(TouchDenied::Expired);
+        }
+        let age = now.saturating_sub(policy.last_password_unlock_at);
         if age > PASSWORD_MAX_AGE.as_secs() {
             return Err(TouchDenied::Expired);
         }
@@ -812,6 +823,26 @@ mod tests {
             s.policy_mut().unwrap().last_password_unlock_at = now - 8 * 24 * 3600;
             assert_eq!(s.touch_policy(), Err(TouchDenied::Expired));
             s.policy_mut().unwrap().last_password_unlock_at = now - 6 * 24 * 3600;
+            assert_eq!(s.touch_policy(), Ok(()));
+        });
+        // A password unlock in the future (edited settings.json, corrected clock): denied
+        // beyond the skew allowance, allowed just within it.
+        let skew = FUTURE_SKEW.as_secs();
+        state.update(cx, |s, _| {
+            s.policy_mut().unwrap().last_password_unlock_at = now + 365 * 24 * 3600;
+            assert_eq!(s.touch_policy(), Err(TouchDenied::Expired));
+            s.policy_mut().unwrap().last_password_unlock_at = u64::MAX;
+            assert_eq!(s.touch_policy(), Err(TouchDenied::Expired));
+            s.policy_mut().unwrap().last_password_unlock_at = now + skew + 60;
+            assert_eq!(s.touch_policy(), Err(TouchDenied::Expired));
+            // `now` was read before this block, so a few seconds of test time only move
+            // the value further inside the allowance.
+            s.policy_mut().unwrap().last_password_unlock_at = now + skew - 60;
+            assert_eq!(s.touch_policy(), Ok(()));
+            // Zero (or anything before boot) is implausible: the reboot rule denies it.
+            s.policy_mut().unwrap().last_password_unlock_at = 0;
+            assert_eq!(s.touch_policy(), Err(TouchDenied::Rebooted));
+            s.policy_mut().unwrap().last_password_unlock_at = now;
             assert_eq!(s.touch_policy(), Ok(()));
         });
         // Five failed attempts, counted from real failures; a cancel is not one.

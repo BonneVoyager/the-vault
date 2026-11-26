@@ -904,11 +904,13 @@ fn title_only_trash_propagates_like_a_content_tombstone() {
 fn equal_stamp_tombstone_tie_is_the_documented_residual() {
     // An equal-stamp tie: both devices delete the same item at the same stamp (a delete
     // against an edit at the same stamp behaves alike). The both-tombstone rule picks B
-    // (greater device id); on A the merge takes B's tombstone at an equal `modified_at` and
-    // bumps it by one (03 §5), so A's copy reads `modified_at = deleted_at + 1`. For a
-    // content tombstone that changes nothing (content keeps it in the trash); for a
-    // title-only tombstone it is the one path that leaves the trash without a strip, and the
-    // devices still converge. Documented in `Item::is_trashed`; this pins the behaviour.
+    // (greater device id); on A the merge takes B's tombstone at a `modified_at` equal to
+    // ours, and restamps it one past (03 §5 bump, symmetric since 2026-11-26: A's own
+    // pre-merge record used that pair with other bytes, 02 guarantee 6), so A's copy reads
+    // `modified_at = deleted_at + 1`. For a content tombstone that changes nothing (content
+    // keeps it in the trash); for a title-only tombstone it is the one path that leaves the
+    // trash without a strip, and the devices still converge. Documented in
+    // `Item::is_trashed`; this pins the behaviour.
     let mut a = new_vault();
     a.set_device_id(dev_a());
     let plain = a.insert(title_only("plain", 1_000), 1_000);

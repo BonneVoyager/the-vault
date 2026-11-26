@@ -22,8 +22,17 @@ is `export.data` at `MAX_EXPORT_DATA` = 64 MiB.
   want them on `TooLarge` too (open question 2026-11-06).
 - **Entry-count cap (security review 2026-11-06):** `check_zip_entry_count` runs before
   `ZipArchive::new` (which materialises one record per declared entry; app reads 1PUX up to
-  1 GiB). Parses the EOCD itself: scan backwards over the last 22 + 65535 bytes for
-  `PK\x05\x06`, check EVERY candidate whose comment fits in the file (a fake record appended
+  1 GiB). Parses the EOCD itself: scan backwards over the last `EOCD_SEARCH_WINDOW` bytes for
+  `PK\x05\x06` (**L-14, 2026-11-26:** zip 9.6.1 searches `size_of::<Zip32CentralDirectoryEnd>()`
+  = 32 in-memory bytes incl. a boxed comment, NOT the 22-byte record, + 4 + 65536 = 65_572;
+  the old 22+4+65536 = 65_562 left a 10-byte gap: real record with a 65_535 comment + 13
+  junk bytes and a decoy EOCD inside the comment -> guard saw only the decoy, zip fell back
+  to the real one. Now `ZIP_EOCD_SEARCH_WINDOW = 65_572` (static-asserted) + 1 KiB margin,
+  AND `check_opened_entry_count(zip.len())` after `ZipArchive::new`, same cap, message
+  "1PUX archive holds more than 10000 entries". Test
+  `eocd_hidden_in_the_gap_behind_a_decoy_comment_is_still_counted`: 10_001 stored entries +
+  `set_raw_comment` (writer caps at u16::MAX) + 13 appended bytes; the decoy's comment_len
+  makes it end exactly at EOF so it "fits"), check EVERY candidate whose comment fits in the file (a fake record appended
   behind the real one cannot hide the count), bound `max(entries on this disk, total)` at
   `MAX_ZIP_ENTRIES` = 10_000 (zip 2.6.1 reads the zip32 count from the on-this-disk field),
   refuse either ZIP64 marker (`u16::MAX` entries or `u32::MAX` CD offset) outright, no

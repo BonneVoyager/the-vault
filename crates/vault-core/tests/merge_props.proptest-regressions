@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d80a184ec979889ff10b6a9c761544bb53ada130c631df1f0d47e515c3211422 # shrinks to (n, skews, steps) = (2, [878, 0, 0], [Step { dev: 0, dt: 0, op: Delete { item: 2 } }, Step { dev: 1, dt: 0, op: Merge { from: 0 } }, Step { dev: 0, dt: 0, op: Icon { item: 53, icon: None } }, Step { dev: 1, dt: 0, op: RemoveField { item: 29, field: 0 } }, Step { dev: 0, dt: 0, op: Merge { from: 0 } }]), base = 3
+cc 05cf5daaa939dbf813bd21caad6f94503479d74a5a0a9f8c80fa8017bb73fdba # shrinks to n = 3, owners = [1, 1, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], t0 = 50, keys = [[3170433422, 1686703628, 0, 2996679645, 0, 1686703628], [0, 1235704973, 374825005, 0, 1235704973, 1235704973], [2035924317, 139792299, 2968865546, 2035924317, 0, 0], [0, 0, 0, 0, 0, 0]]

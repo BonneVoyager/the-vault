@@ -232,8 +232,10 @@ fn same(a: &UnlockedVault, b: &UnlockedVault) -> Result<(), TestCaseError> {
     Ok(())
 }
 
-/// Equality ignoring `modified_at`, which may differ by at most 1 per item (the one-sided
-/// +1 bump of 03 §5).
+/// Equality ignoring `modified_at`, which may differ by at most 1 per item after one
+/// exchange: a true merge (result equal to neither input record) restamps `max + 1` on both
+/// sides, but a tie (the result equals one input record) restamps only on the side that
+/// adopted it (03 §5, symmetric since 2026-11-26).
 fn same_but_bump(a: &UnlockedVault, b: &UnlockedVault) -> Result<(), TestCaseError> {
     let (sa, sb) = (snaps(a), snaps(b));
     prop_assert_eq!(sa.len(), sb.len());
@@ -620,13 +622,25 @@ proptest! {
     }
 
     /// Law 3, cap: more than 64 `removed_fields` markers spread over the devices need up to
-    /// N + 1 rounds, and no removed field ever comes back.
+    /// N + 1 rounds with two devices (a marker is capped only once both input sides lack
+    /// its field, and with two devices the input sides are every device, so no removed
+    /// field ever comes back) and up to N + 2 with three or more: a pair can cap a marker
+    /// while a device outside that merge still holds the field, that device resurrects the
+    /// field at its next contact, and the marker is re-learnt from a peer that kept it,
+    /// which costs one more round (`replay_marker_cap_three_devices_need_n_plus_two` below
+    /// is such a case: 3 devices, 70 markers owned 66/3/1, converges after round 5, not 4).
+    /// Measured 2026-11-26 over ~12 000 random cases (uniform and skewed ownership, n = 3
+    /// and 4): nothing needed more than N + 1 except that case. Rounds past the four
+    /// generated orders reuse them cyclically. For n >= 3 the test also checks that every
+    /// device ended at or below the cap, so the cap fired and the devices still converged.
     #[test]
-    fn devices_converge_in_n_plus_one_rounds_when_the_marker_cap_fires(
-        n in 2usize..=3,
-        owners in prop::collection::vec(0usize..3, FIELD_TOMBSTONE_CAP + 6..=FIELD_TOMBSTONE_CAP + 26),
+    fn devices_converge_in_n_plus_one_or_n_plus_two_rounds_when_the_marker_cap_fires(
+        n in 2usize..=4,
+        owners in prop::collection::vec(0usize..4, FIELD_TOMBSTONE_CAP + 6..=FIELD_TOMBSTONE_CAP + 26),
         t0 in 50u64..500,
-        keys in prop::collection::vec(prop::collection::vec(any::<u32>(), 6), 4),
+        // 12 keys per round: one per ordered pair of four devices (`ordered` zips pairs with
+        // keys, so fewer keys would silently skip pairs and leave a device never merged into).
+        keys in prop::collection::vec(prop::collection::vec(any::<u32>(), 12), 4),
     ) {
         let mut item = Item::new("Many", Uuid::nil(), 10);
         item.id = Uuid::from_u128(0xCA9);
@@ -650,10 +664,18 @@ proptest! {
                 .remove_field(id, Uuid::from_u128(0xF00 + i as u128), t0 + i as u64)
                 .unwrap();
         }
-        for k in keys.iter().take(n + 1) {
-            round(&mut devs, &ordered(n, k));
+        let rounds = n + 1 + usize::from(n >= 3);
+        for r in 0..rounds {
+            round(&mut devs, &ordered(n, &keys[r % keys.len()]));
         }
         all_same(&devs)?;
+        for v in &devs {
+            let markers = v.get(id).unwrap().removed_fields.len();
+            prop_assert!(
+                markers <= FIELD_TOMBSTONE_CAP,
+                "marker list still over the cap after convergence: {markers}"
+            );
+        }
         // With three devices a field can legally come back (03 §5 accepted limit: a device
         // that missed a dropped marker); with two it must not (merge_hunt L1).
         if n == 2 {
@@ -817,4 +839,57 @@ fn replay_three_devices_two_rounds() {
         &[(0, 1), (1, 2), (2, 0), (1, 0), (2, 1), (0, 2)],
     );
     all_same(&sim.devs).unwrap();
+}
+
+/// Regression for the marker-cap law (the case proptest found on 2026-11-26, replayed
+/// deterministically so it survives any strategy change): three devices, 70 markers owned
+/// 66/3/1. After N + 1 = 4 rounds two devices still disagree on which old marker they kept
+/// (the cap's "absent on both input sides" test let a pair drop a marker while the third
+/// device still held the field, which came back once); the fifth round converges them. The
+/// bound in 03 §5 is N + 2 for three or more devices because of exactly this.
+#[test]
+fn replay_marker_cap_three_devices_need_n_plus_two() {
+    let n = 3;
+    let mut owners = vec![1usize, 1, 0, 0, 0, 1, 2];
+    owners.extend(std::iter::repeat_n(0usize, 63));
+    let t0 = 50u64;
+    let keys: [[u32; 6]; 4] = [
+        [3170433422, 1686703628, 0, 2996679645, 0, 1686703628],
+        [0, 1235704973, 374825005, 0, 1235704973, 1235704973],
+        [2035924317, 139792299, 2968865546, 2035924317, 0, 0],
+        [0, 0, 0, 0, 0, 0],
+    ];
+    let mut item = Item::new("Many", Uuid::nil(), 10);
+    item.id = Uuid::from_u128(0xCA9);
+    for i in 0..owners.len() {
+        let mut f = Field::new(format!("f{i}"), FieldKind::Text, secret("x"), 10);
+        f.id = Uuid::from_u128(0xF00 + i as u128);
+        item.fields.push(f);
+    }
+    let mut first = new_vault();
+    first.set_device_id(dev_id(0));
+    let id = first.insert(item, 10);
+    let mut devs = vec![first];
+    for d in 1..n {
+        let mut v = unlock(&devs[0].serialize()).unwrap();
+        v.set_device_id(dev_id(d));
+        devs.push(v);
+    }
+    for (i, owner) in owners.iter().enumerate() {
+        devs[owner % n]
+            .remove_field(id, Uuid::from_u128(0xF00 + i as u128), t0 + i as u64)
+            .unwrap();
+    }
+    for k in &keys {
+        round(&mut devs, &ordered(n, k));
+    }
+    assert!(
+        all_same(&devs).is_err(),
+        "this case needs more than N + 1 rounds; if it converged, the bound in 03 §5 can tighten"
+    );
+    round(&mut devs, &ordered(n, &keys[0]));
+    all_same(&devs).unwrap();
+    for v in &devs {
+        assert!(v.get(id).unwrap().removed_fields.len() <= FIELD_TOMBSTONE_CAP);
+    }
 }

@@ -19,13 +19,12 @@ is written verbatim (key reserved only while `Some`); a colliding extra is dropp
 
 **Merge rule (immutable metadata):** `merge::merge_created_at(ours, theirs)` = min when
 both `Some`, else whichever is `Some`; applied to EVERY `merge_items` outcome (live,
-tombstone, both-tombstone). `item_eq` deliberately does NOT compare `created_at`, so a
-differing value alone is "unchanged": no restamp, no report count, `changed() == false`.
-`merge_from` still carries the min into ours in the unchanged branch (persisted with the
-next save for any other reason; both sides re-derive the same min, so a missed save
-converges). Test helper `common::assert_item_eq` DOES compare it (exact round trips).
-Interpretation reported to the lead: the lead said "must not bump modified_at, but the
-merged item still carries the min"; silent carry without a save signal is my reading.
+tombstone, both-tombstone). `item_eq` deliberately does NOT compare `created_at`.
+**Superseded 2026-11-26 (M-01, see [[symmetric-restamp-decisions]]):** the silent carry is
+gone. `merge_from` decides "changed" with `same_record` (= `item_eq` + `created_at`), so a
+carry reports `updated`, `changed() == true`, and restamps `max+1` (also at an equal stamp:
+the peer's record would otherwise sit under a pair our own record used). Only the peer's
+record at a strictly greater stamp is adopted verbatim. Test helper `common::assert_item_eq` compares `created_at` too.
 
 **Importers:** CSV -> `now` (via `Item::new`). 1PUX -> `createdAt` seconds * 1000 when
 present, `> 0` and an unsigned JSON number; else `now`. KDBX -> `entry.times.creation`
@@ -62,5 +61,5 @@ are exhaustive matches / array-length comparisons that need a `Section` arm.
 **Why:** the owner wants creation dates and section headings in the app without a format
 bump; old files must stay byte-identical.
 **How to apply:** never emit `created_at` when `None`; never let `created_at` into
-`item_eq`; keep Section out of export/search/history; when adding the next optional item
+`item_eq` (it lives in `same_record` instead); keep Section out of export/search/history; when adding the next optional item
 key, update the three key-order lists and `post_removal` if a fixture is generated.

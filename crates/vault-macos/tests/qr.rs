@@ -112,6 +112,78 @@ fn wrong_buffer_length_returns_empty() {
     assert!(decode_qr_from_gray(side, side, &buf).is_empty());
 }
 
+/// xorshift64, so the malformed image below is the same on every run.
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+}
+
+/// A QR render with scattered pixel flips and one inverted block, from `seed`. Found by a
+/// seeded search; with the pinned `qrcode` 0.14.1 and `rqrr` 0.11.0, seed 1358 trips
+/// `rqrr`'s `assertion failed: x <= i32::MAX as f64` (geometry.rs:55).
+fn mutated_render(seed: u64) -> (usize, Vec<u8>) {
+    const DATA: [&str; 3] = [URI, "x", "https://example.com/abc"];
+    let mut rng = XorShift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let data = DATA[(rng.next() % 3) as usize];
+    let scale = 1 + (rng.next() % 4) as usize;
+    let quiet = (rng.next() % 5) as usize;
+    let code = QrCode::new(data).unwrap();
+    let n = code.width();
+    let colors = code.to_colors();
+    let side = (n + 2 * quiet) * scale;
+    let mut px = canvas(side, side);
+    for my in 0..n {
+        for mx in 0..n {
+            if colors[my * n + mx] != Color::Dark {
+                continue;
+            }
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    px[((quiet + my) * scale + dy) * side + (quiet + mx) * scale + dx] = 0;
+                }
+            }
+        }
+    }
+    let flips = 1 + (rng.next() % 60) as usize;
+    for _ in 0..flips {
+        let i = (rng.next() as usize) % px.len();
+        px[i] = 255 - px[i];
+    }
+    let block = 1 + (rng.next() % 8) as usize;
+    let x0 = (rng.next() as usize) % side;
+    let y0 = (rng.next() as usize) % side;
+    for y in y0..(y0 + block).min(side) {
+        for x in x0..(x0 + block).min(side) {
+            px[y * side + x] = 255 - px[y * side + x];
+        }
+    }
+    (side, px)
+}
+
+#[test]
+fn decoder_panic_is_no_code() {
+    let (side, px) = mutated_render(1358);
+    // The raw rqrr sequence panics on this image; if a future rqrr fixes that, this
+    // fixture no longer exercises the guard and needs a new seed.
+    let raw = std::panic::catch_unwind(|| {
+        let mut img =
+            rqrr::PreparedImage::prepare_from_greyscale(side, side, |x, y| px[y * side + x]);
+        for grid in img.detect_grids() {
+            let _ = grid.decode();
+        }
+    });
+    assert!(raw.is_err(), "fixture no longer trips rqrr");
+    assert!(decode_qr_from_gray(side, side, &px).is_empty());
+}
+
 #[test]
 fn permission_check_does_not_panic() {
     let _ = screen_capture_permitted();

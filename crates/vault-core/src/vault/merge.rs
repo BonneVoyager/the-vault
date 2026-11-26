@@ -11,9 +11,13 @@
 //! | both tombstones | — | the side with greater `(modified_at, device_id)`; tie -> greater canonical item bytes. A stripped tombstone (02 "Recently Deleted", `delete_permanently` / `expire_deleted`) is restamped when stripped, so it beats the content tombstone it came from and the strip propagates; a recovery (live, restamped) beats the older tombstone by the row above |
 //! | both live | — | field-level merge, see [`merge_items`] |
 //!
-//! The result's `modified_at` is always `max(ours, theirs)`, and its `created_at` (v1.3) is
-//! always the minimum of the two known values (see [`merge_created_at`]); a differing
-//! `created_at` alone is not a change.
+//! The result's `modified_at` is `max(ours, theirs)` when the result is theirs' record at a
+//! strictly greater stamp (adopted verbatim) or ours (unchanged), and `max(ours, theirs) + 1`
+//! when it is a new record or the two inputs tie on `modified_at` (see the restamp rule in
+//! [`UnlockedVault::merge_from`]). Its `created_at` (v1.3) is always the minimum of the two
+//! known values (see [`merge_created_at`]); a differing `created_at` alone is not a change
+//! of *content* ([`item_eq`]), but it is a change of the persisted record ([`same_record`]),
+//! so carrying the minimum restamps like any other merge result.
 //!
 //! Fields are matched **by [`Field::id`]** (FI-1, 2026-10-31), never by name: a field on one
 //! side only is taken, a field on both sides is whole-field last-writer-wins by
@@ -126,14 +130,37 @@ impl UnlockedVault {
     /// one (a later local slot change), the rotation is undone by the merge and the other
     /// device will in turn see `KeyRotatedOnDisk`. That is the LWW rule applied to keys.
     ///
-    /// **Record timestamp always moves with content.** If the merged item differs from ours but
-    /// the rule's `max(ours, theirs)` leaves `modified_at` equal to ours (e.g. ours
-    /// `{A@10, B@5, item@10}`, theirs `{A@3, B@8, item@8}` -> `{A@10, B@8}` at 10), the
-    /// merged item is stamped `ours.modified_at + 1` instead. Otherwise the new file would
-    /// carry the old `(id, modified_at)` pair with new content, and splicing the pre-merge
-    /// record back in would pass the manifest check (02 guarantee 6 is unconditional). The
-    /// peer takes the max on its next merge, so both sides still converge, at most one extra
-    /// round trip later. The bump behaves exactly like a local edit stamped `prev + 1` by the
+    /// **A record that replaces ours gets a stamp no earlier record shares** (security
+    /// review 2026-11-26 M-01). For an id on both sides the merged result is compared with
+    /// *both* input records ([`same_record`]: content, stamps, `device_id` and `created_at`):
+    ///
+    /// - equal to ours: nothing changes (`unchanged`);
+    /// - equal to theirs, and `theirs.modified_at > ours.modified_at`: theirs' record is
+    ///   adopted verbatim, its `modified_at` included;
+    /// - otherwise (a record neither side wrote, or theirs' record at a stamp equal to
+    ///   ours): stamped `max(ours.modified_at, theirs.modified_at) + 1`.
+    ///
+    /// The manifest binds every record by `(id, modified_at)` (01 §4) and 02 guarantee 6
+    /// promises that an older record of the same item is detected. That only holds if the
+    /// saved file never carries a pair that an earlier record with different bytes used,
+    /// whether that record is the peer's (in the sync folder) or our own (in a backup or the
+    /// previous file). The previous one-sided rule bumped only when the result kept *ours'*
+    /// stamp; a result that kept *theirs'* stamp with different content (ours
+    /// `{user=alice@1, pw=NEW@8}` at 8, theirs `{user=alice@example.com@10, pw=old@1}` at
+    /// 10 -> `{user@10, pw=NEW@8}` at 10) let the peer's earlier record be spliced over the
+    /// merged one and silently revert the password. The rule above covers every shape of
+    /// that gap: a live item resurrecting over a peer's stripped tombstone with a higher
+    /// stamp (result: our content at their stamp), an attachment reorder, a `created_at`
+    /// carry (the earliest creation time is adopted from the peer; the record bytes change,
+    /// so it restamps and counts as `updated` rather than being carried silently as before
+    /// 2026-11-26), and the equal-stamp case the old bump already covered (theirs' record
+    /// adopted at a stamp our own pre-merge record used). Equal stamps are systematic, not
+    /// a coincidence: every write stamps `max(now, prev + 1)` and the restamp itself
+    /// produces them, so the equal-stamp branch is load-bearing.
+    ///
+    /// Both sides of a true merge compute the same stamp, so a conflict converges in one
+    /// exchange; a tie case (the result equals one input) stays one-sided and converges on
+    /// the next. The bump behaves exactly like a local edit stamped `prev + 1` by the
     /// merging device: it can win or lose an exact-millisecond tie with a genuine remote edit
     /// under the normal `(modified_at, device_id)` tie-break, and both sides converge on the
     /// same outcome either way.
@@ -207,22 +234,21 @@ impl UnlockedVault {
                 }
                 Some(ours) => {
                     let mut merged = merge_items(ours, theirs);
-                    if item_eq(ours, &merged) {
-                        // `created_at` is immutable metadata outside the "changed" decision
-                        // (see `item_eq`): carry the merged minimum without a restamp, a
-                        // report entry, or a `changed()` signal. It is persisted with the
-                        // next save made for any other reason, and both sides re-derive the
-                        // same minimum on every merge, so a copy that missed it converges.
-                        if merged.created_at != ours.created_at {
-                            // The borrow of `ours` ends here; re-fetch mutably.
-                            if let Some(item) = self.items.get_mut(id) {
-                                item.created_at = merged.created_at;
-                            }
-                        }
+                    if same_record(ours, &merged) {
                         report.unchanged += 1;
                     } else {
-                        if merged.modified_at == ours.modified_at {
-                            merged.modified_at = ours.modified_at.saturating_add(1);
+                        // Symmetric restamp (security review 2026-11-26 M-01): the result
+                        // differs from ours, so the saved file must not carry a pair
+                        // `(id, modified_at)` that any earlier record with other bytes used.
+                        // `merge_items` already set `modified_at = max(ours, theirs)`. Two
+                        // cases need a fresh stamp: the result is neither input's record
+                        // (new bytes), or it is theirs' record but theirs' stamp equals ours
+                        // (our pre-merge record, in a backup or the previous file, shares
+                        // the pair with different bytes). Only theirs' record at a strictly
+                        // greater stamp is adopted verbatim.
+                        if !same_record(theirs, &merged) || theirs.modified_at == ours.modified_at {
+                            merged.modified_at =
+                                ours.modified_at.max(theirs.modified_at).saturating_add(1);
                         }
                         if merged.is_deleted() && !ours.is_deleted() {
                             report.deleted += 1;
@@ -406,8 +432,14 @@ fn merge_live<'a>(ours: &'a Item, theirs: &'a Item) -> Item {
     // go only once neither input side still carries its field (so the peer just merged
     // cannot bring it back), oldest first. Markers for fields that one side still held
     // are kept even past the cap; the next merge round, when both sides lack the field,
-    // caps them. A third device that never saw the marker can still resurrect such a field
-    // (03 §5 accepted limit).
+    // caps them. With two devices the input sides are every device, so a removed field
+    // never comes back and the devices converge in N + 1 = 3 rounds. With three or more a
+    // pair can cap a marker while a device outside that merge still holds the field; that
+    // device resurrects the field at its next contact (03 §5 accepted limit) and the marker
+    // is re-learnt from a peer that kept it, which costs one more round: N + 2
+    // (tests/merge_props.rs, bound measured 2026-11-26). The alternative, capping to the
+    // newest 64 unconditionally, would converge faster but resurrects fields even with two
+    // devices (merge_hunt L1), so the predicate stays.
     cap_field_tombstones(&mut removed_fields, |id| {
         ours.field_by_id(id).is_none() && theirs.field_by_id(id).is_none()
     });
@@ -717,12 +749,26 @@ fn attachment_eq(a: &AttachmentRef, b: &AttachmentRef) -> bool {
         && a.key.as_ref() == b.key.as_ref()
 }
 
-/// Full structural equality including secrets and order. `Item` has no `PartialEq` (it holds
-/// secrets), so merge decides "unchanged" here.
+/// `true` if `a` and `b` would serialize to the same item record: [`item_eq`] plus
+/// `created_at`. This is the "is the merged result one of the two input records" test of
+/// [`UnlockedVault::merge_from`]: the manifest binds a record by `(id, modified_at)` (01 §4),
+/// so any merged record that differs from both inputs in *any* persisted byte, `created_at`
+/// included, must get a fresh timestamp (02 guarantee 6; security review 2026-11-26 M-01).
 ///
-/// `created_at` is deliberately **not** compared: it is immutable metadata whose merged value
-/// (the minimum) must never count as an update or bump `modified_at`. `merge_from` carries
-/// the minimum separately. Test helpers that need exact equality compare it themselves.
+/// TODO(M-01): record-level plaintext `extras` (`ItemRecord::extras`, kept from ours, not
+/// authenticated, written by nothing today) are outside this check. If a writer ever emits
+/// them, include them here or in the manifest binding.
+pub(crate) fn same_record(a: &Item, b: &Item) -> bool {
+    item_eq(a, b) && a.created_at == b.created_at
+}
+
+/// Full structural *content* equality including secrets and order. `Item` has no
+/// `PartialEq` (it holds secrets), so this is the comparison the merge and its tests use.
+///
+/// `created_at` is deliberately **not** compared: it is immutable metadata and a differing
+/// value alone is not a change of content. Whether the merged *record* changed, which is
+/// what decides a restamp and a `MergeReport` entry, is [`same_record`] (this plus
+/// `created_at`). Test helpers that need exact equality compare `created_at` themselves.
 pub fn item_eq(a: &Item, b: &Item) -> bool {
     a.id == b.id
         && a.title == b.title
