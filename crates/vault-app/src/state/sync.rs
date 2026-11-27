@@ -59,6 +59,8 @@ pub struct SyncUi {
     pub last_saved: Option<SystemTime>,
     /// The red "Export unencrypted?" confirm in Import / Export.
     pub export_confirm: bool,
+    /// A save-panel pick in a cloud folder awaiting the confirm's "Export anyway" (L-12).
+    pub export_cloud: Option<super::transfer::CloudExport>,
     /// The last save attempt failed; the tick does not retry until something changes.
     pub save_failing: bool,
     /// An autosave hit the save lock (`SaveLockTimeout`) or found the file changed under it
@@ -360,7 +362,7 @@ impl AppState {
                 if !self.locked && self.vault.as_ref().is_some_and(SyncedVault::is_dirty) {
                     self.schedule_autosave(cx);
                 }
-                let name = text::file_name(&path);
+                let name = disk_name(&path);
                 self.show_toast(format!("Merged a conflicted copy ({name})"), cx);
                 if self.recheck_touch_slot() {
                     self.show_toast(super::touch_id::SLOT_GONE, cx);
@@ -381,7 +383,7 @@ impl AppState {
                 if !self.locked && self.vault.as_ref().is_some_and(SyncedVault::is_dirty) {
                     self.schedule_autosave(cx);
                 }
-                let name = text::file_name(&path);
+                let name = disk_name(&path);
                 self.show_toast(
                     format!(
                         "Merged a conflicted copy ({name}); waiting for its attachments to download"
@@ -562,7 +564,7 @@ impl AppState {
         };
         match vault.backup_now() {
             Ok(path) => {
-                let name = text::file_name(&path);
+                let name = disk_name(&path);
                 self.show_toast(format!("Backed up to {name}"), cx);
             }
             Err(e) => self.show_toast(format!("Backup failed: {e}"), cx),
@@ -719,7 +721,7 @@ impl AppState {
     /// After a successful restore: the vault is unlocked and clean, everything derived
     /// from it is stale.
     fn restored(&mut self, backup: &Path) {
-        let name = text::file_name(backup);
+        let name = disk_name(backup);
         self.leave_edit_mode();
         self.discard_prompt = None;
         self.delete_confirm = None;
@@ -738,16 +740,23 @@ impl AppState {
     }
 }
 
-/// Longest conflict-copy name shown in a toast, in characters.
-const CONFLICT_NAME_MAX: usize = 60;
+/// Longest disk-derived file name shown in a toast or title, in characters.
+pub const DISK_NAME_MAX: usize = 60;
 
-/// Toast for [`SyncEvent::UnreadableConflict`]: the copy's final path component only,
-/// never the full path, with control characters replaced and cut to a pill-sized length.
-fn unreadable_conflict_message(path: &Path) -> String {
-    let name = path.file_name().map_or_else(
+/// A file name from disk (conflict copy, backup, export target) made safe for a toast or a
+/// window title: the final path component only, never the full path, with control, bidi
+/// and invisible format characters replaced and cut to [`DISK_NAME_MAX`] (security review
+/// 2026-11-26 L-11). Every disk-derived name in UI text goes through this.
+pub fn disk_name(path: &Path) -> String {
+    path.file_name().map_or_else(
         || "unnamed".into(),
-        |n| text::sanitize_line(&n.to_string_lossy(), CONFLICT_NAME_MAX),
-    );
+        |n| text::sanitize_line(&n.to_string_lossy(), DISK_NAME_MAX),
+    )
+}
+
+/// Toast for [`SyncEvent::UnreadableConflict`], by [`disk_name`].
+fn unreadable_conflict_message(path: &Path) -> String {
+    let name = disk_name(path);
     format!("Could not read the conflict copy \u{201c}{name}\u{201d}. It was left in place.")
 }
 
@@ -784,8 +793,7 @@ fn delete_failure_reason(e: &SyncError, backup: &Path) -> String {
         SyncError::SaveLockTimeout(_) => SAVE_BUSY.into(),
         other => {
             let message = other.to_string();
-            let mut scrubbed =
-                message.replace(&backup.display().to_string(), &text::file_name(backup));
+            let mut scrubbed = message.replace(&backup.display().to_string(), &disk_name(backup));
             if let Some(dir) = backup.parent().filter(|d| !d.as_os_str().is_empty()) {
                 scrubbed = scrubbed.replace(&dir.display().to_string(), "backups");
             }
@@ -1470,6 +1478,53 @@ mod tests {
             );
             assert!(!message.contains(&dir.path().display().to_string()));
         });
+    }
+
+    /// L-11: a conflict copy or backup named with a bidi override and an ESC reaches every
+    /// toast as one sanitised line, never the raw control characters.
+    #[gpui::test]
+    fn hostile_disk_names_are_sanitised_in_toasts(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _other, _) = two_devices(dir.path(), cx);
+        let hostile = "evil\u{202e}gpj.\u{1b}[2Jvault";
+        let clean = "evil\u{fffd}gpj.\u{fffd}[2Jvault";
+        let path = dir.path().join(hostile);
+        let unsafe_char = |c: char| c.is_control() || ('\u{202a}'..='\u{202e}').contains(&c);
+        state.update(cx, |s, cx| {
+            for (event, expected) in [
+                (
+                    SyncEvent::ConflictAbsorbed(path.clone()),
+                    format!("Merged a conflicted copy ({clean})"),
+                ),
+                (
+                    SyncEvent::WaitingForBlobs(path.clone()),
+                    format!(
+                        "Merged a conflicted copy ({clean}); \
+                         waiting for its attachments to download"
+                    ),
+                ),
+                (
+                    SyncEvent::UnreadableConflict(path.clone()),
+                    format!(
+                        "Could not read the conflict copy \u{201c}{clean}\u{201d}. \
+                         It was left in place."
+                    ),
+                ),
+            ] {
+                s.toast = None;
+                s.handle_sync_event(event, cx);
+                let message = s.toast.as_ref().unwrap().message.to_string();
+                assert_eq!(message, expected);
+                assert!(!message.chars().any(unsafe_char), "{message:?}");
+            }
+            s.restored(&path);
+            let message = s.toast.as_ref().unwrap().message.to_string();
+            assert_eq!(message, format!("Restored from {clean}"));
+        });
+        // Long names are cut to the toast cap.
+        let long = dir.path().join("y".repeat(200));
+        assert_eq!(disk_name(&long), format!("{}…", "y".repeat(DISK_NAME_MAX)));
+        assert_eq!(disk_name(Path::new("/")), "unnamed");
     }
 
     #[gpui::test]

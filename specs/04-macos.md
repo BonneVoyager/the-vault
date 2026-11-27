@@ -109,7 +109,7 @@ impl CloudHooks for ICloudHooks {
 }
 ```
 
-Detecting "is this path inside iCloud Drive": any path under `~/Library/Mobile Documents` is true (covers files that do not exist yet), otherwise the `NSURL.isUbiquitousItemKey` resource value (spec aligned to code 2026-11-19), used only as the last step of the provider label in 03 §1, because File Provider folders under `~/Library/CloudStorage` also report ubiquitous (bug fixed 2026-10-31). Dropbox needs nothing special (it keeps a real file on disk; smart sync placeholders are handled by the file provider transparently on 15+).
+Detecting "is this path inside iCloud Drive": any path under `~/Library/Mobile Documents` is true (covers files that do not exist yet), otherwise the `NSURL.isUbiquitousItemKey` resource value (spec aligned to code 2026-11-19), used only as the last step of the provider label in 03 §1 (which also drives the cloud-folder line of the CSV export confirm, 05 §2.5), because File Provider folders under `~/Library/CloudStorage` also report ubiquitous (bug fixed 2026-10-31). Dropbox needs nothing special (it keeps a real file on disk; smart sync placeholders are handled by the file provider transparently on 15+).
 
 ## 5. Idle and lock triggers
 

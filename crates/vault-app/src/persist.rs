@@ -2,14 +2,21 @@
 //!
 //! Nothing here is secret: window geometry, vault paths and General settings only. Every failure is
 //! non-fatal: a missing or corrupt file means "use defaults", a failed write is logged.
+//!
+//! Not secret, but private (security review 2026-11-26 L-09): vault paths, vault and slot ids
+//! and the lock settings. The folder is kept 0700 and every file is written 0600 through
+//! [`write_private`] (random-suffix temp created exclusively, removed on failure, renamed
+//! over the target), the export's own writer; files left 0644 by older builds are narrowed
+//! on the first write.
 
-use std::fs;
+use std::fs::{self, Permissions};
 use std::io;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::state::Settings;
+use crate::state::{Settings, write_private};
 
 const WINDOW_FILE: &str = "window.json";
 const RECENT_FILE: &str = "recent.json";
@@ -50,15 +57,39 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
     }
 }
 
-/// Write via a sibling temp file + rename so a crash never leaves half a JSON file.
+/// Write 0600 via a random sibling temp file + rename so a crash never leaves half a JSON
+/// file, into a 0700 folder.
 fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        make_private_dir(dir)?;
     }
     let bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)
+    write_private(path, &bytes)
+}
+
+/// Creates `dir` if needed and narrows it to 0700 and our files in it to 0600 (the
+/// migration for files older builds wrote 0644). Narrowing is best effort: a failure is
+/// logged and the write goes ahead.
+fn make_private_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let narrow = |path: &Path, mode: u32| {
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return;
+        };
+        // Never chmod through a link; only a real file or folder of ours.
+        let ours = meta.is_dir() || meta.is_file();
+        if ours
+            && meta.permissions().mode() & 0o777 != mode
+            && let Err(e) = fs::set_permissions(path, Permissions::from_mode(mode))
+        {
+            eprintln!("vault: could not restrict {}: {e}", path.display());
+        }
+    };
+    narrow(dir, 0o700);
+    for name in [WINDOW_FILE, RECENT_FILE, SETTINGS_FILE] {
+        narrow(&dir.join(name), 0o600);
+    }
+    Ok(())
 }
 
 fn log_write(path: &Path, result: io::Result<()>) {
@@ -247,6 +278,81 @@ mod tests {
         assert!(sidebar.onboarding_dismissed);
         fs::write(dir.path().join(SETTINGS_FILE), "not json").unwrap();
         assert_eq!(load_settings_from(dir.path()), Settings::default());
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// L-09: after a save the folder is 0700 and every file 0600, files an older build left
+    /// 0644 included, and no temp file is left behind.
+    #[test]
+    fn saves_are_private_and_narrow_older_files() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("dev.vault.app");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap();
+        for name in [SETTINGS_FILE, RECENT_FILE, WINDOW_FILE] {
+            let path = dir.join(name);
+            fs::write(&path, "{}").unwrap();
+            fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+        }
+        save_settings_to(&dir, &Settings::default());
+        assert_eq!(mode(&dir), 0o700);
+        for name in [SETTINGS_FILE, RECENT_FILE, WINDOW_FILE] {
+            assert_eq!(mode(&dir.join(name)), 0o600, "{name}");
+        }
+        assert_eq!(load_settings_from(&dir), Settings::default());
+
+        // A fresh folder: created 0700, each file written 0600.
+        let fresh = root.path().join("new").join("dev.vault.app");
+        let window = WindowState {
+            x: 1.,
+            y: 2.,
+            width: 3.,
+            height: 4.,
+            columns: None,
+        };
+        write_json(&fresh.join(WINDOW_FILE), &window).unwrap();
+        write_json(&fresh.join(RECENT_FILE), &RecentFile::default()).unwrap();
+        save_settings_to(&fresh, &Settings::default());
+        assert_eq!(mode(&fresh), 0o700);
+        for name in [SETTINGS_FILE, RECENT_FILE, WINDOW_FILE] {
+            assert_eq!(mode(&fresh.join(name)), 0o600, "{name}");
+        }
+        assert_eq!(
+            read_json::<WindowState>(&fresh.join(WINDOW_FILE)),
+            Some(window)
+        );
+        let leftovers: Vec<_> = fs::read_dir(&fresh)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A failed write (here: a symlink planted at the target) leaves no temp file and
+    /// writes nothing through the link.
+    #[test]
+    fn a_failed_save_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere.json");
+        fs::write(&elsewhere, "untouched").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(write_json(&dir.path().join(SETTINGS_FILE), &Settings::default()).is_err());
+        assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "untouched");
+        let tmp = fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(tmp, 0);
     }
 
     /// `show_in_dock` (05 §2.5): missing = true, `false` = false, garbage = true alone.

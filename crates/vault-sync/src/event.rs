@@ -43,9 +43,10 @@ pub enum SyncEvent {
     SaveBlocked(SaveBlocked),
     /// `delete_backup` removed this backup (a snapshot file or a conflict package directory).
     BackupDeleted(PathBuf),
-    /// Orphan cleanup after a save (03 §1.1) deleted this many attachment blobs that no item
-    /// references any more and that were older than the 24 h grace period. Stale tmp files
-    /// are not counted.
+    /// Orphan cleanup (03 §1.1) moved this many attachment blobs that no item references any
+    /// more and that were older than the 24 h grace period into quarantine
+    /// (`attachments/orphaned/`, deleted there after 30 days; security review 2026-11-26,
+    /// M-02). Stale tmp files and quarantine expiry are not counted.
     AttachmentsPruned(usize),
     /// `vault.bin` disappeared while the vault was unlocked (deleted, or not yet re-created
     /// by a provider). The in-memory vault is kept and marked dirty: the next `save`

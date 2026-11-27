@@ -4,6 +4,10 @@
 //! target and renames it over the target, behind a red confirm. CSV import maps columns with `CsvMapping::default()` and inserts
 //! every row as a new login. 1PUX import inserts every item of a 1Password export. The
 //! plaintext bytes stay in zeroizing wrappers.
+//!
+//! The export save panel starts in `~/Downloads`; a folder that syncs to a cloud provider
+//! (`cloud::provider_label`, the create flow's hint) brings the red confirm back naming the
+//! provider before anything is written (security review 2026-11-26 L-12).
 
 use std::fs::{OpenOptions, Permissions};
 use std::io::{self, Write as _};
@@ -15,10 +19,42 @@ use vault_core::import::import_1pux;
 use vault_core::{CsvMapping, ExposeSecret as _, SecretVec, export_csv, import_csv};
 
 use super::edit::edit_result;
-use super::sync::TRANSFER_TAB;
+use super::sync::{TRANSFER_TAB, disk_name};
 use super::{AppState, Busy, Outcome};
 use crate::bounded_read::{MAX_1PUX_FILE_SIZE, MAX_IMPORT_FILE_SIZE, read_capped};
-use crate::{text, ui};
+use crate::{cloud, text, ui};
+
+/// A save-panel pick in a cloud-synced folder, waiting for the second red confirm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudExport {
+    pub path: PathBuf,
+    /// "iCloud Drive", "Dropbox", … as the create flow's hint names it.
+    pub provider: String,
+    /// [`AppState::panel_session`] when the panel opened.
+    session: (u64, u64),
+}
+
+/// Where the export save panel starts: `~/Downloads` (not `~/Documents`, which "Desktop &
+/// Documents" often syncs to iCloud), else the home folder.
+pub fn export_start_dir() -> PathBuf {
+    dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// The cloud provider whose folder `path` (an export target) is in, by the create flow's
+/// classification; `None` for a local folder.
+pub fn export_provider(path: &Path) -> Option<String> {
+    cloud::provider_label(path.parent().unwrap_or(path))
+}
+
+/// The extra line of the red export confirm for a cloud-synced target folder.
+pub fn export_cloud_hint(provider: &str) -> String {
+    format!(
+        "This folder is in {provider}: the plain-text file will be uploaded and synced to \
+         your other devices."
+    )
+}
 
 /// Publishes `bytes` at `path` owner-read/write only, atomically.
 ///
@@ -74,38 +110,80 @@ impl AppState {
         self.settings_tab = TRANSFER_TAB;
         self.settings_open = true;
         self.sync.export_confirm = true;
+        self.sync.export_cloud = None;
         cx.notify();
     }
 
+    /// Shows or hides the red confirm; either way a pending cloud pick is dropped (Cancel).
     pub fn set_export_confirm(&mut self, show: bool, cx: &mut Context<Self>) {
         self.sync.export_confirm = show && self.main_active();
+        self.sync.export_cloud = None;
         cx.notify();
     }
 
     /// "Export" in the red confirm: native save panel, then [`Self::export_csv_to`].
     pub fn choose_export_path(&mut self, cx: &mut Context<Self>) {
         self.sync.export_confirm = false;
+        self.sync.export_cloud = None;
         cx.notify();
         if !self.main_active() {
             return;
         }
-        let dir = dirs::document_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("/"));
         let name = format!("{}.csv", self.vault_name());
         let session = self.panel_session();
-        let task = ui::pick_new_path(&dir, &name, cx);
+        let task = ui::pick_new_path(&export_start_dir(), &name, cx);
         cx.spawn(async move |this, cx| {
             if let Some(path) = task.await {
+                let provider = export_provider(&path);
                 this.update(cx, |s, cx| {
                     if s.panel_session() == session {
-                        s.export_csv_to(&path, cx);
+                        s.export_picked(path, provider, cx);
                     }
                 })
                 .ok();
             }
         })
         .detach();
+    }
+
+    /// The save panel answered `path`, in `provider`'s folder or a local one (`None`). A
+    /// local target is written now; a cloud one brings the red confirm back with
+    /// [`export_cloud_hint`] and waits for [`Self::confirm_cloud_export`]. Returns whether
+    /// it wrote the file.
+    pub fn export_picked(
+        &mut self,
+        path: PathBuf,
+        provider: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(provider) = provider else {
+            return self.export_csv_to(&path, cx);
+        };
+        if !self.main_active() {
+            return false;
+        }
+        self.sync.export_cloud = Some(CloudExport {
+            path,
+            provider,
+            session: self.panel_session(),
+        });
+        self.sync.export_confirm = true;
+        cx.notify();
+        false
+    }
+
+    /// "Export anyway" in the cloud-folder confirm. Nothing happens if the session it was
+    /// picked in has ended (lock, vault switch). Returns whether it wrote the file.
+    pub fn confirm_cloud_export(&mut self, cx: &mut Context<Self>) -> bool {
+        self.sync.export_confirm = false;
+        let pending = self.sync.export_cloud.take();
+        cx.notify();
+        match pending {
+            Some(p) if p.session == self.panel_session() && self.main_active() => {
+                self.export_csv_to(&p.path, cx)
+            }
+            _ => false,
+        }
     }
 
     /// `(epoch, lock_gen)` when an import/export panel opens. The panels are modeless: a
@@ -125,10 +203,7 @@ impl AppState {
         let bytes = export_csv(vault);
         match write_private(path, &bytes.0) {
             Ok(()) => {
-                self.show_toast(
-                    format!("Exported {count} items to {}", text::file_name(path)),
-                    cx,
-                );
+                self.show_toast(format!("Exported {count} items to {}", disk_name(path)), cx);
                 true
             }
             Err(e) => {
@@ -168,7 +243,7 @@ impl AppState {
         let bytes = match read_capped(path, MAX_IMPORT_FILE_SIZE) {
             Ok(mut b) => SecretVec::new(std::mem::take(&mut *b)),
             Err(e) => {
-                self.show_toast(format!("Could not read {}: {e}", text::file_name(path)), cx);
+                self.show_toast(format!("Could not read {}: {e}", disk_name(path)), cx);
                 return 0;
             }
         };
@@ -230,7 +305,7 @@ impl AppState {
             move || {
                 // Wiped on drop, on every path out of here.
                 let bytes = read_capped(&path, MAX_1PUX_FILE_SIZE)
-                    .map_err(|e| format!("Could not read {}: {e}", text::file_name(&path)))?;
+                    .map_err(|e| format!("Could not read {}: {e}", disk_name(&path)))?;
                 import_1pux(&bytes, device, now).map_err(|e| format!("Import failed: {e}"))
             },
             move |s, result, outcome, cx| {
@@ -619,6 +694,84 @@ mod tests {
         cx.simulate_new_path_selection(|_| Some(csv.clone()));
         cx.run_until_parked();
         assert!(csv.exists());
+    }
+
+    /// L-12: the save panel starts in ~/Downloads, never ~/Documents.
+    #[gpui::test]
+    fn export_panel_starts_in_downloads(cx: &mut TestAppContext) {
+        let downloads = dirs::download_dir().expect("a Downloads folder");
+        assert_eq!(export_start_dir(), downloads);
+        assert_ne!(Some(export_start_dir()), dirs::document_dir());
+        let dir = tempfile::tempdir().unwrap();
+        let state = unlocked_state(&dir.path().join("a.vault"), &["x"], cx);
+        state.update(cx, |s, cx| s.choose_export_path(cx));
+        let mut seen = None;
+        cx.simulate_new_path_selection(|start| {
+            seen = Some(start.to_owned());
+            None
+        });
+        cx.run_until_parked();
+        assert_eq!(seen, Some(downloads));
+    }
+
+    /// L-12: the create flow's provider classification names cloud folders; the hint
+    /// says where the plaintext goes.
+    #[test]
+    fn export_provider_names_cloud_folders_only() {
+        let home = dirs::home_dir().unwrap();
+        let icloud = home.join("Library/Mobile Documents/com~apple~CloudDocs/Vault.csv");
+        assert_eq!(export_provider(&icloud).as_deref(), Some("iCloud Drive"));
+        let dropbox = home.join("Library/CloudStorage/Dropbox/Vault.csv");
+        assert_eq!(export_provider(&dropbox).as_deref(), Some("Dropbox"));
+        let local = tempfile::tempdir().unwrap();
+        assert_eq!(export_provider(&local.path().join("Vault.csv")), None);
+        let hint = export_cloud_hint("iCloud Drive");
+        assert!(hint.contains("in iCloud Drive"), "{hint}");
+        assert!(hint.contains("plain-text"), "{hint}");
+    }
+
+    /// L-12: a cloud pick writes nothing until the second confirm, which names the
+    /// provider; Cancel or a lock in between drops it.
+    #[gpui::test]
+    fn cloud_export_waits_for_the_second_confirm(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = unlocked_state(&dir.path().join("a.vault"), &["Known Title"], cx);
+        let csv = dir.path().join("out.csv");
+        let pick = |s: &mut AppState, cx: &mut Context<AppState>| {
+            s.export_picked(csv.clone(), Some("iCloud Drive".into()), cx)
+        };
+        state.update(cx, |s, cx| {
+            assert!(!pick(s, cx));
+            assert!(s.sync.export_confirm, "the red confirm is back");
+            assert_eq!(
+                s.sync.export_cloud.as_ref().map(|c| c.provider.as_str()),
+                Some("iCloud Drive")
+            );
+            s.set_export_confirm(false, cx);
+            assert!(s.sync.export_cloud.is_none(), "Cancel drops the pick");
+            assert!(!s.confirm_cloud_export(cx));
+        });
+        assert!(!csv.exists());
+        state.update(cx, |s, cx| assert!(!pick(s, cx)));
+        relock(&state, cx);
+        state.update(cx, |s, cx| assert!(!s.confirm_cloud_export(cx)));
+        assert!(!csv.exists(), "a lock in between voids the pick");
+        state.update(cx, |s, cx| {
+            assert!(!pick(s, cx));
+            assert!(s.confirm_cloud_export(cx));
+            assert!(!s.sync.export_confirm && s.sync.export_cloud.is_none());
+        });
+        assert!(
+            std::fs::read_to_string(&csv)
+                .unwrap()
+                .contains("Known Title")
+        );
+        // A local pick exports at once.
+        let local = dir.path().join("local.csv");
+        state.update(cx, |s, cx| {
+            assert!(s.export_picked(local.clone(), None, cx))
+        });
+        assert!(local.exists());
     }
 
     #[gpui::test]

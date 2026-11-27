@@ -67,6 +67,9 @@ impl AppState {
         self.option_reveal = false;
         self.history_open = false;
         self.query.clear();
+        // A tag name is encrypted metadata: it must not outlive the session or become the
+        // next vault's list heading (security review 2026-11-26 L-10).
+        self.filter = Filter::All;
         self.listing = listing::Listing::default();
         self.counts = listing::Counts::default();
         self.listing_version = self.listing_version.wrapping_add(1);
@@ -528,6 +531,44 @@ mod tests {
                 "{target:?}"
             );
         }
+    }
+
+    /// L-10: a tag filter (encrypted metadata) is dropped on lock and on vault switch, so
+    /// it never becomes the next vault's list heading.
+    #[gpui::test]
+    fn tag_filter_resets_on_lock_and_vault_switch(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = state_with_items(dir.path(), cx);
+        let secret_tag = || Filter::Tag("secret-project".into());
+        state.update(cx, |s, cx| {
+            s.set_filter(secret_tag(), cx);
+            assert_eq!(s.filter, secret_tag());
+            s.lock(cx);
+            assert_eq!(s.filter, Filter::All, "lock drops the tag filter");
+        });
+        state.update(cx, |s, cx| s.unlock(SecretString::new("pw".into()), cx));
+        cx.run_until_parked();
+        state.update(cx, |s, cx| {
+            assert!(!s.locked);
+            assert_eq!(s.filter, Filter::All);
+            s.set_filter(secret_tag(), cx);
+            s.close_vault(cx);
+            assert_eq!(s.filter, Filter::All, "closing the vault drops it");
+        });
+        // A vault installed while a tag filter is somehow set starts at All Items.
+        let other = SyncedVault::create(
+            &dir.path().join("other.vault"),
+            &SecretString::new("pw".into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        state.update(cx, |s, _| {
+            s.filter = secret_tag();
+            s.install(other, false);
+            assert_eq!(s.filter, Filter::All, "a vault switch drops it");
+        });
     }
 
     #[gpui::test]

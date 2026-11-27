@@ -704,9 +704,22 @@ impl SettingsView {
                 .child(ui::muted("Unlock the vault to import or export items.", cx));
         }
         let export = if s.sync.export_confirm {
+            // A pick in a cloud folder (L-12): the confirm names the provider and its
+            // button writes that pick instead of opening the panel again.
+            let cloud = s.sync.export_cloud.as_ref().map(|c| c.provider.clone());
+            let cloud_pick = cloud.is_some();
             confirm_strip(true, cx)
                 .mt(px(10.))
                 .child(div().text_sm().child(EXPORT_WARNING))
+                .when_some(cloud, |strip, provider| {
+                    strip.child(
+                        div()
+                            .debug_selector(|| "export-cloud-hint".into())
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(crate::state::export_cloud_hint(&provider)),
+                    )
+                })
                 .child(
                     ui::h_flex()
                         .gap(px(8.))
@@ -718,12 +731,23 @@ impl SettingsView {
                             .ghost(),
                         )
                         .child(
-                            state_button(
-                                "export-confirm",
-                                "Export\u{2026}",
-                                &self.state,
-                                |s, cx| s.choose_export_path(cx),
-                            )
+                            if cloud_pick {
+                                state_button(
+                                    "export-confirm",
+                                    "Export Anyway",
+                                    &self.state,
+                                    |s, cx| {
+                                        s.confirm_cloud_export(cx);
+                                    },
+                                )
+                            } else {
+                                state_button(
+                                    "export-confirm",
+                                    "Export\u{2026}",
+                                    &self.state,
+                                    |s, cx| s.choose_export_path(cx),
+                                )
+                            }
                             .danger(),
                         ),
                 )

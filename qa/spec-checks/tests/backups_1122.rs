@@ -168,11 +168,15 @@ fn check_multiplier(m: f32) -> Vec<String> {
     let ages = planted_ages();
     let r = retention_run(now, &ages, Some(m));
     let mut bad = vec![];
-    let recent_total = ages.iter().filter(|a| **a < 23 * 3_600).count();
-    let recent_kept = r.kept.iter().filter(|a| **a < 23 * 3_600).count();
+    // 03 §4: "The multiplier scales every tier: the keep-all window (24 h × m)", so 12 h at
+    // 0.5×. Check one hour short of the window: past it the daily tier keeps one per UTC day,
+    // and whether two planted ages share a UTC day depends on the time of day of the run.
+    let keep_all = (24.0 * 3_600.0 * f64::from(m)) as u64 - 3_600;
+    let recent_total = ages.iter().filter(|a| **a < keep_all).count();
+    let recent_kept = r.kept.iter().filter(|a| **a < keep_all).count();
     if recent_kept != recent_total {
         bad.push(format!(
-            "m={m}: keep all from the last 24 h: {recent_kept}/{recent_total}"
+            "m={m}: keep all from the last 24 h × {m}: {recent_kept}/{recent_total}"
         ));
     }
     let daily_days = (30.0 * m) as u64;

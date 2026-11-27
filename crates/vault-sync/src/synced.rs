@@ -421,6 +421,11 @@ impl SyncedVault {
             return Ok(());
         }
         let disk_read = self.refresh_locked_from_disk();
+        // M-02 skip rule (security review 2026-11-26): `locked_fallback` is set exactly when
+        // the copy to open replaced, unverified, the last version this process verified
+        // (read or written while unlocked, or opened). Such a file may be a stale authentic
+        // copy planted while locked: open it, but run no destructive cleanup on first contact.
+        let changed_since_verified = self.locked_fallback.is_some();
         let vault = match open(&self.locked) {
             Ok(v) => v,
             Err(VaultError::Tampered(kind)) => {
@@ -456,10 +461,20 @@ impl SyncedVault {
         {
             self.note_primary_missing();
         }
+        // Referenced blobs in quarantine come back whatever happens below (M-02).
+        self.restore_quarantined_blobs();
         // Orphan cleanup once per unlock, only when memory provably matches what is on disk:
-        // the primary was read, nothing is pending a write, saving is allowed.
-        if disk_read && !self.dirty && !self.key_mismatch && self.save_blocked.is_none() {
+        // the primary was read, nothing is pending a write, saving is allowed, and the file
+        // is the one this process last verified (M-02; a changed file waits for a save).
+        if disk_read
+            && !changed_since_verified
+            && !self.dirty
+            && !self.key_mismatch
+            && self.save_blocked.is_none()
+        {
             self.prune_orphan_attachments();
+        } else if changed_since_verified {
+            tracing::info!("vault file changed while locked; skipping orphan cleanup this unlock");
         }
         Ok(())
     }
@@ -1050,6 +1065,8 @@ impl SyncedVault {
         }
         // Restoring from locked is an unlock: absorb conflicted copies queued meanwhile.
         self.after_unlock();
+        // The restored references may name blobs that cleanup quarantined (M-02).
+        self.restore_quarantined_blobs();
         tracing::info!(path = %self.path.display(), from = %backup.display(), "restored vault from backup");
         Ok(())
     }

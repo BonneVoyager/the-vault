@@ -12,7 +12,8 @@ use tempfile::TempDir;
 use vault_core::attachment::{CHUNK_SIZE, MAX_ATTACHMENT_SIZE, blob_file_name};
 use vault_core::{AttachmentError, Item, KdfParams, SecretString, Uuid};
 use vault_sync::{
-    AttachmentState, CloudError, CloudHooks, NoopHooks, SyncError, SyncEvent, SyncedVault,
+    AttachmentState, CloudError, CloudHooks, NoopHooks, QUARANTINE_DIR_NAME, QUARANTINE_GRACE,
+    SyncError, SyncEvent, SyncedVault,
 };
 
 const NOW: u64 = 1_700_000_000_000;
@@ -396,6 +397,13 @@ fn pruned_counts(events: &crossbeam_channel::Receiver<SyncEvent>) -> Vec<usize> 
         .collect()
 }
 
+/// Where orphan cleanup puts blob `id` (M-02): `attachments/orphaned/<id>.bin`.
+fn quarantined(v: &SyncedVault, id: Uuid) -> PathBuf {
+    v.attachments_dir()
+        .join(QUARANTINE_DIR_NAME)
+        .join(blob_file_name(id))
+}
+
 /// Ages are simulated with the prune clock offset: they count from max(mtime, ctime), and
 /// ctime cannot be set back. Backdated mtimes alone must not make anything old.
 #[test]
@@ -437,11 +445,13 @@ fn orphan_cleanup_after_save() {
         "tmp files are not counted"
     );
 
-    // A day on: the orphan goes; referenced blobs and foreign names stay.
+    // A day on: the orphan moves into quarantine (M-02); referenced blobs and foreign names
+    // stay.
     v.set_prune_clock_offset_for_tests(DAY + Duration::from_secs(60));
     touch(&mut v, "n2");
     v.save().unwrap();
     assert!(!orphan.exists());
+    assert!(quarantined(&v, Uuid::from_u128(1)).exists());
     for p in [&junk, &upper, &blob(&v, kept_ref)] {
         assert!(p.exists(), "{} must be kept", p.display());
     }
@@ -470,6 +480,7 @@ fn prune_skips_clean_saves_and_locked_vaults() {
     // Unlocking runs cleanup once (memory and disk agree).
     v.unlock(&pw()).unwrap();
     assert!(!orphan.exists());
+    assert!(quarantined(&v, Uuid::from_u128(1)).exists());
 }
 
 #[test]
@@ -486,6 +497,7 @@ fn orphan_cleanup_runs_once_at_unlock() {
     let events = v.subscribe();
     v.unlock(&pw()).unwrap();
     assert!(!orphan.exists());
+    assert!(quarantined(&v, Uuid::from_u128(1)).exists());
     assert!(blob(&v, kept).exists());
     assert_eq!(pruned_counts(&events), vec![1]);
 
@@ -595,6 +607,7 @@ fn removed_attachment_blob_goes_after_the_grace_period() {
     touch(&mut v, "later");
     v.save().unwrap();
     assert_eq!(v.attachment_state(id), AttachmentState::Missing);
+    assert!(quarantined(&v, id).exists(), "quarantined, not deleted");
 }
 
 #[test]
@@ -680,6 +693,7 @@ fn peer_prunes_unreferenced_blob_only_after_grace() {
     touch(&mut b, "b2");
     b.save().unwrap();
     assert_eq!(b.attachment_state(id), AttachmentState::Missing);
+    assert!(quarantined(&b, id).exists());
 }
 
 /// Once B holds a reference, A's removal still wins: core keeps an attachment tombstone, so
@@ -737,6 +751,7 @@ fn removal_survives_merge_on_both_devices_and_blob_is_pruned() {
     );
     assert_eq!(a.attachment_state(id), AttachmentState::Missing);
     assert_eq!(b.attachment_state(id), AttachmentState::Missing);
+    assert!(quarantined(&b, id).exists(), "quarantined, not deleted");
 }
 
 /// A conflicted package (03 §6) holding a blob we lack: the merge brings its reference, the
@@ -1246,4 +1261,148 @@ fn backups_contain_no_attachment_blobs() {
     }
     // The snapshot is the vault file at that moment, nothing more.
     assert_eq!(fs::read(&snap).unwrap(), fs::read(v.vault_file()).unwrap());
+}
+
+// --- quarantine instead of deletion (security review 2026-11-26, M-02) ---
+
+/// A vault with blob `x` saved and snapshotted, plus the bytes of the vault file from before
+/// `x` was added (an older authentic copy, as in a provider's version history).
+fn rollback_setup() -> (TempDir, PathBuf, SyncedVault, Uuid, Uuid, Vec<u8>, PathBuf) {
+    let (dir, path, mut v, item) = setup();
+    let file = path.join(vault_sync::VAULT_FILE_NAME);
+    let old = fs::read(&file).unwrap();
+    let x = add(&mut v, item, b"added after the old copy");
+    v.save().unwrap();
+    let newest = v.backup_now().unwrap();
+    (dir, path, v, item, x, old, newest)
+}
+
+/// Report scenario F1: an older authentic `vault.bin` planted while the app is closed. The
+/// unlock adopts it and cleanup runs, but the blob it does not know is quarantined, not
+/// deleted; restoring the newest snapshot brings the reference back and the blob with it.
+#[test]
+fn rolled_back_vault_quarantines_blob_and_restore_brings_it_back() {
+    let (_dir, path, v, item, x, old, newest) = rollback_setup();
+    let blob_path = blob(&v, x);
+    let q = quarantined(&v, x);
+    drop(v);
+    fs::write(path.join(vault_sync::VAULT_FILE_NAME), &old).unwrap();
+
+    // App restart: a fresh process has verified nothing, so the unlock-time pass runs.
+    let mut v = SyncedVault::open(&path, DEV_A, Arc::new(NoopHooks)).unwrap();
+    v.set_prune_clock_offset_for_tests(2 * DAY);
+    let events = v.subscribe();
+    v.unlock(&pw()).unwrap();
+    assert!(!has_ref(&v, item, x), "the stale file does not know x");
+    assert!(!blob_path.exists());
+    assert!(q.exists(), "quarantined, not deleted");
+    assert_eq!(pruned_counts(&events), vec![1]);
+    assert_eq!(
+        fs::metadata(q.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(mode(&q), 0o600);
+
+    v.restore_from(&newest, &pw()).unwrap();
+    assert!(has_ref(&v, item, x));
+    assert!(blob_path.exists(), "moved back by the restore itself");
+    assert!(!q.exists());
+    assert_eq!(v.attachment_state(x), AttachmentState::Present);
+    assert_eq!(read_all(&v, item, x).unwrap(), b"added after the old copy");
+}
+
+/// A merge that brings the reference back restores the blob too, and `attachment_state`
+/// never reports a referenced quarantined blob as missing.
+#[test]
+fn reference_coming_back_restores_the_blob_from_quarantine() {
+    let (_dir, path, mut v, item, x, old, _newest) = rollback_setup();
+    let current = fs::read(path.join(vault_sync::VAULT_FILE_NAME)).unwrap();
+    drop(v);
+    fs::write(path.join(vault_sync::VAULT_FILE_NAME), &old).unwrap();
+    v = SyncedVault::open(&path, DEV_A, Arc::new(NoopHooks)).unwrap();
+    v.set_prune_clock_offset_for_tests(2 * DAY);
+    v.unlock(&pw()).unwrap();
+    assert!(quarantined(&v, x).exists());
+
+    // A peer (or the user) puts the newer file back; the pre-save merge brings the ref back.
+    fs::write(path.join(vault_sync::VAULT_FILE_NAME), &current).unwrap();
+    touch(&mut v, "edit");
+    v.save().unwrap();
+    assert!(has_ref(&v, item, x));
+    assert!(blob(&v, x).exists());
+    assert!(!quarantined(&v, x).exists());
+
+    // Quarantined by hand while referenced: the state query moves it back.
+    fs::rename(blob(&v, x), quarantined(&v, x)).unwrap();
+    assert_eq!(v.attachment_state(x), AttachmentState::Present);
+    fs::rename(blob(&v, x), quarantined(&v, x)).unwrap();
+    assert_eq!(read_all(&v, item, x).unwrap(), b"added after the old copy");
+
+    // Locked: nothing is moved (references unknown), the blob reads as Missing.
+    fs::rename(blob(&v, x), quarantined(&v, x)).unwrap();
+    let _ = v.lock();
+    assert_eq!(v.attachment_state(x), AttachmentState::Missing);
+    assert!(quarantined(&v, x).exists());
+}
+
+/// The second grace period: a quarantined blob stays for 30 days, then goes.
+#[test]
+fn quarantined_blob_is_deleted_after_the_second_grace_period() {
+    let (_dir, _path, mut v, item) = setup();
+    let id = add(&mut v, item, b"bye");
+    v.save().unwrap();
+    v.remove_attachment(item, id, NOW + 2).unwrap();
+    v.save().unwrap();
+    v.set_prune_clock_offset_for_tests(DAY + Duration::from_secs(60));
+    touch(&mut v, "a");
+    v.save().unwrap();
+    let q = quarantined(&v, id);
+    assert!(q.exists());
+
+    // The quarantine age counts from the move (ctime), not from the blob's arrival.
+    v.set_prune_clock_offset_for_tests(QUARANTINE_GRACE - Duration::from_secs(60 * 60));
+    touch(&mut v, "b");
+    v.save().unwrap();
+    assert!(q.exists(), "within the second grace period");
+
+    v.set_prune_clock_offset_for_tests(QUARANTINE_GRACE + Duration::from_secs(60 * 60));
+    touch(&mut v, "c");
+    v.save().unwrap();
+    assert!(!q.exists(), "deleted after the second grace period");
+    assert_eq!(v.attachment_state(id), AttachmentState::Missing);
+}
+
+/// The skip rule: a vault file that changed while locked (here: rolled back) is opened, but
+/// the unlock-time orphan pass does not run on it. The next unlock over the same,
+/// now verified, file prunes as before.
+#[test]
+fn unlock_skips_orphan_cleanup_when_the_file_changed_while_locked() {
+    let (_dir, path, mut v, item, x, old, _newest) = rollback_setup();
+    v.set_prune_clock_offset_for_tests(2 * DAY);
+    let events = v.subscribe();
+
+    // Unchanged file: the unlock-time pass runs (nothing to prune here).
+    let _ = v.lock();
+    v.unlock(&pw()).unwrap();
+    assert!(blob(&v, x).exists());
+
+    // Changed while locked: adopted, no prune.
+    let _ = v.lock();
+    fs::write(path.join(vault_sync::VAULT_FILE_NAME), &old).unwrap();
+    v.unlock(&pw()).unwrap();
+    assert!(!has_ref(&v, item, x), "the changed file is adopted");
+    assert!(blob(&v, x).exists(), "no cleanup on first contact");
+    assert!(!quarantined(&v, x).exists());
+    assert!(pruned_counts(&events).is_empty());
+
+    // Same file again (verified by the last unlock): the pass runs as before.
+    let _ = v.lock();
+    v.unlock(&pw()).unwrap();
+    assert!(!blob(&v, x).exists());
+    assert!(quarantined(&v, x).exists());
+    assert_eq!(pruned_counts(&events), vec![1]);
 }

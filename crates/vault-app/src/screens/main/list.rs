@@ -794,6 +794,28 @@ mod tests {
         })
     }
 
+    /// L-10: after lock and unlock the collapsed-sidebar heading is "All Items", never the
+    /// tag the previous session filtered by.
+    #[gpui::test]
+    fn heading_forgets_the_tag_across_lock(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut vcx) = open(dir.path(), cx);
+        state.update(&mut vcx, |s, cx| {
+            s.set_filter(Filter::Tag("secret-project".into()), cx);
+            assert_eq!(filter_heading(s).0, "#secret-project");
+            s.lock(cx);
+            assert_eq!(filter_heading(s), ("All Items".into(), 0));
+        });
+        state.update(&mut vcx, |s, cx| {
+            s.unlock(SecretString::new("pw".into()), cx)
+        });
+        vcx.run_until_parked();
+        state.read_with(&vcx, |s, _| {
+            assert!(!s.locked);
+            assert_eq!(filter_heading(s).0, "All Items");
+        });
+    }
+
     /// The badge names each kind once, weak before reused, whatever the field order.
     #[test]
     fn issue_kinds_are_distinct_weak_first() {

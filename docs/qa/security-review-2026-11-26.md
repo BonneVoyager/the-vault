@@ -93,10 +93,10 @@ Severity is rated against the project's own threat model.
 | ID | Severity | Component | Finding | Status |
 |---|---|---|---|---|
 | M-01 | Medium | vault-core | Spliced item record passes the manifest check after a merge | Confirmed, reproduced. **Fixed 2026-11-26** (symmetric restamp, 02 guarantee 6) |
-| M-02 | Medium | vault-sync | Rolled-back vault file causes permanent deletion of attachment blobs | Confirmed, reproduced |
+| M-02 | Medium | vault-sync | Rolled-back vault file causes permanent deletion of attachment blobs | Confirmed, reproduced. **Fixed 2026-11-26** (quarantine under `attachments/orphaned/`, 30-day grace, move-back on reappearance) |
 | M-03 | Medium | vault-app | Touch ID policy state is unauthenticated and fails open on a future timestamp | Confirmed. **Partly fixed 2026-11-26** (future timestamp beyond 5 min denied); Keychain-held policy and boot-session id still open |
 | M-04 | Medium | vault-app | Lock triggers and clipboard timer stall during the modal icon file panel | Plausible. **Not reproduced 2026-11-26** (owner: screen lock with the icon panel open locked the vault); idle timeout and clipboard timer with the panel open still unchecked |
-| M-05 | Medium | importers | KDBX import inflates gzip data without a bound | Confirmed, measured |
+| M-05 | Medium | importers | KDBX import inflates gzip data without a bound | Confirmed, measured. **Fixed 2026-11-27** (vendored keepass with a 256 MiB inflate cap under `vendor/keepass`, mapped to `TooLarge`; advisory draft in `docs/qa/keepass-rs-advisory-draft.md`, upstream advisory submitted 2026-11-27, PR pending maintainer response) |
 | L-01 | Low | vault-core | Edited KDF costs make the correct password read as wrong | Confirmed, measured |
 | L-02 | Low | vault-core | Legacy unstamped header: a key-less slot edit is merged and saved | Confirmed, reproduced |
 | L-03 | Low | vault-core, app | Changing the master password does not revoke an old password | Confirmed (by design) |
@@ -105,10 +105,10 @@ Severity is rated against the project's own threat model.
 | L-06 | Low | vault-sync | Unbounded directory work on the save path | Confirmed by reading |
 | L-07 | Low | vault-macos | A malformed QR image aborts the app | Confirmed in a harness. **Fixed 2026-11-26** (`catch_unwind`, seeded reproduction test) |
 | L-08 | Low | vault-macos | The QR picker hands any file to ImageIO | Confirmed path |
-| L-09 | Low | vault-app | Settings files are world-readable and carry security state | Confirmed |
-| L-10 | Low | vault-app | Tag filter survives lock and vault switch | Confirmed |
-| L-11 | Low | vault-app | File names from the sync folder reach toasts and titles unsanitised | Confirmed |
-| L-12 | Low | vault-app | Plaintext export starts in `~/Documents` | Confirmed |
+| L-09 | Low | vault-app | Settings files are world-readable and carry security state | Confirmed. **Fixed 2026-11-26** (0600 files, 0700 directory) |
+| L-10 | Low | vault-app | Tag filter survives lock and vault switch | Confirmed. **Fixed 2026-11-26** |
+| L-11 | Low | vault-app | File names from the sync folder reach toasts and titles unsanitised | Confirmed. **Fixed 2026-11-26** (sanitised, cut at 60 chars) |
+| L-12 | Low | vault-app | Plaintext export starts in `~/Documents` | Confirmed. **Fixed 2026-11-26** (starts in `~/Downloads`; cloud-synced pick asks a second confirm) |
 | L-13 | Low | vault-app | Sleep time is not counted toward idle lock when lock-on-sleep is off | Plausible |
 | L-14 | Low | importers | 1PUX entry-count and ZIP64 guard can be bypassed | Confirmed, reproduced. **Fixed 2026-11-26** (window widened, count re-checked after open) |
 | L-15 | Low | importers | KDBX field de-duplication is quadratic | Confirmed, measured |

@@ -1,6 +1,6 @@
 ---
 name: kdbx-import-decisions
-description: KDBX importer hardening (2026-10-30) — pre-parse outer-header walk mirroring keepass-rs 0.17.0, KDF limits, error mapping (classify_open_error 2026-11-06), history value-dedup, native TOTP field mapping
+description: KDBX importer hardening (2026-10-30) — pre-parse outer-header walk mirroring keepass-rs 0.17.0, KDF limits, error mapping (classify_open_error 2026-11-06), history value-dedup, native TOTP field mapping, vendored keepass with a 256 MiB inflate cap (M-05, 2026-11-27)
 metadata:
   type: project
 ---
@@ -52,6 +52,29 @@ the wildcard arm defaults to `KdbxMalformed`. keepass-rs's XML layer (xml-rs) ca
 64 MiB thread and imports on an 8 MiB thread (debug frames overflow 2 MiB around depth 200).
 The importer's group walk is iterative and prepends the template tag ("login") before the
 group-path tag.
+
+**Vendored keepass + inflate cap (2026-11-27, security review M-05):** keepass 0.17.0 lives in
+`vendor/keepass` (registry copy minus `.cargo_vcs_info.json`/`.cargo-ok`/`Cargo.toml.orig`; its
+`Cargo.lock` kept), wired by `[patch.crates-io] keepass = { path = ... }` in the root,
+`fuzz/` and `qa/spec-checks/` manifests, and `exclude`d from the root workspace so
+`cargo test --manifest-path vendor/keepass/Cargo.toml --features save_kdbx4` runs standalone
+(its `test_xml` always fails: the tarball ships no `tests/resources`). The patch is only
+`src/compression.rs` + a `lib.rs` re-export: `decompress` -> `decompress_bounded(buf, limit)`
+via `Read::take(limit + 1)`, `pub const MAX_DECOMPRESSED_SIZE = 256 MiB` (inclusive), error =
+`io::Error::new(InvalidData, DECOMPRESSED_SIZE_EXCEEDED)`. Detection = `is_inflate_cap(&io)`: kind
+`InvalidData` AND `to_string() == keepass::DECOMPRESSED_SIZE_EXCEEDED` (flate2 1.1.x reports
+corrupt streams as `InvalidInput`/`UnexpectedEof` with fixed literal messages; those stay
+`KdbxMalformed`). The error arrives on TWO paths: body inflate = `DatabaseOpenError::Io`;
+compressed attachment = `Format(Kdbx3|Kdbx4(Xml(ParseXmlError::Unprotect(UnprotectError::Io))))`
+(review follow-up 2026-11-27) — the patch also re-exports `UnprotectError` from
+`keepass::error` (`format` is `pub(crate)`) so vault-core can name that variant. Residual,
+documented in 02 only: the cap is per stream, not per database (many attachments x 256 MiB). The cap
+maps to `ImportError::TooLarge("KeePass database content exceeds 256 MiB when decompressed")`
+(the 100 MiB input cap stays `Malformed`). vault-core tests only the classification arm (a
+real over-cap file would inflate 256 MiB in the test). Upstream style: rustfmt max_width 120;
+the crate denies `clippy::unwrap_used` so test modules carry `#[allow(clippy::unwrap_used)]`;
+its `-D warnings` clippy fails on pre-existing lints elsewhere. Drop the vendor dir and the
+three patch entries when upstream ships an equivalent fix (VAULT-PATCH.md).
 
 **Why:** security review of the importer (2026-10-30; findings [8]/[9] 2026-11-06) and bug hunt
 2026-11-06 L2 (05 §2.5 keeps the prompt open on `KdbxCredentials`, so damaged content must not

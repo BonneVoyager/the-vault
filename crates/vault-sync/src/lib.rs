@@ -8,8 +8,8 @@
 //! external changes and conflicted packages (§3, §6). Attachment blobs (§1.1, v1.1) live in
 //! the package's `attachments/`:
 //! [`SyncedVault::add_attachment`] writes them atomically, [`AttachmentReader`] streams them
-//! decrypted, and every save that writes the file (and every unlock) prunes unreferenced
-//! blobs after 24 h.
+//! decrypted, and every save that writes the file (and every unlock) moves unreferenced
+//! blobs into quarantine after 24 h and deletes them from there after 30 days.
 //!
 //! # Threading
 //!
@@ -31,7 +31,10 @@ mod package;
 mod synced;
 mod watch;
 
-pub use attachments::{AttachmentReader, AttachmentState, ORPHAN_GRACE, STALE_TMP_GRACE};
+pub use attachments::{
+    AttachmentReader, AttachmentState, ORPHAN_GRACE, QUARANTINE_DIR_NAME, QUARANTINE_GRACE,
+    STALE_TMP_GRACE,
+};
 pub use backup::{
     BackupInfo, BackupKind, RETENTION_MULTIPLIER_DEFAULT, RETENTION_MULTIPLIER_MAX,
     RETENTION_MULTIPLIER_MIN, retain,

@@ -38,7 +38,7 @@ use super::main::sidebar::{SidebarColumn, sidebar_column};
 use super::main::{LIST, SIDEBAR, fit_widths};
 use crate::actions::{CopyUsername, FocusDetail, LIST_CONTEXT, NextItem, PrevItem, Search};
 use crate::listing::{self, Counts, Listing, Row};
-use crate::state::{AppState, COPIED_TTL, CopyTarget, Filter, Sort, parse_totp};
+use crate::state::{AppState, COPIED_TTL, CopyTarget, Filter, Sort, disk_name, parse_totp};
 use crate::ui::Clickable as _;
 use crate::{audit, text, theme, ui};
 
@@ -148,7 +148,7 @@ const STRIP_PAD_LEFT: f32 = ui::TRAFFIC_LIGHTS_RIGHT + 24.;
 /// name when it is not one of ours (no timestamp parsed).
 fn backup_subtitle(info: Option<&BackupInfo>, path: &Path) -> String {
     let Some(info) = info else {
-        return text::file_name(path);
+        return disk_name(path);
     };
     let kind = match info.kind {
         BackupKind::Snapshot => "Backup",
@@ -166,7 +166,7 @@ const OPEN_LABEL: &str = "Open read-only";
 
 /// "Backup — <file name>": the strip's title and the window title (Dock, Window menu).
 fn backup_title(path: &Path) -> String {
-    format!("Backup \u{2014} {}", text::file_name(path))
+    format!("Backup \u{2014} {}", disk_name(path))
 }
 
 /// Opens the viewer for `path` in a new window: the main window's chrome (transparent
@@ -207,7 +207,7 @@ impl BackupWindow {
         let password = ui::password_input(ui::MASTER_PASSWORD_PLACEHOLDER, window, cx);
         let subtitle = backup_subtitle(info, &path).into();
         let vault_name = if vault_name.is_empty() {
-            text::file_name(&path)
+            disk_name(&path)
         } else {
             vault_name
         }
@@ -2398,6 +2398,43 @@ mod tests {
         let (view, vcx) = window_with(&state, &odd, Some(info(BackupKind::Conflict)), cx);
         vcx.run_until_parked();
         assert!(view.read_with(&vcx, |w, _| w.subtitle.starts_with("Conflict copy from ")));
+    }
+
+    /// L-11: a file named with a bidi override and an ESC is drawn sanitised in the strip
+    /// title, the window title and the card's fallback name and line.
+    #[gpui::test]
+    fn hostile_file_name_is_sanitised_in_the_titles(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = setup(dir.path(), cx);
+        let hostile = dir.path().join("evil\u{202e}gpj.\u{1b}[2Jvault");
+        std::fs::write(&hostile, b"x").unwrap();
+        let clean = "evil\u{fffd}gpj.\u{fffd}[2Jvault";
+        let expected = format!("Backup \u{2014} {clean}");
+        assert_eq!(backup_title(&hostile), expected);
+        let (view, vcx) = window_with(&state, &hostile, None, cx);
+        vcx.run_until_parked();
+        let line = view.read_with(&vcx, |w, _| w.subtitle.clone());
+        assert_eq!(
+            line, clean,
+            "the card's line when the file is not in the list"
+        );
+        let handle = cx
+            .update(|cx| {
+                open_backup_window(state.clone(), hostile.clone(), None, String::new(), cx)
+            })
+            .unwrap();
+        let title = VisualTestContext::from_window(handle, cx).window_title();
+        assert_eq!(title, Some(expected));
+        let root = handle.downcast::<Root>().unwrap();
+        let card_name = cx.update(|cx| {
+            let view = root.read(cx).unwrap().view().clone();
+            view.downcast::<BackupWindow>()
+                .unwrap()
+                .read(cx)
+                .vault_name
+                .to_string()
+        });
+        assert_eq!(card_name, clean, "the card's fallback name");
     }
 
     /// Opened from Settings (`AppState::open_backup`): the card's line comes from the

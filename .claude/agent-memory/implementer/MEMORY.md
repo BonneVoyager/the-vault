@@ -1,4 +1,4 @@
-- [vault-sync structure](vault-sync-structure.md) — layout, shorten_lock_timeout_for_tests, before-write hook (trash sweep), lock.rs, state model, scan fixes, review [1][2][6][11] (blob verify, bounded watcher queue, ReplaceIf hash), read_capped, VaultTooLarge write cap, read_package_entry_capped; tests/cloud.rs Provider double
+- [vault-sync structure](vault-sync-structure.md) — layout, M-02 attachment quarantine + unlock skip rule, shorten_lock_timeout_for_tests, before-write hook (trash sweep), lock.rs, state model, scan fixes, review [1][2][6][11] (blob verify, bounded watcher queue, ReplaceIf hash), read_capped, VaultTooLarge write cap, read_package_entry_capped; tests/cloud.rs Provider double
 - [objc2 patterns](objc2-patterns.md) — objc2 0.6/0.3.2 API shapes, observers, NSPasteboard, NSURL, Security/LAContext, SMAppService, NSStatusItem/NSMenu, CG capture, NSBitmapImageRep lazy decode, rqrr (+panic repro seed), NSColor accent, Apple Events
 - [vault-macos layout](vault-macos-layout.md) — modules incl. appearance.rs, biometric.rs, login_item.rs, dock.rs, status_item.rs, login_launch.rs, host.rs (os/model), qr.rs (screen + image file), panel.rs (choose_file), cfg split, no vault-sync dep, device_id fallback, entitlement need
 - [notify watcher](notify-watcher.md) — poll() design, single recursive parent watch + NoCache, FSEvents quirks, NFC matching (APFS masks it in tests), WaitingForBlobs
@@ -8,3 +8,4 @@
 - [build profiles](build-profiles.md) — dist profile choice + numbers, brand-icons.tsv now compressed via build.rs (sizes, decode cost), rustfmt blocked -> use cargo fmt --check, noisy-bench protocol, panic=abort banned
 - [fuzzing](fuzzing.md) — fuzz/ standalone cargo-fuzz crate, nightly install gotcha, VaultKeyHandle seed-key trick, cmin renames seeds
 - [zip 9 + zxcvbn deps](deps-zip-zxcvbn.md) — zip 9 EOCD window, ZIP64 markers, declared-size gotchas, fuzz/ also declares zip; zxcvbn 64-bit ceiling, clock reads, audit cost
+- [keepass KDBX internals](keepass-kdbx.md) — no inflate hook in keepass 0.17, nested Meta/Binaries gzip bomb, M-05 measurements, how to craft KDBX bombs

@@ -387,6 +387,10 @@ impl SyncedVault {
             }
         };
         tracing::debug!(?report, "merged external change");
+        // A reference the merge brought back may name a quarantined blob (M-02).
+        if report.changed() {
+            self.restore_quarantined_blobs();
+        }
         self.emit(SyncEvent::Merged(report));
         report.changed() || disk_behind
     }
@@ -742,6 +746,8 @@ impl SyncedVault {
         let was_dirty = self.dirty;
         self.install(theirs);
         self.locked_fallback = None;
+        // The adopted file may reference blobs that cleanup quarantined (M-02).
+        self.restore_quarantined_blobs();
         // Our items that the disk lacked still need writing.
         self.dirty = was_dirty || report.changed();
         tracing::warn!("adopted the on-disk vault's keys after a key mismatch");

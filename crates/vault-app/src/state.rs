@@ -53,8 +53,9 @@ pub use prefs::{LoginRow, set_dock_icon};
 pub use qr::QrScanner;
 pub use security::{SECURITY_TAB, SecurityForm, SecurityUi};
 pub use session::{COPIED_TTL, CopyTarget, FocusTarget, parse_totp};
-pub use sync::{RestorePrompt, SYNC_TAB, SyncUi, TRANSFER_TAB};
+pub use sync::{RestorePrompt, SYNC_TAB, SyncUi, TRANSFER_TAB, disk_name};
 pub use touch_id::{TouchAuto, TouchDenied, TouchIdPolicy, TouchUi};
+pub use transfer::{export_cloud_hint, write_private};
 pub use trash::{DELETE_RECOVERABLE, NO_DELETED_ITEMS, PURGE_CONFIRM, TRASH_INFO, expiry_text};
 
 /// Target duration of one KDF derivation on this Mac (01 §6).
@@ -1356,7 +1357,7 @@ impl AppState {
         }
     }
 
-    fn forget(&mut self, path: &Path) {
+    pub(crate) fn forget(&mut self, path: &Path) {
         self.recent_vaults.retain(|p| p != path);
         self.legacy_recents.remove(path);
         if self.persist_recent {

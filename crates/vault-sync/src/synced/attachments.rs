@@ -1,9 +1,10 @@
 //! Attachment methods of [`SyncedVault`] (03 §1.1, §8, v1.1). Blobs are immutable, so the
 //! watcher, merge and backups never touch them. `add_attachment` writes one, absorbing a
 //! conflicted package copies in the blobs we lack (03 §6), and only orphan cleanup (after a
-//! `save` that wrote, and once after `unlock`) deletes one.
+//! `save` that wrote, and once after `unlock`) moves one into quarantine (`attachments/orphaned/`,
+//! security review 2026-11-26, M-02) and, 30 days later, deletes it there.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -34,7 +35,7 @@ impl SyncedVault {
     /// into `.<id>.bin.tmp-<hex>` (0600), fsynced and renamed to `<id>.bin`; if sealing fails
     /// (input not exactly `size` bytes, read or write error) the tmp is deleted and nothing
     /// changes. Until the next `save` the reference exists only in memory; a crash meanwhile
-    /// leaves an unreferenced blob that orphan cleanup deletes after 24 h.
+    /// leaves an unreferenced blob that orphan cleanup quarantines after 24 h.
     pub fn add_attachment(
         &mut self,
         item: Uuid,
@@ -100,6 +101,10 @@ impl SyncedVault {
             .clone();
         package::check_dir(&self.attachments_dir())?;
         let path = attachments::blob_path(&self.path, id);
+        // A referenced blob in quarantine (M-02) goes back before anything reports it missing.
+        if matches!(fs::symlink_metadata(&path), Err(e) if e.kind() == ErrorKind::NotFound) {
+            self.rescue_from_quarantine(id);
+        }
         // Never ask the provider to download through a link (`attachment_state` says Missing).
         if fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
             return Err(SyncError::UnsafePackageEntry(path));
@@ -136,9 +141,18 @@ impl SyncedVault {
     /// `NotDownloaded` (a download would not fix it, and the hook might follow the link).
     /// `open_attachment` refuses such an entry with [`SyncError::UnsafePackageEntry`]; the
     /// app does not open a `Missing` attachment, so the two never disagree in the UI.
+    ///
+    /// While unlocked, a referenced blob that orphan cleanup moved into quarantine is moved
+    /// back first (security review 2026-11-26, M-02), so it reports `Present`.
     pub fn attachment_state(&self, id: Uuid) -> AttachmentState {
         let path = attachments::blob_path(&self.path, id);
-        match fs::symlink_metadata(&path) {
+        let meta = match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == ErrorKind::NotFound && self.rescue_from_quarantine(id) => {
+                fs::symlink_metadata(&path)
+            }
+            m => m,
+        };
+        match meta {
             Ok(m) if !m.file_type().is_file() => AttachmentState::Missing,
             _ if self.hooks.is_evicted(&path) => AttachmentState::NotDownloaded,
             Ok(_) => AttachmentState::Present,
@@ -147,7 +161,8 @@ impl SyncedVault {
     }
 
     /// Drop the reference to attachment `id` from `item` and mark the vault dirty. The blob
-    /// stays until orphan cleanup (24 h after its mtime, once no item references it).
+    /// stays until orphan cleanup quarantines it (24 h after it arrived, once no item
+    /// references it) and is deleted 30 days after that.
     ///
     /// Core records a removal tombstone, so the removal survives merging with a peer that
     /// still holds the reference.
@@ -173,17 +188,67 @@ impl SyncedVault {
     }
 
     /// Orphan cleanup (03 §1.1), run after a save that wrote the file and once after a
-    /// successful unlock, when disk and memory agree. Failures are logged, never returned.
+    /// successful unlock, when disk and memory agree: referenced blobs come back from
+    /// quarantine, quarantined blobs past [`attachments::QUARANTINE_GRACE`] are deleted, and
+    /// orphans past the 24 h grace are moved into quarantine (security review 2026-11-26,
+    /// M-02). Failures are logged, never returned.
     pub(super) fn prune_orphan_attachments(&self) {
         let Some(vault) = &self.unlocked else {
             return;
         };
-        let referenced: HashSet<Uuid> = vault.attachment_ids().collect();
+        let wanted = wanted_lengths(vault);
         let now = SystemTime::now() + self.prune_clock_offset;
-        match attachments::prune(&self.attachments_dir(), &referenced, now) {
-            Ok(0) => {}
-            Ok(n) => self.emit(SyncEvent::AttachmentsPruned(n)),
+        match attachments::prune(&self.attachments_dir(), &wanted, now) {
+            Ok(report) => {
+                if report.restored + report.expired > 0 {
+                    tracing::info!(
+                        restored = report.restored,
+                        expired = report.expired,
+                        "attachment quarantine maintenance"
+                    );
+                }
+                if report.quarantined > 0 {
+                    self.emit(SyncEvent::AttachmentsPruned(report.quarantined));
+                }
+            }
             Err(e) => tracing::warn!(error = %e, "attachment orphan cleanup failed"),
+        }
+    }
+
+    /// Move every quarantined blob that the unlocked vault references back into
+    /// `attachments/` (security review 2026-11-26, M-02). Run after anything that can bring a
+    /// reference back without a save: an unlock (re-adoption of the on-disk file), a merge, a
+    /// restore. Never deletes anything; failures are logged.
+    pub(super) fn restore_quarantined_blobs(&self) {
+        let Some(vault) = &self.unlocked else {
+            return;
+        };
+        match attachments::restore_quarantined(&self.attachments_dir(), &wanted_lengths(vault)) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(count = n, "restored attachment blobs from quarantine"),
+            Err(e) => {
+                tracing::warn!(error = %e, "restoring attachment blobs from quarantine failed")
+            }
+        }
+    }
+
+    /// Before reporting blob `id` missing: if the unlocked vault references it and a copy is
+    /// in quarantine, move it back. Returns whether the blob is in place now.
+    fn rescue_from_quarantine(&self, id: Uuid) -> bool {
+        let Some(len) = self
+            .unlocked
+            .as_ref()
+            .and_then(|v| wanted_blobs(&[v]).get(&id).map(|r| sealed_len(r)))
+        else {
+            return false;
+        };
+        let wanted = HashMap::from([(id, len)]);
+        match attachments::restore_quarantined(&self.attachments_dir(), &wanted) {
+            Ok(n) => n > 0,
+            Err(e) => {
+                tracing::warn!(error = %e, "restoring an attachment blob from quarantine failed");
+                false
+            }
         }
     }
 
@@ -333,6 +398,15 @@ pub(super) fn sealed_len(r: &AttachmentRef) -> u64 {
     const TAG_LEN: u64 = 16;
     let size = r.size.min(attachment::MAX_ATTACHMENT_SIZE);
     size + attachment::chunk_count(size) * TAG_LEN
+}
+
+/// Every id `vault` references (live items and tombstoned ones) -> its sealed blob length:
+/// what orphan cleanup keeps and quarantine restores.
+fn wanted_lengths(vault: &UnlockedVault) -> HashMap<Uuid, u64> {
+    wanted_blobs(&[vault])
+        .into_iter()
+        .map(|(id, r)| (id, sealed_len(r)))
+        .collect()
 }
 
 /// Every attachment reference in `vaults` (live items and tombstoned ones) by id. When two
