@@ -792,7 +792,10 @@ fn tr16_cli_rm_keeps_content() {
         c.arg("--vault")
             .arg(&pkg)
             .args(["--password-env", "QA_MPW"]);
-        c.args(args).env("QA_MPW", spec_checks::dev::PW);
+        // `--kdf-test-params` is gated behind VAULT_DEV_KDF=1 (security review 2026-11-26 L-20).
+        c.args(args)
+            .env("QA_MPW", spec_checks::dev::PW)
+            .env("VAULT_DEV_KDF", "1");
         for (k, v) in env {
             c.env(k, v);
         }

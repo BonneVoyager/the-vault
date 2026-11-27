@@ -95,3 +95,26 @@ fn calibrate_tiny_target_returns_recommended() {
         "calibrate never leaves the accepted bounds"
     );
 }
+
+/// Security review 2026-11-26 L-20: the recommended floor is what calibration starts from;
+/// test parameters and anything with less memory or fewer passes are below it, lanes are not
+/// part of it, and `validate` still accepts every such vault.
+#[test]
+fn below_recommended_floor() {
+    use vault_core::kdf::{RECOMMENDED_MIN_M_COST_KIB, RECOMMENDED_MIN_T_COST};
+    assert_eq!(
+        (RECOMMENDED_MIN_M_COST_KIB, RECOMMENDED_MIN_T_COST),
+        (64 * 1024, 3)
+    );
+    assert!(!KdfParams::recommended().below_recommended());
+    assert!(!KdfParams::calibrate(Duration::ZERO).below_recommended());
+    assert!(KdfParams::for_tests().below_recommended());
+    let mut p = KdfParams::recommended();
+    p.p_cost = 1;
+    assert!(!p.below_recommended());
+    p.t_cost = 2;
+    assert!(p.below_recommended() && p.validate().is_ok());
+    let mut p = KdfParams::recommended();
+    p.m_cost_kib -= 1;
+    assert!(p.below_recommended() && p.validate().is_ok());
+}

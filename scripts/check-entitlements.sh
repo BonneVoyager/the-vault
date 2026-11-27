@@ -26,14 +26,12 @@ if [[ -z "$APP" || ! -d "$APP" ]]; then
   exit 2
 fi
 
-FORBIDDEN=(
-  com.apple.security.get-task-allow
-  com.apple.security.cs.disable-library-validation
-  com.apple.security.cs.allow-dyld-environment-variables
-  com.apple.security.cs.allow-unsigned-executable-memory
-  com.apple.security.cs.allow-jit
-  com.apple.security.cs.debugger
-)
+# The only entitlements allowed: exactly the ones in this file (allow-list, review L-23).
+EXPECTED="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/entitlements.plist"
+if [[ ! -f "$EXPECTED" ]]; then
+  echo "FAIL: expected entitlements file $EXPECTED is missing" >&2
+  exit 1
+fi
 
 if ! codesign --verify --strict "$APP" 2> /dev/null; then
   echo "FAIL: signature of $APP is missing or invalid (codesign --verify --strict)" >&2
@@ -69,20 +67,24 @@ else
   printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict/></plist>\n' > "$ents"
 fi
 
-bad=0
-for key in "${FORBIDDEN[@]}"; do
-  if val="$(/usr/libexec/PlistBuddy -c "Print :$key" "$ents" 2> /dev/null)"; then
-    if [[ "$val" != "false" ]]; then
-      echo "FAIL: forbidden entitlement $key is present (value: $val) in $APP" >&2
-      bad=1
-    fi
-  fi
-done
-if [[ $bad -ne 0 ]]; then
-  echo "FAIL: hardened runtime is weakened; refusing to package." >&2
+# Normalise both through plutil (XML, sorted keys, comments and whitespace dropped), then
+# require equality: any added, missing or changed entitlement fails.
+if ! plutil -convert xml1 -o "$tmp/actual.xml" "$ents" 2> "$tmp/err"; then
+  cat "$tmp/err" >&2
+  echo "FAIL: could not normalise the entitlements of $APP" >&2
   exit 1
 fi
-echo "OK: no forbidden entitlements"
+if ! plutil -convert xml1 -o "$tmp/expected.xml" "$EXPECTED" 2> "$tmp/err"; then
+  cat "$tmp/err" >&2
+  echo "FAIL: could not normalise $EXPECTED" >&2
+  exit 1
+fi
+if ! diff -u "$tmp/expected.xml" "$tmp/actual.xml" >&2; then
+  echo "FAIL: entitlements of $APP differ from $EXPECTED (diff above: - expected, + signed)" >&2
+  echo "FAIL: refusing to package." >&2
+  exit 1
+fi
+echo "OK: entitlements equal $EXPECTED"
 
 sig="$(codesign -d -vv "$APP" 2>&1)" || { echo "FAIL: codesign -d failed for $APP" >&2; exit 1; }
 if ! grep -Eq 'flags=0x[0-9a-f]+\([^)]*runtime' <<< "$sig"; then

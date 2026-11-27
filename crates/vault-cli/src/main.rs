@@ -68,8 +68,9 @@ struct Cli {
 enum Cmd {
     /// Create a new vault.
     Init {
-        /// Use fast test KDF parameters instead of calibrating.
-        #[arg(long)]
+        /// Use fast test KDF parameters instead of calibrating. Hidden; needs
+        /// `VAULT_DEV_KDF=1` (security review 2026-11-26 L-20).
+        #[arg(long, hide = true)]
         kdf_test_params: bool,
         /// Accept a master password under 50 bits of strength (for scripts and tests).
         #[arg(long)]
@@ -611,8 +612,22 @@ fn sync_err(e: SyncError) -> anyhow::Error {
 fn open_synced(path: &Path, password: &SecretString) -> Result<SyncedVault> {
     let mut sv = SyncedVault::open(path, device_id()?, Arc::new(NoopHooks)).map_err(sync_err)?;
     sv.unlock(password).map_err(sync_err)?;
+    if sv
+        .vault()
+        .is_some_and(|v| v.header().kdf.below_recommended())
+    {
+        // Not `eprintln!`: a closed stderr must not end the command (an export would be lost).
+        let _ = writeln!(std::io::stderr(), "{KDF_FLOOR_WARNING}");
+    }
     Ok(sv)
 }
+
+/// Printed after a successful unlock of a vault whose KDF costs are under
+/// [`KdfParams::below_recommended`]'s floor (security review 2026-11-26 L-20).
+const KDF_FLOOR_WARNING: &str = "warning: this vault's encryption settings are below the recommended minimum; re-create it or change the master password on a current build";
+
+/// Environment variable that unlocks `init --kdf-test-params` (L-20).
+const DEV_KDF_VAR: &str = "VAULT_DEV_KDF";
 
 /// Save, then print each [`vault_sync::SyncEvent::Error`] the save raised (a failed snapshot:
 /// symlinked `backups/`, full disk, oversized backup) to stderr as one sanitised
@@ -714,8 +729,15 @@ fn attach_get(sv: &SyncedVault, item: Uuid, id: Uuid, out: &Path) -> Result<()> 
         bail!("attachment not found: {id}");
     }
     let mut reader = sv.open_attachment(item, id).map_err(sync_err)?;
+    write_new_private(out, &mut reader)
+}
+
+/// Create `out` exclusively (0600), copy `reader` into it and fsync; on any failure after the
+/// create the partial file is removed. Used by `attach get` and `export` without `--force`
+/// (security review 2026-11-26 L-25).
+fn write_new_private(out: &Path, reader: &mut impl std::io::Read) -> Result<()> {
     let mut f = create_private(out)?;
-    let result = std::io::copy(&mut reader, &mut f)
+    let result = std::io::copy(reader, &mut f)
         .map(drop)
         .and_then(|()| f.sync_all())
         .with_context(|| format!("writing {}", out.display()));
@@ -838,6 +860,9 @@ fn run(cli: Cli) -> Result<()> {
             kdf_test_params,
             allow_weak,
         } => {
+            if *kdf_test_params && std::env::var_os(DEV_KDF_VAR).is_none_or(|v| v != "1") {
+                bail!("--kdf-test-params is for tests only and requires {DEV_KDF_VAR}=1");
+            }
             let path = vault_path(&cli)?;
             let pw = master_password(&cli, true)?;
             if !*allow_weak {
@@ -1137,10 +1162,13 @@ fn run(cli: Cli) -> Result<()> {
             if *force {
                 replace_private(out, &export.0)?;
             } else {
-                let mut f =
-                    create_private(out).context("use --force to overwrite an existing file")?;
-                f.write_all(&export.0)
-                    .with_context(|| format!("writing {}", out.display()))?;
+                write_new_private(out, &mut export.0.as_slice()).map_err(|e| {
+                    if fs::symlink_metadata(out).is_ok() {
+                        e.context("use --force to overwrite an existing file")
+                    } else {
+                        e
+                    }
+                })?;
             }
             // Warn only after the file is written: a closed stderr must not end the program
             // before the export exists.
@@ -1615,6 +1643,41 @@ mod tests {
             r.problems,
             vec!["unreadable conflict copy: /x/vault 2.bin\\n\\u{1b}[2J".to_owned()]
         );
+    }
+
+    /// Security review 2026-11-26 L-25: a write that fails after the exclusive create (here a
+    /// reader that errors mid-copy) leaves no partial file; a success is complete and 0600.
+    #[test]
+    fn write_new_private_removes_partial_file_on_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+        struct Failing(bool);
+        impl std::io::Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::replace(&mut self.0, true) {
+                    return Err(std::io::Error::other("disk full"));
+                }
+                buf[..7].copy_from_slice(b"partial");
+                Ok(7)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("export.csv");
+        let e = write_new_private(&out, &mut Failing(false)).unwrap_err();
+        assert!(format!("{e:#}").contains("disk full"), "{e:#}");
+        assert!(
+            fs::symlink_metadata(&out).is_err(),
+            "partial file left behind"
+        );
+        // A target that cannot be created (an existing directory) is left as it was.
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        assert!(write_new_private(&sub, &mut &b"x"[..]).is_err());
+        assert!(sub.is_dir());
+
+        write_new_private(&out, &mut &b"title\n"[..]).unwrap();
+        assert_eq!(fs::read(&out).unwrap(), b"title\n");
+        let mode = fs::metadata(&out).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

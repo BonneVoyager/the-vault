@@ -177,12 +177,44 @@ fn choose_home(cx: &mut TestAppContext) {
         dir.path().join("b.vault"),
         legacy,
     ];
+    // Every row's × (normally on the hovered or focused row only), the legacy row's too.
+    let _forget = crate::screens::AllForgetForTests::on();
     let (_, mut vcx) = app(recent, 720., cx);
     audit(
         Case {
             label: "choose",
-            targets: &["create", "open", "recent-0", "recent-1"],
-            disabled: &["recent-2"],
+            targets: &[
+                "create", "open", "recent-0", "recent-1", "forget-0", "forget-1", "forget-2",
+            ],
+            // The legacy row itself (its × above stays a target).
+            disabled: &["vault-root.recent-2"],
+        },
+        &mut vcx,
+    );
+}
+
+/// While a vault opens: the rows, their ×, Create, Open and the spinner keep the arrow.
+#[gpui::test]
+fn choose_home_busy(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("old.vault");
+    std::fs::write(&legacy, b"old single-file vault").unwrap();
+    let recent = vec![dir.path().join("a.vault"), legacy];
+    let _forget = crate::screens::AllForgetForTests::on();
+    let (state, mut vcx) = app(recent, 720., cx);
+    state.update(&mut vcx, |s, cx| {
+        s.busy = Some(crate::state::Busy::Opening);
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    audit(
+        Case {
+            label: "choose-busy",
+            targets: &[],
+            // `circle`: the "Opening vault…" spinner.
+            disabled: &[
+                "create", "open", "recent-0", "recent-1", "forget-0", "forget-1", "circle",
+            ],
         },
         &mut vcx,
     );

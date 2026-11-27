@@ -375,15 +375,20 @@ fn flipped_slot_nonce_on_a_fresh_vault_fails_unlock_with_key() {
     );
     assert_eq!(locked.unlock(&pw()).unwrap_err(), VaultError::WrongPassword);
 
-    // The same edit on a never-stamped file is invisible to the key path: this is the gap
-    // that stamping at creation closes. (Existing v1.0 files stay this way until a slot
-    // mutation stamps them.)
+    // The same edit on the never-stamped fixture bytes is invisible to the key path: the gap
+    // stamping at creation closed for new files. An existing v1.0 file is stamped by its
+    // first save (L-02, 2026-11-26), after which the key path catches the edit too.
     let mut old = unstamped_vault();
     populate(&mut old, 2);
     let handle = old.export_vault_key();
-    let locked = LockedVault::parse(&flip(&old.serialize())).unwrap();
+    let locked = LockedVault::parse(&flip(unstamped_bytes())).unwrap();
     assert!(locked.unlock_with_key(&handle, device()).is_ok());
     assert_eq!(locked.unlock(&pw()).unwrap_err(), VaultError::WrongPassword);
+    let locked = LockedVault::parse(&flip(&old.serialize())).unwrap();
+    assert_eq!(
+        locked.unlock_with_key(&handle, device()).unwrap_err(),
+        VaultError::Tampered(TamperKind::Manifest)
+    );
 
     // Empty fresh vault: the manifest is the only tag check on this path and there is nothing
     // to probe, so the tamper is reported as `WrongPassword` (see
@@ -393,6 +398,75 @@ fn flipped_slot_nonce_on_a_fresh_vault_fails_unlock_with_key() {
     let locked = LockedVault::parse(&flip(&empty.serialize())).unwrap();
     assert_eq!(
         locked.unlock_with_key(&handle, device()).unwrap_err(),
+        VaultError::WrongPassword
+    );
+}
+
+/// Security review 2026-11-26 L-02, Appendix B: unlock the unstamped fixture, export the
+/// key handle, overwrite the password slot's wrapped key with `0xFF` bytes in a copy, open
+/// the copy with `unlock_with_key` (it opens: no digest binds an unstamped header), merge it,
+/// serialize, unlock with the password. The merge used to adopt the planted header on the
+/// byte tie-break and the password then failed; now the unstamped peer header is never
+/// adopted, the save stamps the header, and the same plant on the saved file is caught.
+#[test]
+fn l02_planted_password_slot_in_an_unstamped_copy_is_not_merged_and_the_password_still_opens() {
+    const BASIC: &[u8] = include_bytes!("fixtures/v1-basic.vault");
+    let plant = |bytes: &[u8]| {
+        rewrite(bytes, |f| {
+            f.header.slots[0]
+                .as_key_mut()
+                .unwrap()
+                .wrapped_key
+                .fill(0xFF);
+        })
+    };
+    let mut ours = LockedVault::parse(BASIC).unwrap().unlock(&pw()).unwrap();
+    ours.set_device_id(device());
+    assert_eq!(
+        ours.header().slots_modified_at,
+        None,
+        "fixture stamped: false"
+    );
+    let handle = ours.export_vault_key();
+
+    let planted = LockedVault::parse(&plant(BASIC))
+        .unwrap()
+        .unlock_with_key(&handle, other_device())
+        .expect("planted copy opens with the cached key: the gap");
+    let report = ours.merge_from(&planted).unwrap();
+    assert!(
+        !report.header_updated,
+        "an unstamped peer header is never adopted"
+    );
+    assert!(!report.changed());
+    assert_eq!(
+        ours.header().slots,
+        LockedVault::parse(BASIC).unwrap().header().slots
+    );
+
+    let saved = ours.serialize();
+    let locked = LockedVault::parse(&saved).unwrap();
+    assert_eq!(
+        locked.header().slots_modified_at,
+        Some(1),
+        "stamped by the save"
+    );
+    assert!(
+        locked.unlock(&pw()).is_ok(),
+        "the correct password still opens"
+    );
+    assert!(locked.unlock_with_key(&handle, other_device()).is_ok());
+
+    // The same plant on the saved (now digest-bound) file fails on both paths.
+    let replanted = LockedVault::parse(&plant(&saved)).unwrap();
+    assert_eq!(
+        replanted
+            .unlock_with_key(&handle, other_device())
+            .unwrap_err(),
+        VaultError::Tampered(TamperKind::Manifest)
+    );
+    assert_eq!(
+        replanted.unlock(&pw()).unwrap_err(),
         VaultError::WrongPassword
     );
 }

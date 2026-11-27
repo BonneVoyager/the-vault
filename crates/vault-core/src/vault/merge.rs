@@ -75,7 +75,8 @@ pub struct MergeReport {
     /// Ids whose merged result equals ours, including ids absent from theirs.
     pub unchanged: usize,
     /// The slot set and KDF parameters were taken from theirs (their
-    /// `header.slots_modified_at` was greater; 03 §5 "Header merge").
+    /// `header.slots_modified_at` was greater; 03 §5 "Header merge"). Never set by a peer
+    /// whose header carries no stamp.
     pub header_updated: bool,
 }
 
@@ -91,7 +92,10 @@ impl UnlockedVault {
     /// Fold every item of `other` into `self` per `03-sync.md` §5. See the module docs for the
     /// rules. `other` is only read.
     ///
-    /// **Header merge** (03 §5). The header winner is chosen by the tuple
+    /// **Header merge** (03 §5). A peer header without `slots_modified_at` is never adopted,
+    /// whatever the tuple below says (L-02, 2026-11-26): the stamp is what binds a header
+    /// into its manifest (01 §4), so only a stamped header of an [`UnlockedVault`] is known
+    /// to come from a holder of the vault key. Otherwise the winner is chosen by the tuple
     /// `(format_version, slots_modified_at, slots_device_id, canonical CBOR of the slot set)`:
     /// if theirs is greater (a missing stamp reads as 0, a missing device id sorts below any
     /// present one, greater device-id bytes win like item metadata, and the canonical slot
@@ -200,17 +204,29 @@ impl UnlockedVault {
         // on both sides, and the loser adopts the winner's slots (which wrap the winner's key).
         // Equal bytes mean identical slot sets (the same change seen twice), so "keep ours" is
         // still idempotent. The slice comparison runs only on an otherwise-exact tie.
-        let theirs_newer = (
-            other.header.format_version,
-            other.header.slots_stamp(),
-            other.header.slots_device_id,
-            other.header.slots_canonical_bytes(),
-        ) > (
-            self.header.format_version,
-            self.header.slots_stamp(),
-            self.header.slots_device_id,
-            self.header.slots_canonical_bytes(),
-        );
+        //
+        // An UNSTAMPED peer header is never adopted (security review 2026-11-26 L-02).
+        // Only a stamped header is bound into its file's manifest (01 §4 `header_digest`),
+        // so a stamped `other` was written by a holder of the vault key: that is the whole
+        // authentication, performed when `other` was unlocked, and there is none for a
+        // header without the stamp. Without this guard two unstamped headers tied on
+        // `(version, 0, None)` and the canonical slot bytes decided: a key-less edit of the
+        // password slot in a copy of a v1.0-era file (the copy still opens with the cached
+        // key) could win that tie-break and be written back by the next save, after which
+        // the correct password no longer opened the file. The first `serialize` stamps such
+        // a header (see there), so this branch only matters until the file is saved once.
+        let theirs_newer = other.header.slots_modified_at.is_some()
+            && (
+                other.header.format_version,
+                other.header.slots_stamp(),
+                other.header.slots_device_id,
+                other.header.slots_canonical_bytes(),
+            ) > (
+                self.header.format_version,
+                self.header.slots_stamp(),
+                self.header.slots_device_id,
+                self.header.slots_canonical_bytes(),
+            );
         if theirs_newer {
             self.header.format_version = other.header.format_version;
             self.header.slots = other.header.slots.clone();

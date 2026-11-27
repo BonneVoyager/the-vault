@@ -3,14 +3,16 @@
 <!--
   Intentionally empty. gpui may require additions at integration time
   (check when the app is first signed and run with the hardened runtime).
-  com.apple.security.cs.allow-jit is NOT needed and must not be added.
-  FORBIDDEN (enforced by scripts/check-entitlements.sh, which fails packaging): each one
-  weakens the hardened runtime by allowing code injection or debugger attach to a process
-  that holds the unlocked vault key:
+  scripts/check-entitlements.sh requires the signed app's entitlements to EQUAL this file
+  (both normalised with plutil); any extra, missing or changed key fails packaging. So every
+  entitlement the app ships with must be added here deliberately, in review.
+  Never add any of these: each weakens the hardened runtime by allowing code injection or
+  debugger attach to a process that holds the unlocked vault key:
     com.apple.security.get-task-allow
     com.apple.security.cs.disable-library-validation
     com.apple.security.cs.allow-dyld-environment-variables
     com.apple.security.cs.allow-unsigned-executable-memory
+    com.apple.security.cs.disable-executable-page-protection
     com.apple.security.cs.allow-jit
     com.apple.security.cs.debugger
 -->

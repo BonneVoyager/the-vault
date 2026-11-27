@@ -11,12 +11,16 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use common::*;
 use proptest::prelude::*;
 use vault_core::vault::merge::item_eq;
 use vault_core::vault::{FIELD_TOMBSTONE_CAP, MergeReport};
-use vault_core::{ExposeSecret, Field, FieldKind, Item, ItemIcon, UnlockedVault, Uuid, VaultError};
+use vault_core::{
+    ExposeSecret, Field, FieldKind, Item, ItemIcon, LockedVault, SecretVec, UnlockedVault, Uuid,
+    VaultError,
+};
 
 // ---------------------------------------------------------------------------------------
 // Scripts
@@ -335,6 +339,55 @@ fn dev_id(d: usize) -> Uuid {
     Uuid::from_u128(0xD000 + d as u128)
 }
 
+/// Header stamp of a stamped device in `Sim::new_from_fixture`: past every clock the
+/// scripts use, distinct per device, and far above the first-save stamp 1.
+fn genuine_stamp(d: usize) -> u64 {
+    1_000_000 + d as u64
+}
+
+fn base_kek() -> SecretVec<u8> {
+    SecretVec::new(vec![0x5A; 32])
+}
+
+/// The unstamped fixture with an `enclave` slot (KEK [`base_kek`]) spliced into its header,
+/// and that slot's id. A pre-v1.1 file with Touch ID enrolled had this shape; it is unstamped,
+/// so the splice is tolerated (no digest). Every device and snapshot of the legacy fleets is
+/// opened through this slot with `unlock_with_kek`, which runs no Argon2: the password unlock
+/// costs about 5 ms per device, which dominated the 4000-case run. Built once; the wrapped
+/// key comes from the API (`add_enclave_slot` on the unlocked fixture).
+fn legacy_base() -> &'static (Vec<u8>, Uuid) {
+    static BASE: OnceLock<(Vec<u8>, Uuid)> = OnceLock::new();
+    BASE.get_or_init(|| {
+        let mut v = unstamped_vault();
+        let id = v.add_enclave_slot(&base_kek(), 1);
+        let slot = v
+            .header()
+            .slots
+            .iter()
+            .find(|s| s.id() == id)
+            .expect("the slot just added")
+            .clone();
+        let bytes = rewrite(unstamped_bytes(), |f| f.header.slots.push(slot));
+        (bytes, id)
+    })
+}
+
+/// Open a file of the legacy fleet through the base enclave slot (no KDF). Every header in
+/// such a fleet carries that slot: devices start from `legacy_base` and only add slots.
+fn open_legacy(bytes: &[u8]) -> UnlockedVault {
+    LockedVault::parse(bytes)
+        .unwrap()
+        .unlock_with_kek(legacy_base().1, &base_kek())
+        .unwrap()
+}
+
+/// `dup` for the legacy fleets: the same save + re-open, through [`open_legacy`].
+fn dup_legacy(v: &UnlockedVault) -> UnlockedVault {
+    let mut c = open_legacy(&v.serialize());
+    c.set_device_id(v.device_id());
+    c
+}
+
 fn dup(v: &UnlockedVault) -> UnlockedVault {
     let mut c = unlock(&v.serialize()).unwrap();
     c.set_device_id(v.device_id());
@@ -358,6 +411,8 @@ struct Sim {
     clocks: Vec<u64>,
     /// Assert the monotone-stamp law (law 4) after every step; only that law's test sets it.
     check: bool,
+    /// Every device holds an unstamped header (`new_legacy`): no merge may adopt a header.
+    legacy: bool,
 }
 
 impl Sim {
@@ -374,11 +429,47 @@ impl Sim {
             devs.push(v);
         }
         devs.insert(0, first);
-        let clocks = (0..n).map(|d| 2_000 + skews[d]).collect();
+        Self::with_devs(devs, skews, false)
+    }
+
+    /// Every device holds the unstamped v1.0 fixture ([`legacy_base`]) with the same base
+    /// items (inserted as device 0 on each, so the records are identical); a save would
+    /// stamp it, so the copies are built independently instead of through `serialize`.
+    fn new_legacy(n: usize, skews: &[u64], base_items: u64) -> Self {
+        Self::new_from_fixture(n, skews, base_items, &[false; 3])
+    }
+
+    /// Like `new_legacy`, but device `d` with `stamped[d]` has a genuine slot change (an
+    /// enclave slot under its own KEK; no KDF) stamped [`genuine_stamp`]`(d)`, so its header
+    /// is digest-bound and differs from every other device's. `legacy` is set only when no
+    /// device is stamped.
+    fn new_from_fixture(n: usize, skews: &[u64], base_items: u64, stamped: &[bool]) -> Self {
+        let devs = (0..n)
+            .map(|d| {
+                let mut v = open_legacy(&legacy_base().0);
+                v.set_device_id(dev_id(0));
+                for i in 0..base_items {
+                    v.insert(base_item(i), 1_000);
+                }
+                v.set_device_id(dev_id(d));
+                if stamped[d] {
+                    let kek = SecretVec::new(vec![d as u8 + 1; 32]);
+                    v.add_enclave_slot(&kek, genuine_stamp(d));
+                    assert_eq!(v.header().slots_modified_at, Some(genuine_stamp(d)));
+                }
+                v
+            })
+            .collect();
+        Self::with_devs(devs, skews, !stamped[..n].iter().any(|s| *s))
+    }
+
+    fn with_devs(devs: Vec<UnlockedVault>, skews: &[u64], legacy: bool) -> Self {
+        let clocks = (0..devs.len()).map(|d| 2_000 + skews[d]).collect();
         Self {
             devs,
             clocks,
             check: false,
+            legacy,
         }
     }
 
@@ -481,7 +572,16 @@ impl Sim {
             debug_assert!(merged);
             let src = (d + 1 + usize::from(*from) % (n - 1)) % n;
             let (dst, other) = two(&mut self.devs, d, src);
-            dst.merge_from(other).unwrap();
+            let stamp_before = dst.header().slots_stamp();
+            let report = dst.merge_from(other).unwrap();
+            prop_assert!(
+                !(self.legacy && report.header_updated),
+                "an unstamped peer header was adopted (L-02)"
+            );
+            prop_assert!(
+                dst.header().slots_stamp() >= stamp_before,
+                "a merge lowered the header stamp"
+            );
             if !self.check {
                 return Ok(());
             }
@@ -579,6 +679,63 @@ proptest! {
         sim.devs[0].merge_from(&b_snap).unwrap();
         sim.devs[1].merge_from(&a_snap).unwrap();
         same(&sim.devs[0], &sim.devs[1])?;
+    }
+
+    /// L-02 (2026-11-26): a fleet of unstamped (v1.0) headers never adopts a header in any
+    /// merge (`header_updated` stays false, checked at every merge step by `Sim`), and the
+    /// item laws are unaffected: all devices are equal after N rounds.
+    #[test]
+    fn unstamped_headers_are_never_adopted_and_items_still_converge(
+        (n, skews, steps) in scenario(true),
+        base in 1u64..=3,
+    ) {
+        let mut sim = Sim::new_legacy(usize::from(n), &skews, base);
+        sim.run(&steps)?;
+        let n = sim.devs.len();
+        for _ in 0..n {
+            for (i, j) in pairs(n) {
+                let (dst, src) = two(&mut sim.devs, i, j);
+                prop_assert!(!dst.merge_from(src).unwrap().header_updated);
+            }
+        }
+        all_same(&sim.devs)?;
+        for v in &sim.devs {
+            prop_assert_eq!(v.header().slots_modified_at, None);
+        }
+    }
+
+    /// L-02 follow-up: a mixed fleet, some devices unstamped and some with a genuine stamp,
+    /// merging through saved files (so legacy devices put stamp-1 headers into play).
+    /// Everything converges, and the converged header is the greatest genuine stamp when
+    /// there is one (a stamp-1 header never displaces it), else a stamp-1 header.
+    #[test]
+    fn mixed_legacy_and_stamped_fleet_converges_and_keeps_the_genuine_stamp(
+        (n, skews, steps) in scenario(true),
+        stamped in prop::collection::vec(any::<bool>(), 3),
+        base in 1u64..=3,
+    ) {
+        let n = usize::from(n);
+        let mut sim = Sim::new_from_fixture(n, &skews, base, &stamped);
+        sim.run(&steps)?;
+        // N full rounds is the convergence bound (law 3); each merge goes through a save.
+        for _ in 0..n {
+            for (i, j) in pairs(n) {
+                let snap = dup_legacy(&sim.devs[j]);
+                let before = sim.devs[i].header().slots_stamp();
+                sim.devs[i].merge_from(&snap).unwrap();
+                prop_assert!(sim.devs[i].header().slots_stamp() >= before);
+            }
+        }
+        all_same(&sim.devs)?;
+        let expected = (0..n)
+            .filter(|d| stamped[*d])
+            .map(genuine_stamp)
+            .max()
+            .unwrap_or(1);
+        for v in &sim.devs {
+            prop_assert_eq!(v.header().slots_modified_at, Some(expected));
+            prop_assert_eq!(v.header(), sim.devs[0].header());
+        }
     }
 
     /// Law 2: a second merge of the same other vault changes nothing.

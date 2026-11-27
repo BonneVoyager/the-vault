@@ -275,18 +275,18 @@ fn with_declared_size(mut zip: Vec<u8>, name: &str, size: u32) -> Vec<u8> {
 
 #[test]
 fn oversized_export_data_is_too_large() {
-    // Valid JSON padded with whitespace past the 64 MiB cap. The zip writer records the true
+    // Valid JSON padded with whitespace past the 16 MiB cap. The zip writer records the true
     // size, so this is refused from the central directory, before inflation.
     let mut big = br#"{"accounts":[]}"#.to_vec();
-    big.resize(64 * 1024 * 1024 + 16, b' ');
+    big.resize(16 * 1024 * 1024 + 16, b' ');
     let z = zip_with(&[("export.data", &big)]);
     assert!(matches!(
         import_1pux(&z, Uuid::nil(), NOW),
-        Err(ImportError::TooLarge(m)) if m.contains("larger than 64 MiB")
+        Err(ImportError::TooLarge(m)) if m.contains("larger than 16 MiB")
     ));
     // A declared size that lies small is refused too. Since zip 9 the reader itself stops one
     // byte past the declared size and fails the read, so this surfaces as `Malformed` before
-    // the importer's own `take(64 MiB + 1)` backstop is reached (with zip 2.6.1 it was the
+    // the importer's own `take(16 MiB + 1)` backstop is reached (with zip 2.6.1 it was the
     // backstop's `TooLarge`). Either way nothing past the cap is inflated.
     let lying = with_declared_size(z, "export.data", 16);
     assert!(matches!(
@@ -317,16 +317,16 @@ fn declared_oversize_export_data_is_refused_before_inflation() {
     );
     // The entry's bytes are valid, so had the importer inflated them the import would have
     // succeeded; the typed error proves the declared size was checked first.
-    let forged = with_declared_size(z, "export.data", 64 * 1024 * 1024 + 1);
+    let forged = with_declared_size(z, "export.data", 16 * 1024 * 1024 + 1);
     match import_1pux(&forged, Uuid::nil(), NOW) {
-        Err(ImportError::TooLarge(m)) => assert!(m.contains("larger than 64 MiB"), "{m}"),
+        Err(ImportError::TooLarge(m)) => assert!(m.contains("larger than 16 MiB"), "{m}"),
         other => panic!("expected TooLarge, got {:?}", other.map(|v| v.len())),
     }
     // Exactly at the cap is still accepted (the check is `>`).
     let at_cap = with_declared_size(
         zip_with(&[("export.data", data.as_bytes())]),
         "export.data",
-        64 * 1024 * 1024,
+        16 * 1024 * 1024,
     );
     assert!(import_1pux(&at_cap, Uuid::nil(), NOW).is_ok());
 }
@@ -573,4 +573,18 @@ fn eocd_hidden_in_the_gap_behind_a_decoy_comment_is_still_counted() {
         import_1pux(&far, Uuid::nil(), NOW),
         Err(ImportError::TooLarge(_))
     ));
+}
+
+/// Security review 2026-11-26 L-16: more than 100 000 active items is refused while items
+/// are converted, with the bound named. The archive stays small (the items compress well).
+#[test]
+fn active_item_count_is_capped() {
+    let items: Vec<Value> = (0..100_001).map(|_| json!({"state": "active"})).collect();
+    let bytes = archive(&export(items));
+    assert!(bytes.len() < 256 * 1024, "{}", bytes.len());
+    let err = import_1pux(&bytes, Uuid::nil(), NOW).unwrap_err();
+    assert!(
+        matches!(&err, ImportError::TooLarge(m) if m == "import holds more than 100000 items"),
+        "{err:?}"
+    );
 }

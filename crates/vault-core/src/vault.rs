@@ -26,7 +26,8 @@
 //! `vault_key` (01 §3). Each of them also stamps `header.slots_modified_at` with
 //! `max(now, previous + 1)` so the header merge (03 §5, [`UnlockedVault::merge_from`]) can
 //! tell which device's slot set is newer. `create` stamps too (01 §2), so only files written
-//! before v1.1 lack the stamp; the key is only ever written once it is set.
+//! before v1.1 lack the stamp, and `serialize` stamps such a header (with 1) on its first
+//! save; `merge_from` never adopts a peer header that lacks it (L-02, 2026-11-26).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1271,8 +1272,30 @@ impl UnlockedVault {
     /// must still beat the untouched copy it was made from, instead of tying. The device id
     /// breaks the remaining exact-millisecond ties between two devices deterministically.
     fn bump_slots_stamp(&mut self, now: Millis) {
-        self.header.slots_modified_at = Some(stamp(now, self.header.slots_stamp()));
-        self.header.slots_device_id = Some(self.device_id);
+        stamp_header(&mut self.header, now, self.device_id);
+    }
+
+    /// The header as [`UnlockedVault::serialize`] writes it: a header that carries no
+    /// `slots_modified_at` (a file written before v1.1 that never had a slot change) is
+    /// stamped here, on its first save, so the manifest binds it from then on (01 §4
+    /// `header_digest`; security review 2026-11-26 L-02). The stamp is `max(now, 0 + 1)`
+    /// with `now = 0`, that is **1**, by the same [`stamp`] rule every slot mutation uses: the
+    /// core has no clock, and a save that changes no slot must not outrank a genuine slot
+    /// change made elsewhere, so the header gets the smallest stamp there is and loses every
+    /// header merge against a real change while still being digest-bound. The device id is
+    /// this vault's. The in-memory header is left as it was: `self.header` still reads as
+    /// unstamped, which is exactly what tells [`UnlockedVault::merge_from`] that no manifest
+    /// ever vouched for it; a re-unlock of the written file yields the stamped header, and a
+    /// merge from that file adopts it (identical slots, same key, `header_updated`).
+    /// [`UnlockedVault::create`] (`created_at = 0`) also stamps 1, indistinguishable from a
+    /// legacy first save; harmless, since the two vaults differ in `vault_id` and never
+    /// merge.
+    fn header_for_write(&self) -> Header {
+        let mut header = self.header.clone();
+        if header.slots_modified_at.is_none() {
+            stamp_header(&mut header, 0, self.device_id);
+        }
+        header
     }
 
     /// Derive the KEK for `password` under the header's current KDF params and prove it
@@ -1477,10 +1500,13 @@ impl UnlockedVault {
     /// Encrypt every item (id order) and the manifest with fresh nonces and emit the file.
     /// Slots are written as stored, opaque ones verbatim in their original position. Items of
     /// an unknown kind and fields of an unknown kind are written back with their original
-    /// kind string. Never fails.
+    /// kind string. A header without `slots_modified_at` is written stamped (see
+    /// [`UnlockedVault::header_for_write`]), so every file this build saves is digest-bound.
+    /// Never fails.
     pub fn serialize(&self) -> Vec<u8> {
-        let vault_id = self.header.vault_id;
-        let version = self.header.format_version;
+        let header = self.header_for_write();
+        let vault_id = header.vault_id;
+        let version = header.format_version;
         let mut records = Vec::with_capacity(self.items.len());
         let mut pairs = Vec::with_capacity(self.items.len());
         for (id, item) in &self.items {
@@ -1501,7 +1527,7 @@ impl UnlockedVault {
         // BTreeMap iteration is already sorted by id (Uuid orders by bytes).
         let item_count = u32::try_from(records.len()).expect("more than u32::MAX items");
         let nonce = crypto::random_nonce();
-        let digest = self.header.digest();
+        let digest = header.digest();
         let aad = manifest_aad(version, vault_id, item_count, digest.as_ref());
         let ct = crypto::seal(
             &self.keys.manifest_key,
@@ -1516,7 +1542,7 @@ impl UnlockedVault {
         };
 
         VaultFile {
-            header: self.header.clone(),
+            header,
             items: records,
             manifest,
         }
@@ -1607,6 +1633,15 @@ fn strip_tombstone(item: &mut Item, now: Millis, device_id: Uuid) {
 /// the edit beats the untouched copy it was made from in a merge instead of tying.
 fn stamp(now: Millis, previous: Millis) -> Millis {
     now.max(previous.saturating_add(1))
+}
+
+/// The one place a header stamp is written: `slots_modified_at = max(now, previous + 1)`
+/// (a missing stamp reads as 0) and `slots_device_id = device_id`. Used by every slot
+/// mutation ([`UnlockedVault::bump_slots_stamp`]) and by the first save of a never-stamped
+/// header ([`UnlockedVault::header_for_write`]).
+fn stamp_header(header: &mut Header, now: Millis, device_id: Uuid) {
+    header.slots_modified_at = Some(stamp(now, header.slots_stamp()));
+    header.slots_device_id = Some(device_id);
 }
 
 /// Pin any unset attribute stamp at the pre-mutation item stamp, then recompute

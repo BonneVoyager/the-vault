@@ -748,3 +748,32 @@ fn generate_fixture() {
     )
     .unwrap();
 }
+
+/// Security review 2026-11-26 L-15: field-name de-duplication is linear. 50 000 custom fields
+/// on one entry took seconds with the old per-field scan; the bound is generous for a debug
+/// build. Names are unchanged: a custom `password` still collides with the standard one.
+#[test]
+fn many_custom_fields_import_in_linear_time() {
+    let mut db = Database::new();
+    db.config.kdf_config = KdfConfig::Aes { rounds: 10 };
+    {
+        let mut root = db.root_mut();
+        let mut entry = root.add_entry();
+        entry.set_unprotected("Title", "Wide");
+        entry.set_protected("Password", "pw");
+        entry.set_unprotected("password", "custom");
+        for i in 0..50_000 {
+            entry.set_unprotected(format!("f{i:05}"), "v");
+        }
+    }
+    let bytes = encoded(&db, Some(PASSWORD), None);
+    let start = std::time::Instant::now();
+    let items = import_kdbx(&bytes, &password(PASSWORD), None, Uuid::nil(), NOW).unwrap();
+    let elapsed = start.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    let item = &items[0];
+    assert_eq!(item.fields.len(), 50_002);
+    assert_eq!(item.fields[0].name, "password");
+    assert_eq!(item.fields[1].name, "f00000");
+    assert!(item.fields.iter().any(|f| f.name == "password (2)"));
+}

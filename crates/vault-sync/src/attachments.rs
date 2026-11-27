@@ -66,6 +66,28 @@ pub const QUARANTINE_DIR_NAME: &str = "orphaned";
 /// `1 <= n <= MAX_QUARANTINE_COPIES`; past that it stays where it is (logged).
 const MAX_QUARANTINE_COPIES: u32 = 16;
 
+/// Most directory entries one pass reads from `backups/`, `attachments/`, the quarantine or
+/// the package directory (security review 2026-11-26, L-06): planted names cannot make a save,
+/// which holds the package lock, read an unbounded directory. Entries past it wait for a pass
+/// that happens to read them (directory order); nothing is deleted on the strength of a
+/// partial listing that a full one would keep.
+pub(crate) const MAX_DIR_ENTRIES: usize = 10_000;
+
+/// `entries` of `dir`, stopping after [`MAX_DIR_ENTRIES`] with one warning (path and cap only).
+pub(crate) fn capped_entries(
+    dir: &Path,
+    entries: fs::ReadDir,
+) -> impl Iterator<Item = io::Result<fs::DirEntry>> {
+    let dir = dir.to_owned();
+    entries.enumerate().map_while(move |(i, entry)| {
+        if i < MAX_DIR_ENTRIES {
+            return Some(entry);
+        }
+        tracing::warn!(path = %dir.display(), cap = MAX_DIR_ENTRIES, "directory has more entries than one pass reads; skipping the rest");
+        None
+    })
+}
+
 /// Where an attachment's blob stands locally (03 §1.1). Never an error that blocks the item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentState {
@@ -172,7 +194,7 @@ pub(crate) fn prune_stale_vault_tmp(package: &Path, now: SystemTime) -> Result<u
         Err(e) => return Err(SyncError::io(package, e)),
     };
     let mut pruned = 0;
-    for entry in entries {
+    for entry in capped_entries(package, entries) {
         let entry = entry.map_err(|e| SyncError::io(package, e))?;
         if !entry.file_name().to_str().is_some_and(is_vault_tmp) {
             continue;
@@ -241,7 +263,7 @@ pub(crate) fn prune(
         Err(e) => return Err(SyncError::io(dir, e)),
     };
     let older_than = |path: &Path, grace: Duration| older_than(path, grace, now);
-    for entry in entries {
+    for entry in capped_entries(dir, entries) {
         let entry = entry.map_err(|e| SyncError::io(dir, e))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -305,7 +327,7 @@ fn expire_quarantine(qdir: &Path, now: SystemTime) -> Result<usize, SyncError> {
         Err(e) => return Err(SyncError::io(qdir, e)),
     };
     let mut expired = 0;
-    for entry in entries {
+    for entry in capped_entries(qdir, entries) {
         let entry = entry.map_err(|e| SyncError::io(qdir, e))?;
         if entry
             .file_name()
@@ -353,7 +375,7 @@ pub(crate) fn restore_quarantined(
     };
     // id -> (n, path) of the best candidate so far.
     let mut best: BTreeMap<Uuid, (u32, PathBuf)> = BTreeMap::new();
-    for entry in entries {
+    for entry in capped_entries(&qdir, entries) {
         let entry = entry.map_err(|e| SyncError::io(&qdir, e))?;
         let Some((id, n)) = entry.file_name().to_str().and_then(parse_quarantined_name) else {
             continue;

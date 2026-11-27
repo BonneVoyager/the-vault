@@ -20,14 +20,19 @@ pub fn new_vault() -> UnlockedVault {
     UnlockedVault::create_with_created_at(&pw(), KdfParams::for_tests(), device(), 1_700_000_000)
 }
 
-/// An empty vault whose header carries **no** `slots_modified_at` (a v1.0 file). `create`
-/// stamps every new vault (01 §2), so the only way to get one is the committed, unstamped
-/// `v1-empty.vault` fixture (same password and KDF as `new_vault`). Tests that splice slots
-/// or header keys into a file by hand must start here: a stamped header is digest-bound into
-/// the manifest AAD (01 §4) and any by-hand edit of it is `Tampered(Manifest)`.
+/// The committed, unstamped `v1-empty.vault` bytes (same password and KDF as `new_vault`).
+/// The only unstamped file with this password: `create` stamps every new vault (01 §2) and
+/// `serialize` stamps a never-stamped header on its first save (L-02, 2026-11-26), so a
+/// test that splices slots or header keys into a file by hand must `rewrite` *these* bytes
+/// and unlock the result; any by-hand header edit of a saved file is `Tampered(Manifest)`.
+pub fn unstamped_bytes() -> &'static [u8] {
+    include_bytes!("../fixtures/v1-empty.vault")
+}
+
+/// [`unstamped_bytes`] unlocked, with `device()` set. The in-memory header carries **no**
+/// `slots_modified_at`; a `serialize` writes it stamped with 1.
 pub fn unstamped_vault() -> UnlockedVault {
-    const EMPTY: &[u8] = include_bytes!("../fixtures/v1-empty.vault");
-    let mut v = LockedVault::parse(EMPTY)
+    let mut v = LockedVault::parse(unstamped_bytes())
         .expect("v1-empty fixture parses")
         .unlock(&pw())
         .expect("v1-empty fixture opens");

@@ -11,6 +11,8 @@ mod settings;
 pub(crate) mod unlock;
 
 pub use backup::open_backup_window;
+#[cfg(test)]
+pub(crate) use choose::AllForgetForTests;
 pub use choose::ChooseScreen;
 pub use item_window::open_item_window;
 #[cfg(test)]

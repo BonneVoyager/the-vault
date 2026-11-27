@@ -119,9 +119,50 @@ notarize_submit() {
   fi
 }
 
+# Revision recorded in the bundle (Info.plist key VaultGitRevision); "-dirty" when the work
+# tree has any change, untracked files included, "unknown" outside a git checkout.
+if REVISION="$(git rev-parse --verify HEAD 2> /dev/null)"; then
+  if [[ -n "$(git status --porcelain 2> /dev/null)" ]]; then
+    REVISION="$REVISION-dirty"
+  fi
+else
+  REVISION="unknown"
+fi
+
+# Dependency gate (licences, sources, bans, advisories in deny.toml) before anything is built.
+if ! command -v cargo-deny > /dev/null 2>&1; then
+  echo "error: cargo-deny is not installed (cargo install --locked cargo-deny)" >&2
+  exit 1
+fi
+echo "==> cargo deny check"
+if ! cargo deny check; then
+  echo "error: cargo deny check failed; refusing to build a release" >&2
+  exit 1
+fi
+
+# Keep builder paths out of the binary and the dSYM: the home directory, then the more specific
+# cargo registry and git checkouts and this checkout (rustc applies the last matching prefix).
+# RUSTFLAGS is space-separated, so paths with whitespace are refused rather than mis-split.
+CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+for p in "$HOME" "$CARGO_HOME_DIR" "$PWD"; do
+  if [[ "$p" =~ [[:space:]] ]]; then
+    echo "error: path contains whitespace, cannot remap it via RUSTFLAGS: $p" >&2
+    exit 1
+  fi
+done
+REMAP="--remap-path-prefix=$HOME=/home"
+REMAP+=" --remap-path-prefix=$CARGO_HOME_DIR/registry/src=/cargo/registry/src"
+REMAP+=" --remap-path-prefix=$CARGO_HOME_DIR/git/checkouts=/cargo/git"
+REMAP+=" --remap-path-prefix=$PWD=/vault"
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$REMAP"
+
 # `dist` (workspace Cargo.toml): fat LTO, one codegen unit, stripped binary, packed dSYM.
-echo "==> Building vault-app (dist profile), version $VERSION"
-cargo build --profile dist -p vault-app
+echo "==> Building vault-app (dist profile), version $VERSION, revision $REVISION"
+cargo build --locked --profile dist -p vault-app
+leaked="$(strings -a target/dist/vault-app | grep -cF "$HOME" || true)"
+if [[ "$leaked" -ne 0 ]]; then
+  echo "warning: $leaked strings in the binary still contain the home directory" >&2
+fi
 
 echo "==> Assembling $APP"
 rm -rf target/package
@@ -136,6 +177,7 @@ else
   echo "warning: target/dist/vault-app.dSYM not found; crash reports cannot be symbolicated" >&2
 fi
 sed "s/@VERSION@/$VERSION/g" scripts/Info.plist > "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :VaultGitRevision string $REVISION" "$APP/Contents/Info.plist"
 if [[ -f assets/icon/Vault.icns ]]; then
   cp assets/icon/Vault.icns "$APP/Contents/Resources/Vault.icns"
 else

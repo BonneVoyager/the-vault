@@ -105,6 +105,65 @@ pub(crate) fn add_template_tag(item: &mut Item, tag: &str) {
     }
 }
 
+/// Most items one CSV or 1PUX import may produce (security review 2026-11-26 L-16).
+const MAX_IMPORT_ITEMS: usize = 100_000;
+/// Most bytes of titles, tags, field names, field values and history values one CSV or 1PUX
+/// import may produce: the 64 MiB vault file cap, which a larger import could never be saved
+/// under anyway (L-16).
+const MAX_IMPORT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Running item count and size of an import, checked per item so an oversized input fails
+/// while it is converted instead of after every item is in memory (L-16).
+struct ImportBudget {
+    items: usize,
+    bytes: usize,
+    max_items: usize,
+    max_bytes: usize,
+}
+
+impl ImportBudget {
+    fn new(max_items: usize, max_bytes: usize) -> Self {
+        Self {
+            items: 0,
+            bytes: 0,
+            max_items,
+            max_bytes,
+        }
+    }
+
+    /// Refuse one more item when the count is already at the cap.
+    fn reserve_item(&mut self) -> Result<(), ImportError> {
+        if self.items >= self.max_items {
+            return Err(too_large(&format!(
+                "import holds more than {} items",
+                self.max_items
+            )));
+        }
+        self.items += 1;
+        Ok(())
+    }
+
+    /// Add `item`'s text to the running size.
+    fn charge(&mut self, item: &Item) -> Result<(), ImportError> {
+        use secrecy::ExposeSecret;
+        let fields = item
+            .fields
+            .iter()
+            .map(|f| f.name.len() + f.value.expose_secret().len());
+        let history = item.history.iter().map(|h| h.value.expose_secret().len());
+        let tags = item.tags.iter().map(String::len);
+        let size = item.title.len() + fields.chain(history).chain(tags).sum::<usize>();
+        self.bytes = self.bytes.saturating_add(size);
+        if self.bytes > self.max_bytes {
+            return Err(too_large(&format!(
+                "imported data exceeds {} MiB",
+                self.max_bytes / (1024 * 1024)
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Undo the CSV-injection guard of [`crate::export::export_csv`]: one leading `'` is dropped
 /// when (and only when) what follows it is a formula trigger (`=`, `+`, `-`, `@`, tab,
 /// carriage return) behind zero or more further `'`. So `'=x` -> `=x`, `''=x` -> `'=x` (what
@@ -120,15 +179,35 @@ fn strip_formula_guard(cell: &str) -> &str {
 /// Each row becomes a `login` item with a fresh id. Only non-empty mapped cells become fields.
 ///
 /// One leading `'` before a formula trigger (`=`, `+`, `-`, `@`, tab, carriage return) is
-/// stripped from every cell, title included, so our own exports (and other managers that
-/// follow the same OWASP guidance) round-trip to the original values. A value that genuinely
-/// starts with `'=` and comes from a source that did *not* escape it loses that quote;
-/// accepted.
+/// stripped from every non-secret cell (title, username, url, notes), so our own exports (and
+/// other managers that follow the same OWASP guidance) round-trip to the original values. A
+/// value that genuinely starts with `'=` and comes from a source that did *not* escape it
+/// loses that quote; accepted. Password and TOTP cells are taken verbatim, matching
+/// [`crate::export::export_csv`], which never guards them (security review 2026-11-26 L-17).
+///
+/// More than 100 000 rows, or more than 64 MiB of imported text, is
+/// [`ImportError::TooLarge`] (L-16).
 pub fn import_csv(
     bytes: &[u8],
     mapping: &CsvMapping,
     device_id: Uuid,
     now: Millis,
+) -> Result<Vec<Item>, ImportError> {
+    import_csv_within(
+        bytes,
+        mapping,
+        device_id,
+        now,
+        ImportBudget::new(MAX_IMPORT_ITEMS, MAX_IMPORT_BYTES),
+    )
+}
+
+fn import_csv_within(
+    bytes: &[u8],
+    mapping: &CsvMapping,
+    device_id: Uuid,
+    now: Millis,
+    mut budget: ImportBudget,
 ) -> Result<Vec<Item>, ImportError> {
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(mapping.has_header)
@@ -168,11 +247,17 @@ pub fn import_csv(
     let mut items = Vec::new();
     for rec in rdr.records() {
         let rec = rec.map_err(|e| ImportError::Csv(e.to_string()))?;
+        budget.reserve_item()?;
         let title = strip_formula_guard(rec.get(title_col).unwrap_or(""));
         let mut item = Item::new(title, device_id, now);
         add_template_tag(&mut item, TAG_LOGIN);
         for (name, kind, col) in &parts {
-            let value = strip_formula_guard(col.and_then(|c| rec.get(c)).unwrap_or(""));
+            let cell = col.and_then(|c| rec.get(c)).unwrap_or("");
+            let value = if crate::export::is_secret_kind(*kind) {
+                cell
+            } else {
+                strip_formula_guard(cell)
+            };
             if !value.is_empty() {
                 item.fields.push(Field::new(
                     *name,
@@ -182,6 +267,7 @@ pub fn import_csv(
                 ));
             }
         }
+        budget.charge(&item)?;
         items.push(item);
     }
     Ok(items)
@@ -192,8 +278,11 @@ pub fn import_csv(
 // ---------------------------------------------------------------------------------------------
 
 const MAX_HISTORY: usize = 10;
-/// Upper bound on the decompressed size of `export.data` (zip-bomb guard).
-const MAX_EXPORT_DATA: u64 = 64 * 1024 * 1024;
+/// Upper bound on the decompressed size of `export.data` (zip-bomb guard). 16 MiB, down from
+/// 64 MiB (security review 2026-11-26 L-16, owner decision): the parsed `serde_json::Value`
+/// tree costs up to about 40x the JSON bytes, so this bounds it near 640 MB. A real export's
+/// `export.data` is a few MB for thousands of items; attachments are separate entries.
+const MAX_EXPORT_DATA: u64 = 16 * 1024 * 1024;
 
 fn malformed(msg: &str) -> ImportError {
     ImportError::Malformed(msg.to_owned())
@@ -300,6 +389,28 @@ fn check_opened_entry_count(entries: usize) -> Result<(), ImportError> {
 #[cfg(test)]
 mod entry_count_tests {
     use super::*;
+
+    /// L-16: the running size is checked per row with the real bound's wording; the real
+    /// 64 MiB bound would need a 64 MiB input, so a small one stands in.
+    #[test]
+    fn csv_running_size_is_bounded() {
+        let csv = b"title,username,password,url,notes,totp\na,,0123456789,,,\nb,,0123456789,,,\nc,,0123456789,,,\n";
+        let run = |max_bytes| {
+            import_csv_within(
+                csv,
+                &CsvMapping::default(),
+                Uuid::nil(),
+                1,
+                ImportBudget::new(10, max_bytes),
+            )
+        };
+        // Per row: title 1 + "password" 8 + value 10 + "login" tag 5 = 24 bytes.
+        assert_eq!(run(72).unwrap().len(), 3);
+        assert!(matches!(
+            run(71),
+            Err(ImportError::TooLarge(m)) if m == "imported data exceeds 0 MiB"
+        ));
+    }
 
     #[test]
     fn opened_entry_count_is_bounded_at_the_same_cap() {
@@ -558,7 +669,8 @@ fn convert_1pux_item(src: &serde_json::Value, device_id: Uuid, now: Millis) -> I
 /// Archived items (`state != "active"`) are skipped. Imported items get fresh ids and
 /// `modified_at = now` on the item and every field; `created_at` is the source's `createdAt`
 /// (seconds, converted to millis) when present, else `now`. Unknown keys are ignored. Errors
-/// never contain item values.
+/// never contain item values. More than 100 000 active items, or more than 64 MiB of imported
+/// text, is [`ImportError::TooLarge`] (security review 2026-11-26 L-16).
 pub fn import_1pux(bytes: &[u8], device_id: Uuid, now: Millis) -> Result<Vec<Item>, ImportError> {
     use std::io::Read;
 
@@ -584,7 +696,7 @@ pub fn import_1pux(bytes: &[u8], device_id: Uuid, now: Millis) -> Result<Vec<Ite
         .map_err(|_| malformed("cannot read export.data"))?
         .size();
     if declared > MAX_EXPORT_DATA {
-        return Err(too_large("export.data is larger than 64 MiB"));
+        return Err(too_large("export.data is larger than 16 MiB"));
     }
     let file = zip
         .by_index(index)
@@ -594,13 +706,14 @@ pub fn import_1pux(bytes: &[u8], device_id: Uuid, now: Millis) -> Result<Vec<Ite
         .read_to_end(&mut data)
         .map_err(|_| malformed("cannot read export.data"))?;
     if data.len() as u64 > MAX_EXPORT_DATA {
-        return Err(too_large("export.data inflates past 64 MiB"));
+        return Err(too_large("export.data inflates past 16 MiB"));
     }
     // NOTE: the `serde_json::Value` tree cannot be zeroized on drop (same limitation as the CBOR
     // tree in format.rs); only the raw buffer and intermediate strings are wiped.
     let root: serde_json::Value =
         serde_json::from_slice(&data).map_err(|_| malformed("export.data is not valid JSON"))?;
 
+    let mut budget = ImportBudget::new(MAX_IMPORT_ITEMS, MAX_IMPORT_BYTES);
     let mut items = Vec::new();
     for account in arr_of(&root, "accounts") {
         for vault in arr_of(account, "vaults") {
@@ -608,7 +721,10 @@ pub fn import_1pux(bytes: &[u8], device_id: Uuid, now: Millis) -> Result<Vec<Ite
                 if str_of(src, "state") != "active" {
                     continue;
                 }
-                items.push(convert_1pux_item(src, device_id, now));
+                budget.reserve_item()?;
+                let item = convert_1pux_item(src, device_id, now);
+                budget.charge(&item)?;
+                items.push(item);
             }
         }
     }

@@ -15,8 +15,8 @@
 //! eight map levels a newer build could add one to: header, `header.kdf`, the opaque slot,
 //! a known (password) key slot, an item record (plaintext), an item's encrypted payload, a
 //! field, and the manifest record. It never carries `slots_modified_at` (v1.1 header merge):
-//! a build that writes that key only does so after a slot mutation, so an untouched fixture
-//! must stay byte-identical through unlock + serialize.
+//! the committed bytes are byte-identical through a structural parse + write, and a save by
+//! this build stamps the header with 1 (L-02, 2026-11-26) while keeping every unknown key.
 //!
 //! Item categories (`ItemPlain.kind`) were removed on 2026-10-30 without a version bump.
 //! Every fixture written before that still carries a `kind` entry per item; the reader keeps
@@ -1129,13 +1129,14 @@ fn future_item(vault: &UnlockedVault) -> &Item {
     item
 }
 
-fn assert_forward_header(locked: &LockedVault) {
+/// `stamp`: `None` for the committed bytes, `Some(1)` after a save by this build (L-02).
+fn assert_forward_header(locked: &LockedVault, stamp: Option<u64>) {
     check_kdf(locked);
     let header = locked.header();
     assert_eq!(header.extras, vec![header_extra()]);
     assert_eq!(header.kdf_extras, vec![kdf_extra()]);
-    assert_eq!(header.slots_modified_at, None, "untouched header: no stamp");
-    assert_eq!(header.slots_device_id, None);
+    assert_eq!(header.slots_modified_at, stamp);
+    assert_eq!(header.slots_device_id, stamp.map(|_| Uuid::nil()));
     assert_eq!(header.slots.len(), 2);
     assert_eq!(
         header.slots[0],
@@ -1160,7 +1161,7 @@ fn assert_forward_header(locked: &LockedVault) {
 #[test]
 fn v1_forward_unlocks_with_unknown_kinds_intact() {
     let locked = LockedVault::parse(FORWARD).unwrap();
-    assert_forward_header(&locked);
+    assert_forward_header(&locked, None);
     let vault = locked.unlock(&pw()).unwrap();
     future_item(&vault);
     assert_eq!(vault.items_including_deleted().count(), 1);
@@ -1188,11 +1189,11 @@ fn v1_forward_unknowns_survive_serialize_parse_roundtrip() {
     assert_forward_records(&file);
 
     let locked = LockedVault::parse(FORWARD).unwrap();
-    assert_forward_header(&locked);
+    assert_forward_header(&locked, None);
     let vault = locked.unlock(&pw()).unwrap();
     let again = vault.serialize();
     let relocked = LockedVault::parse(&again).unwrap();
-    assert_forward_header(&relocked);
+    assert_forward_header(&relocked, Some(1));
     assert_forward_records(&VaultFile::parse(&again).unwrap());
     let reopened = relocked.unlock(&pw()).unwrap();
     let a = future_item(&vault);
@@ -1339,23 +1340,28 @@ fn every_fixture_in_the_directory_opens() {
                 "{name}: legacy kind is text"
             );
         }
-        // Only `v1-stamped` (slot mutation) and `v1-icon` (created after stamp-at-create)
-        // carry the stamp. A save by this build must neither invent the v1.1 stamp (old bytes
-        // would change on every round trip) nor lose it.
+        // Only the post-removal fixtures carry the stamp. A save by this build keeps a
+        // committed stamp and gives a never-stamped header the stamp 1 by this device
+        // (`Uuid::nil()`: nothing set one) so the manifest binds it (L-02, 2026-11-26).
         let committed = (file.header.slots_modified_at, file.header.slots_device_id);
         assert_eq!(
             committed.0.is_some(),
             post_removal(name),
             "{name}: committed stamp"
         );
-        // Whatever it holds, it must survive a save by this build, extras included. A save
-        // never changes the prefix version (a v1 file stays v1; see `FORMAT_VERSION`).
+        // Extras survive a save by this build. A save never changes the prefix version (a v1
+        // file stays v1; see `FORMAT_VERSION`).
         let again = vault.serialize();
         let again_header = VaultFile::parse(&again).unwrap().header;
+        let expected = if committed.0.is_some() {
+            committed
+        } else {
+            (Some(1), Some(Uuid::nil()))
+        };
         assert_eq!(
             (again_header.slots_modified_at, again_header.slots_device_id),
-            committed,
-            "{name}: a plain save keeps slots_modified_at / slots_device_id as committed"
+            expected,
+            "{name}: a plain save keeps a committed stamp or stamps a legacy header with 1"
         );
         assert_eq!(
             again_header.format_version, named_version,

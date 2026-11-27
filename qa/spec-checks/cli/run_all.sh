@@ -10,6 +10,8 @@ T="$(mktemp -d "$TMPROOT/cli-XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 export MPW="tidy-Walrus-orbit-Velvet-42"
 export VAULT_FILE="$T/main.vault"
+# `init --kdf-test-params` is gated behind this since security review 2026-11-26 L-20.
+export VAULT_DEV_KDF=1
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "PASS $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "FAIL $1"; shift; for l in "$@"; do echo "     $l"; done; }

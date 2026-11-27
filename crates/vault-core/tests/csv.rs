@@ -74,8 +74,9 @@ fn export_then_import_round_trips() {
     assert!(note.fields.is_empty());
 }
 
-/// CSV injection: a cell that would be read as a formula by a spreadsheet is exported with a
-/// leading `'`, and `import_csv` strips exactly that quote again, so values round-trip.
+/// CSV injection: a non-secret cell that would be read as a formula by a spreadsheet is
+/// exported with a leading `'`, and `import_csv` strips exactly that quote again, so values
+/// round-trip. Password and TOTP cells are written and read verbatim (review L-17).
 #[test]
 fn formula_cells_are_neutralised_on_export_and_restored_on_import() {
     let mut evil = login("=HYPERLINK(\"http://evil.test\")", "+1 555 0100", "-secret");
@@ -101,7 +102,8 @@ fn formula_cells_are_neutralised_on_export_and_restored_on_import() {
     rows.sort();
     assert_eq!(rows.len(), 3);
     for row in &rows {
-        for cell in row {
+        // Columns 2 (password) and 5 (totp) are secrets and never guarded.
+        for (_, cell) in row.iter().enumerate().filter(|(i, _)| ![2, 5].contains(i)) {
             assert!(
                 !cell.starts_with(['=', '+', '-', '@', '\t', '\r']),
                 "cell {cell:?} would be read as a formula"
@@ -113,10 +115,10 @@ fn formula_cells_are_neutralised_on_export_and_restored_on_import() {
         [
             "'=HYPERLINK(\"http://evil.test\")",
             "'+1 555 0100",
-            "'-secret",
+            "-secret",
             "'@host",
             "'\tindented",
-            "'\rcr"
+            "\rcr"
         ]
     );
     assert_eq!(rows[0], ["'''=twice", "", "", "", "''", ""]);
@@ -138,15 +140,72 @@ fn formula_cells_are_neutralised_on_export_and_restored_on_import() {
     }
 
     // A foreign CSV that follows the same guidance: the quote is stripped only before a
-    // trigger character.
+    // trigger character, and never from a password.
     let foreign = b"title,username,password,url,notes,totp\n'=x,'y,'-z,,,\n'\t,'' ,''+,,,\n";
     let items = import_csv(foreign, &CsvMapping::default(), Uuid::nil(), 1).unwrap();
     assert_eq!(items[0].title, "=x");
     assert_eq!(get(&items[0], "username"), "'y");
-    assert_eq!(get(&items[0], "password"), "-z");
+    assert_eq!(get(&items[0], "password"), "'-z");
     assert_eq!(items[1].title, "\t");
     assert_eq!(get(&items[1], "username"), "'' ");
-    assert_eq!(get(&items[1], "password"), "'+");
+    assert_eq!(get(&items[1], "password"), "''+");
+}
+
+/// Review L-17: a password (or TOTP) starting with a formula trigger, or with a quote before
+/// one, leaves the export unaltered and comes back identical through our own import.
+#[test]
+fn secret_starting_with_a_trigger_round_trips_unaltered() {
+    let mut item = login("Site", "user", "=SUM(A1)");
+    item.fields
+        .push(field("totp", FieldKind::Totp, "-not-a-formula"));
+    let quoted = login("Quoted", "user", "'=pw");
+    let v = vault(vec![item, quoted]);
+    let out = export_csv(&v);
+    let text = std::str::from_utf8(&out.0).unwrap();
+    assert!(
+        text.contains(",=SUM(A1),") && !text.contains("'=SUM"),
+        "{text}"
+    );
+    assert!(
+        text.contains(",-not-a-formula") && text.contains(",'=pw,"),
+        "{text}"
+    );
+    let back = import_csv(&out.0, &CsvMapping::default(), Uuid::nil(), 1).unwrap();
+    let site = back.iter().find(|i| i.title == "Site").unwrap();
+    assert_eq!(get(site, "password"), "=SUM(A1)");
+    assert_eq!(get(site, "totp"), "-not-a-formula");
+    let quoted = back.iter().find(|i| i.title == "Quoted").unwrap();
+    assert_eq!(get(quoted, "password"), "'=pw");
+}
+
+/// Review L-17: the guard still applies to the non-secret columns.
+#[test]
+fn title_starting_with_a_trigger_is_still_guarded() {
+    let v = vault(vec![login("=cmd|' /C calc'!A0", "@user", "pw")]);
+    let out = export_csv(&v);
+    let mut rdr = csv::Reader::from_reader(out.0.as_slice());
+    let row = rdr.records().next().unwrap().unwrap();
+    assert_eq!(&row[0], "'=cmd|' /C calc'!A0");
+    assert_eq!(&row[1], "'@user");
+    let back = import_csv(&out.0, &CsvMapping::default(), Uuid::nil(), 1).unwrap();
+    assert_eq!(back[0].title, "=cmd|' /C calc'!A0");
+    assert_eq!(get(&back[0], "username"), "@user");
+}
+
+/// Review L-16: more than 100 000 rows is refused while importing, with the bound named.
+#[test]
+fn csv_row_count_is_capped() {
+    let mut csv = b"title,username,password,url,notes,totp\n".to_vec();
+    csv.extend(b"a\n".repeat(100_001));
+    let err = import_csv(&csv, &CsvMapping::default(), Uuid::nil(), 1).unwrap_err();
+    assert!(
+        matches!(&err, ImportError::TooLarge(m) if m == "import holds more than 100000 items"),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "import too large: import holds more than 100000 items"
+    );
 }
 
 #[test]

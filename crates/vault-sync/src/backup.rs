@@ -5,15 +5,27 @@
 //! `-3`, ... before `.vault.bin`. Conflict absorptions (03 §6) move the whole conflicted
 //! package into the same directory as `conflict-<timestamp>-<original name>/`; they are listed
 //! but never rotated. Any other entry there is ignored and never deleted.
+//!
+//! Names are not trusted (security review 2026-11-26, L-04): a listed file counts as one of
+//! ours only after its fixed-size prefix and plaintext header read as a vault with this vault's
+//! id ([`BackupInfo::validated`]). Only validated snapshots take a retention slot or satisfy
+//! the hourly rule; unvalidated ones are listed after every validated entry and never deleted.
 
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use vault_core::Uuid;
+use vault_core::format::{FORMAT_VERSION, Header, MAGIC, MIN_FORMAT_VERSION, PREFIX_LEN};
+
 use crate::atomic::{Mode, rename_no_replace, write_atomic_stat};
+use crate::attachments::MAX_DIR_ENTRIES;
+use crate::cloud::CloudHooks;
 use crate::error::SyncError;
 use crate::package::{self, backups_dir, ensure_dir, file_name, vault_name};
 
@@ -34,6 +46,15 @@ const STAMP_LEN: usize = 20;
 const CONFLICT_PREFIX: &str = "conflict-";
 /// Extension of a snapshot file (a copy of the package's `vault.bin`).
 const SNAPSHOT_EXT: &str = ".vault.bin";
+/// Most snapshots the hourly check validates per save before it takes a snapshot anyway.
+const NEWEST_PROBES: usize = 64;
+/// Longest plaintext header the validation reads. Measured 2026-11-27: 324 bytes with one
+/// password slot, about 140 more per slot, so this allows over 100 slots.
+const MAX_HEADER_LEN: usize = 16 * 1024;
+/// Bytes one retention pass may read to fully authenticate bucket winners: the cost of eight
+/// authentications at the 64 MiB read cap. Results are cached, so later passes only pay for
+/// new or changed files.
+const AUTH_BUDGET: u64 = 8 * crate::synced::MAX_VAULT_FILE_SIZE;
 
 /// One entry in the backups directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +69,14 @@ pub struct BackupInfo {
     /// Orders files that share a `taken_at` second: the `-N` file-name suffix for snapshots
     /// (1 when absent), 0 for conflict copies (03 §6).
     pub seq: u32,
+    /// Parsed from the file name, like `taken_at`.
     pub kind: BackupKind,
+    /// The file (a conflict package's `vault.bin`) starts with a vault header of a supported
+    /// version carrying this vault's id (L-04). `false` for anything else, and for an evicted
+    /// (cloud-only) file, which is not downloaded to be checked. Such an
+    /// entry is shown as unknown, never deleted by retention, never counted as a snapshot.
+    /// This checks provenance, not age: an authentic older copy under a newer name passes.
+    pub validated: bool,
 }
 
 /// What a file in the backups directory holds.
@@ -71,8 +99,9 @@ impl BackupInfo {
         self.kind == BackupKind::Conflict
     }
 
-    fn order_key(&self) -> Reverse<(SystemTime, u32)> {
-        Reverse((self.taken_at, self.seq))
+    /// Validated entries first, then newest first.
+    fn order_key(&self) -> Reverse<(bool, SystemTime, u32)> {
+        Reverse((self.validated, self.taken_at, self.seq))
     }
 }
 
@@ -256,77 +285,332 @@ fn parse_seq(t: SystemTime, tail: &str) -> Option<(SystemTime, u32)> {
 /// buckets only its own files. The newest snapshot is always kept. Future-dated files count
 /// as age zero.
 ///
-/// Only [`BackupKind::Snapshot`] files rotate. [`BackupKind::Unsaved`] files (possibly the only
-/// copy of edits that could not be saved) and [`BackupKind::Conflict`] copies (03 §6: never
-/// delete a conflict copy) are always kept; they are user-managed, with no automatic pruning
-/// or cap.
+/// Only validated [`BackupKind::Snapshot`] files rotate. [`BackupKind::Unsaved`] files
+/// (possibly the only copy of edits that could not be saved) and [`BackupKind::Conflict`]
+/// copies (03 §6: never delete a conflict copy) are always kept; they are user-managed, with
+/// no automatic pruning or cap. Unvalidated files are kept too and take no slot, so a planted
+/// name can never displace a validated snapshot (L-04).
 pub fn retain(
     infos: &[BackupInfo],
     now: SystemTime,
     multiplier: f32,
 ) -> (Vec<BackupInfo>, Vec<BackupInfo>) {
-    let m = f64::from(clamp_multiplier(multiplier));
-    let recent = DAY as f64 * m;
-    let daily = 30.0 * DAY as f64 * m;
-    let weekly = 12.0 * WEEK as f64 * m;
-    let month_cap = (36.0 * m).round() as usize;
-
     let mut sorted: Vec<&BackupInfo> = infos.iter().collect();
     sorted.sort_by_key(|a| a.order_key());
-
-    let (mut days, mut weeks, mut months) = (HashSet::new(), HashSet::new(), HashSet::new());
-    let (mut keep, mut delete) = (Vec::new(), Vec::new());
     let (user_managed, snapshots): (Vec<&BackupInfo>, Vec<&BackupInfo>) = sorted
         .into_iter()
-        .partition(|i| i.kind != BackupKind::Snapshot);
-    keep.extend(user_managed.into_iter().cloned());
-    for (i, info) in snapshots.into_iter().enumerate() {
-        let age = now
-            .duration_since(info.taken_at)
-            .map_or(0.0, |d| d.as_secs_f64());
-        let day = unix_secs(info.taken_at).div_euclid(DAY as i64);
-        let tier_keeps = if age < recent {
-            true
-        } else if age < daily {
-            days.insert(day)
-        } else if age < weekly {
-            // 1970-01-01 was a Thursday; +3 makes buckets start on Monday.
-            weeks.insert((day + 3).div_euclid(7))
-        } else {
-            let (y, mo, _) = civil_from_days(day);
-            let month = y * 12 + i64::from(mo);
-            !months.contains(&month) && months.len() < month_cap && months.insert(month)
-        };
-        if i == 0 || tier_keeps {
-            keep.push(info.clone());
-        } else {
-            delete.push(info.clone());
+        .partition(|i| i.kind != BackupKind::Snapshot || !i.validated);
+    let mut keep: Vec<BackupInfo> = user_managed.into_iter().cloned().collect();
+    let mut delete = Vec::new();
+    for (info, fate) in snapshots.iter().zip(decide(&snapshots, now, multiplier)) {
+        match fate {
+            Fate::Keep => keep.push((*info).clone()),
+            Fate::Delete(_) => delete.push((*info).clone()),
         }
     }
     keep.sort_by_key(BackupInfo::order_key);
     (keep, delete)
 }
 
+/// [`retain`]'s decision for one validated snapshot.
+enum Fate {
+    Keep,
+    /// Deleted because the snapshots at these indices hold its bucket (one) or the monthly cap
+    /// (all monthly keepers).
+    Delete(Vec<usize>),
+}
+
+/// Claim `bucket` for snapshot `i`, or lose to its holder.
+fn take(map: &mut HashMap<i64, usize>, bucket: i64, i: usize) -> Fate {
+    match map.get(&bucket) {
+        Some(&w) => Fate::Delete(vec![w]),
+        None => {
+            map.insert(bucket, i);
+            Fate::Keep
+        }
+    }
+}
+
+/// The 03 §4 tiers over `snapshots` (validated `Snapshot`s, sorted by [`BackupInfo::order_key`]).
+fn decide(snapshots: &[&BackupInfo], now: SystemTime, multiplier: f32) -> Vec<Fate> {
+    let m = f64::from(clamp_multiplier(multiplier));
+    let recent = DAY as f64 * m;
+    let daily = 30.0 * DAY as f64 * m;
+    let weekly = 12.0 * WEEK as f64 * m;
+    let month_cap = (36.0 * m).round() as usize;
+    // Bucket -> index of the snapshot holding it.
+    let (mut days, mut weeks, mut months) = (HashMap::new(), HashMap::new(), HashMap::new());
+    let mut fates = Vec::with_capacity(snapshots.len());
+    for (i, info) in snapshots.iter().enumerate() {
+        let age = now
+            .duration_since(info.taken_at)
+            .map_or(0.0, |d| d.as_secs_f64());
+        let day = unix_secs(info.taken_at).div_euclid(DAY as i64);
+        let fate = if age < recent {
+            Fate::Keep
+        } else if age < daily {
+            take(&mut days, day, i)
+        } else if age < weekly {
+            // 1970-01-01 was a Thursday; +3 makes buckets start on Monday.
+            take(&mut weeks, (day + 3).div_euclid(7), i)
+        } else {
+            let (y, mo, _) = civil_from_days(day);
+            let month = y * 12 + i64::from(mo);
+            if !months.contains_key(&month) && months.len() >= month_cap {
+                Fate::Delete(months.values().copied().collect())
+            } else {
+                take(&mut months, month, i)
+            }
+        };
+        // The newest snapshot is always kept.
+        fates.push(if i == 0 { Fate::Keep } else { fate });
+    }
+    fates
+}
+
 // ---------------------------------------------------------------------------------------------
 // Files
 
-/// Every snapshot and conflict package of the vault package at `package`, newest first. A
-/// missing backups directory is an empty list; a symlinked one is
+/// Identity of a checked file: any change of length, mtime, ctime or inode re-checks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    dev: u64,
+    ino: u64,
+}
+
+impl FileStamp {
+    fn of(path: &Path) -> Option<Self> {
+        let m = fs::symlink_metadata(path).ok()?;
+        m.is_file().then(|| Self {
+            len: m.len(),
+            mtime: (m.mtime(), m.mtime_nsec()),
+            ctime: (m.ctime(), m.ctime_nsec()),
+            dev: m.dev(),
+            ino: m.ino(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Failed the header check.
+    Unknown,
+    /// The header is a supported vault header with our id; not authenticated (yet).
+    Header,
+    /// Header check passed and every record authenticated under the current vault key.
+    Authentic,
+    /// Header check passed but full authentication under the current key failed: a forged
+    /// body, or a snapshot sealed under a since-rotated key. Still listed as validated; never
+    /// trusted to displace another snapshot.
+    NotAuthentic,
+}
+
+/// Per-session memo of backup checks (L-04/L-06), keyed by the checked file's path and
+/// [`FileStamp`]: a listing or retention pass re-reads only new or changed files. Pruned to
+/// the entries of the latest full listing, so bounded by the directory cap.
+#[derive(Debug, Default)]
+pub(crate) struct Checks {
+    seen: HashMap<PathBuf, (FileStamp, Verdict)>,
+    /// Header reads and full authentications done so far (test observability).
+    pub(crate) header_reads: usize,
+    pub(crate) authentications: usize,
+}
+
+/// Full authentication of a backup's bytes under the unlocked vault key.
+pub(crate) type Authenticate<'a> = &'a dyn Fn(&[u8]) -> bool;
+
+/// What a backup must be to count as one of ours (L-04): a vault with this id, read only if
+/// it is local.
+pub(crate) struct Expect<'a> {
+    pub vault_id: Uuid,
+    pub hooks: &'a dyn CloudHooks,
+    pub checks: &'a Mutex<Checks>,
+    /// Full authentication of a file's bytes under the unlocked vault key; `None` while
+    /// locked, when retention deletes nothing.
+    pub authenticate: Option<Authenticate<'a>>,
+}
+
+/// The file a check reads: a conflict package's `vault.bin`, else the entry itself.
+fn checked_path(info: &BackupInfo) -> PathBuf {
+    match info.kind {
+        BackupKind::Conflict => package::vault_file(&info.path),
+        _ => info.path.clone(),
+    }
+}
+
+impl Expect<'_> {
+    fn checks(&self) -> std::sync::MutexGuard<'_, Checks> {
+        self.checks.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The cached verdict for `path` if its stamp is unchanged, and the current stamp.
+    /// `None` stamp: not a local regular file.
+    fn cached(&self, path: &Path) -> (Option<FileStamp>, Option<Verdict>) {
+        if self.hooks.is_evicted(path) {
+            return (None, None);
+        }
+        let stamp = FileStamp::of(path);
+        let verdict = stamp.and_then(|st| {
+            self.checks()
+                .seen
+                .get(path)
+                .and_then(|(s, v)| (*s == st).then_some(*v))
+        });
+        (stamp, verdict)
+    }
+
+    fn record(&self, path: PathBuf, stamp: FileStamp, verdict: Verdict) {
+        self.checks().seen.insert(path, (stamp, verdict));
+    }
+
+    /// Whether `info` passes the header check (cached): its 10-byte prefix and plaintext
+    /// header read as a supported vault with our id. No decryption, no download.
+    fn admits(&self, info: &BackupInfo) -> bool {
+        let path = checked_path(info);
+        let (Some(stamp), cached) = self.cached(&path) else {
+            return false;
+        };
+        if let Some(v) = cached {
+            return v != Verdict::Unknown;
+        }
+        self.checks().header_reads += 1;
+        let ok = header_matches(&path, self.vault_id);
+        self.record(
+            path,
+            stamp,
+            if ok {
+                Verdict::Header
+            } else {
+                Verdict::Unknown
+            },
+        );
+        ok
+    }
+
+    /// Fully authenticate `info` (cached). `None` when it cannot be done now: locked, or the
+    /// pass's byte `budget` would be exceeded.
+    fn authentic(&self, info: &BackupInfo, budget: &mut u64) -> Option<bool> {
+        let path = checked_path(info);
+        let (Some(stamp), cached) = self.cached(&path) else {
+            return Some(false);
+        };
+        match cached {
+            Some(Verdict::Authentic) => return Some(true),
+            Some(Verdict::Unknown | Verdict::NotAuthentic) => return Some(false),
+            _ => {}
+        }
+        let auth = self.authenticate?;
+        *budget = budget.checked_sub(stamp.len)?;
+        self.checks().authentications += 1;
+        let ok = crate::synced::read_package_entry_capped(&path).is_ok_and(|b| auth(&b))
+            && FileStamp::of(&path) == Some(stamp);
+        let verdict = if ok {
+            Verdict::Authentic
+        } else {
+            Verdict::NotAuthentic
+        };
+        self.record(path, stamp, verdict);
+        Some(ok)
+    }
+}
+
+/// The prefix and header of the file at `path` name a supported version and `vault_id`.
+fn header_matches(path: &Path, vault_id: Uuid) -> bool {
+    let Ok(mut file) = package::open_regular(path) else {
+        return false;
+    };
+    let mut prefix = [0u8; PREFIX_LEN];
+    if file.read_exact(&mut prefix).is_err() || prefix[..MAGIC.len()] != MAGIC {
+        return false;
+    }
+    let version = u16::from_be_bytes([prefix[4], prefix[5]]);
+    let len = u32::from_be_bytes([prefix[6], prefix[7], prefix[8], prefix[9]]) as usize;
+    if !(MIN_FORMAT_VERSION..=FORMAT_VERSION).contains(&version) || len > MAX_HEADER_LEN {
+        return false;
+    }
+    let mut header = vec![0u8; len];
+    file.read_exact(&mut header).is_ok()
+        && Header::from_bytes(&header, version).is_ok_and(|h| h.vault_id == vault_id)
+}
+
+/// Every snapshot and conflict package of the vault package at `package`: validated entries
+/// newest first, then the unvalidated ones newest first. Checks every listed entry, or with
+/// `snapshots_only` only `Snapshot` names (the rest stay unvalidated; retention never deletes
+/// them anyway). A missing backups directory is an empty list; a symlinked one is
 /// [`SyncError::UnsafePackageDir`].
-pub(crate) fn list_backups(package: &Path) -> Result<Vec<BackupInfo>, SyncError> {
+pub(crate) fn list_backups(
+    package: &Path,
+    expect: &Expect,
+    snapshots_only: bool,
+) -> Result<Vec<BackupInfo>, SyncError> {
+    list_checked(package, expect, snapshots_only).map(|(list, _)| list)
+}
+
+/// [`list_backups`], and whether the directory listing was truncated at the cap.
+fn list_checked(
+    package: &Path,
+    expect: &Expect,
+    snapshots_only: bool,
+) -> Result<(Vec<BackupInfo>, bool), SyncError> {
+    let (mut out, truncated) = scan(package)?;
+    if truncated && snapshots_only {
+        // Retention skips a truncated listing; reading headers for it would be wasted.
+        return Ok((out, true));
+    }
+    let listed: HashSet<PathBuf> = out.iter().map(checked_path).collect();
+    expect.checks().seen.retain(|p, _| listed.contains(p));
+    for info in &mut out {
+        if !snapshots_only || info.kind == BackupKind::Snapshot {
+            info.validated = expect.admits(info);
+        }
+    }
+    out.sort_by_key(BackupInfo::order_key);
+    Ok((out, truncated))
+}
+
+/// `taken_at` of the newest validated snapshot not dated after `now` (03 §4 hourly rule).
+/// Checks at most [`NEWEST_PROBES`] candidates, newest by name first; `None` past that, so
+/// planted names cost a bounded number of reads and at worst cause one extra snapshot.
+pub(crate) fn newest_snapshot(
+    package: &Path,
+    expect: &Expect,
+    now: SystemTime,
+) -> Result<Option<SystemTime>, SyncError> {
+    Ok(scan(package)?
+        .0
+        .iter()
+        // Only past snapshots: a future-dated name from a skewed clock must not shadow the real
+        // newest. Conflict and unsaved copies are not backups of the disk.
+        .filter(|b| b.kind == BackupKind::Snapshot && b.taken_at <= now)
+        .take(NEWEST_PROBES)
+        .find(|b| expect.admits(b))
+        .map(|b| b.taken_at))
+}
+
+/// The managed names in `backups/`, all unvalidated, newest first, and whether the directory
+/// held more than the [`MAX_DIR_ENTRIES`] entries read (L-06).
+fn scan(package: &Path) -> Result<(Vec<BackupInfo>, bool), SyncError> {
     let dir = backups_dir(package);
     let name = vault_name(package);
     // Never list (and so never let retention delete in) a symlinked `backups/`.
     if !package::check_dir(&dir)? {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((Vec::new(), false)),
         Err(e) => return Err(SyncError::io(&dir, e)),
     };
     let mut out = Vec::new();
-    for entry in entries {
+    let mut truncated = false;
+    for (i, entry) in entries.enumerate() {
+        if i == MAX_DIR_ENTRIES {
+            truncated = true;
+            break;
+        }
         let entry = entry.map_err(|e| SyncError::io(&dir, e))?;
         let file = entry.file_name();
         let Some(file) = file.to_str() else { continue };
@@ -360,10 +644,11 @@ pub(crate) fn list_backups(package: &Path) -> Result<Vec<BackupInfo>, SyncError>
             size,
             seq,
             kind,
+            validated: false,
         });
     }
     out.sort_by_key(BackupInfo::order_key);
-    Ok(out)
+    Ok((out, truncated))
 }
 
 /// Atomically write `bytes` as a new snapshot taken at `now`; never overwrites an existing
@@ -399,21 +684,53 @@ pub(crate) fn write_snapshot(
 
 /// Run [`retain`] over the backups directory and delete what it rejects, except `protect`
 /// (the snapshot just written). Individual delete failures are logged and skipped.
+///
+/// Buckets are chosen on the header check ([`BackupInfo::validated`]), but a snapshot is
+/// deleted only once every snapshot that displaces it (its bucket's holder, or for the monthly
+/// cap every monthly keeper) is fully authenticated under the current vault key (L-04: a
+/// header copied onto garbage passes the header check). Otherwise it is kept: when a holder
+/// fails (a forged body, or a snapshot sealed under a since-rotated key), when the pass has
+/// read [`AUTH_BUDGET`] bytes, or while locked. Nothing about the listing changes.
 pub(crate) fn apply_retention(
     package: &Path,
+    expect: &Expect,
     now: SystemTime,
     multiplier: f32,
     protect: &Path,
 ) -> Result<usize, SyncError> {
-    let infos = list_backups(package)?;
-    let (_, delete) = retain(&infos, now, multiplier);
+    let (infos, truncated) = list_checked(package, expect, true)?;
+    // A partial listing could hide the snapshot that should hold a bucket: delete nothing.
+    if truncated {
+        tracing::warn!(
+            cap = MAX_DIR_ENTRIES,
+            "backups folder holds more entries than one pass reads; retention skipped"
+        );
+        return Ok(0);
+    }
+    let mut snaps: Vec<&BackupInfo> = infos
+        .iter()
+        .filter(|i| i.kind == BackupKind::Snapshot && i.validated)
+        .collect();
+    snaps.sort_by_key(|a| a.order_key());
+    let mut budget = AUTH_BUDGET;
     let mut deleted = 0;
-    for info in delete.iter().filter(|i| i.path != protect) {
-        match fs::remove_file(&info.path) {
+    for (i, fate) in decide(&snaps, now, multiplier).into_iter().enumerate() {
+        let Fate::Delete(holders) = fate else {
+            continue;
+        };
+        let path = &snaps[i].path;
+        if path == protect
+            || !holders
+                .iter()
+                .all(|&w| expect.authentic(snaps[w], &mut budget) == Some(true))
+        {
+            continue;
+        }
+        match fs::remove_file(path) {
             Ok(()) => deleted += 1,
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => {
-                tracing::warn!(path = %info.path.display(), error = %e, "could not delete old backup");
+                tracing::warn!(path = %path.display(), error = %e, "could not delete old backup");
             }
         }
     }
@@ -720,6 +1037,7 @@ mod tests {
             size: 1,
             seq,
             kind,
+            validated: true,
         }
     }
 
@@ -859,6 +1177,32 @@ mod tests {
         assert_eq!(keep, vec![b]);
         assert_eq!(delete, vec![a]);
         assert!(retain(&[], at(NOW), 1.0).0.is_empty());
+    }
+
+    #[test]
+    fn unvalidated_files_take_no_slot_and_are_never_deleted() {
+        // A genuine snapshot loses its month to a newer one only if that one is validated.
+        let genuine = info(200 * D, BackupKind::Snapshot);
+        let mut planted = info(195 * D, BackupKind::Snapshot);
+        planted.validated = false;
+        let mut planted_newest = info(0, BackupKind::Snapshot);
+        planted_newest.validated = false;
+        let recent = info(H, BackupKind::Snapshot);
+        let all = [
+            genuine.clone(),
+            planted.clone(),
+            planted_newest.clone(),
+            recent.clone(),
+        ];
+        let (keep, delete) = retain(&all, at(NOW), 1.0);
+        assert!(delete.is_empty());
+        // Validated first, then unvalidated newest first.
+        assert_eq!(keep, vec![recent, genuine.clone(), planted_newest, planted]);
+        // Validated against validated, the newer still wins as before.
+        let mut newer = info(195 * D, BackupKind::Snapshot);
+        newer.path.set_file_name("test-newer.vault.bin");
+        let (_, delete) = retain(&[genuine.clone(), newer], at(NOW), 1.0);
+        assert_eq!(delete, vec![genuine]);
     }
 
     #[test]

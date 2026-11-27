@@ -16,6 +16,7 @@ fn vault(file: &Path, pw: &str, args: &[&str]) -> Output {
         .args(args)
         .env("VAULT_TEST_PW", pw)
         .env("VAULT_ITEM_PASSWORD", "s3cret-item-pw")
+        .env("VAULT_DEV_KDF", "1")
         .env("VAULT_DEVICE_ID", "11111111-1111-4111-8111-111111111111")
         .output()
         .unwrap()
@@ -205,6 +206,7 @@ fn unparsable_device_id_errors() {
         ])
         .env("VAULT_TEST_PW", PW)
         .env("VAULT_DEVICE_ID", "not-a-uuid")
+        .env("VAULT_DEV_KDF", "1")
         .output()
         .unwrap();
     assert!(!o.status.success());
@@ -871,6 +873,7 @@ fn vault_dev(file: &Path, device: &str, args: &[&str]) -> Output {
         .args(args)
         .env("VAULT_TEST_PW", PW)
         .env("VAULT_DEVICE_ID", device)
+        .env("VAULT_DEV_KDF", "1")
         .output()
         .unwrap()
 }
@@ -1169,11 +1172,13 @@ fn add_warns_when_backup_fails() {
     assert!(ok(&vault(&f, PW, &["list"])).contains("Linked"));
 }
 
+/// Also the L-20 "no warning on a calibrated vault" case: the vault is created without
+/// `--kdf-test-params`, so its costs are at or above the recommended floor.
 #[test]
 fn add_without_problems_is_silent_on_stderr() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("a.vault");
-    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    ok(&vault(&f, PW, &["init"]));
     let o = vault(&f, PW, &["add", "--title", "Plain"]);
     ok(&o);
     assert!(
@@ -1252,4 +1257,60 @@ fn notes_cannot_forge_labelled_lines() {
             "{out}"
         );
     }
+}
+
+/// Security review 2026-11-26 L-20: `--kdf-test-params` is not in the help text.
+#[test]
+fn kdf_test_params_is_hidden_from_help() {
+    let o = Command::new(env!("CARGO_BIN_EXE_vault"))
+        .args(["init", "--help"])
+        .output()
+        .unwrap();
+    let help = ok(&o);
+    assert!(help.contains("--allow-weak"), "{help}");
+    assert!(!help.contains("kdf-test-params"), "{help}");
+}
+
+/// L-20: without `VAULT_DEV_KDF=1` the flag is refused, the error names the variable, and no
+/// vault is created.
+#[test]
+fn kdf_test_params_requires_the_dev_variable() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.vault");
+    for value in [None, Some("0")] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_vault"));
+        cmd.args([
+            "--vault",
+            f.to_str().unwrap(),
+            "--password-env",
+            "VAULT_TEST_PW",
+        ])
+        .args(["init", "--kdf-test-params"])
+        .env("VAULT_TEST_PW", PW)
+        .env("VAULT_DEVICE_ID", "11111111-1111-4111-8111-111111111111")
+        .env_remove("VAULT_DEV_KDF");
+        if let Some(v) = value {
+            cmd.env("VAULT_DEV_KDF", v);
+        }
+        let o = cmd.output().unwrap();
+        assert!(!o.status.success());
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains("VAULT_DEV_KDF=1"), "{err}");
+        assert!(!f.exists());
+    }
+}
+
+/// L-20: opening a vault whose KDF costs are under the recommended floor prints one warning
+/// line on stderr; the command still succeeds.
+#[test]
+fn weak_kdf_vault_warns_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.vault");
+    let init = vault(&f, PW, &["init", "--kdf-test-params"]);
+    ok(&init);
+    let o = vault(&f, PW, &["list"]);
+    ok(&o);
+    let err = String::from_utf8_lossy(&o.stderr);
+    let warning = "warning: this vault's encryption settings are below the recommended minimum; re-create it or change the master password on a current build";
+    assert_eq!(err.lines().filter(|l| *l == warning).count(), 1, "{err}");
 }

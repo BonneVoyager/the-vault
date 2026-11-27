@@ -221,9 +221,20 @@ fn canonical_cbor_item_plain() {
 
 #[test]
 fn unknown_keys_survive_roundtrip() {
-    // The file-layer splices below edit the header by hand, which only an unstamped (v1.0)
-    // header tolerates: a fresh vault is stamped and digest-bound into the manifest (01 §4).
-    let mut v = unstamped_vault();
+    // The header-level splices (kdf map, slot) go into the unstamped fixture bytes before the
+    // unlock: every saved header is digest-bound into the manifest (01 §4; L-02), and only
+    // the plaintext record and manifest extras can still be added at the file layer after.
+    let spliced = rewrite(unstamped_bytes(), |f| {
+        f.header
+            .kdf_extras
+            .push((Value::Text("x_kdf".into()), Value::Integer(1.into())));
+        f.header.slots[0]
+            .as_key_mut()
+            .unwrap()
+            .extras
+            .push((Value::Text("x_slot".into()), Value::Integer(2.into())));
+    });
+    let mut v = unlock(&spliced).unwrap();
     let mut item = sample_item(1, 10);
     item.extras
         .push((Value::Text("x_future".into()), Value::Integer(7.into())));
@@ -250,16 +261,8 @@ fn unknown_keys_survive_roundtrip() {
     ));
     let bytes = v.serialize();
 
-    // Add unknown keys at the file layer too: kdf map, slot, item record, manifest record.
+    // Add unknown keys at the file layer too: item record, manifest record.
     let bytes = rewrite(&bytes, |f| {
-        f.header
-            .kdf_extras
-            .push((Value::Text("x_kdf".into()), Value::Integer(1.into())));
-        f.header.slots[0]
-            .as_key_mut()
-            .unwrap()
-            .extras
-            .push((Value::Text("x_slot".into()), Value::Integer(2.into())));
         f.items[0]
             .extras
             .push((Value::Text("x_rec".into()), Value::Integer(3.into())));

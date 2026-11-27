@@ -146,6 +146,10 @@ pub struct SyncedVault {
     /// The primary is a newer format or another vault; `save` refuses until a valid file of
     /// this vault is seen again.
     save_blocked: Option<SaveBlocked>,
+    /// Opened through a key slot (Touch ID) over a never-stamped header: saves are refused
+    /// with [`SaveBlocked::PasswordUnlockRequired`] until an unlock with the password (L-02).
+    /// Kept apart from `save_blocked`, which a valid primary clears.
+    needs_password_unlock: bool,
     /// The last `locked` that was verified (opened, or written by us), kept while `locked`
     /// holds a version not yet verified (changed while locked, or after a key mismatch). If
     /// that version turns out tampered, unlock falls back to this one.
@@ -179,6 +183,14 @@ pub struct SyncedVault {
     /// Added to the clock by orphan cleanup. Always zero unless the `test-support` feature is
     /// on (file ages count from ctime, which tests cannot set back).
     prune_clock_offset: Duration,
+    /// Referenced blob ids (with sealed lengths), wall-clock time and test clock offset of the
+    /// last orphan-cleanup pass. A save runs the pass only when its references or the offset differ
+    /// or [`attachments::ORPHAN_GRACE`] has passed since (L-06). Reset on every unlock.
+    ///
+    /// [`attachments::ORPHAN_GRACE`]: crate::attachments::ORPHAN_GRACE
+    orphan_pass: Option<(HashMap<Uuid, u64>, SystemTime, Duration)>,
+    /// Backup header and authentication results for this session (L-04/L-06).
+    backup_checks: Mutex<backup::Checks>,
     /// App policy run on the in-memory vault right before it is serialised for a write.
     before_write: Option<BeforeWrite>,
 }
@@ -240,6 +252,7 @@ impl SyncedVault {
             snapshot_retry: false,
             key_mismatch: false,
             save_blocked: None,
+            needs_password_unlock: false,
             locked_fallback: None,
             sibling_reports: HashMap::new(),
             waiting_for_blobs: HashMap::new(),
@@ -247,6 +260,8 @@ impl SyncedVault {
             primary_missing: false,
             primary_seen: None,
             prune_clock_offset: Duration::ZERO,
+            orphan_pass: None,
+            backup_checks: Mutex::default(),
             before_write: None,
         };
         let written = match this.write(&bytes, Mode::NoReplace) {
@@ -346,6 +361,7 @@ impl SyncedVault {
             snapshot_retry: false,
             key_mismatch: false,
             save_blocked: None,
+            needs_password_unlock: false,
             locked_fallback: None,
             sibling_reports: HashMap::new(),
             waiting_for_blobs: HashMap::new(),
@@ -353,6 +369,8 @@ impl SyncedVault {
             primary_missing: false,
             primary_seen: None,
             prune_clock_offset: Duration::ZERO,
+            orphan_pass: None,
+            backup_checks: Mutex::default(),
             before_write: None,
         })
     }
@@ -398,6 +416,9 @@ impl SyncedVault {
         if self.unlocked.is_some() {
             if !self.key_mismatch {
                 open(&self.locked)?;
+                if password_path {
+                    self.needs_password_unlock = false;
+                }
                 return Ok(());
             }
             if !password_path {
@@ -451,7 +472,17 @@ impl SyncedVault {
             Err(e) => return Err(e.into()),
         };
         self.locked_fallback = None;
+        // L-02: a never-stamped header opened without the password must not be stamped (and
+        // so bound) by an autosave; the password path verifies it (and its save stamps it).
+        let unstamped = vault.header().slots_modified_at.is_none();
+        self.needs_password_unlock = !password_path && unstamped;
         self.install(vault);
+        if self.needs_password_unlock {
+            tracing::warn!(
+                "unstamped vault opened with a key slot; saving needs one password unlock"
+            );
+            self.emit(SyncEvent::SaveBlocked(SaveBlocked::PasswordUnlockRequired));
+        }
         // Stale tmp cleanup runs only while unlocked (03 §1.1 "never while locked").
         self.prune_stale_tmp(SystemTime::now() + self.prune_clock_offset);
         self.after_unlock();
@@ -471,8 +502,9 @@ impl SyncedVault {
             && !self.dirty
             && !self.key_mismatch
             && self.save_blocked.is_none()
+            && !self.needs_password_unlock
         {
-            self.prune_orphan_attachments();
+            self.orphan_cleanup(true);
         } else if changed_since_verified {
             tracing::info!("vault file changed while locked; skipping orphan cleanup this unlock");
         }
@@ -487,6 +519,7 @@ impl SyncedVault {
         self.dirty = false;
         self.dirty_from_corrupt = false;
         self.key_mismatch = false;
+        self.orphan_pass = None;
     }
 
     /// Drop the unlocked vault (zeroizing its keys and items). The app is expected to `save`
@@ -595,7 +628,7 @@ impl SyncedVault {
     /// nonces. Any failure to read or open it counts as "not covered", and so does an evicted
     /// (cloud-only) file: `lock` must not block on a download, so it writes a new one.
     fn newest_unsaved_covering(&self, vault: &UnlockedVault) -> Option<PathBuf> {
-        let list = backup::list_backups(&self.path).ok()?;
+        let list = backup::list_backups(&self.path, &self.expect(None), false).ok()?;
         let newest = list.into_iter().find(|b| b.kind == BackupKind::Unsaved)?;
         if self.hooks.is_evicted(&newest.path) {
             return None;
@@ -693,6 +726,11 @@ impl SyncedVault {
         if !self.dirty {
             return Ok(());
         }
+        if self.needs_password_unlock {
+            let blocked = SaveBlocked::PasswordUnlockRequired;
+            self.emit(SyncEvent::SaveBlocked(blocked));
+            return Err(SyncError::SaveBlocked(blocked));
+        }
         // After the pre-write merge, so the hook also sees what a peer's file brought in.
         self.run_before_write();
         let vault = self.unlocked.as_ref().ok_or(SyncError::Locked)?;
@@ -727,9 +765,69 @@ impl SyncedVault {
         self.dirty_from_corrupt = false;
         let first = std::mem::take(&mut self.first_save_after_unlock);
         self.maybe_backup(&bytes, item_count, first);
-        self.prune_orphan_attachments();
+        self.orphan_cleanup(false);
         self.prune_stale_tmp(SystemTime::now() + self.prune_clock_offset);
         Ok(())
+    }
+
+    /// Orphan cleanup ([`SyncedVault::prune_orphan_attachments`]), skipped unless `force`, the
+    /// set of referenced blobs (or the test clock offset) changed since the last pass, or that
+    /// pass is older than
+    /// [`ORPHAN_GRACE`](crate::attachments::ORPHAN_GRACE) (L-06: a save that changed no
+    /// attachment does not walk `attachments/`).
+    fn orphan_cleanup(&mut self, force: bool) {
+        let Some(vault) = &self.unlocked else {
+            return;
+        };
+        let wanted: HashMap<Uuid, u64> = attachments::wanted_blobs(&[vault])
+            .into_iter()
+            .map(|(id, r)| (id, attachments::sealed_len(r)))
+            .collect();
+        let offset = self.prune_clock_offset;
+        // Wall clock, not `Instant` (which stops while the Mac sleeps): the fallback is about
+        // file ages, which run on during sleep. A clock that moved back reads as due.
+        let now = SystemTime::now();
+        let unchanged = self.orphan_pass.as_ref().is_some_and(|(prev, at, off)| {
+            *prev == wanted
+                && *off == offset
+                && now
+                    .duration_since(*at)
+                    .is_ok_and(|d| d < crate::attachments::ORPHAN_GRACE)
+        });
+        if force || !unchanged {
+            self.prune_orphan_attachments();
+            self.orphan_pass = Some((wanted, now, offset));
+        }
+    }
+
+    /// Tests only: pretend the last orphan-cleanup pass ran `by` earlier.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn age_orphan_pass_for_tests(&mut self, by: Duration) {
+        if let Some((_, at, _)) = &mut self.orphan_pass {
+            *at -= by;
+        }
+    }
+
+    /// Tests only: `(header reads, full authentications)` done by backup checks so far.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn backup_checks_for_tests(&self) -> (usize, usize) {
+        let c = self
+            .backup_checks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (c.header_reads, c.authentications)
+    }
+
+    /// The validation every backup listing applies (L-04).
+    fn expect<'a>(&'a self, authenticate: Option<backup::Authenticate<'a>>) -> backup::Expect<'a> {
+        backup::Expect {
+            vault_id: self.locked.vault_id(),
+            hooks: &*self.hooks,
+            checks: &self.backup_checks,
+            authenticate,
+        }
     }
 
     /// Delete `.vault.bin.tmp-*` files in the package older than 1 h (03 §1.1, same rule as
@@ -776,14 +874,9 @@ impl SyncedVault {
             return;
         }
         let now = SystemTime::now();
-        let newest = match backup::list_backups(&self.path) {
-            // Only our own snapshots count (a conflict or unsaved copy is not a backup of the
-            // disk), and only past ones: a future-dated file from a skewed clock must not
-            // shadow the real newest.
-            Ok(list) => list
-                .iter()
-                .find(|b| b.kind == BackupKind::Snapshot && b.taken_at <= now)
-                .map(|b| b.taken_at),
+        // Only validated, past snapshots of our own count (L-04).
+        let newest = match backup::newest_snapshot(&self.path, &self.expect(None), now) {
+            Ok(newest) => newest,
             Err(e) => {
                 tracing::warn!(error = %e, "could not list backups; taking one");
                 None
@@ -824,16 +917,30 @@ impl SyncedVault {
     ) -> Result<(PathBuf, Result<(), SyncError>), SyncError> {
         let (path, durable) = backup::write_snapshot(&self.path, bytes, now, kind)?;
         self.emit(SyncEvent::BackupTaken(path.clone()));
-        if let Err(e) = backup::apply_retention(&self.path, now, self.retention_multiplier, &path) {
+        // Retention deletes only on fully authenticated holders (L-04): needs the key.
+        let key = self.unlocked.as_ref().map(UnlockedVault::export_vault_key);
+        let (vault_id, device) = (self.locked.vault_id(), self.device_id);
+        let authenticate = |bytes: &[u8]| {
+            key.as_ref().is_some_and(|k| {
+                LockedVault::parse(bytes)
+                    .is_ok_and(|l| l.vault_id() == vault_id && l.unlock_with_key(k, device).is_ok())
+            })
+        };
+        let auth: Option<backup::Authenticate<'_>> = key.is_some().then_some(&authenticate);
+        let expect = self.expect(auth);
+        if let Err(e) =
+            backup::apply_retention(&self.path, &expect, now, self.retention_multiplier, &path)
+        {
             tracing::warn!(error = %e, "backup retention failed");
         }
         Ok((path, durable))
     }
 
-    /// Snapshots, unsaved copies and absorbed conflict packages in `<name>.vault/backups/`,
-    /// newest first.
+    /// Snapshots, unsaved copies and absorbed conflict packages in `<name>.vault/backups/`:
+    /// validated entries newest first, then unvalidated ones ([`BackupInfo::validated`])
+    /// newest first. Names alone never make an entry look current (L-04).
     pub fn backups(&self) -> Result<Vec<BackupInfo>, SyncError> {
-        backup::list_backups(&self.path)
+        backup::list_backups(&self.path, &self.expect(None), false)
     }
 
     /// Delete one backup (user-initiated, 03 §8): a snapshot or unsaved file, or an absorbed
@@ -892,7 +999,7 @@ impl SyncedVault {
         if meta.file_type().is_symlink() {
             return Err(refuse());
         }
-        let info = backup::list_backups(&self.path)?
+        let info = backup::list_backups(&self.path, &self.expect(None), false)?
             .into_iter()
             .find(|b| {
                 b.path
@@ -1056,6 +1163,8 @@ impl SyncedVault {
         // An explicit restore replaces whatever is on disk (a newer-format file was refused
         // above), so earlier blocks and pending rewrites no longer apply.
         self.save_blocked = None;
+        // The restored vault was opened with the password.
+        self.needs_password_unlock = false;
         self.rewrite_on_unlock = false;
         self.install(vault);
         if let Err(e) = durable {
@@ -1122,7 +1231,9 @@ impl SyncedVault {
     /// emitted. Cleared when a valid file of this vault is read again (which a successful save
     /// or a clean merge implies) and by a restore. `None` otherwise.
     pub fn save_blocked(&self) -> Option<SaveBlocked> {
-        self.save_blocked
+        self.save_blocked.or(self
+            .needs_password_unlock
+            .then_some(SaveBlocked::PasswordUnlockRequired))
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -1405,6 +1516,90 @@ pub(crate) fn fingerprint(meta: Option<&fs::Metadata>, bytes: &[u8]) -> LastWrit
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    /// v1.0-era fixture: never-stamped header, one password slot.
+    const UNSTAMPED: &[u8] = include_bytes!("../../vault-core/tests/fixtures/v1-basic.vault");
+
+    fn fixture_pw() -> SecretString {
+        SecretString::new("correct horse battery staple".to_owned())
+    }
+
+    /// A package holding the unstamped fixture, opened locked.
+    fn unstamped_package() -> (tempfile::TempDir, SyncedVault) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.vault");
+        fs::create_dir(&path).unwrap();
+        fs::write(package::vault_file(&path), UNSTAMPED).unwrap();
+        let v =
+            SyncedVault::open(&path, Uuid::from_u128(0xD1), Arc::new(crate::NoopHooks)).unwrap();
+        (dir, v)
+    }
+
+    fn add_item(v: &mut SyncedVault) {
+        v.edit(|vault| vault.insert(vault_core::Item::new("new", Uuid::nil(), 1), 1))
+            .unwrap();
+    }
+
+    fn on_disk_stamp(v: &SyncedVault) -> Option<u64> {
+        let bytes = fs::read(v.vault_file()).unwrap();
+        LockedVault::parse(&bytes)
+            .unwrap()
+            .header()
+            .slots_modified_at
+    }
+
+    /// L-02: the key-slot (Touch ID) path over a never-stamped header refuses saves until a
+    /// password unlock; `unlock_with_kek` itself needs an enclave slot this fixture lacks, so
+    /// the test drives the same `open_with(password_path = false, ..)`.
+    #[test]
+    fn key_slot_open_of_an_unstamped_vault_blocks_saving() {
+        let (_dir, mut v) = unstamped_package();
+        let events = v.subscribe();
+        let pw = fixture_pw();
+        v.open_with(false, |l| l.unlock(&pw)).unwrap();
+        let blocked = SaveBlocked::PasswordUnlockRequired;
+        assert!(
+            events
+                .try_iter()
+                .any(|e| e == SyncEvent::SaveBlocked(blocked))
+        );
+        assert_eq!(v.save_blocked(), Some(blocked));
+        add_item(&mut v);
+        assert!(matches!(v.save(), Err(SyncError::SaveBlocked(b)) if b == blocked));
+        assert_eq!(on_disk_stamp(&v), None, "nothing written");
+        // Lock keeps the edit in an Unsaved backup.
+        assert!(matches!(v.lock(), LockOutcome::Snapshotted(_)));
+
+        // One password unlock clears it; the next save stamps the header.
+        v.unlock(&pw).unwrap();
+        assert_eq!(v.save_blocked(), None);
+        add_item(&mut v);
+        v.save().unwrap();
+        assert!(on_disk_stamp(&v).is_some());
+    }
+
+    #[test]
+    fn password_open_of_an_unstamped_vault_saves_stamped() {
+        let (_dir, mut v) = unstamped_package();
+        v.unlock(&fixture_pw()).unwrap();
+        assert_eq!(v.save_blocked(), None);
+        add_item(&mut v);
+        v.save().unwrap();
+        assert!(on_disk_stamp(&v).is_some());
+    }
+
+    /// Already unlocked via the key slot: verifying the password lifts the block too.
+    #[test]
+    fn password_verify_while_unlocked_lifts_the_block() {
+        let (_dir, mut v) = unstamped_package();
+        let pw = fixture_pw();
+        v.open_with(false, |l| l.unlock(&pw)).unwrap();
+        add_item(&mut v);
+        assert!(v.save().is_err());
+        v.unlock(&pw).unwrap();
+        v.save().unwrap();
+        assert!(on_disk_stamp(&v).is_some());
+    }
 
     /// The path is replaced (rename, new inode) between open and fstat: the stat and the
     /// bytes still both describe the file that was opened.

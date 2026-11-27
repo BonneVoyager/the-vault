@@ -26,6 +26,12 @@ pub const TEST_M_COST_KIB: u32 = 8 * 1024;
 pub const MAX_T_COST: u32 = 16;
 /// Upper bound accepted for `p_cost` (header parsing and construction).
 pub const MAX_P_COST: u32 = 64;
+/// Recommended floor for `m_cost` (security review 2026-11-26 L-20): the least
+/// [`KdfParams::calibrate`] ever produces, since it starts at [`KdfParams::recommended`] and
+/// only raises `m_cost`. Advisory only; [`KdfParams::validate`] does not enforce it.
+pub const RECOMMENDED_MIN_M_COST_KIB: u32 = RECOMMENDED_M_COST_KIB;
+/// Recommended floor for `t_cost`; calibration always keeps [`RECOMMENDED_T_COST`].
+pub const RECOMMENDED_MIN_T_COST: u32 = RECOMMENDED_T_COST;
 
 /// Argon2id parameters stored in the plaintext header (`kdf` map).
 ///
@@ -60,6 +66,14 @@ impl KdfParams {
             return bad("p_cost");
         }
         Ok(())
+    }
+
+    /// `true` when the memory or iteration cost is under the recommended floor
+    /// ([`RECOMMENDED_MIN_M_COST_KIB`], [`RECOMMENDED_MIN_T_COST`]): a vault made with
+    /// [`KdfParams::for_tests`] or a hand-written header, never one from `calibrate`.
+    /// Parallelism is not part of the floor: fewer lanes do not make a guess cheaper.
+    pub fn below_recommended(&self) -> bool {
+        self.m_cost_kib < RECOMMENDED_MIN_M_COST_KIB || self.t_cost < RECOMMENDED_MIN_T_COST
     }
 
     fn with_random_salt(m_cost_kib: u32, t_cost: u32, p_cost: u32) -> Self {

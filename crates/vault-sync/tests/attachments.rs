@@ -1406,3 +1406,82 @@ fn unlock_skips_orphan_cleanup_when_the_file_changed_while_locked() {
     assert!(quarantined(&v, x).exists());
     assert_eq!(pruned_counts(&events), vec![1]);
 }
+
+/// L-06 (security review 2026-11-26): a save that changed no attachment reference does not
+/// walk `attachments/`; the next save that changes one does.
+#[test]
+fn save_without_attachment_change_skips_orphan_cleanup() {
+    let (_dir, _path, mut v, item) = setup();
+    let events = v.subscribe();
+    v.set_prune_clock_offset_for_tests(2 * DAY);
+    let first = add(&mut v, item, b"referenced");
+    v.save().unwrap(); // references changed: a pass runs (nothing to quarantine yet)
+    let orphan = v.attachments_dir().join(blob_file_name(Uuid::from_u128(1)));
+    fs::write(&orphan, b"x").unwrap();
+
+    // Past its grace on the test clock, but this save changes no reference.
+    touch(&mut v, "unrelated");
+    v.save().unwrap();
+    assert!(
+        orphan.exists(),
+        "a save without attachment changes walked attachments/"
+    );
+    assert!(pruned_counts(&events).is_empty());
+
+    // Removing a reference makes the next save run the pass: the planted orphan goes to
+    // quarantine.
+    v.remove_attachment(item, first, NOW + 2).unwrap();
+    v.save().unwrap();
+    assert!(!orphan.exists());
+    assert!(quarantined(&v, Uuid::from_u128(1)).exists());
+}
+
+/// L-06: with no reference change, the save-time pass still runs once the last one is more
+/// than a day old (wall clock).
+#[test]
+fn orphan_pass_reruns_after_a_day_without_changes() {
+    let (_dir, _path, mut v, item) = setup();
+    v.set_prune_clock_offset_for_tests(2 * DAY);
+    add(&mut v, item, b"referenced");
+    v.save().unwrap();
+    let orphan = v.attachments_dir().join(blob_file_name(Uuid::from_u128(1)));
+    fs::write(&orphan, b"x").unwrap();
+    touch(&mut v, "same refs");
+    v.save().unwrap();
+    assert!(orphan.exists());
+
+    v.age_orphan_pass_for_tests(DAY + Duration::from_secs(60));
+    touch(&mut v, "a day later");
+    v.save().unwrap();
+    assert!(!orphan.exists());
+    assert!(quarantined(&v, Uuid::from_u128(1)).exists());
+}
+
+/// L-06: every unlock forgets the last pass, so when the unlock-time pass is skipped (file
+/// changed while locked) the first save runs one even though the references match.
+#[test]
+fn unlock_resets_orphan_pass_tracking() {
+    let (_dir, path, mut v, item) = setup();
+    v.set_prune_clock_offset_for_tests(2 * DAY);
+    add(&mut v, item, b"referenced");
+    v.save().unwrap();
+    let old = fs::read(path.join(vault_sync::VAULT_FILE_NAME)).unwrap();
+    touch(&mut v, "newer, same refs");
+    v.save().unwrap();
+    let orphan = v.attachments_dir().join(blob_file_name(Uuid::from_u128(1)));
+    fs::write(&orphan, b"x").unwrap();
+
+    // Changed while locked (same references): the unlock-time pass is skipped.
+    let _ = v.lock();
+    fs::write(path.join(vault_sync::VAULT_FILE_NAME), &old).unwrap();
+    v.unlock(&pw()).unwrap();
+    assert!(orphan.exists(), "unlock-time pass skipped");
+
+    touch(&mut v, "after unlock");
+    v.save().unwrap();
+    assert!(
+        !orphan.exists(),
+        "the reset makes the first save run the pass"
+    );
+    assert!(quarantined(&v, Uuid::from_u128(1)).exists());
+}

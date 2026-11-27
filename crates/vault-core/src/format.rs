@@ -664,8 +664,10 @@ pub struct Header {
     /// Unix millis of the last change to `slots` or `kdf` (01 §2, optional since v1.1):
     /// password change, slot add/remove, re-calibration, key rotation. `None` when the file
     /// has no such key (every v1.0 writer); treated as 0 by [`Header::slots_stamp`] and by the
-    /// header merge (03 §5). Only written when `Some`, so files that never had the key stay
-    /// byte-identical through a parse/write round trip.
+    /// header merge (03 §5), which never adopts a peer header that lacks it. Only written
+    /// when `Some`, so files that never had the key stay byte-identical through a
+    /// structural parse/write round trip; a save through `UnlockedVault::serialize` stamps
+    /// a never-stamped header with 1 (L-02, 2026-11-26).
     pub slots_modified_at: Option<Millis>,
     /// `device_id` of the device that made the change `slots_modified_at` records (01 §2,
     /// optional since v1.1, `bytes(16)`). Breaks an exact stamp tie in the header merge:

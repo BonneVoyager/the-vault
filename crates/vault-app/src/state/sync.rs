@@ -769,6 +769,10 @@ fn save_blocked_message(blocked: &SaveBlocked) -> &'static str {
         SaveBlocked::ForeignVault => {
             "Not saving: the vault file on disk now holds a different vault."
         }
+        // Placeholder until the UI work for L-02 (unlock once with the password).
+        SaveBlocked::PasswordUnlockRequired => {
+            "Not saving: lock Vault and unlock it once with your master password."
+        }
     }
 }
 

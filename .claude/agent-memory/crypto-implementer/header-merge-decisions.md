@@ -1,6 +1,6 @@
 ---
 name: header-merge-decisions
-description: 2026-10-30 bug-hunt fixes in vault-core — slots_modified_at/slots_device_id header stamp (also set at creation; unstamped_vault() test helper) + merge_from header LWW with author tie-break (V-01/V-03), keys travel with the header, MergeReport.header_updated, slot mutators take `now`, t_cost cap 16 (V-08), generator clamps + min_length (V-07), v1-forward eight unknown-key sites (V-09), CSV formula guard bijection
+description: 2026-10-30 bug-hunt fixes + 2026-11-27 L-02 (unstamped peer never adopted, first save stamps 1) in vault-core — slots_modified_at/slots_device_id header stamp (also set at creation; unstamped_vault() test helper) + merge_from header LWW with author tie-break (V-01/V-03), keys travel with the header, MergeReport.header_updated, slot mutators take `now`, t_cost cap 16 (V-08), generator clamps + min_length (V-07), v1-forward eight unknown-key sites (V-09), CSV formula guard bijection
 metadata:
   type: project
 ---
@@ -20,8 +20,9 @@ day):** `create_with_created_at` sets `slots_modified_at = max(created_at_secs *
 nonce was invisible to a device holding the cached key (unlock_with_key opened, the watcher
 merged, nothing rewrote the slot, only the next password unlock failed). Only pre-v1.1 files
 and the committed fixtures are unstamped now. Test consequence: NO fresh vault can be spliced
-by hand any more; tests that need a by-hand header edit start from
-`common::unstamped_vault()` (unlocks the committed `v1-empty.vault`, sets `device()`), and
+by hand any more; tests that need a by-hand header edit must `rewrite(common::unstamped_bytes())`
+(the committed `v1-empty.vault`) and unlock the result — since L-02 (below) a `serialize` of
+`unstamped_vault()` is stamped too, so splicing into `v.serialize()` is `Tampered(Manifest)`; and
 `new_vault()` (created_at 1_700_000_000 s) has creation stamp T1 = 1_700_000_000_000, so a
 mutation with `now <= T1` stamps `T1 + 1`. Password path on a flipped password-slot nonce is
 still `WrongPassword` (01 §7 slot-first order); `unlock_with_key`/`unlock_with_kek` report
@@ -109,3 +110,35 @@ and then run the stamping mutator through the API (see forward_compat.rs). Fixtu
 the only one without a legacy `kind` extra; `every_fixture_in_the_directory_opens` compares the
 stamp before/after a save instead of asserting None. `Null` for either optional key reads as
 missing (no digest).
+
+**L-02 (security review 2026-11-26, implemented 2026-11-27, no FORMAT_VERSION bump):**
+(1) `merge_from` never adopts a peer header whose `slots_modified_at` is `None`
+(`theirs_newer = other.header.slots_modified_at.is_some() && tuple > tuple`): both unstamped ->
+keep ours whatever the canonical-bytes tie-break says; ours unstamped + theirs stamped -> theirs
+under the existing tuple (its authentication is the peer's own manifest check at unlock, 01 §4;
+there is no KEK check in the merge and none is possible). (2) `serialize(&self)` writes a
+never-stamped header through `header_for_write()`: `stamp_header(&mut copy, 0, self.device_id)`
+= stamp **1** (`max(0, 0+1)`), the SAME `stamp_header` that `bump_slots_stamp` uses. Chose 1
+over "current time" deliberately: core has no clock, `serialize` has no `now` and takes `&self`
+(callers in vault-sync/app hold `&UnlockedVault`), and a save that changes no slot must lose
+LWW against a genuine slot change elsewhere; 1 is the smallest stamp, binds the digest, ties
+only with another legacy first save (identical slots -> keep ours). The IN-MEMORY header stays
+`None` after a save (it is the "no manifest vouched for this" marker the merge relies on); a
+re-unlock of the written file is stamped (1, device) and a merge from it reports
+`header_updated` once (harmless, identical slots/key). Residual: a planted legacy copy opened
+DIRECTLY by a non-password path (Touch ID) is "ours" and gets stamped-and-saved with the planted
+slot; only the password path notices. `fixtures.rs::every_fixture_in_the_directory_opens`
+expects `(Some(1), Some(Uuid::nil()))` after a save of an unstamped fixture;
+`assert_forward_header(locked, stamp)` takes the expected stamp. Tests: `tests/legacy_header.rs`
+(3), `sync_feature.rs::l02_planted_password_slot_...` (Appendix B), `merge_props::
+unstamped_headers_are_never_adopted_and_items_still_converge` (`Sim::new_legacy`, `legacy` flag
+asserts `!header_updated` at every merge step; 13 s at 4000 cases), `merge_props::
+mixed_legacy_and_stamped_fleet_converges_and_keeps_the_genuine_stamp` (`Sim::new_from_fixture`
+with a `stamped` mask: stamped devices = `add_enclave_slot` under a per-device KEK at
+`genuine_stamp(d)` = 1_000_000 + d; N rounds through `dup_legacy()` so stamp-1 headers are in
+play; converged stamp = max genuine else 1; 42 s at 4000 cases). NO ARGON2 in the legacy
+fleets: `legacy_base()` (OnceLock) = `unstamped_bytes()` with an enclave slot (KEK 0x5A*32,
+produced via the API then spliced — tolerated because the file is unstamped) and every
+device/snapshot opens with `unlock_with_kek`; `change_password` + password `dup()` had cost
+~290 s. `Sim::apply` also asserts a merge never lowers `slots_stamp()`. Coordinator review 2026-11-27: SHIP; vault-sync
+follow-up assigned elsewhere.

@@ -107,19 +107,21 @@ fn fresh_vault_is_stamped_at_creation_and_every_slot_mutation_stamps_monotonical
 }
 
 #[test]
-fn stamp_key_is_written_only_once_set() {
-    // A v1.0 (never-stamped) file saved by this build stays key-free ...
+fn stamp_key_is_written_at_first_save_and_by_every_slot_change() {
+    // A v1.0 (never-stamped) file saved by this build is stamped with 1 (the smallest stamp:
+    // it loses every header merge against a real slot change) by this device, so the
+    // manifest binds the header from its first save on (L-02, 2026-11-26). The in-memory
+    // header stays unstamped: no manifest vouched for it yet.
     let mut v = unstamped_vault();
     populate(&mut v, 1);
     let file = VaultFile::parse(&v.serialize()).unwrap();
-    assert_eq!(file.header.slots_modified_at, None);
+    assert_eq!(v.header().slots_modified_at, None, "in memory: unstamped");
+    assert_eq!(header_key(&file, "slots_modified_at"), Some(Value::from(1)));
     assert_eq!(
-        header_key(&file, "slots_modified_at"),
-        None,
-        "never-stamped: no key"
+        header_key(&file, "slots_device_id"),
+        Some(Value::Bytes(device().as_bytes().to_vec()))
     );
-    assert_eq!(header_key(&file, "slots_device_id"), None);
-    // ... while a freshly created vault writes both keys from its very first save.
+    // A freshly created vault writes both keys from its very first save too.
     let fresh = VaultFile::parse(&new_vault().serialize()).unwrap();
     assert_eq!(
         header_key(&fresh, "slots_modified_at"),
@@ -147,17 +149,16 @@ fn stamp_key_is_written_only_once_set() {
 
 #[test]
 fn stamp_of_the_wrong_type_is_malformed_and_null_reads_as_missing() {
-    let v = unstamped_vault();
     let key = t("slots_modified_at");
-    // No stamp is set, so an extra with that name is emitted as-is by the writer.
-    let bad = rewrite(&v.serialize(), |f| {
+    // The fixture has no stamp, so an extra with that name is emitted as-is by the writer.
+    let bad = rewrite(unstamped_bytes(), |f| {
         f.header.extras.push((key.clone(), t("soon")));
     });
     assert!(matches!(
         LockedVault::parse(&bad),
         Err(VaultError::Malformed(m)) if m.contains("slots_modified_at")
     ));
-    let null = rewrite(&v.serialize(), |f| {
+    let null = rewrite(unstamped_bytes(), |f| {
         f.header.extras.push((key, Value::Null));
         f.header.extras.push((t("slots_device_id"), Value::Null));
     });
@@ -165,7 +166,7 @@ fn stamp_of_the_wrong_type_is_malformed_and_null_reads_as_missing() {
     assert_eq!(locked.header().slots_modified_at, None);
     assert_eq!(locked.header().slots_device_id, None);
     assert!(locked.unlock(&pw()).is_ok());
-    let bad_by = rewrite(&v.serialize(), |f| {
+    let bad_by = rewrite(unstamped_bytes(), |f| {
         f.header
             .extras
             .push((t("slots_device_id"), Value::Bytes(vec![1, 2, 3])));
@@ -484,11 +485,10 @@ fn equal_stamps_are_broken_by_device_id_and_converge_both_ways() {
 
 #[test]
 fn opaque_slots_and_kdf_extras_travel_with_the_header() {
-    // Both devices start from an unstamped (v1.0) file so the opaque slot and kdf extra can
-    // be spliced in by hand; a fresh vault's header is digest-bound (01 §4).
+    // Both devices start from the unstamped (v1.0) fixture so the opaque slot and kdf extra
+    // can be spliced into B's file by hand; every saved header is digest-bound (01 §4).
     let mut a = unstamped_vault();
     populate(&mut a, 3);
-    let b = unlock(&a.serialize()).unwrap();
     // B is a newer build: its file carries an opaque slot and an unknown key in `kdf`, and it
     // then adds an enclave slot (which stamps the header).
     let opaque = OpaqueSlot::new(
@@ -498,7 +498,7 @@ fn opaque_slots_and_kdf_extras_travel_with_the_header() {
     )
     .unwrap();
     let kdf_extra = (t("x_kdf"), Value::Integer(1.into()));
-    let bytes = rewrite(&b.serialize(), |f| {
+    let bytes = rewrite(unstamped_bytes(), |f| {
         f.header.slots.insert(0, Slot::Opaque(opaque.clone()));
         f.header.kdf_extras.push(kdf_extra.clone());
     });
@@ -599,7 +599,9 @@ fn later_local_password_change_beats_remote_rotation() {
 fn stamped_header_is_bound_into_the_manifest() {
     let mut v = unstamped_vault();
     populate(&mut v, 2);
-    let old = v.serialize(); // unstamped (v1.0): old AAD, still opens with the old password
+    // Unstamped (v1.0): old AAD, opens with the old password. The fixture bytes, because a
+    // save by this build stamps the header (L-02).
+    let old = unstamped_bytes().to_vec();
     v.change_password(&pw(), &new_pw(), KdfParams::for_tests(), T1)
         .unwrap();
     let cur = v.serialize(); // stamped at T1 by `device()`
@@ -743,7 +745,7 @@ fn old_unstamped_header_spliced_over_stamped_file_is_tampered() {
     let manifest = VaultError::Tampered(TamperKind::Manifest);
     let mut v = unstamped_vault();
     populate(&mut v, 2);
-    let old = v.serialize();
+    let old = unstamped_bytes().to_vec(); // a save would stamp it (L-02)
     v.change_password(&pw(), &new_pw(), KdfParams::for_tests(), T1)
         .unwrap();
     #[cfg(feature = "sync")]

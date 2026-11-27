@@ -2365,6 +2365,7 @@ mod tests {
             size: 0,
             seq: 0,
             kind,
+            validated: true,
         };
         assert_eq!(
             backup_subtitle(Some(&info(BackupKind::Conflict)), path),

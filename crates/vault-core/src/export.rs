@@ -58,28 +58,44 @@ fn neutralise(cell: &str) -> Zeroizing<String> {
     out
 }
 
+/// Secret columns (password, TOTP) are exported and imported verbatim: the formula guard
+/// would hand another password manager an altered secret (security review 2026-11-26 L-17).
+/// Shared with [`crate::import::import_csv`] so the two stay exact inverses.
+pub(crate) fn is_secret_kind(kind: FieldKind) -> bool {
+    matches!(kind, FieldKind::Password | FieldKind::Totp)
+}
+
 /// Columns: `title,username,password,url,notes,totp`. Every live item is one row; a column is
 /// empty when the item has no matching field. (Item categories were removed on 2026-10-30, so
 /// there is no longer a "non-login" gate on the credential columns.) Section headings
 /// ([`FieldKind::Section`]) are never exported.
 ///
-/// Every cell whose first character is `=`, `+`, `-`, `@`, tab or carriage return is written
-/// with a leading `'` so a spreadsheet opening the export cannot execute it as a formula
-/// (CSV injection). [`crate::import::import_csv`] strips that quote again, so an export
-/// imported back yields the original values.
+/// Every non-secret cell (title, username, url, notes) whose first character is `=`, `+`,
+/// `-`, `@`, tab or carriage return is written with a leading `'` so a spreadsheet opening the
+/// export cannot execute it as a formula (CSV injection). [`crate::import::import_csv`] strips
+/// that quote again, so an export imported back yields the original values. Password and TOTP
+/// cells are never altered ([`is_secret_kind`]).
 pub fn export_csv(vault: &UnlockedVault) -> PlaintextExport {
     let mut w = csv::Writer::from_writer(Vec::new());
     // Writing to a Vec cannot fail.
     w.write_record(["title", "username", "password", "url", "notes", "totp"])
         .expect("write to Vec");
     for item in vault.items() {
+        let cell = |name: &str, kind: FieldKind| {
+            let v = value(item, name, kind);
+            if is_secret_kind(kind) {
+                Zeroizing::new(v.to_owned())
+            } else {
+                neutralise(v)
+            }
+        };
         let cells = [
             neutralise(item.title.as_str()),
-            neutralise(value(item, "username", FieldKind::Email)),
-            neutralise(value(item, "password", FieldKind::Password)),
-            neutralise(value(item, "url", FieldKind::Url)),
-            neutralise(value(item, "notes", FieldKind::Notes)),
-            neutralise(value(item, "totp", FieldKind::Totp)),
+            cell("username", FieldKind::Email),
+            cell("password", FieldKind::Password),
+            cell("url", FieldKind::Url),
+            cell("notes", FieldKind::Notes),
+            cell("totp", FieldKind::Totp),
         ];
         w.write_record(cells.iter().map(|c| c.as_str()))
             .expect("write to Vec");

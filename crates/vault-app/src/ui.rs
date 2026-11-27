@@ -846,6 +846,7 @@ pub fn master_password_feedback(
                 )
                 .child(
                     Button::new(suggest_id)
+                        .debug_selector(move || suggest_id.into())
                         .link()
                         .small()
                         .label("Suggest passphrase")
@@ -1505,6 +1506,45 @@ pub fn shake_field(
 /// `relative` container with the controls kept `invisible`, so the card keeps its size.
 /// `id` is its element id and test selector.
 pub fn unlocking_overlay(id: &'static str, cx: &App) -> gpui::Stateful<Div> {
+    busy_overlay(id, "Unlocking…", Cover::Hide, cx)
+}
+
+/// How a [`busy_overlay`] covers the controls under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cover {
+    /// The controls are `invisible` (kept in the layout): the label alone (the unlock
+    /// card while verifying).
+    Hide,
+    /// The controls stay drawn at [`DIMMED_OPACITY`] under a spinner and the label (the
+    /// create form while calibrating; owner decision 2026-11-27, option A). The overlay
+    /// occludes them, so they take no pointer; the caller keeps focus out of them.
+    Dim,
+}
+
+/// Opacity of controls under a [`Cover::Dim`] overlay.
+pub const DIMMED_OPACITY: f32 = 0.4;
+
+/// Applies `cover` to the controls under a [`busy_overlay`].
+pub fn covered<E: gpui::Styled>(controls: E, cover: Cover) -> E {
+    match cover {
+        Cover::Hide => controls.invisible(),
+        Cover::Dim => controls.opacity(DIMMED_OPACITY),
+    }
+}
+
+/// [`unlocking_overlay`] with another `label`, e.g. the create form's "Calibrating
+/// encryption for this Mac…" (05 §2.1). VoiceOver reads the label without the ellipsis.
+/// Put the controls through [`covered`] with the same `cover`.
+pub fn busy_overlay(
+    id: &'static str,
+    label: &'static str,
+    cover: Cover,
+    cx: &App,
+) -> gpui::Stateful<Div> {
+    let text = gpui::div()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .child(label);
     v_flex()
         .absolute()
         .inset_0()
@@ -1512,13 +1552,22 @@ pub fn unlocking_overlay(id: &'static str, cx: &App) -> gpui::Stateful<Div> {
         .justify_center()
         .id(id)
         .debug_selector(move || id.into())
-        .aria_label("Unlocking")
-        .child(
-            gpui::div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child("Unlocking…"),
-        )
+        .aria_label(label.trim_end_matches('…'))
+        .map(|overlay| match cover {
+            Cover::Hide => overlay.child(text),
+            // Drawn controls stay visible: block the pointer from them and set the
+            // line on the card's fill so it reads over the dimmed fields.
+            Cover::Dim => overlay.occlude().child(
+                h_flex()
+                    .gap(px(8.))
+                    .px(px(10.))
+                    .py(px(4.))
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().popover)
+                    .child(gpui_component::spinner::Spinner::new())
+                    .child(text),
+            ),
+        })
 }
 
 /// Transient copy feedback, positioned consistently over either detail host.

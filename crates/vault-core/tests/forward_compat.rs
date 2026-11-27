@@ -31,13 +31,16 @@ fn opaque(id: u128) -> OpaqueSlot {
 }
 
 /// A populated vault whose header has an opaque slot *before* its password slot.
+/// The slot is spliced into the unstamped fixture bytes, then the file is unlocked,
+/// populated and saved (stamped, digest covering the opaque slot).
 fn with_opaque_first() -> (Vec<u8>, Uuid) {
-    let mut v = unstamped_vault();
-    populate(&mut v, 2);
-    let bytes = rewrite(&v.serialize(), |f| {
+    let spliced = rewrite(unstamped_bytes(), |f| {
         f.header.slots.insert(0, Slot::Opaque(opaque(0x55)));
     });
-    (bytes, Uuid::from_u128(0x55))
+    let mut v = unlock(&spliced).unwrap();
+    v.set_device_id(device());
+    populate(&mut v, 2);
+    (v.serialize(), Uuid::from_u128(0x55))
 }
 
 #[test]
@@ -372,8 +375,7 @@ fn duplicate_slot_ids_are_malformed() {
     // ahead of it. The opaque slot is spliced into the *unstamped* file before the enclave
     // slot is added, so the stamped header's digest covers it (splicing it into the stamped
     // file would be a tamper, 01 §4).
-    let v = unstamped_vault();
-    let with_opaque = rewrite(&v.serialize(), |f| {
+    let with_opaque = rewrite(unstamped_bytes(), |f| {
         f.header.slots.insert(0, Slot::Opaque(opaque(0x77)));
     });
     let mut v = unlock(&with_opaque).unwrap();
@@ -439,9 +441,8 @@ fn unknown_kind_strings_are_exact_matches_only() {
 
 #[test]
 fn opaque_slots_survive_slot_management_and_keep_order() {
-    // Spliced into an unstamped file: a fresh vault is stamped and digest-bound (01 §4).
-    let mut v = unstamped_vault();
-    populate(&mut v, 1);
+    // Spliced into the unstamped fixture bytes: every saved file is stamped and digest-bound
+    // (01 §4).
     let nested = OpaqueSlot::new(
         Uuid::from_u128(0xA1),
         "future-kind",
@@ -461,7 +462,7 @@ fn opaque_slots_survive_slot_management_and_keep_order() {
     )
     .unwrap();
     let second = OpaqueSlot::new(Uuid::from_u128(0xA2), "another-future-kind", vec![]).unwrap();
-    let bytes = rewrite(&v.serialize(), |f| {
+    let bytes = rewrite(unstamped_bytes(), |f| {
         f.header.slots.insert(0, Slot::Opaque(nested.clone()));
         f.header.slots.push(Slot::Opaque(second.clone()));
     });
@@ -488,6 +489,7 @@ fn opaque_slots_survive_slot_management_and_keep_order() {
     let other = |s: &str| SlotKind::Other(s.to_owned());
 
     let mut v = unlock(&bytes).unwrap();
+    populate(&mut v, 1);
     assert_eq!(
         kinds(&v),
         [

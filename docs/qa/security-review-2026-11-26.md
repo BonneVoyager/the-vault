@@ -98,11 +98,11 @@ Severity is rated against the project's own threat model.
 | M-04 | Medium | vault-app | Lock triggers and clipboard timer stall during the modal icon file panel | Plausible. **Not reproduced 2026-11-26** (owner: screen lock with the icon panel open locked the vault); idle timeout and clipboard timer with the panel open still unchecked |
 | M-05 | Medium | importers | KDBX import inflates gzip data without a bound | Confirmed, measured. **Fixed 2026-11-27** (vendored keepass with a 256 MiB inflate cap under `vendor/keepass`, mapped to `TooLarge`; advisory draft in `docs/qa/keepass-rs-advisory-draft.md`, upstream advisory submitted 2026-11-27, PR pending maintainer response) |
 | L-01 | Low | vault-core | Edited KDF costs make the correct password read as wrong | Confirmed, measured |
-| L-02 | Low | vault-core | Legacy unstamped header: a key-less slot edit is merged and saved | Confirmed, reproduced |
+| L-02 | Low | vault-core | Legacy unstamped header: a key-less slot edit is merged and saved | Confirmed, reproduced. **Fixed 2026-11-27** (unstamped peer header never adopted; first save stamps with 1; Touch ID open of an unstamped vault blocks saving until a password unlock) |
 | L-03 | Low | vault-core, app | Changing the master password does not revoke an old password | Confirmed (by design) |
-| L-04 | Low | vault-sync | Backups are identified by file name only | Confirmed, reproduced |
+| L-04 | Low | vault-sync | Backups are identified by file name only | Confirmed, reproduced. **Fixed 2026-11-27** (header check for listing and the hourly rule; full authentication before any deletion). Residual: a planted name still holds off hourly snapshots for its hour |
 | L-05 | Low | vault-sync | Planted entries block all saving; edits are dropped at lock | Confirmed, reproduced |
-| L-06 | Low | vault-sync | Unbounded directory work on the save path | Confirmed by reading |
+| L-06 | Low | vault-sync | Unbounded directory work on the save path | Confirmed by reading. **Fixed 2026-11-27** (10,000-entry listing cap, 16 KiB header reads memoised per session, orphan pass only on reference change or daily) |
 | L-07 | Low | vault-macos | A malformed QR image aborts the app | Confirmed in a harness. **Fixed 2026-11-26** (`catch_unwind`, seeded reproduction test) |
 | L-08 | Low | vault-macos | The QR picker hands any file to ImageIO | Confirmed path |
 | L-09 | Low | vault-app | Settings files are world-readable and carry security state | Confirmed. **Fixed 2026-11-26** (0600 files, 0700 directory) |
@@ -111,17 +111,17 @@ Severity is rated against the project's own threat model.
 | L-12 | Low | vault-app | Plaintext export starts in `~/Documents` | Confirmed. **Fixed 2026-11-26** (starts in `~/Downloads`; cloud-synced pick asks a second confirm) |
 | L-13 | Low | vault-app | Sleep time is not counted toward idle lock when lock-on-sleep is off | Plausible |
 | L-14 | Low | importers | 1PUX entry-count and ZIP64 guard can be bypassed | Confirmed, reproduced. **Fixed 2026-11-26** (window widened, count re-checked after open) |
-| L-15 | Low | importers | KDBX field de-duplication is quadratic | Confirmed, measured |
-| L-16 | Low | importers | CSV rows and the 1PUX JSON tree are unbounded in memory | Confirmed, measured |
-| L-17 | Low | export | The CSV formula guard alters exported secrets | Confirmed |
+| L-15 | Low | importers | KDBX field de-duplication is quadratic | Confirmed, measured. **Fixed 2026-11-27** |
+| L-16 | Low | importers | CSV rows and the 1PUX JSON tree are unbounded in memory | Confirmed, measured. **Fixed 2026-11-27** (100,000 items / 64 MiB imported text; `export.data` 16 MiB). Residual: the 1PUX tree still peaks near 640 MB |
+| L-17 | Low | export | The CSV formula guard alters exported secrets | Confirmed. **Fixed 2026-11-27** (password and TOTP cells never guarded or stripped) |
 | L-18 | Low | vault-cli | Masked card number writes raw control characters to the terminal | Confirmed, reproduced. **Fixed 2026-11-26** |
 | L-19 | Low | vault-cli | A notes value can forge labelled output lines | Confirmed, reproduced. **Fixed 2026-11-26** (continuation lines indented) |
-| L-20 | Low | vault-cli, core | `--kdf-test-params` is public and there is no KDF floor | Confirmed, reproduced |
+| L-20 | Low | vault-cli, core | `--kdf-test-params` is public and there is no KDF floor | Confirmed, reproduced. **Fixed 2026-11-27** (hidden, needs `VAULT_DEV_KDF=1`; `below_recommended` floor 64 MiB / 3 passes with a CLI warning; app warning not yet) |
 | L-21 | Low | build | Dependency gate is failing | Confirmed |
-| L-22 | Low | build | Release build is not locked and embeds builder paths | Confirmed |
-| L-23 | Low | build | Entitlement checker is a deny-list | Confirmed |
+| L-22 | Low | build | Release build is not locked and embeds builder paths | Confirmed. **Fixed 2026-11-27** (`--locked`, deny gate, `--remap-path-prefix`, `VaultGitRevision` in Info.plist); not yet exercised by a release build |
+| L-23 | Low | build | Entitlement checker is a deny-list | Confirmed. **Fixed 2026-11-27** (equality with `scripts/entitlements.plist`) |
 | L-24 | Low | build | Integer overflow is unchecked in the shipped profile | Confirmed. **Fixed 2026-11-26** |
-| L-25 | Low | vault-cli | Export can leave a partial plaintext file | Confirmed by reading |
+| L-25 | Low | vault-cli | Export can leave a partial plaintext file | Confirmed by reading. **Fixed 2026-11-27** |
 | I-01 to I-14 | Info | various | See section 6 | |
 
 ## 4. Medium severity findings

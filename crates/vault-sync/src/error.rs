@@ -141,4 +141,10 @@ pub enum SaveBlocked {
     /// The primary now holds a different vault (another `vault_id`).
     #[error("the vault file now holds a different vault; not overwriting it")]
     ForeignVault,
+    /// The vault was opened with Touch ID (a key slot, no password) and its header has never
+    /// been stamped (`slots_modified_at` absent, a v1.0-era file). Saving would stamp and so
+    /// bind whatever slots it carries, which nothing has verified against the password
+    /// (security review 2026-11-26, L-02). Cleared by one unlock with the password.
+    #[error("unlock once with the master password before saving this vault")]
+    PasswordUnlockRequired,
 }

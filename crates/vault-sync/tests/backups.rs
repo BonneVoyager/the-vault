@@ -307,15 +307,17 @@ fn conflict_files_are_listed_and_unknown_files_ignored() {
 
 #[test]
 fn retention_runs_after_a_snapshot() {
-    let (dir, _path, mut v) = setup();
+    let (dir, path, mut v) = setup();
     let b = backups_dir(dir.path());
     fs::create_dir(&b).unwrap();
     // Two old snapshots in the same month beyond the weekly window: only the newer survives.
+    // Retention only touches validated files, so they hold this vault's real bytes.
     let old_a = b.join("test-2020-01-05T00-00-00Z.vault.bin");
     let old_b = b.join("test-2020-01-20T00-00-00Z.vault.bin");
     let stray = b.join("notes.txt");
+    let bytes = fs::read(bin(&path)).unwrap();
     for p in [&old_a, &old_b, &stray] {
-        fs::write(p, b"x").unwrap();
+        fs::write(p, &bytes).unwrap();
     }
     insert_item(&mut v, "a");
     v.save().unwrap();
@@ -770,7 +772,7 @@ fn restore_of_a_clean_vault_writes_no_unsaved_backup() {
 /// them, and still lists a real conflict copy as a conflict.
 #[test]
 fn a_vault_named_conflict_manages_its_snapshots() {
-    let (dir, _path, mut v) = setup_named("conflict");
+    let (dir, path, mut v) = setup_named("conflict");
     let b = dir.path().join("conflict.vault").join("backups");
     let rx = v.subscribe();
     insert_item(&mut v, "a");
@@ -796,8 +798,9 @@ fn a_vault_named_conflict_manages_its_snapshots() {
     let old_a = b.join("conflict-2020-01-05T00-00-00Z.vault.bin");
     let old_b = b.join("conflict-2020-01-20T00-00-00Z.vault.bin");
     let old_b2 = b.join("conflict-2020-01-20T00-00-00Z-2.vault.bin");
+    let bytes = fs::read(bin(&path)).unwrap();
     for p in [&old_a, &old_b, &old_b2] {
-        fs::write(p, b"x").unwrap();
+        fs::write(p, &bytes).unwrap();
     }
     let conflict = b.join("conflict-2020-01-05T00-00-00Z-conflict.vault");
     fs::create_dir(&conflict).unwrap();
@@ -817,4 +820,243 @@ fn a_vault_named_conflict_manages_its_snapshots() {
     assert!(!old_b.exists(), "older of the same second");
     assert!(old_b2.exists(), "newest of its month");
     assert!(conflict.exists(), "conflict copies are never pruned");
+}
+
+// ---- L-04: planted names (security review 2026-11-26, Appendix B F2) ----
+
+/// Bytes of a different vault (valid header, foreign id).
+fn foreign_vault_bytes() -> Vec<u8> {
+    let (_dir, path, _v) = setup_named("test");
+    fs::read(bin(&path)).unwrap()
+}
+
+#[test]
+fn planted_name_does_not_evict_a_genuine_snapshot() {
+    let (dir, path, mut v) = setup();
+    let b = backups_dir(dir.path());
+    fs::create_dir(&b).unwrap();
+    // A genuine snapshot and, later in the same month (which would win the monthly slot), an
+    // empty file and another vault's file.
+    let genuine = b.join("test-2020-01-05T00-00-00Z.vault.bin");
+    fs::write(&genuine, fs::read(bin(&path)).unwrap()).unwrap();
+    let empty = b.join("test-2020-01-31T23-59-59Z.vault.bin");
+    fs::write(&empty, b"").unwrap();
+    let foreign = b.join("test-2020-01-20T00-00-00Z.vault.bin");
+    fs::write(&foreign, foreign_vault_bytes()).unwrap();
+
+    insert_item(&mut v, "a");
+    v.save().unwrap(); // first save: snapshot + retention
+    assert!(
+        genuine.exists(),
+        "genuine snapshot evicted by a planted name"
+    );
+    assert!(
+        empty.exists() && foreign.exists(),
+        "unvalidated files are never deleted"
+    );
+    let list = v.backups().unwrap();
+    let validated = |p: &Path| list.iter().find(|i| i.path == p).unwrap().validated;
+    assert!(validated(&genuine));
+    assert!(!validated(&empty) && !validated(&foreign));
+}
+
+#[test]
+fn planted_fresh_name_does_not_suppress_the_hourly_snapshot() {
+    let (_dir, _path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    // Our seconds-old snapshot is replaced by garbage under the same (fresh) name, as if one
+    // were planted each hour: no validated snapshot is newer than an hour.
+    let ours = v.backups().unwrap()[0].path.clone();
+    fs::write(&ours, b"planted").unwrap();
+    let rx = v.subscribe();
+    insert_item(&mut v, "b");
+    v.save().unwrap();
+    assert_eq!(backups_taken(&rx).len(), 1);
+    assert!(ours.exists());
+}
+
+#[test]
+fn planted_newer_name_does_not_list_first() {
+    let (dir, _path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let genuine = v.backups().unwrap()[0].path.clone();
+    let b = backups_dir(dir.path());
+    let empty = b.join("test-2099-01-01T00-00-00Z.vault.bin");
+    fs::write(&empty, b"").unwrap();
+    let foreign = b.join("test-2098-01-01T00-00-00Z.vault.bin");
+    fs::write(&foreign, foreign_vault_bytes()).unwrap();
+    let list = v.backups().unwrap();
+    assert_eq!(list[0].path, genuine);
+    assert!(list[0].validated);
+    let tail: Vec<_> = list[1..].iter().map(|i| (&i.path, i.validated)).collect();
+    assert_eq!(tail, [(&empty, false), (&foreign, false)]);
+}
+
+// ---- L-06: bounded directory work on the save path ----
+
+#[test]
+fn copied_header_plant_does_not_evict_a_genuine_snapshot() {
+    let (dir, path, mut v) = setup();
+    let b = backups_dir(dir.path());
+    fs::create_dir(&b).unwrap();
+    let bytes = fs::read(bin(&path)).unwrap();
+    let genuine = b.join("test-2020-01-05T00-00-00Z.vault.bin");
+    fs::write(&genuine, &bytes).unwrap();
+    // The genuine prefix and header, then garbage: passes the header check only.
+    let header_end = 10 + u32::from_be_bytes(bytes[6..10].try_into().unwrap()) as usize;
+    let mut forged = bytes[..header_end].to_vec();
+    forged.extend_from_slice(&[0xA5; 512]);
+    let plant = b.join("test-2020-01-31T23-59-59Z.vault.bin");
+    fs::write(&plant, &forged).unwrap();
+
+    insert_item(&mut v, "a");
+    v.save().unwrap(); // first save: snapshot + retention
+    assert!(
+        genuine.exists(),
+        "genuine snapshot evicted by a forged header"
+    );
+    assert!(plant.exists());
+    // The listing stays header-based: the plant reads as validated (and fails at restore);
+    // only deletions need full authentication.
+    let list = v.backups().unwrap();
+    let validated = |p: &Path| list.iter().find(|i| i.path == p).unwrap().validated;
+    assert!(validated(&genuine) && validated(&plant));
+    assert!(matches!(
+        v.restore_from(&plant, &pw()),
+        Err(SyncError::Vault(_))
+    ));
+}
+
+#[test]
+fn locked_retention_deletes_nothing() {
+    let (dir, path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let b = backups_dir(dir.path());
+    let bytes = fs::read(bin(&path)).unwrap();
+    let older = b.join("test-2020-01-05T00-00-00Z.vault.bin");
+    let newer = b.join("test-2020-01-20T00-00-00Z.vault.bin");
+    for p in [&older, &newer] {
+        fs::write(p, &bytes).unwrap();
+    }
+    let _ = v.lock();
+    v.backup_now().unwrap();
+    assert!(
+        older.exists(),
+        "no key, no authenticated holder, no deletion"
+    );
+    v.unlock(&pw()).unwrap();
+    v.backup_now().unwrap();
+    assert!(!older.exists());
+    assert!(newer.exists());
+}
+
+#[test]
+fn backup_checks_are_cached_across_saves() {
+    let (dir, _path, mut v) = setup();
+    let a = insert_item(&mut v, "a");
+    insert_item(&mut v, "b");
+    v.save().unwrap();
+    let b = backups_dir(dir.path());
+    // Just under the listing cap, so every name is listed on every pass.
+    for n in 2..=9_990 {
+        fs::write(
+            b.join(format!("test-2020-01-01T00-00-00Z-{n}.vault.bin")),
+            b"",
+        )
+        .unwrap();
+    }
+    v.backups().unwrap();
+    let (reads, _) = v.backup_checks_for_tests();
+    assert!(reads >= 9_989);
+    // A deletion forces a snapshot and a retention pass.
+    v.edit(|vault| vault.delete(a, NOW + 1)).unwrap().unwrap();
+    let rx = v.subscribe();
+    v.save().unwrap();
+    assert_eq!(backups_taken(&rx).len(), 1);
+    let (again, _) = v.backup_checks_for_tests();
+    assert!(
+        again - reads <= 4,
+        "{} header reads on the second pass",
+        again - reads
+    );
+}
+
+#[test]
+fn save_succeeds_with_more_backup_entries_than_the_listing_cap() {
+    let (dir, _path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let b = backups_dir(dir.path());
+    // 10,001 planted snapshot-shaped names (the cap is 10,000 entries per listing).
+    for n in 2..=10_002 {
+        fs::write(
+            b.join(format!("test-2020-01-01T00-00-00Z-{n}.vault.bin")),
+            b"",
+        )
+        .unwrap();
+    }
+    let total = fs::read_dir(&b).unwrap().count();
+    assert!(total > 10_000);
+    insert_item(&mut v, "b");
+    v.save().unwrap();
+    assert!(v.backups().unwrap().len() <= 10_000, "listing is capped");
+    // Nothing planted was deleted; at most a new snapshot was added.
+    assert!(fs::read_dir(&b).unwrap().count() >= total);
+}
+
+#[test]
+fn genuine_snapshots_beyond_the_listing_cap_are_not_deleted() {
+    let (dir, path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let b = backups_dir(dir.path());
+    let bytes = fs::read(bin(&path)).unwrap();
+    // Genuine copies sharing one monthly bucket: a full listing would prune all but one.
+    for n in 2..=10_002 {
+        fs::write(
+            b.join(format!("test-2020-01-01T00-00-00Z-{n}.vault.bin")),
+            &bytes,
+        )
+        .unwrap();
+    }
+    let total = fs::read_dir(&b).unwrap().count();
+    let id = v.vault().unwrap().items().next().unwrap().id;
+    v.edit(|vault| vault.delete(id, NOW + 1)).unwrap().unwrap();
+    v.save().unwrap(); // deletion: snapshot, then retention over a truncated listing
+    assert!(
+        fs::read_dir(&b).unwrap().count() > total,
+        "nothing deleted, one snapshot added"
+    );
+}
+
+/// Snapshots sealed under a since-rotated key stay listed as validated (the backup viewer
+/// opens them with the password) but are never pruned: they cannot be authenticated under
+/// the current key.
+#[test]
+fn pre_rotation_snapshots_stay_listed_and_are_not_pruned() {
+    let (dir, path, mut v) = setup();
+    insert_item(&mut v, "a");
+    v.save().unwrap();
+    let b = backups_dir(dir.path());
+    let old_key_bytes = fs::read(bin(&path)).unwrap();
+    let older = b.join("test-2020-01-05T00-00-00Z.vault.bin");
+    let newer = b.join("test-2020-01-20T00-00-00Z.vault.bin");
+    for p in [&older, &newer] {
+        fs::write(p, &old_key_bytes).unwrap();
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    v.edit(|vault| vault.rotate_vault_key(&pw(), now_ms))
+        .unwrap()
+        .unwrap();
+    v.save().unwrap();
+    v.backup_now().unwrap();
+    assert!(older.exists(), "its holder is sealed under the old key");
+    assert!(v.backups().unwrap().iter().all(|i| i.validated));
+    assert_eq!(titles_in(&newer), ["a"], "still opens with the password");
 }

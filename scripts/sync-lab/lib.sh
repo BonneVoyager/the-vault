@@ -36,11 +36,17 @@ dpath() { echo "$LAB/$1/main.vault"; }
 
 # vx DEV args...  Run the CLI as device DEV: own device id, own HOME, own package.
 # VX_FILE overrides the package path (two devices working on one shared package).
+# Lab vaults use `init --kdf-test-params` (gated by VAULT_DEV_KDF=1 since security review
+# 2026-11-26 L-20), so every open prints KDF_FLOOR_WARNING on stderr. vx drops exactly that
+# line so callers that read `2>&1` output (ids, states) see what they did before; any other
+# stderr passes through, and vx returns the CLI's own exit status.
+KDF_FLOOR_WARNING="warning: this vault's encryption settings are below the recommended minimum; re-create it or change the master password on a current build"
 vx() {
   local d="$1"
   shift
-  HOME="$LAB/home-$d" VAULT_DEVICE_ID="$(dev_id "$d")" VAULT_FILE="${VX_FILE:-$(dpath "$d")}" \
-    LABPW="$LAB_PW" VAULT_ITEM_PASSWORD=p0 "$V" --password-env LABPW "$@"
+  { HOME="$LAB/home-$d" VAULT_DEVICE_ID="$(dev_id "$d")" VAULT_FILE="${VX_FILE:-$(dpath "$d")}" \
+      LABPW="$LAB_PW" VAULT_ITEM_PASSWORD=p0 VAULT_DEV_KDF=1 "$V" --password-env LABPW "$@" \
+      2>&1 1>&3 3>&- | grep -vxF -- "$KDF_FLOOR_WARNING" >&2; return "${PIPESTATUS[0]}"; } 3>&1
 }
 
 lab_begin() {

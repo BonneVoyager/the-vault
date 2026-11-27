@@ -22,6 +22,7 @@ fn b01_cli_init_header_created_at() {
             "--kdf-test-params",
         ])
         .env("QA_MPW", "tidy-Walrus-orbit-Velvet-42")
+        .env("VAULT_DEV_KDF", "1")
         .output()
         .unwrap();
     assert!(
@@ -61,6 +62,7 @@ fn cli(pkg: &std::path::Path, password: &str, args: &[&str]) -> (i32, String) {
         .args(["--password-env", "QA_MPW"])
         .args(args)
         .env("QA_MPW", password)
+        .env("VAULT_DEV_KDF", "1")
         .env_remove("VAULT_FILE")
         .output()
         .unwrap();
@@ -434,6 +436,7 @@ fn cli_env(pkg: &std::path::Path, env: &[(&str, &str)], args: &[&str]) -> (i32, 
         .args(["--password-env", "QA_MPW"])
         .args(args)
         .env("QA_MPW", "tidy-Walrus-orbit-Velvet-42")
+        .env("VAULT_DEV_KDF", "1")
         .env_remove("VAULT_FILE")
         .env_remove("VAULT_DEVICE_ID");
     for (k, v) in env {
