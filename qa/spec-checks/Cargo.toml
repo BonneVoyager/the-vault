@@ -35,3 +35,7 @@ vault-macos = { path = "../../crates/vault-macos" }
 # Deps at opt-level 1 so Argon2 and friends are usable in tests.
 [profile.dev.package."*"]
 opt-level = 1
+
+# Same patched keepass as the root workspace (vendor/keepass/VAULT-PATCH.md).
+[patch.crates-io]
+keepass = { path = "../../vendor/keepass" }

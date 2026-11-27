@@ -16,13 +16,16 @@
 
 use std::io::Cursor;
 
-use keepass::error::{DatabaseFormatError, DatabaseOpenError, Kdbx3OpenError, Kdbx4OpenError};
+use keepass::error::{
+    DatabaseFormatError, DatabaseOpenError, Kdbx3OpenError, Kdbx4OpenError, ParseXmlError,
+    UnprotectError,
+};
 use keepass::{Database, DatabaseKey, db::Entry};
 use secrecy::{ExposeSecret as _, SecretString};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::{ImportError, TAG_LOGIN, add_template_tag};
+use super::{ImportError, TAG_LOGIN, UsedNames, add_template_tag};
 use crate::item::{Field, FieldKind, HistoryEntry, Item, Millis};
 use crate::totp::Totp;
 use crate::vault::HISTORY_CAP;
@@ -159,24 +162,44 @@ fn malformed(what: &str) -> ImportError {
 ///   2026-11-06). KDBX3 is the one exception by construction: a corrupted *final* AES-CBC
 ///   block fails padding before any block hash is read, and that `Cryptography` error is
 ///   indistinguishable from a wrong key.
+/// - The gzip inflate is capped at `keepass::MAX_DECOMPRESSED_SIZE` (256 MiB per stream; the
+///   vendored `vendor/keepass` patch for security review 2026-11-26 M-05). The patched crate
+///   reports the cap as an `io::Error` of kind `InvalidData` whose message is exactly
+///   `keepass::DECOMPRESSED_SIZE_EXCEEDED` ([`is_inflate_cap`]); flate2's own errors for a
+///   corrupt stream use other kinds (`InvalidInput`, `UnexpectedEof`) and fixed literal
+///   messages, none equal to the sentinel, so the message is the discriminator and the kind a
+///   belt-and-braces check. That error reaches us on two paths: the KDBX3/4 body inflate is
+///   `DatabaseOpenError::Io`, and a compressed attachment inflated while the XML is read is
+///   `Format(Kdbx3|Kdbx4(Xml(ParseXmlError::Unprotect(UnprotectError::Io))))`. Both map to
+///   `TooLarge`, whose payload names only the bound (like the 1PUX `export.data` bound).
 /// - Everything else is structure: the XML body (including xml-rs's 128-level nesting cap,
 ///   which a valid 150-deep group tree trips), the KDBX4 inner header, the outer header and
 ///   its SHA-256 (both pre-validated by `check_outer_header`, so rarely seen here), the
-///   version prefix, a truncated payload (`UnexpectedEof`) and I/O errors from the
-///   in-memory decompressor. None of these depend on the password, so retrying it cannot
-///   help: `KdbxMalformed`.
+///   version prefix, a truncated payload (`UnexpectedEof`) and the remaining I/O errors from
+///   the in-memory decompressor (a corrupt stream). None of these depend on the password, so
+///   retrying it cannot help: `KdbxMalformed`.
 ///
 /// `DatabaseOpenError` is `#[non_exhaustive]`, so the final arm covers a variant a future
 /// keepass-rs adds; it defaults to `KdbxMalformed` (the review's D-8 direction: never let an
 /// unknown failure keep a user retrying a correct password). A dependency bump must re-read
-/// the enum and place any new variant explicitly. Neither variant carries any of the
+/// the enum and place any new variant explicitly. No variant carries any of the
 /// dependency's text (02 import_kdbx: "Error text never includes dependency parser errors or
-/// secret values").
+/// secret values"); the `TooLarge` payload is composed here from the constant's value.
 fn classify_open_error(error: DatabaseOpenError) -> ImportError {
     match error {
         DatabaseOpenError::Key(_) | DatabaseOpenError::Cryptography(_) => {
             ImportError::KdbxCredentials
         }
+        DatabaseOpenError::Io(io)
+        | DatabaseOpenError::Format(DatabaseFormatError::Kdbx3(Kdbx3OpenError::Xml(
+            ParseXmlError::Unprotect(UnprotectError::Io(io)),
+        )))
+        | DatabaseOpenError::Format(DatabaseFormatError::Kdbx4(Kdbx4OpenError::Xml(
+            ParseXmlError::Unprotect(UnprotectError::Io(io)),
+        ))) if is_inflate_cap(&io) => ImportError::TooLarge(format!(
+            "KeePass database content exceeds {} MiB when decompressed",
+            keepass::MAX_DECOMPRESSED_SIZE / (1024 * 1024)
+        )),
         DatabaseOpenError::Format(DatabaseFormatError::Kdbx4(Kdbx4OpenError::BlockStream(_)))
         | DatabaseOpenError::Format(DatabaseFormatError::Kdbx3(
             Kdbx3OpenError::BlockHashMismatch(_),
@@ -188,6 +211,13 @@ fn classify_open_error(error: DatabaseOpenError) -> ImportError {
         | DatabaseOpenError::Format(_) => ImportError::KdbxMalformed,
         _ => ImportError::KdbxMalformed,
     }
+}
+
+/// The vendored keepass's "inflated past `MAX_DECOMPRESSED_SIZE`" error: kind `InvalidData`
+/// with exactly the `DECOMPRESSED_SIZE_EXCEEDED` message (see [`classify_open_error`]).
+fn is_inflate_cap(io: &std::io::Error) -> bool {
+    io.kind() == std::io::ErrorKind::InvalidData
+        && io.to_string() == keepass::DECOMPRESSED_SIZE_EXCEEDED
 }
 
 /// `len` bytes at `*pos`, advancing; `Malformed` instead of a panic on overflow or EOF.
@@ -401,6 +431,9 @@ fn convert(entry: &Entry, device_id: Uuid, now: Millis) -> Item {
             name.as_str(),
         )
     });
+    // Linear de-duplication (security review 2026-11-26 L-15): the per-field scan of
+    // `item.fields` was quadratic in the number of custom fields.
+    let mut names = UsedNames::default();
     for (name, value) in fields {
         let (name, kind) = match name.as_str() {
             "UserName" => ("username", FieldKind::Text),
@@ -419,6 +452,7 @@ fn convert(entry: &Entry, device_id: Uuid, now: Millis) -> Item {
         };
         push_field(
             &mut item,
+            &mut names,
             name,
             kind,
             SecretString::new(value.get().clone()),
@@ -426,7 +460,7 @@ fn convert(entry: &Entry, device_id: Uuid, now: Millis) -> Item {
         );
     }
     if let Some(uri) = totp {
-        push_field(&mut item, "totp", FieldKind::Totp, uri, now);
+        push_field(&mut item, &mut names, "totp", FieldKind::Totp, uri, now);
     }
     if let Some(history) = &entry.history {
         let current = entry.get_password();
@@ -465,14 +499,16 @@ fn convert(entry: &Entry, device_id: Uuid, now: Millis) -> Item {
 }
 
 /// Append a field, suffixing its name with ` (2)`, ` (3)`, … on a collision.
-fn push_field(item: &mut Item, name: &str, kind: FieldKind, value: SecretString, now: Millis) {
-    let mut unique = name.to_owned();
-    let mut suffix = 2;
-    while item.fields.iter().any(|field| field.name == unique) {
-        unique = format!("{name} ({suffix})");
-        suffix += 1;
-    }
-    item.fields.push(Field::new(unique, kind, value, now));
+fn push_field(
+    item: &mut Item,
+    names: &mut UsedNames,
+    name: &str,
+    kind: FieldKind,
+    value: SecretString,
+    now: Millis,
+) {
+    item.fields
+        .push(Field::new(names.claim(name), kind, value, now));
 }
 
 /// KeePass 2.x native TOTP (`TimeOtp-Secret-Base32` plus optional `TimeOtp-Length`,
@@ -521,4 +557,86 @@ fn percent_encode(text: &str) -> Zeroizing<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    fn cap_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            keepass::DECOMPRESSED_SIZE_EXCEEDED,
+        )
+    }
+
+    fn assert_too_large(error: DatabaseOpenError) {
+        match classify_open_error(error) {
+            ImportError::TooLarge(message) => {
+                assert_eq!(
+                    message,
+                    "KeePass database content exceeds 256 MiB when decompressed"
+                );
+                assert!(!message.contains(keepass::DECOMPRESSED_SIZE_EXCEEDED));
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    /// Security review 2026-11-26 M-05: the vendored keepass caps the gzip inflate and reports
+    /// the cap as an `InvalidData` error with a fixed message. A real over-cap file would have
+    /// to inflate 256 MiB inside the test before failing, so the classification arms are
+    /// exercised directly. The body inflate surfaces as `DatabaseOpenError::Io`.
+    #[test]
+    fn capped_body_inflate_is_too_large() {
+        assert_too_large(DatabaseOpenError::Io(cap_error()));
+    }
+
+    /// A compressed attachment is inflated while the XML is read, so the same error arrives
+    /// wrapped in the KDBX3 or KDBX4 XML error (review follow-up 2026-11-27, item 1).
+    #[test]
+    fn capped_attachment_inflate_in_kdbx3_is_too_large() {
+        assert_too_large(DatabaseOpenError::Format(DatabaseFormatError::Kdbx3(
+            Kdbx3OpenError::Xml(ParseXmlError::Unprotect(UnprotectError::Io(cap_error()))),
+        )));
+    }
+
+    #[test]
+    fn capped_attachment_inflate_in_kdbx4_is_too_large() {
+        assert_too_large(DatabaseOpenError::Format(DatabaseFormatError::Kdbx4(
+            Kdbx4OpenError::Xml(ParseXmlError::Unprotect(UnprotectError::Io(cap_error()))),
+        )));
+    }
+
+    /// flate2 reports a corrupt gzip stream with other kinds (`InvalidInput`, `UnexpectedEof`)
+    /// and fixed literal messages, none equal to the sentinel; such errors stay
+    /// `KdbxMalformed` on every path. So does the sentinel message under another kind.
+    #[test]
+    fn corrupt_gzip_stays_malformed() {
+        let corrupt = || io::Error::new(io::ErrorKind::InvalidInput, "invalid gzip header");
+        assert!(matches!(
+            classify_open_error(DatabaseOpenError::Io(corrupt())),
+            ImportError::KdbxMalformed
+        ));
+        assert!(matches!(
+            classify_open_error(DatabaseOpenError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "corrupt deflate stream"
+            ))),
+            ImportError::KdbxMalformed
+        ));
+        assert!(matches!(
+            classify_open_error(DatabaseOpenError::Format(DatabaseFormatError::Kdbx4(
+                Kdbx4OpenError::Xml(ParseXmlError::Unprotect(UnprotectError::Io(corrupt()))),
+            ))),
+            ImportError::KdbxMalformed
+        ));
+        assert!(matches!(
+            classify_open_error(DatabaseOpenError::Io(io::Error::other(
+                keepass::DECOMPRESSED_SIZE_EXCEEDED
+            ))),
+            ImportError::KdbxMalformed
+        ));
+    }
 }

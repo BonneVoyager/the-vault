@@ -1,5 +1,8 @@
 [workspace]
 members = ["crates/*"]
+# Vendored, patched keepass (see vendor/keepass/VAULT-PATCH.md): built through [patch] below,
+# not as a member, so its own test suite runs with its own lockfile.
+exclude = ["vendor/keepass"]
 resolver = "3"
 
 [workspace.package]
@@ -31,3 +34,8 @@ opt-level = 1
 [profile.dev.package.vault-app]
 # No debuginfo for the app crate: each debug rebuild otherwise leaves ~256 stale .o files in target/debug/deps.
 debug = false
+
+# keepass 0.17.0 inflates gzip payloads without a bound (security review 2026-11-26, M-05).
+# Local copy with a capped inflate; drop once upstream ships the fix (vendor/keepass/VAULT-PATCH.md).
+[patch.crates-io]
+keepass = { path = "vendor/keepass" }

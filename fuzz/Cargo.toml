@@ -62,3 +62,7 @@ features = ["deflate"]
 
 [dependencies.serde_json]
 version = "^1.0.128"
+
+# Same patched keepass as the root workspace (vendor/keepass/VAULT-PATCH.md).
+[patch.crates-io]
+keepass = { path = "../vendor/keepass" }
