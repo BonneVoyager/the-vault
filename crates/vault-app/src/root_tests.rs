@@ -157,6 +157,40 @@ fn unlock_finish_ends_before_the_crossfade(cx: &mut TestAppContext) {
     });
 }
 
+/// No window toast is drawn over the unlock card while the finish plays; the unlock's
+/// own toast (here the weak-KDF notice of a test-cost vault, L-20) shows with the items.
+#[gpui::test]
+fn unlock_toast_waits_for_the_finish(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _root, mut vcx) = root_with_vault(dir.path(), cx);
+    let ms = Duration::from_millis(1);
+    state.update(&mut vcx, |s, cx| {
+        s.unlock_hold = crate::state::MIN_UNLOCK_HOLD;
+        s.fake_work_time = 50 * ms;
+        s.unlock(vault_core::SecretString::new("pw".into()), cx)
+    });
+    vcx.executor().advance_clock(350 * ms - ms);
+    assert!(
+        vcx.debug_bounds("unlock-keyhole-flare").is_some(),
+        "finishing"
+    );
+    // Something else raises a toast mid-finish (a sync event, say).
+    state.update(&mut vcx, |s, cx| s.show_toast("Vault updated", cx));
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("window-toast").is_none(),
+        "not on the card"
+    );
+    vcx.executor().advance_clock(ms);
+    vcx.run_until_parked();
+    assert_eq!(state.read_with(&vcx, |s, _| s.screen), Screen::Main);
+    assert!(vcx.debug_bounds("window-toast").is_some(), "with the items");
+    assert_eq!(
+        state.read_with(&vcx, |s, _| s.toast.as_ref().map(|t| t.message.clone())),
+        Some(crate::state::WEAK_KDF.into())
+    );
+}
+
 #[gpui::test]
 fn close_window_locks_before_closing_and_reopens_locked(cx: &mut TestAppContext) {
     use std::sync::Arc;
@@ -796,6 +830,7 @@ fn item_shortcuts_are_scoped_to_the_main_window(cx: &mut TestAppContext) {
     cx.run_until_parked();
     state.update(cx, |s, cx| {
         s.install_unlocked_for_tests(vault);
+        s.refresh_backups();
         s.select(id, cx);
         s.open_backup(backup.clone(), cx);
     });
@@ -1172,4 +1207,200 @@ fn open_vault_without_a_main_window_shows_no_panel_later(cx: &mut TestAppContext
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("choose-card").is_some());
     assert!(!vcx.did_prompt_for_paths(), "no panel on the next window");
+}
+
+/// An unlocked main window (auto-lock 5 minutes, lock-on-sleep off) with one item whose
+/// password is "hunter2", selected; the fake pasteboard is returned.
+fn sleepy_window(
+    dir: &std::path::Path,
+    cx: &mut TestAppContext,
+) -> (
+    Entity<AppState>,
+    Uuid,
+    crate::clipboard::fake::FakePasteboard,
+    VisualTestContext,
+) {
+    use std::sync::Arc;
+    use vault_core::{Field, FieldKind, Item, KdfParams, SecretString};
+    use vault_sync::{NoopHooks, SyncedVault};
+
+    let mut vault = SyncedVault::create(
+        &dir.join("t.vault"),
+        &SecretString::new("pw".into()),
+        KdfParams::for_tests(),
+        Uuid::new_v4(),
+        Arc::new(NoopHooks),
+    )
+    .unwrap();
+    let device = vault.device_id();
+    let mut item = Item::new("GitHub", device, 1);
+    item.fields = vec![
+        Field::new(
+            "username",
+            FieldKind::Text,
+            SecretString::new("chris".into()),
+            1,
+        ),
+        Field::new(
+            "password",
+            FieldKind::Password,
+            SecretString::new("hunter2".into()),
+            1,
+        ),
+    ];
+    let id = vault.edit(|v| v.insert(item, 1)).unwrap();
+    vault.save().unwrap();
+
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        actions::bind_keys(cx);
+        actions::register(&state, cx);
+    });
+    let window = cx.add_window(|window, cx| {
+        theme::apply(window, cx);
+        let view = cx.new(|cx| VaultRoot::new(state.clone(), None, window, cx));
+        ui::main_root(view, window, cx)
+    });
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    let board = crate::clipboard::fake::FakePasteboard::default();
+    state.update(&mut vcx, |s, cx| {
+        s.install_unlocked_for_tests(vault);
+        s.set_pasteboard(Box::new(board.clone()));
+        s.settings.auto_lock_minutes = Some(5);
+        s.settings.lock_on_sleep = false;
+        s.select(id, cx);
+        // The unlock's weak-KDF notice (test KDF costs) is not under test here.
+        s.toast = None;
+    });
+    vcx.run_until_parked();
+    (state, id, board, vcx)
+}
+
+fn sleep_for(state: &Entity<AppState>, minutes: u64, vcx: &mut VisualTestContext) {
+    state.update(vcx, |s, _| {
+        s.clock.sleep(std::time::Duration::from_secs(minutes * 60));
+    });
+}
+
+/// A shortcut after a sleep past the idle limit locks before gpui matches its binding
+/// (the keystroke interceptor), so ⌘⇧C copies nothing (L-13). Without the sleep the same
+/// shortcut copies, which shows the gate is what stopped it.
+#[gpui::test]
+fn shortcut_after_a_long_sleep_locks_and_copies_nothing(cx: &mut TestAppContext) {
+    // Actions gpui dispatched for a keystroke (observers run after dispatch, and not at
+    // all when an interceptor stopped the keystroke).
+    let dispatched = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let _observer = cx.update(|cx| {
+        let dispatched = dispatched.clone();
+        cx.observe_keystrokes(move |event, _, _| {
+            if let Some(action) = &event.action {
+                dispatched.borrow_mut().push(action.name().to_owned());
+            }
+        })
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, board, mut vcx) = sleepy_window(dir.path(), cx);
+    vcx.simulate_keystrokes("cmd-shift-c");
+    vcx.run_until_parked();
+    assert_eq!(
+        board.contents().as_deref(),
+        Some("hunter2"),
+        "awake: copies"
+    );
+    assert_eq!(dispatched.borrow().len(), 1, "awake: the action ran");
+    dispatched.borrow_mut().clear();
+    state.update(&mut vcx, |s, cx| s.lock(cx));
+
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, board, mut vcx) = sleepy_window(dir.path(), cx);
+    sleep_for(&state, 10, &mut vcx);
+    vcx.simulate_keystrokes("cmd-shift-c");
+    vcx.run_until_parked();
+    assert!(
+        state.read_with(&vcx, |s, _| s.locked),
+        "locked by the key press"
+    );
+    assert_eq!(board.contents(), None, "nothing copied");
+    assert!(board.clear_calls().is_empty(), "nothing was ever written");
+    assert!(dispatched.borrow().is_empty(), "stopped before the binding");
+
+    // ⌘L is let through when the gate locks: its own action still runs.
+    state.update(&mut vcx, |s, cx| s.lock(cx));
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, _, mut vcx) = sleepy_window(dir.path(), cx);
+    sleep_for(&state, 10, &mut vcx);
+    vcx.simulate_keystrokes("cmd-l");
+    vcx.run_until_parked();
+    assert!(state.read_with(&vcx, |s, _| s.locked));
+    assert_eq!(dispatched.borrow().len(), 1, "⌘L dispatched");
+}
+
+/// A click in the main window after a sleep past the idle limit locks in the capture
+/// phase and never reaches the field it hit (L-13).
+#[gpui::test]
+fn click_after_a_long_sleep_locks_and_copies_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, board, mut vcx) = sleepy_window(dir.path(), cx);
+    let password = vcx
+        .debug_bounds("field-value 1")
+        .expect("password row")
+        .center();
+    sleep_for(&state, 10, &mut vcx);
+    vcx.simulate_click(password, gpui::Modifiers::none());
+    vcx.run_until_parked();
+    assert!(state.read_with(&vcx, |s, _| s.locked));
+    assert_eq!(board.contents(), None, "nothing copied");
+}
+
+/// The same gate on a pinned item window: its own root, not the main one (L-13).
+#[gpui::test]
+fn item_window_click_after_a_long_sleep_locks_and_copies_nothing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, id, board, mut vcx) = sleepy_window(dir.path(), cx);
+    let item = vcx
+        .update(|_, cx| crate::screens::open_item_window(state.clone(), id, cx))
+        .unwrap();
+    vcx.run_until_parked();
+    let mut item = VisualTestContext::from_window(item, &vcx);
+    item.run_until_parked();
+    let password = item
+        .debug_bounds("field-value 1")
+        .expect("password row")
+        .center();
+    // Control: awake, the click copies.
+    item.simulate_click(password, gpui::Modifiers::none());
+    item.run_until_parked();
+    assert_eq!(board.contents().as_deref(), Some("hunter2"));
+    board.set("from another app");
+
+    sleep_for(&state, 10, &mut item);
+    let windows = vcx.update(|_, cx| cx.windows().len());
+    // Mouse-down only: the lock closes the item window, so no mouse-up can follow.
+    item.simulate_event(gpui::MouseDownEvent {
+        position: password,
+        modifiers: gpui::Modifiers::none(),
+        button: gpui::MouseButton::Left,
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.run_until_parked();
+    assert!(state.read_with(&vcx, |s, _| s.locked));
+    assert_eq!(
+        vcx.update(|_, cx| cx.windows().len()),
+        windows - 1,
+        "closed"
+    );
+    assert_eq!(board.contents().as_deref(), Some("from another app"));
+}
+
+/// ⌘L and ⌘Q pass the gate; everything else stops there once it has locked.
+#[test]
+fn only_lock_and_quit_pass_the_gate() {
+    let k = |s: &'static str| gpui::Keystroke::parse(s).unwrap();
+    assert!(autolock::passes_lock(&k("cmd-l")));
+    assert!(autolock::passes_lock(&k("cmd-q")));
+    for other in ["cmd-shift-c", "cmd-shift-r", "cmd-c", "l", "cmd-shift-l"] {
+        assert!(!autolock::passes_lock(&k(other)), "{other}");
+    }
 }

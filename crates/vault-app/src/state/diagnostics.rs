@@ -376,6 +376,7 @@ mod tests {
             s.sync.save_blocked = Some(super::super::sync::SaveBlockedNotice {
                 message: leaky.clone().into(),
                 offers_trash: false,
+                offers_repair: false,
             });
             diagnostics_text(s, now, &Host::default())
         });

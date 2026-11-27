@@ -181,7 +181,7 @@ impl Totp {
 }
 ```
 
-Supports SHA1/SHA256/SHA512, 6/7/8 digits, any period. Steam-style codes are out of scope.
+Supports SHA1/SHA256/SHA512, 6/7/8 digits, a period of 1–300 s (`MAX_PERIOD`; a URI outside that range is `InvalidUri`, a missing period is 30; security review 2026-11-26 I-14, 2026-11-27: an unbounded period made an effectively static code). Steam-style codes are out of scope.
 
 ## `generator`
 

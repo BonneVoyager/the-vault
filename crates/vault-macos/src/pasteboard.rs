@@ -55,10 +55,13 @@ impl Clipboard {
         imp::types()
     }
 
-    /// Writes `text` as plain text without the concealed marker, as another
-    /// app would. Test helper only.
+    /// Writes `text` as plain text without the concealed marker, simulating
+    /// another app's copy. Only with the `test-support` feature: release
+    /// builds have no way to put unconcealed text on the pasteboard
+    /// (security review 2026-11-26, I-10).
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
-    pub fn write_plain(text: &str) -> Option<ChangeCount> {
+    pub fn test_write_plain_as_other_app(text: &str) -> Option<ChangeCount> {
         imp::write_plain(text).map(ChangeCount)
     }
 }
@@ -67,7 +70,7 @@ impl Clipboard {
 mod imp {
     use objc2::rc::Retained;
     use objc2_app_kit::{NSPasteboard, NSPasteboardContentsOptions, NSPasteboardType};
-    use objc2_foundation::{NSArray, NSString};
+    use objc2_foundation::NSString;
 
     use super::{CONCEALED_TYPE, PLAIN_TEXT_TYPE};
 
@@ -80,7 +83,10 @@ mod imp {
     }
 
     /// Plain write as another app would do it (test helper path).
+    #[cfg(feature = "test-support")]
     fn declare_and_set(pb: &NSPasteboard, values: &[(&str, &str)]) -> Option<i64> {
+        use objc2_foundation::NSArray;
+
         let types: Vec<Retained<NSString>> = values.iter().map(|(t, _)| pb_type(t)).collect();
         let types = NSArray::from_retained_slice(&types);
         // SAFETY: `declareTypes:owner:` with a nil owner is always valid; the
@@ -114,6 +120,7 @@ mod imp {
         Some(pb.changeCount() as i64)
     }
 
+    #[cfg(feature = "test-support")]
     pub fn write_plain(text: &str) -> Option<i64> {
         declare_and_set(&general(), &[(PLAIN_TEXT_TYPE, text)])
     }
@@ -190,6 +197,7 @@ mod imp {
         Some(set(text, vec![CONCEALED_TYPE, PLAIN_TEXT_TYPE]))
     }
 
+    #[cfg(feature = "test-support")]
     pub fn write_plain(text: &str) -> Option<i64> {
         Some(set(text, vec![PLAIN_TEXT_TYPE]))
     }

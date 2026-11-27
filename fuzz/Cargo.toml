@@ -47,7 +47,36 @@ test = false
 doc = false
 bench = false
 
-# Seed generator (`seed.sh`): decrypts the fixtures and builds sample 1PUX archives.
+[[bin]]
+name = "import_csv"
+path = "fuzz_targets/import_csv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "totp_uri"
+path = "fuzz_targets/totp_uri.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attachment_blob"
+path = "fuzz_targets/attachment_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "export_csv_roundtrip"
+path = "fuzz_targets/export_csv_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+# Seed generator (`seed.sh`): decrypts the fixtures, builds sample 1PUX archives and writes the
+# committed `seeds/` (CSV, otpauth URIs, a sealed attachment blob, export round-trip items).
 [[bin]]
 name = "seed"
 path = "src/bin/seed.rs"

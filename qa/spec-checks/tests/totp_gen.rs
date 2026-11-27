@@ -104,7 +104,7 @@ fn t02_against_independent_hmac() {
         let key: Vec<u8> = (0..len).map(|_| rng.r#gen()).collect();
         let alg = ["SHA1", "SHA256", "SHA512"][n % 3];
         let digits = [6u32, 7, 8][(n / 3) % 3];
-        let period = [30u64, 60, 15, 1, 3600][(n / 9) % 5];
+        let period = [30u64, 60, 15, 1, 300][(n / 9) % 5];
         let ts: u64 = rng.gen_range(0..4_000_000_000);
         let uri = format!(
             "otpauth://totp/x?secret={}&algorithm={alg}&digits={digits}&period={period}",
@@ -129,6 +129,22 @@ fn t02_against_independent_hmac() {
     }
     bad.truncate(10);
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Security review 2026-11-26 I-14: the period is capped at 300 s (`MAX_PERIOD`).
+#[test]
+fn t05_period_above_300_is_rejected() {
+    let uri = |p: u32| {
+        format!(
+            "otpauth://totp/x?secret={}&period={p}",
+            b32(b"12345678901234567890")
+        )
+    };
+    assert_eq!(Totp::parse_uri(&uri(300)).unwrap().period(), 300);
+    assert!(matches!(
+        Totp::parse_uri(&uri(301)),
+        Err(TotpError::InvalidUri)
+    ));
 }
 
 /// 02: scheme/host case-insensitive; secret normalised (case, padding, spaces, dashes); hotp rejected;

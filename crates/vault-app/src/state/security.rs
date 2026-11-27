@@ -11,10 +11,32 @@
 use std::time::{Duration, Instant};
 
 use gpui::{Context, SharedString};
-use vault_core::{ExposeSecret as _, KdfParams, SecretString, UnlockedVault, Uuid, VaultError};
+use vault_core::{
+    ExposeSecret as _, KdfParams, LockedVault, SecretString, UnlockedVault, Uuid, VaultError,
+};
 use vault_sync::{SyncError, SyncedVault};
 
-use super::{AppState, Busy, KDF_TARGET, Navigation, Outcome, Toast};
+use super::{AppState, Busy, KDF_TARGET, KdfSeen, Navigation, Outcome, Toast};
+
+/// Unlock error for a wrong password when the file's Argon2 costs differ from the ones last
+/// seen on this Mac (security review 2026-11-26 L-01): an attacker who raises them makes the
+/// correct password fail, and the user should not conclude they forgot it.
+pub const KDF_CHANGED: &str = "Wrong password. This vault's encryption settings changed since \
+    it was last unlocked on this Mac; if you did not re-calibrate them, the file may have been \
+    altered.";
+
+/// The costs in the unlocked vault's header.
+pub(super) fn kdf_seen_of(vault: &SyncedVault) -> Option<KdfSeen> {
+    vault.vault().map(|v| KdfSeen::from(&v.header().kdf))
+}
+
+/// The costs in the header of `vault.bin` as it is on disk now, read the way the package
+/// reads it. `None` if the file cannot be read or parsed.
+pub(super) fn on_disk_kdf(vault: &SyncedVault) -> Option<KdfSeen> {
+    let bytes = vault_sync::read_package_entry_capped(vault.vault_file()).ok()?;
+    let locked = LockedVault::parse(&bytes).ok()?;
+    Some(KdfSeen::from(locked.kdf_params()))
+}
 
 /// Index of the Security tab in the settings sheet.
 pub const SECURITY_TAB: usize = 1;
@@ -93,6 +115,30 @@ fn vault_error_message(e: &VaultError) -> String {
 }
 
 impl AppState {
+    /// Records `seen` as the current vault's last-seen costs in settings.json (L-01).
+    pub(super) fn remember_kdf(&mut self, seen: Option<KdfSeen>, cx: &mut Context<Self>) {
+        if let (Some(id), Some(seen)) = (self.vault_id, seen) {
+            self.update_settings(cx, |s| {
+                s.kdf_seen.insert(id, seen);
+            });
+        }
+    }
+
+    /// The unlock card's text for a failed password unlock: [`KDF_CHANGED`] for a wrong
+    /// password when `on_disk` differs from the costs recorded for this vault, otherwise
+    /// the usual message.
+    pub(super) fn unlock_error_message(&self, e: &SyncError, on_disk: Option<KdfSeen>) -> String {
+        let recorded = self.vault_id.and_then(|id| self.settings.kdf_seen.get(&id));
+        match (e, recorded, on_disk) {
+            (SyncError::Vault(VaultError::WrongPassword), Some(seen), Some(now))
+                if *seen != now =>
+            {
+                KDF_CHANGED.into()
+            }
+            _ => super::error_message(e),
+        }
+    }
+
     /// KDF params in the unlocked vault's header.
     pub fn current_kdf(&self) -> Option<KdfParams> {
         self.unlocked_vault().map(|v| v.header().kdf.clone())
@@ -295,20 +341,23 @@ impl AppState {
             return;
         };
         self.security.error = None;
-        self.run_bg(
+        self.run_bg_cx(
             busy,
             cx,
             move || {
                 let result = work(&mut vault);
                 (vault, result)
             },
-            move |this, (mut vault, result), outcome| match (outcome, result) {
+            move |this, (mut vault, result), outcome, cx| match (outcome, result) {
                 (Outcome::Closed, _) => this.report_lock(None, &vault.lock()),
                 (Outcome::Locked, result) => {
+                    // Saved with the password just checked: these costs are this Mac's (L-01).
+                    let seen = kdf_seen_of(&vault);
                     let lock = vault.lock();
                     this.vault = Some(vault);
                     let save_error = match result {
                         Ok(()) => {
+                            this.remember_kdf(seen, cx);
                             let message = done(this);
                             this.set_toast(Toast::window(message));
                             None
@@ -320,7 +369,9 @@ impl AppState {
                     this.report_lock(save_error.as_deref(), &lock);
                 }
                 (Outcome::Fresh, Ok(())) => {
+                    let seen = kdf_seen_of(&vault);
                     this.vault = Some(vault);
+                    this.remember_kdf(seen, cx);
                     this.record_save(Ok(()));
                     this.security.form = None;
                     let message = done(this);
@@ -549,6 +600,12 @@ mod tests {
         assert_ne!(cost(&after), cost(&before));
         assert_eq!(cost(&after), cost(&KdfParams::recommended()));
         state.read_with(cx, |s, _| {
+            let id = s.vault_id.unwrap();
+            assert_eq!(
+                s.settings.kdf_seen[&id],
+                KdfSeen::from(&after),
+                "L-01 record"
+            );
             assert!(s.security.error.is_none());
             assert_eq!(s.current_kdf().map(|k| cost(&k)), Some(cost(&after)));
             assert!(s.kdf_seconds().is_none(), "old measurement is stale");

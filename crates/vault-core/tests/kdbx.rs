@@ -503,6 +503,10 @@ fn maps_native_keepass_and_keetraytotp_fields() {
         broken.set_unprotected("Title", "Broken");
         broken.set_protected("TimeOtp-Secret-Base32", "!!!");
         broken.set_unprotected("TimeOtp-Period", "60");
+        let mut slow = root.add_entry();
+        slow.set_unprotected("Title", "Slow");
+        slow.set_protected("TimeOtp-Secret-Base32", "JBSWY3DPEHPK3PXP");
+        slow.set_unprotected("TimeOtp-Period", "301");
     }
     let items = import(&encoded(&db, Some(PASSWORD), None), PASSWORD).unwrap();
     let by_title = |title: &str| items.iter().find(|item| item.title == title).unwrap();
@@ -540,6 +544,10 @@ fn maps_native_keepass_and_keetraytotp_fields() {
             .kind,
         FieldKind::Password
     );
+    // A period over the 300 s cap is not representable: raw fields kept, no totp field.
+    let slow = by_title("Slow");
+    assert!(slow.fields.iter().all(|f| f.name != "totp"));
+    assert_eq!(slow.fields.len(), 2);
 }
 
 /// HMAC-SHA256 (RFC 2104), built from `sha2` because no HMAC crate is a dependency. This is

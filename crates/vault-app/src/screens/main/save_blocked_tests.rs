@@ -207,3 +207,120 @@ fn save_blocked_event_shows_the_strip_without_the_link(cx: &mut TestAppContext) 
     assert!(vcx.debug_bounds(BANNER).is_some());
     assert!(vcx.debug_bounds(LINK).is_none());
 }
+
+const REPAIR: &str = "save-blocked-repair";
+
+/// The strip for a planted `backups` entry in the package (L-05).
+const NOT_A_FOLDER: &str = "Not saving: \u{201c}backups\u{201d} inside the vault package is not \
+                            a folder. Repair moves it aside.";
+
+fn package(state: &gpui::Entity<AppState>, vcx: &mut VisualTestContext) -> std::path::PathBuf {
+    state.read_with(vcx, |s, _| s.vault.as_ref().unwrap().path().to_owned())
+}
+
+fn toast(state: &gpui::Entity<AppState>, vcx: &mut VisualTestContext) -> Option<String> {
+    state.read_with(vcx, |s, _| s.toast.as_ref().map(|t| t.message.to_string()))
+}
+
+fn click_repair(vcx: &mut VisualTestContext) {
+    let button = bounds(REPAIR, vcx);
+    assert!(bounds(BANNER, vcx).contains(&button.center()));
+    vcx.simulate_click(button.center(), gpui::Modifiers::none());
+    vcx.run_until_parked();
+    frame(vcx);
+}
+
+/// L-05: a save refused for a package entry that is not a folder raises the strip with
+/// the entry's name and a Repair action, no Recently Deleted link.
+#[gpui::test]
+fn unsafe_package_dir_offers_repair(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, mut vcx) = open(true, dir.path(), cx);
+    let pkg = package(&state, &mut vcx);
+    state.update(&mut vcx, |s, cx| {
+        s.toggle_favorite(cx);
+        let err = SyncError::UnsafePackageDir(pkg.join("backups"));
+        s.finish_autosave_for_test(Err(err), cx);
+    });
+    frame(&mut vcx);
+    state.read_with(&vcx, |s, _| {
+        let notice = s.save_blocked().expect("strip state");
+        assert_eq!(notice.message.as_ref(), NOT_A_FOLDER);
+        assert!(notice.offers_repair && !notice.offers_trash);
+    });
+    assert_eq!(super::save_blocked::REPAIR, "Repair");
+    assert!(bounds(BANNER, &mut vcx).contains(&bounds(REPAIR, &mut vcx).center()));
+    assert!(vcx.debug_bounds(LINK).is_none());
+}
+
+/// L-05: with a plain file planted as `backups`, a save that writes a snapshot there fails
+/// (a save with no snapshot due never touches `backups/`, so the error is fed in); Repair
+/// moves the file aside, clears the strip, toasts and saves the dirty vault.
+#[gpui::test]
+fn repair_moves_a_planted_backups_file_and_saves(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, mut vcx) = open(true, dir.path(), cx);
+    let pkg = package(&state, &mut vcx);
+    let planted = pkg.join("backups");
+    if planted.is_dir() {
+        std::fs::remove_dir_all(&planted).unwrap();
+    }
+    std::fs::write(&planted, b"not a folder").unwrap();
+    state.update(&mut vcx, |s, cx| {
+        s.toggle_favorite(cx);
+        let err = SyncError::UnsafePackageDir(planted.clone());
+        s.finish_autosave_for_test(Err(err), cx);
+        assert!(s.save_blocked().unwrap().offers_repair);
+    });
+    frame(&mut vcx);
+    click_repair(&mut vcx);
+    assert_eq!(
+        toast(&state, &mut vcx).as_deref(),
+        Some("Moved 1 item(s) aside; saving again.")
+    );
+    state.read_with(&vcx, |s, _| {
+        assert!(s.save_blocked().is_none() && s.sync.save_blocked.is_none());
+        assert!(!s.vault.as_ref().unwrap().is_dirty(), "saved again");
+        assert!(!s.sync.save_failing);
+    });
+    assert!(vcx.debug_bounds(BANNER).is_none());
+    assert!(!planted.is_file(), "moved aside");
+    let quarantined = std::fs::read_dir(&pkg)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("backups.quarantined-")
+        });
+    assert!(quarantined, "renamed, never deleted");
+    // The next save works too.
+    state.update(&mut vcx, |s, cx| {
+        s.toggle_favorite(cx);
+        s.vault.as_mut().unwrap().save().expect("next save");
+    });
+}
+
+/// L-05: Repair with nothing planted says so and leaves the strip up.
+#[gpui::test]
+fn repair_with_nothing_planted_keeps_the_strip(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, mut vcx) = open(true, dir.path(), cx);
+    let pkg = package(&state, &mut vcx);
+    state.update(&mut vcx, |s, cx| {
+        s.toggle_favorite(cx);
+        let err = SyncError::UnsafePackageDir(pkg.join("backups"));
+        s.finish_autosave_for_test(Err(err), cx);
+    });
+    frame(&mut vcx);
+    click_repair(&mut vcx);
+    assert_eq!(
+        toast(&state, &mut vcx).as_deref(),
+        Some(crate::state::NOTHING_TO_REPAIR)
+    );
+    assert_eq!(crate::state::NOTHING_TO_REPAIR, "Nothing to repair.");
+    state.read_with(&vcx, |s, _| {
+        assert!(s.save_blocked().is_some_and(|n| n.offers_repair));
+    });
+    assert!(vcx.debug_bounds(BANNER).is_some());
+}

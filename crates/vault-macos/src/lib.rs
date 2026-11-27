@@ -42,16 +42,17 @@ mod login_launch;
 pub use login_launch::launched_as_login_item;
 
 mod qr;
+#[cfg(feature = "test-support")]
+pub use qr::test_image_decoder_calls;
 pub use qr::{
     MAX_IMAGE_FILE_BYTES, MAX_IMAGE_PIXELS, decode_qr_from_gray, scan_qr_from_image_file,
-    scan_qr_from_screen, screen_capture_permitted,
 };
 
 mod appearance;
 pub use appearance::{Rgba, on_system_colors_changed, system_accent_color};
 
 mod panel;
-pub use panel::{choose_file, normalize_extensions};
+pub use panel::{cancel_open_panel, choose_file_async, normalize_extensions};
 
 mod dock;
 pub use dock::{dock_icon_visible, set_dock_icon_visible};

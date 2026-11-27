@@ -20,6 +20,10 @@ impl AppState {
         let state = cx.entity();
         // The card's kind and time line comes from the Settings backups list.
         let info = self.sync.backups.iter().find(|b| b.path == path).cloned();
+        // Only a listed entry vault-sync tied to this vault is opened (L-04).
+        if !self.listed_and_validated(&path) {
+            return self.show_toast(super::NOT_THIS_VAULT, cx);
+        }
         let name = self.vault_name();
         match crate::screens::open_backup_window(state, path, info, name, cx) {
             Ok(handle) => {

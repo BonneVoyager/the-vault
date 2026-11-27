@@ -620,6 +620,38 @@ fn export_force_is_atomic_and_refuses_symlink() {
     assert_eq!(names.len(), 3, "no temp left: {names:?}");
 }
 
+/// A revealed secret escapes reversibly: backslash as `\\`, tab as `\t`. Masked stays masked.
+#[test]
+fn revealed_secret_escapes_backslash_and_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("r.vault");
+    ok(&vault(&f, PW, &["init", "--kdf-test-params"]));
+    let add = Command::new(env!("CARGO_BIN_EXE_vault"))
+        .args([
+            "--vault",
+            f.to_str().unwrap(),
+            "--password-env",
+            "VAULT_TEST_PW",
+        ])
+        .args(["add", "--title", "Esc", "--password-field"])
+        .env("VAULT_TEST_PW", PW)
+        .env("VAULT_ITEM_PASSWORD", "a\tb\\c")
+        .env("VAULT_DEV_KDF", "1")
+        .env("VAULT_DEVICE_ID", "11111111-1111-4111-8111-111111111111")
+        .output()
+        .unwrap();
+    ok(&add);
+    let shown = ok(&vault(&f, PW, &["get", "Esc", "--reveal"]));
+    assert!(shown.contains("password: a\\tb\\\\c\n"), "{shown}");
+    assert!(!shown.contains('\t'), "{shown}");
+    let masked = ok(&vault(&f, PW, &["get", "Esc"]));
+    assert!(masked.contains("password: ********"), "{masked}");
+    assert!(
+        !masked.contains("a\\tb") && !masked.contains("b\\c"),
+        "{masked}"
+    );
+}
+
 #[test]
 fn terminal_control_characters_are_escaped() {
     let dir = tempfile::tempdir().unwrap();

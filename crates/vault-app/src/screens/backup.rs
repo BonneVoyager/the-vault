@@ -982,6 +982,8 @@ impl Render for BackupWindow {
         };
         ui::clear_focus_ring_on_click(div())
             .id("backup-window")
+            // Activity gate (L-13): a click after a long sleep locks, never copies.
+            .map(|el| crate::autolock::gate_mouse(el, &self.state))
             .track_focus(&self.focus)
             .on_modifiers_changed(
                 cx.listener(|this, ev: &gpui::ModifiersChangedEvent, _, cx| {
@@ -1045,7 +1047,11 @@ mod tests {
         vault.save().unwrap();
         let backup = vault.backup_now().unwrap();
         let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
-        state.update(cx, |s, _| s.install_unlocked_for_tests(vault));
+        state.update(cx, |s, _| {
+            s.install_unlocked_for_tests(vault);
+            // Settings lists it: only listed, validated entries open or restore (L-04).
+            s.refresh_backups();
+        });
         (state, backup)
     }
 
@@ -1552,7 +1558,8 @@ mod tests {
     }
 
     /// An absorbed iCloud conflict copy is a whole package directory: the viewer reads its
-    /// vault.bin, and `open_backup` opens a window for it.
+    /// vault.bin. `open_backup` opens only listed, validated entries, and this one (another
+    /// vault, outside `backups/`) is not listed.
     #[gpui::test]
     fn opens_a_conflict_package_dir(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -1582,10 +1589,11 @@ mod tests {
             assert_eq!(w.item_ids().len(), 1);
         });
 
+        // From the app it is refused: not in this vault's backups list (L-04).
         let before = vcx.update(|_, cx| cx.windows().len());
         state.update(&mut vcx, |s, cx| s.open_backup(conflict.clone(), cx));
         vcx.run_until_parked();
-        assert_eq!(vcx.update(|_, cx| cx.windows().len()), before + 1);
+        assert_eq!(vcx.update(|_, cx| cx.windows().len()), before);
     }
 
     /// `window` with the backup at `backup` opened, GitHub selected.

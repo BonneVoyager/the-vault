@@ -98,6 +98,24 @@ fn uri_round_trip() {
     assert_eq!(again.code(100), custom.code(100));
 }
 
+/// Period is bounded to `1..=300` s (security review 2026-11-26 I-14); absent means 30.
+#[test]
+fn period_is_bounded() {
+    let with = |p: &str| Totp::parse_uri(&format!("otpauth://totp/x?secret={}{p}", base32(S1)));
+    assert_eq!(with("&period=300").unwrap().period(), 300);
+    assert_eq!(
+        with("&period=300").unwrap().period(),
+        vault_core::totp::MAX_PERIOD
+    );
+    assert_eq!(with("").unwrap().period(), 30);
+    for bad in ["301", "0", "86400", "4294967296"] {
+        assert!(
+            matches!(with(&format!("&period={bad}")), Err(TotpError::InvalidUri)),
+            "period={bad} accepted"
+        );
+    }
+}
+
 // ---- real-world otpauth URI shapes ----
 
 const JB: &str = "JBSWY3DPEHPK3PXP";

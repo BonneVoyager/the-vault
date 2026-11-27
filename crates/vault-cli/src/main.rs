@@ -81,6 +81,8 @@ enum Cmd {
     /// Show an item.
     Get {
         id_or_title: String,
+        /// Print secret values. Revealed values are escaped reversibly: a backslash prints as
+        /// `\\`, a tab as `\t`, other control and format characters as `\u{XXXX}`.
         #[arg(long)]
         reveal: bool,
         /// Show each field's id in a trailing column.
@@ -305,21 +307,37 @@ fn read_capped(path: &Path, cap: u64) -> std::io::Result<Zeroizing<Vec<u8>>> {
 /// value, notes) is printed. C0 controls, DEL, C1 controls and bidi/format controls become
 /// `\u{XXXX}`; tab becomes a single space and line feed is kept.
 fn sanitize_for_terminal(s: &str) -> String {
-    sanitize(s, true)
+    sanitize(s, true, false)
+}
+
+/// [`sanitize_for_terminal`] for revealed notes: reversible, so a backslash prints as `\\`
+/// and a tab as `\t` (every other escape starts with a backslash, so the output is
+/// unambiguous). Line feed is kept.
+fn sanitize_revealed_multiline(s: &str) -> String {
+    sanitize(s, true, true)
+}
+
+/// [`sanitize_line`] for revealed values: reversible like [`sanitize_revealed_multiline`].
+fn sanitize_revealed_line(s: &str) -> String {
+    sanitize(s, false, true)
 }
 
 /// [`sanitize_for_terminal`] for text that must stay on one physical line (titles, names,
 /// paths, sync events, errors): line feed and carriage return become a visible `\n` / `\r`,
 /// so a crafted name cannot forge extra output lines.
 fn sanitize_line(s: &str) -> String {
-    sanitize(s, false)
+    sanitize(s, false, false)
 }
 
-fn sanitize(s: &str, keep_newlines: bool) -> String {
+/// `reversible` (revealed values only) doubles backslashes and writes tab as `\t`, so the
+/// printed text maps back to exactly one value; otherwise tab becomes a space.
+fn sanitize(s: &str, keep_newlines: bool, reversible: bool) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
+            '\\' if reversible => out.push_str("\\\\"),
+            '\t' if reversible => out.push_str("\\t"),
             '\t' => out.push(' '),
             '\n' if keep_newlines => out.push('\n'),
             '\n' => out.push_str("\\n"),
@@ -456,7 +474,9 @@ fn sync_report(events: impl Iterator<Item = vault_sync::SyncEvent>) -> SyncRepor
             SyncEvent::ForeignVault => r
                 .lines
                 .push("note: a different vault sits next to this one; left alone".to_owned()),
-            SyncEvent::Error(m) => r.problems.push(sanitize_line(&format!("error: {m}"))),
+            SyncEvent::Error(m) | SyncEvent::BackupFailed { message: m, .. } => {
+                r.problems.push(sanitize_line(&format!("error: {m}")))
+            }
             SyncEvent::KeyMismatch | SyncEvent::KeyRotatedOnDisk => r
                 .problems
                 .push("the vault on disk no longer opens with this key".to_owned()),
@@ -487,12 +507,13 @@ fn display_value(item: &Item, f: &Field, reveal: bool) -> String {
     // Only notes are multi-line; any other value with a line break would forge a line. Notes
     // continuation lines are indented by two spaces so they cannot pass for a `label: value`
     // line (a script reading `vault get` output keys on the line start).
-    let shown = |raw: &str| {
-        if f.kind == FieldKind::Notes {
-            sanitize_for_terminal(raw).replace('\n', "\n  ")
-        } else {
-            sanitize_line(raw)
-        }
+    // Revealed output escapes reversibly (backslash and tab included); unrevealed plain
+    // values keep the lossy tab-to-space form.
+    let shown = |raw: &str| match (f.kind == FieldKind::Notes, reveal) {
+        (true, false) => sanitize_for_terminal(raw).replace('\n', "\n  "),
+        (true, true) => sanitize_revealed_multiline(raw).replace('\n', "\n  "),
+        (false, false) => sanitize_line(raw),
+        (false, true) => sanitize_revealed_line(raw),
     };
     if reveal {
         return shown(raw);
@@ -629,7 +650,8 @@ const KDF_FLOOR_WARNING: &str = "warning: this vault's encryption settings are b
 /// Environment variable that unlocks `init --kdf-test-params` (L-20).
 const DEV_KDF_VAR: &str = "VAULT_DEV_KDF";
 
-/// Save, then print each [`vault_sync::SyncEvent::Error`] the save raised (a failed snapshot:
+/// Save, then print each [`vault_sync::SyncEvent::Error`] or
+/// [`vault_sync::SyncEvent::BackupFailed`] the save raised (a failed snapshot:
 /// symlinked `backups/`, full disk, oversized backup) to stderr as one sanitised
 /// `warning: …` line. The warnings do not change the exit code; only a failed save does.
 /// `sync` reports its own events and does not use this.
@@ -646,7 +668,10 @@ fn save_and_warn(sv: &mut SyncedVault) -> Result<()> {
 fn sync_warnings(events: impl Iterator<Item = vault_sync::SyncEvent>) -> Vec<String> {
     events
         .filter_map(|ev| match ev {
-            vault_sync::SyncEvent::Error(m) => Some(sanitize_line(&format!("warning: {m}"))),
+            vault_sync::SyncEvent::Error(m)
+            | vault_sync::SyncEvent::BackupFailed { message: m, .. } => {
+                Some(sanitize_line(&format!("warning: {m}")))
+            }
             _ => None,
         })
         .collect()
@@ -1238,6 +1263,11 @@ mod tests {
     #[test]
     fn sanitize_escapes_controls_and_format_chars() {
         assert_eq!(sanitize_for_terminal("a\tb"), "a b");
+        assert_eq!(sanitize_for_terminal("a\\b"), "a\\b");
+        assert_eq!(sanitize_revealed_multiline("a\tb\\c\nd"), "a\\tb\\\\c\nd");
+        assert_eq!(sanitize_revealed_line("a\tb\\c\nd"), "a\\tb\\\\c\\nd");
+        assert_eq!(sanitize_revealed_line("\u{1b}"), "\\u{1b}");
+        assert_eq!(sanitize_revealed_line("\\u{1b}"), "\\\\u{1b}");
         assert_eq!(sanitize_for_terminal("a\nb"), "a\nb");
         assert_eq!(sanitize_for_terminal("a\rb"), "a\\u{d}b");
         assert_eq!(sanitize_for_terminal("\u{9b}31m"), "\\u{9b}31m");
@@ -1261,7 +1291,10 @@ mod tests {
         let lines = sync_warnings(
             vec![
                 SyncEvent::BackupTaken(PathBuf::from("/x/b.vault.bin")),
-                SyncEvent::Error("backup failed: disk\nerror: forged".to_owned()),
+                SyncEvent::BackupFailed {
+                    unsafe_dir: false,
+                    message: "backup failed: disk\nerror: forged".to_owned(),
+                },
                 SyncEvent::AttachmentsPruned(2),
             ]
             .into_iter(),

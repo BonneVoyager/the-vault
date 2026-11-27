@@ -1984,6 +1984,8 @@ fn revealed_secret_copies_through_the_concealed_path(cx: &mut TestAppContext) {
         ui::focus_input(&input, window, cx);
     });
 
+    // The unlock's weak-KDF notice (test vaults use test KDF costs, L-20).
+    take_toast(&mut vcx);
     // Masked: nothing anywhere.
     vcx.simulate_keystrokes("cmd-a cmd-c");
     vcx.run_until_parked();

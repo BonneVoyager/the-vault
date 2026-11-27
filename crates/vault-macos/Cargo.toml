@@ -20,7 +20,7 @@ tracing = "=0.1.44"
 secrecy = "=0.8.0"
 # CBOR payload of the Touch ID Keychain item (spec 04 §2.1d); same version as vault-core.
 ciborium = "=0.2.2"
-# QR decoding for "Scan QR from screen" (spec 05 §2.3): pure Rust, no network, no image crate
+# QR decoding for "Scan QR from image…" (image-file scan, spec 05 §2.3): pure Rust, no network, no image crate
 # (default `img` feature off; we feed 8-bit gray via prepare_from_greyscale).
 # Transitive: g2p (Galois-field math for Reed-Solomon; its build pulls proc-macro g2gen,
 # g2poly, syn/quote/proc-macro2) and lru (+ hashbrown, foldhash).
@@ -39,14 +39,15 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = ["
 # bitflags: NSPasteboardContentsOptions (currentHostOnly). NSWindow/NSResponder/NSApplication:
 # sharingType for window.rs; NSGraphics: NSBackingStoreType for the window test.
 # NSColor/NSColorSpace (+ objc2-core-foundation for CGFloat): accent colour in appearance.rs.
-# NSPanel/NSSavePanel/NSOpenPanel: extension-filtered open panel in panel.rs.
+# NSPanel/NSSavePanel/NSOpenPanel: extension-filtered open panel in panel.rs; block2 gates
+# beginWithCompletionHandler (non-modal panel, security review M-04).
 # NSRunningApplication: NSApplicationActivationPolicy for dock.rs (Dock icon visibility).
 # NSStatusBar/NSStatusItem/NSStatusBarButton/NSButton/NSControl/NSView/NSImage/NSMenu/
 # NSMenuItem/NSEvent/NSBezierPath: menu bar status item in status_item.rs (spec 04 §5c).
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "bitflags", "NSWorkspace", "NSPasteboard", "NSAccessibility", "NSImageRep", "NSBitmapImageRep", "objc2-core-graphics", "NSResponder", "NSWindow", "NSApplication", "NSGraphics", "NSColor", "NSColorSpace", "objc2-core-foundation", "NSPanel", "NSSavePanel", "NSOpenPanel", "NSRunningApplication", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSImage", "NSMenu", "NSMenuItem", "NSEvent", "NSBezierPath"] }
-# CGEventSourceSecondsSinceLastEventType for idle detection; CGDisplayCreateImage, bitmap
-# contexts and Screen Recording preflight/request for QR scanning (qr.rs).
-objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGEventSource", "CGEventTypes", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGImage", "CGColorSpace", "CGContext", "CGBitmapContext", "CGWindow"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "bitflags", "NSWorkspace", "NSPasteboard", "NSAccessibility", "NSImageRep", "NSBitmapImageRep", "objc2-core-graphics", "NSResponder", "NSWindow", "NSApplication", "NSGraphics", "NSColor", "NSColorSpace", "objc2-core-foundation", "NSPanel", "NSSavePanel", "NSOpenPanel", "block2", "NSRunningApplication", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSImage", "NSMenu", "NSMenuItem", "NSEvent", "NSBezierPath"] }
+# CGEventSourceSecondsSinceLastEventType for idle detection; bitmap contexts for the gray
+# conversion of QR image files (qr.rs).
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["std", "CGEventSource", "CGEventTypes", "CGImage", "CGColorSpace", "CGContext", "CGBitmapContext"] }
 # Wipes the grayscale screen buffers in qr.rs (same version as vault-core's lock).
 zeroize = "=1.9.1"
 # sysctl(kern.boottime) and timeval; sysctlbyname("hw.model") in host.rs.
@@ -62,10 +63,19 @@ objc2-core-foundation = { version = "=0.3.2", default-features = false, features
 # LADomainState: LAContext.domainState.biometry.stateHash, the enrolled finger-set hash
 # (replaces the macOS 15 deprecated evaluatedPolicyDomainState).
 objc2-local-authentication = { version = "=0.3.2", default-features = false, features = ["std", "LAContext", "LAError", "LADomainState"] }
+# Completion handler of NSOpenPanel.beginWithCompletionHandler in panel.rs (M-04: no nested
+# modal loop). Already in Cargo.lock via gpui and objc2-app-kit; same version.
+block2 = "=0.6.2"
 # Launch at login (spec 05 §2.5): SMAppService.mainAppService register/unregister/status.
 objc2-service-management = { version = "=0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 
+[features]
+# Test-only hooks (`test_image_decoder_calls`). Never enable outside tests.
+test-support = []
+
 [dev-dependencies]
+# Self dependency so the integration tests get the `test-support` hooks.
+vault-macos = { path = ".", features = ["test-support"] }
 tempfile = "=3.27.0"
 # Renders test QR codes for tests/qr.rs, including the PNG fixtures written at test time for
 # scan_qr_from_image_file (pure Rust; image/svg/pic renderers off).
@@ -102,4 +112,11 @@ harness = false
 # Opens an NSOpenPanel (main thread only) when run with `-- --ignored`; manual check.
 [[test]]
 name = "panel"
+harness = false
+
+# M-04 regression: main-queue callbacks are held during a runModal entered from the main
+# queue, and run while choose_file_async's panel is up; cancel_open_panel closes it.
+# Skipped without a window server session or with VAULT_SKIP_GUI_TESTS.
+[[test]]
+name = "modal_queue"
 harness = false

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use gpui::{App, Entity, Task};
+use gpui::{App, Entity, InteractiveElement, Keystroke, Modifiers, Subscription, Task};
 
 use crate::state::AppState;
 
@@ -32,6 +32,7 @@ pub struct LockTriggers {
     _user_switched: vault_macos::Subscription,
     _signals: Task<()>,
     _tick: Task<()>,
+    _keys: Subscription,
 }
 
 pub fn install(state: &Entity<AppState>, cx: &mut App) -> LockTriggers {
@@ -48,6 +49,7 @@ pub fn install(state: &Entity<AppState>, cx: &mut App) -> LockTriggers {
         let _ = tx.unbounded_send(Signal::WillSleep);
     });
     let signals = drain_signals(state, rx, cx);
+    let keys = gate_keys(state, cx);
 
     let reduce_motion = vault_macos::reduce_motion_enabled();
     state.update(cx, |s, cx| s.set_reduce_motion(reduce_motion, cx));
@@ -74,7 +76,44 @@ pub fn install(state: &Entity<AppState>, cx: &mut App) -> LockTriggers {
         _user_switched: user_switched,
         _signals: signals,
         _tick: tick,
+        _keys: keys,
     }
+}
+
+/// Every keystroke in every window counts as activity, before gpui matches it to a key
+/// binding or a menu key equivalent. When the Mac slept past the idle limit the vault
+/// locks instead and the keystroke stops here, so a shortcut (⌘⇧C, ⌘⇧R…) cannot act on
+/// the vault it found open (L-13). ⌘L and ⌘Q still go through.
+pub fn gate_keys(state: &Entity<AppState>, cx: &mut App) -> Subscription {
+    let state = state.downgrade();
+    cx.intercept_keystrokes(move |event, _, cx| {
+        let locked = state
+            .update(cx, |s, cx| s.note_activity(cx))
+            .unwrap_or(false);
+        if locked && !passes_lock(&event.keystroke) {
+            cx.stop_propagation();
+        }
+    })
+}
+
+/// ⌘L and ⌘Q: harmless on a locked vault, and the user expects them to work.
+pub(crate) fn passes_lock(k: &Keystroke) -> bool {
+    k.modifiers == Modifiers::command() && matches!(k.key.as_str(), "l" | "q")
+}
+
+/// Mouse-down anywhere in `el` (a window's root) counts as activity. When the Mac slept
+/// past the idle limit the vault locks instead and the press stops in the capture phase,
+/// so no click (copy, reveal) reaches the vault it found open (L-13).
+pub fn gate_mouse<E: InteractiveElement>(el: E, state: &Entity<AppState>) -> E {
+    let state = state.downgrade();
+    el.capture_any_mouse_down(move |_, _, cx| {
+        let locked = state
+            .update(cx, |s, cx| s.note_activity(cx))
+            .unwrap_or(false);
+        if locked {
+            cx.stop_propagation();
+        }
+    })
 }
 
 /// Locks on every signal while "Lock on sleep, screen lock or user switch" is on. Ends

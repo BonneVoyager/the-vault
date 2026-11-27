@@ -13,7 +13,7 @@ Pre-release and not yet signed or notarized. It is built and reviewed by an agen
 ## Features
 
 - Three-column, keyboard-first UI in light and dark themes (gpui, no webview)
-- Touch ID unlock through a Secure Enclave wrapped key
+- Touch ID unlock through a Secure Enclave wrapped key (not yet verified on hardware: it needs a signed build with a keychain access group, and it fails closed until then)
 - TOTP codes with a countdown, including QR-code import from an image file
 - Password and passphrase generator
 - Hold ⌥ to reveal every masked value of the shown item, in the main window or an item window
@@ -22,7 +22,7 @@ Pre-release and not yet signed or notarized. It is built and reviewed by an agen
 - Item icons: a Lucide symbol searchable from the full catalog, a colour, or a custom image chosen per item; a letter avatar otherwise
 - Field icons: an optional symbol next to any field name, chosen from the same symbol set
 - Sync through any folder (iCloud Drive, Dropbox, NAS) with field-level merge and conflict-copy absorption
-- Rotating encrypted backups
+- Rotating encrypted backups of the vault file (attachments are not backed up; a backup takes a retention slot only after its header is checked, and nothing is deleted until the replacing backup authenticates under the vault key)
 - Recently Deleted: deleted items can be recovered for 30 days, then they are permanently removed
 - Import from CSV, 1Password (1PUX), and KeePass (KDBX 3/4, with optional key file)
 - Forward-compatible file format: unknown slot, item, and field kinds are preserved
@@ -30,11 +30,11 @@ Pre-release and not yet signed or notarized. It is built and reviewed by an agen
 
 ## Security in brief
 
-- Master password goes through Argon2id, calibrated to at least 500 ms on your machine
-- Each item is encrypted with XChaCha20-Poly1305 and authenticated metadata, so swapped or rolled-back items are detected (replacing the whole file with an older complete copy is not; see the threat model)
+- Master password goes through Argon2id, calibrated to at least 500 ms on your machine (memory is capped at 1 GiB; a vault below the 64 MiB / 3-pass floor, which only the hidden developer flag can produce, is flagged at open)
+- Each item is encrypted with XChaCha20-Poly1305 and authenticated metadata, so swapped or rolled-back items are detected, across merges too (replacing the whole file with an older complete copy is not; see the threat model)
 - The manifest is encrypted, and subkeys are derived with HKDF
 - Vault encryption uses RustCrypto crates, with no custom primitives; KeePass import uses the `keepass` parser
-- The file leaks only the item count, item UUIDs, last-modified times, and creation time
+- The file reveals, without the password: the item count, item UUIDs, last-modified and creation times, each item's ciphertext length (which tracks content size), the key slot kinds (so whether Touch ID is enrolled) and when each was created, the time and device id of the last credential change, and the KDF parameters; the package folder also shows the number and sizes of attachments and the names and times of backups
 
 Not protected: malware or physical access on an unlocked session, and a weak master password. Unlock factors protect the file at rest only.
 

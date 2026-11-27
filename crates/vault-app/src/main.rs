@@ -7,6 +7,7 @@ mod autolock;
 mod biometric;
 mod bounded_read;
 mod clipboard;
+mod clock;
 mod cloud;
 mod cursor_audit;
 mod icon;

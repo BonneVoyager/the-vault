@@ -1,35 +1,25 @@
-//! "Scan QR from screen" for TOTP fields (spec 05 §2.3 Edit mode, phase 5).
+//! QR decoding for TOTP fields: "Scan QR from image" (spec 05 §2.3 Edit mode).
 //!
-//! Capture uses CoreGraphics `CGDisplayCreateImage`, one synchronous call per
-//! active display. Apple deprecated it in macOS 14.4 in favour of
-//! ScreenCaptureKit, but it still works on 14 and 15 and later. It needs the
-//! Screen Recording permission. Each capture is drawn into an 8-bit
-//! `DeviceGray` bitmap context, so CoreGraphics does the luma conversion and
-//! no image crate is needed. QR codes are then decoded with `rqrr`.
-//!
-//! Migration note: if `CGDisplayCreateImage` stops working, switch to
-//! ScreenCaptureKit's `SCScreenshotManager.captureImage` via
-//! `objc2-screen-capture-kit`. That API is async (completion handler), so it
-//! needs a bridge to a synchronous wait with a timeout. On macOS 15 and later
-//! the system also re-prompts periodically for Screen Recording consent (TCC),
-//! whichever API is used.
-//!
-//! `scan_qr_from_image_file` is the permission-free alternative: the user picks
-//! a screenshot or exported QR image. AppKit's `NSBitmapImageRep` decodes it
-//! (any format ImageIO reads: PNG, JPEG, HEIC, TIFF, GIF, BMP...) and the
-//! first frame goes through the same gray conversion and decoder.
+//! The user picks a screenshot or exported QR image; no Screen Recording
+//! permission is needed. (A whole-screen scan was removed from the spec on
+//! 2026-10-29 and from this crate by security review 2026-11-26, I-10.) Only
+//! PNG and JPEG are accepted, checked by their leading magic bytes before any
+//! system decoder sees the file (security review 2026-11-26, L-08): ImageIO
+//! sniffs some 60 formats by content, and this process holds the decrypted
+//! vault. Accepted files are decoded by AppKit's `NSBitmapImageRep` (ImageIO)
+//! and the first frame is drawn into an 8-bit `DeviceGray` bitmap context, so
+//! CoreGraphics does the luma conversion and no image crate is needed. QR
+//! codes are then decoded with `rqrr`.
 //!
 //! Decoded payloads may hold TOTP secrets, so they are returned as
-//! `SecretString`. Payloads are never logged or `Debug`-printed. Our gray
-//! screen buffers are wrapped in `Zeroizing`.
+//! `SecretString`. Payloads are never logged or `Debug`-printed. Our file and
+//! gray buffers are wrapped in `Zeroizing`.
 //!
 //! Accepted limitation, pending an owner decision on the `rqrr-zeroize` fork:
-//! these copies of screen or payload data are NOT wiped on drop:
-//! - the CG-owned `CGImage` returned by `CGDisplayCreateImage`, freed by
-//!   CoreGraphics;
-//! - for image files: the `NSData` copy of the file bytes and the decoded
-//!   bitmap held by `NSBitmapImageRep` / its `CGImage` (our own read buffer
-//!   is wrapped in `Zeroizing`);
+//! these copies of image or payload data are NOT wiped on drop:
+//! - the `NSData` copy of the file bytes and the decoded bitmap held by
+//!   `NSBitmapImageRep` / its `CGImage` (our own read buffer is wrapped in
+//!   `Zeroizing`);
 //! - `rqrr`'s internal pixel buffer inside `PreparedImage`;
 //! - `rqrr`'s internal decode state (`RawData`, `CorrectedDataStream`) and the
 //!   partially filled payload `Vec` when decoding fails part way.
@@ -40,47 +30,62 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::MacError;
 
-/// True when this process may capture the screen (Screen Recording granted).
-///
-/// Never prompts. Always false off macOS.
-pub fn screen_capture_permitted() -> bool {
-    imp::permitted()
-}
-
-/// Capture every active display and decode all QR codes on it.
-///
-/// Returns the payloads deduplicated and in screen order. Displays are ordered
-/// top-to-bottom then left-to-right by their global origin. Codes on one display
-/// are ordered by the top-left corner of their bounds, also top-to-bottom then
-/// left-to-right. Nothing is filtered: callers keep only `otpauth://` URIs.
-///
-/// When Screen Recording is not granted this asks macOS for it once and then
-/// returns `MacError::NotAvailable`. macOS shows its own prompt only the first
-/// time. The app must then show "Grant Screen Recording in System Settings";
-/// the grant takes effect after the app restarts. Off macOS this always returns
-/// `MacError::NotAvailable`.
-pub fn scan_qr_from_screen() -> Result<Vec<SecretString>, MacError> {
-    imp::scan()
-}
-
 /// Largest image accepted by [`scan_qr_from_image_file`], in pixels.
 pub const MAX_IMAGE_PIXELS: usize = 50_000_000;
 
 /// Largest image file accepted by [`scan_qr_from_image_file`], in bytes.
 pub const MAX_IMAGE_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Decode every QR code in an image file (PNG, JPEG, HEIC, TIFF, ...).
+/// Decode every QR code in a PNG or JPEG image file.
 ///
-/// Needs no Screen Recording permission. Only the first frame of multi-frame
-/// files is read. Payloads are deduplicated and ordered like
-/// [`decode_qr_from_gray`]; an image with no QR code gives `Ok(vec![])`.
+/// Needs no Screen Recording permission. Payloads are deduplicated and ordered
+/// like [`decode_qr_from_gray`]; an image with no QR code gives `Ok(vec![])`.
+///
+/// The file must start with the PNG signature or the JPEG SOI marker; any
+/// other content (GIF, PDF, HEIC, TIFF, text, an empty file...) also gives
+/// `Ok(vec![])` without reaching ImageIO.
 ///
 /// Errors with `MacError::Other("could not read image: ...")` when the file
-/// cannot be read, is not a decodable bitmap image, is larger than
-/// [`MAX_IMAGE_FILE_BYTES`], or has more than [`MAX_IMAGE_PIXELS`] pixels.
-/// Off macOS this always returns `MacError::NotAvailable`.
+/// cannot be read, is not a regular file, is larger than
+/// [`MAX_IMAGE_FILE_BYTES`], has the PNG or JPEG magic but does not decode, or
+/// has more than [`MAX_IMAGE_PIXELS`] pixels. Off macOS this always returns
+/// `MacError::NotAvailable`.
 pub fn scan_qr_from_image_file(path: &Path) -> Result<Vec<SecretString>, MacError> {
     imp::scan_file(path)
+}
+
+/// Image formats [`scan_qr_from_image_file`] passes to the system decoder.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageKind {
+    Png,
+    Jpeg,
+}
+
+/// PNG file signature (PNG spec §5.2).
+const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+/// JPEG start-of-image marker followed by the first byte of the next marker.
+const JPEG_MAGIC: [u8; 3] = [0xFF, 0xD8, 0xFF];
+
+/// The format named by the leading magic bytes, or `None` for anything else.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn image_kind(bytes: &[u8]) -> Option<ImageKind> {
+    if bytes.starts_with(&PNG_MAGIC) {
+        Some(ImageKind::Png)
+    } else if bytes.starts_with(&JPEG_MAGIC) {
+        Some(ImageKind::Jpeg)
+    } else {
+        None
+    }
+}
+
+/// How many times [`scan_qr_from_image_file`] has handed file bytes to ImageIO
+/// on the calling thread. Tests use it to show refused files never reach the
+/// system decoder. Always 0 off macOS. Only with the `test-support` feature.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn test_image_decoder_calls() -> u64 {
+    imp::decoder_calls()
 }
 
 /// Decode every QR code in an 8-bit grayscale image (0 = black, 255 = white).
@@ -149,6 +154,32 @@ mod tests {
     }
 
     #[test]
+    fn image_kind_matches_only_png_and_jpeg_magic() {
+        assert_eq!(image_kind(&PNG_MAGIC), Some(ImageKind::Png));
+        assert_eq!(
+            image_kind(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"),
+            Some(ImageKind::Png)
+        );
+        assert_eq!(image_kind(&[0xFF, 0xD8, 0xFF, 0xE0]), Some(ImageKind::Jpeg));
+        assert_eq!(image_kind(&JPEG_MAGIC), Some(ImageKind::Jpeg));
+        for refused in [
+            &b""[..],
+            b"\x89PNG\r\n\x1a",     // PNG signature cut short
+            b"\x89PNG\r\n\x1a\x0b", // last byte wrong
+            &[0xFF, 0xD8],          // SOI without a following marker
+            &[0xFF, 0xD8, 0x00],
+            b"GIF89a",
+            b"%PDF-1.7",
+            b"II*\0",              // TIFF
+            b"\0\0\0\x18ftypheic", // HEIC
+            b"BM",
+            b" \x89PNG\r\n\x1a\n", // signature not at offset 0
+        ] {
+            assert_eq!(image_kind(refused), None, "{refused:?}");
+        }
+    }
+
+    #[test]
     fn non_panicking_decode_passes_through() {
         let found = no_code_on_panic(|| vec![1, 2]);
         assert_eq!(found, vec![1, 2]);
@@ -163,12 +194,9 @@ mod imp {
 
     use objc2::AnyThread;
     use objc2_app_kit::{NSBitmapImageRep, NSImageRep};
-    use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
-    #[allow(deprecated)] // CGDisplayCreateImage, see the module docs.
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use objc2_core_graphics::{
-        CGBitmapContextCreate, CGColorSpace, CGContext, CGDirectDisplayID, CGDisplayBounds,
-        CGDisplayCreateImage, CGError, CGGetActiveDisplayList, CGImage, CGImageAlphaInfo,
-        CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess,
+        CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo,
     };
     use objc2_foundation::NSData;
     use secrecy::SecretString;
@@ -177,25 +205,15 @@ mod imp {
     use super::{MAX_IMAGE_FILE_BYTES, MAX_IMAGE_PIXELS};
     use crate::MacError;
 
-    /// Upper bound on displays queried; macOS supports far fewer.
-    const MAX_DISPLAYS: u32 = 32;
-
-    pub fn permitted() -> bool {
-        CGPreflightScreenCaptureAccess()
+    #[cfg(feature = "test-support")]
+    thread_local! {
+        /// Calls into ImageIO from `scan_file` on this thread (see `decoder_calls`).
+        static DECODER_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
-    pub fn scan() -> Result<Vec<SecretString>, MacError> {
-        if !CGPreflightScreenCaptureAccess() {
-            // Registers the app in System Settings and shows the system prompt
-            // the first time. It returns at once; the grant needs a relaunch.
-            let _ = CGRequestScreenCaptureAccess();
-            return Err(MacError::NotAvailable);
-        }
-        let captures = active_displays()?.into_iter().map(|display| {
-            #[allow(deprecated)] // Deprecated in 14.4 for ScreenCaptureKit; still works.
-            CGDisplayCreateImage(display)
-        });
-        decode_captures(captures)
+    #[cfg(feature = "test-support")]
+    pub fn decoder_calls() -> u64 {
+        DECODER_CALLS.with(std::cell::Cell::get)
     }
 
     fn read_error(reason: impl std::fmt::Display) -> MacError {
@@ -256,8 +274,17 @@ mod imp {
 
     pub fn scan_file(path: &Path) -> Result<Vec<SecretString>, MacError> {
         let bytes = read_capped(path)?;
+        // L-08: only PNG and JPEG reach ImageIO; anything else is "no code
+        // found". `NSBitmapImageRep` takes no type hint, so ImageIO still picks
+        // the format itself, but the bytes it sees start with a PNG or JPEG
+        // signature, which no other ImageIO format shares.
+        if super::image_kind(&bytes).is_none() {
+            return Ok(Vec::new());
+        }
         let data = NSData::with_bytes(&bytes);
         drop(bytes);
+        #[cfg(feature = "test-support")]
+        DECODER_CALLS.with(|c| c.set(c.get() + 1));
         // ImageIO decodes lazily: this parses the header, and the pixels are
         // only decoded when the CGImage is drawn below, after the size check.
         let rep = NSBitmapImageRep::initWithData(NSBitmapImageRep::alloc(), &data)
@@ -278,51 +305,6 @@ mod imp {
         let mut out = Vec::new();
         super::decode_into(w, h, &gray, &mut out);
         Ok(out)
-    }
-
-    /// Decode every capture. `None` is a display CoreGraphics refused to capture.
-    ///
-    /// Returns `MacError::NotAvailable` when no display yielded a usable image,
-    /// so "capture refused" is distinct from "captured, but no QR found".
-    pub(super) fn decode_captures(
-        captures: impl IntoIterator<Item = Option<CFRetained<CGImage>>>,
-    ) -> Result<Vec<SecretString>, MacError> {
-        let mut out = Vec::new();
-        let mut captured_any = false;
-        for image in captures.into_iter().flatten() {
-            if let Some((w, h, gray)) = gray_pixels(&image) {
-                captured_any = true;
-                super::decode_into(w, h, &gray, &mut out);
-            }
-        }
-        if captured_any {
-            Ok(out)
-        } else {
-            Err(MacError::NotAvailable)
-        }
-    }
-
-    /// Active display ids, sorted top-to-bottom then left-to-right.
-    fn active_displays() -> Result<Vec<CGDirectDisplayID>, MacError> {
-        let mut ids = vec![0 as CGDirectDisplayID; MAX_DISPLAYS as usize];
-        let mut count: u32 = 0;
-        // SAFETY: `ids` has room for MAX_DISPLAYS entries and `count` is a valid
-        // out-pointer; CoreGraphics writes at most MAX_DISPLAYS ids.
-        let err = unsafe { CGGetActiveDisplayList(MAX_DISPLAYS, ids.as_mut_ptr(), &mut count) };
-        if err != CGError::Success {
-            return Err(MacError::Other(format!(
-                "CGGetActiveDisplayList failed: {}",
-                err.0
-            )));
-        }
-        ids.truncate(count.min(MAX_DISPLAYS) as usize);
-        ids.sort_by(|a, b| {
-            let (ra, rb) = (CGDisplayBounds(*a).origin, CGDisplayBounds(*b).origin);
-            (ra.y, ra.x)
-                .partial_cmp(&(rb.y, rb.x))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Ok(ids)
     }
 
     /// Draw `image` into an 8-bit DeviceGray bitmap and return its pixels,
@@ -416,25 +398,6 @@ mod imp {
         }
 
         #[test]
-        fn all_captures_refused_is_not_available() {
-            assert!(matches!(
-                super::decode_captures([None, None]),
-                Err(MacError::NotAvailable)
-            ));
-            assert!(matches!(
-                super::decode_captures(std::iter::empty()),
-                Err(MacError::NotAvailable)
-            ));
-        }
-
-        #[test]
-        fn one_capture_without_qr_is_ok_empty() {
-            let white = rgba_image(8, 8, vec![255u8; 8 * 8 * 4]);
-            let got = super::decode_captures([None, Some(white)]).unwrap();
-            assert!(got.is_empty());
-        }
-
-        #[test]
         fn check_dimensions_bounds() {
             let max = super::MAX_IMAGE_PIXELS;
             assert!(super::check_dimensions(max, 1).is_ok());
@@ -463,15 +426,12 @@ mod imp {
 
     use crate::MacError;
 
-    pub fn permitted() -> bool {
-        false
-    }
-
-    pub fn scan() -> Result<Vec<SecretString>, MacError> {
-        Err(MacError::NotAvailable)
-    }
-
     pub fn scan_file(_path: &std::path::Path) -> Result<Vec<SecretString>, MacError> {
         Err(MacError::NotAvailable)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn decoder_calls() -> u64 {
+        0
     }
 }

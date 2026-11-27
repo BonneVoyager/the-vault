@@ -253,7 +253,13 @@ fn restore_rejects_a_different_vault() {
     let (_dir, path, mut v) = setup();
     let (_dir2, other_path, _other) = setup();
     let before = fs::read(bin(&path)).unwrap();
+    // Only entries of backups/ are restorable (L-05): a path elsewhere is not a backup.
     let err = v.restore_from(&other_path, &pw()).unwrap_err();
+    assert!(matches!(err, SyncError::NotABackup(_)), "{err:?}");
+    let planted = path.join("backups").join("other.vault.bin");
+    fs::create_dir(path.join("backups")).unwrap();
+    fs::copy(bin(&other_path), &planted).unwrap();
+    let err = v.restore_from(&planted, &pw()).unwrap_err();
     assert!(matches!(err, SyncError::ForeignVault { .. }), "{err:?}");
     assert_eq!(fs::read(bin(&path)).unwrap(), before);
     assert!(v.backups().unwrap().is_empty());
@@ -428,7 +434,11 @@ fn failed_first_snapshot_is_retried_on_next_save() {
     v.save().unwrap();
     set_mode(0o700);
     assert!(
-        rx.try_iter().any(|e| matches!(e, SyncEvent::Error(_))),
+        rx.try_iter().any(|e| matches!(
+            e,
+            SyncEvent::BackupFailed { unsafe_dir: false, ref message }
+                if message.starts_with("backup failed: ")
+        )),
         "snapshot failure is reported"
     );
     assert_eq!(v.backups().unwrap().len(), 1);

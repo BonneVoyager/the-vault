@@ -934,6 +934,8 @@ mod tests {
         );
         assert!(detail.debug_bounds("detail-title GitHub").is_some());
 
+        // The unlock's weak-KDF notice (test vaults use test KDF costs, L-20).
+        state.update(&mut vcx, |s, _| s.toast = None);
         // Value clicks copy from the pinned item, even with Visa selected in the main window.
         let username = detail.debug_bounds("field-value 0").unwrap().center();
         detail.simulate_click(username, Modifiers::default());

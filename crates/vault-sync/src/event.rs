@@ -19,6 +19,15 @@ pub enum SyncEvent {
     CloudUnavailable,
     BackupTaken(PathBuf),
     Error(String),
+    /// A snapshot triggered by a save failed (the save itself succeeded; the next save
+    /// retries the snapshot). `message` is `backup failed: <error>`, as [`SyncEvent::Error`]
+    /// carried it before. `unsafe_dir` is true when the error was
+    /// [`crate::SyncError::UnsafePackageDir`] (a planted non-folder `backups` entry, L-05):
+    /// `repair_package` fixes it.
+    BackupFailed {
+        unsafe_dir: bool,
+        message: String,
+    },
     /// The on-disk vault no longer opens with the cached vault key and does not look like a key
     /// rotation (03 §8 "password changed elsewhere"): our password slots were replaced or
     /// removed, or the KDF parameters changed. Also reported when the slots are unchanged but

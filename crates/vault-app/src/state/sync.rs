@@ -52,6 +52,9 @@ pub struct SyncUi {
     /// Newest first, as `SyncedVault::backups` returns them.
     pub backups: Vec<BackupInfo>,
     pub backups_error: Option<SharedString>,
+    /// The list was refused with `UnsafePackageDir` (L-05): `backups_error` holds
+    /// [`BACKUPS_NEED_REPAIR`], shown muted rather than as an error.
+    pub backups_unsafe: bool,
     pub restore: Option<RestorePrompt>,
     /// The backup whose row shows the inline "Delete this backup?" confirm.
     pub delete_confirm: Option<PathBuf>,
@@ -95,6 +98,7 @@ pub fn sync_event_label(event: &SyncEvent) -> &'static str {
         SyncEvent::KeyMismatch => "key mismatch",
         SyncEvent::KeyRotatedOnDisk => "key rotated on disk",
         SyncEvent::Error(_) => "error",
+        SyncEvent::BackupFailed { .. } => "backup failed",
     }
 }
 
@@ -105,6 +109,8 @@ pub struct SaveBlockedNotice {
     pub message: SharedString,
     /// Offer "Show Recently Deleted": the vault is too large, and trashed notes count.
     pub offers_trash: bool,
+    /// Offer "Repair": a package entry that must be a folder is not one (L-05).
+    pub offers_repair: bool,
 }
 
 /// Toast on the Merged that follows re-entering the password after a key rotation.
@@ -134,6 +140,8 @@ impl AppState {
         let Some(vault) = self.vault.as_mut() else {
             return;
         };
+        // L-05: Unsaved copies go here while the package's `backups` is unusable.
+        vault.set_fallback_dir(self.unsaved_dir.clone());
         if let Err(e) = vault.start_watching() {
             // Not fatal: the vault still works, it just won't see other devices' changes.
             eprintln!("vault: file watcher failed: {e}");
@@ -170,7 +178,22 @@ impl AppState {
         self.sync.save_blocked = Some(SaveBlockedNotice {
             message: message.into(),
             offers_trash: false,
+            offers_repair: false,
         });
+    }
+
+    /// Strip and status line for [`SyncError::UnsafePackageDir`] (L-05): saves and restores
+    /// are refused until the entry is moved aside. Returns the strip's text.
+    fn raise_unsafe_package_dir(&mut self, path: &Path) -> String {
+        let message = unsafe_package_dir_message(path);
+        self.sync_status = SyncStatus::Error(message.clone().into());
+        self.sync.save_failing = true;
+        self.sync.save_blocked = Some(SaveBlockedNotice {
+            message: message.clone().into(),
+            offers_trash: false,
+            offers_repair: true,
+        });
+        message
     }
 
     /// After an unlock: the file on disk may still refuse saves (the unlock opened the last
@@ -219,9 +242,11 @@ impl AppState {
                 self.sync.save_blocked = Some(SaveBlockedNotice {
                     message: message.clone().into(),
                     offers_trash: true,
+                    offers_repair: false,
                 });
                 Some(message)
             }
+            Err(SyncError::UnsafePackageDir(path)) => Some(self.raise_unsafe_package_dir(&path)),
             // Transient: toasted only. A reason already on the strip stays while saves
             // keep failing (the status line keeps it too); a new run of failures, after a
             // success or an unlock reset `save_failing`, drops a stale one.
@@ -264,6 +289,7 @@ impl AppState {
         let busy = matches!(result, Err(SyncError::SaveLockTimeout(_)));
         let changed = matches!(result, Err(SyncError::PrimaryChangedDuringSave(_)));
         let too_large = matches!(result, Err(SyncError::VaultTooLarge { .. }));
+        let unsafe_dir = matches!(result, Err(SyncError::UnsafePackageDir(_)));
         // Only a busy lock or a racing writer is worth one retry; a too-large vault is
         // refused the same way until it shrinks.
         let retry = (busy || changed) && !self.sync.busy_retried && !self.locked;
@@ -283,6 +309,11 @@ impl AppState {
                 // refusals (one per edit) leave the reason to the status line.
                 if !was_failing {
                     self.set_toast(Toast::danger(e));
+                }
+            } else if unsafe_dir {
+                // Once, like too large; a plain toast so Repair's outcome replaces it.
+                if !was_failing {
+                    self.show_toast(e, cx);
                 }
             } else {
                 self.show_toast(format!("Could not save: {e}"), cx);
@@ -449,20 +480,30 @@ impl AppState {
                     self.sync.key_rotated = event == SyncEvent::KeyRotatedOnDisk;
                 }
             }
-            // Fallback for errors without a typed event (watcher failures, a failed backup).
-            // While the save-blocked strip is up, the status line keeps its text (the
-            // two always agree); the error still toasts.
-            SyncEvent::Error(message) => {
-                if self.sync.save_blocked.is_none() {
-                    self.sync_status = SyncStatus::Error(message.clone().into());
-                }
-                // A lock that lost unsaved edits already shows a danger toast; keep it.
-                if !self.toast.as_ref().is_some_and(|t| t.danger) {
-                    self.show_toast(message, cx);
-                }
-            }
+            // L-05, owner decision B: a snapshot refused by a planted `backups` entry is
+            // what the Repair strip explains. A save that needs a snapshot succeeds and
+            // clears the strip first, so re-read the list, which raises it again (and sets
+            // `backups_unsafe`); no toast.
+            SyncEvent::BackupFailed {
+                unsafe_dir: true, ..
+            } => self.refresh_backups(),
+            SyncEvent::BackupFailed { message, .. } => self.sync_error(message, cx),
+            SyncEvent::Error(message) => self.sync_error(message, cx),
         }
         cx.notify();
+    }
+
+    /// [`SyncEvent::Error`] (errors without a typed event: watcher failures, merge
+    /// write-backs) and a [`SyncEvent::BackupFailed`] not caused by L-05. While the save-blocked strip is up, the status line keeps its text (the two always
+    /// agree); the error still toasts (05 §2.2).
+    fn sync_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if self.sync.save_blocked.is_none() {
+            self.sync_status = SyncStatus::Error(message.clone().into());
+        }
+        // A lock that lost unsaved edits already shows a danger toast; keep it.
+        if !self.toast.as_ref().is_some_and(|t| t.danger) {
+            self.show_toast(message, cx);
+        }
     }
 
     /// Marks edit-buffer rows (and the title) that the user touched and that changed
@@ -498,6 +539,13 @@ impl AppState {
             cx,
             move || {
                 let result = vault.unlock(&password);
+                // L-01: the file's costs, to name a changed KDF on a wrong password.
+                let on_disk = match result {
+                    Err(SyncError::Vault(vault_core::VaultError::WrongPassword)) => {
+                        super::on_disk_kdf(&vault)
+                    }
+                    _ => None,
+                };
                 // The edits made during the mismatch could not be saved. Write them now,
                 // on this thread, so a lock, close or quit during the Argon2 window cannot
                 // drop them (vault-sync's `lock` only preserves them while mismatched).
@@ -505,9 +553,9 @@ impl AppState {
                     Ok(()) if vault.is_dirty() => Some(vault.save()),
                     _ => None,
                 };
-                (vault, result, saved)
+                (vault, result, saved, on_disk)
             },
-            |this, (mut vault, result, saved), outcome| match (outcome, result) {
+            |this, (mut vault, result, saved, on_disk), outcome| match (outcome, result) {
                 (Outcome::Closed, _) => {
                     let save_error = saved.and_then(Result::err).map(|e| e.to_string());
                     if let Some(e) = &save_error {
@@ -532,7 +580,8 @@ impl AppState {
                 }
                 (Outcome::Fresh, Err(e)) => {
                     this.vault = Some(vault);
-                    this.sync.key_mismatch_error = Some(super::error_message(&e).into());
+                    this.sync.key_mismatch_error =
+                        Some(this.unlock_error_message(&e, on_disk).into());
                 }
             },
         );
@@ -540,6 +589,7 @@ impl AppState {
 
     /// Re-reads the backups directory for the Sync & Backup tab.
     pub fn refresh_backups(&mut self) {
+        self.sync.backups_unsafe = false;
         let Some(vault) = self.vault.as_ref() else {
             self.sync.backups.clear();
             self.sync.backups_error = None;
@@ -549,6 +599,14 @@ impl AppState {
             Ok(list) => {
                 self.sync.backups = list;
                 self.sync.backups_error = None;
+            }
+            // L-05: a planted `backups` hides every copy until Repair; the strip offers it,
+            // the list says why in plain words (owner decision B).
+            Err(SyncError::UnsafePackageDir(path)) => {
+                self.raise_unsafe_package_dir(&path);
+                self.sync.backups.clear();
+                self.sync.backups_error = Some(BACKUPS_NEED_REPAIR.into());
+                self.sync.backups_unsafe = true;
             }
             Err(e) => {
                 self.sync.backups.clear();
@@ -577,7 +635,7 @@ impl AppState {
     /// the unsaved-changes guard first; the guard's prompt lives in the editor, so the
     /// sheet closes while it is up and reopens here after "Discard".
     pub fn request_restore(&mut self, backup: PathBuf, cx: &mut Context<Self>) {
-        if self.locked {
+        if self.locked || !self.listed_and_validated(&backup) {
             return;
         }
         if !self.guard(Navigation::Restore(backup.clone()), cx) {
@@ -594,6 +652,16 @@ impl AppState {
             error: None,
         });
         cx.notify();
+    }
+
+    /// True only for an entry of the Settings backups list that vault-sync tied to this
+    /// vault (L-04): an unknown entry, or a path not in the list at all, is never opened
+    /// or restored.
+    pub(crate) fn listed_and_validated(&self, backup: &Path) -> bool {
+        self.sync
+            .backups
+            .iter()
+            .any(|b| b.path == backup && b.validated)
     }
 
     /// "Replace…" in the confirm: ask for the backup's master password next.
@@ -651,6 +719,13 @@ impl AppState {
                     this.vault = Some(vault);
                     this.restored(&backup);
                 }
+                // L-05: a planted `backups` entry refuses every restore until repaired.
+                (Outcome::Fresh, Err(SyncError::UnsafePackageDir(path))) => {
+                    this.vault = Some(vault);
+                    this.sync.restore = None;
+                    this.raise_unsafe_package_dir(&path);
+                    this.set_toast(Toast::window(REPAIR_FIRST));
+                }
                 (Outcome::Fresh, Err(e)) => {
                     this.vault = Some(vault);
                     if let Some(r) = this.sync.restore.as_mut() {
@@ -679,8 +754,10 @@ impl AppState {
     }
 
     /// "Delete" in the confirm: removes the snapshot file or conflict package (03 §8).
-    /// No undo. Runs as a task like the other vault operations, so a lock or close while
-    /// it runs discards the result.
+    /// No undo. Runs on the main thread with the vault in place: an unlink or a small
+    /// recursive remove, after vault-sync re-lists the directory (header reads only, no
+    /// download, no lock). Taking the vault into a task would blank the list and detail
+    /// while it ran.
     pub fn confirm_delete_backup(&mut self, cx: &mut Context<Self>) {
         if self.busy.is_some() {
             return;
@@ -688,34 +765,52 @@ impl AppState {
         let Some(backup) = self.sync.delete_confirm.take() else {
             return;
         };
-        let Some(mut vault) = self.vault.take() else {
+        let Some(vault) = self.vault.as_mut() else {
             cx.notify();
             return;
         };
-        self.run_bg_cx(
-            Busy::DeletingBackup,
-            cx,
-            move || {
-                let result = vault.delete_backup(&backup);
-                (vault, backup, result)
-            },
-            |this, (mut vault, backup, result), outcome, cx| match outcome {
-                Outcome::Closed => this.report_lock(None, &vault.lock()),
-                Outcome::Locked => {
-                    this.report_lock(None, &vault.lock());
-                    this.vault = Some(vault);
-                    this.refresh_backups();
+        let result = vault.delete_backup(&backup);
+        self.refresh_backups();
+        if let Err(e) = result {
+            let reason = delete_failure_reason(&e, &backup);
+            self.show_toast(format!("Could not delete backup: {reason}"), cx);
+        }
+        cx.notify();
+    }
+
+    /// "Repair" on the save-blocked strip (L-05): vault-sync renames a planted non-folder
+    /// `backups` or `attachments` entry aside (never deletes), then the dirty vault saves.
+    /// Runs on the main thread like delete: one or two renames, under the save lock (which
+    /// can wait up to its 10 s timeout if another process is writing).
+    pub fn repair_vault_package(&mut self, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(vault) = self.vault.as_mut() else {
+            return;
+        };
+        let result = vault.repair_package();
+        self.refresh_backups();
+        match result {
+            Ok(moved) if !moved.is_empty() => {
+                self.sync.save_failing = false;
+                self.clear_save_blocked();
+                let n = moved.len();
+                self.show_toast(format!("Moved {n} item(s) aside; saving again."), cx);
+                if !self.locked {
+                    self.save_now(cx);
                 }
-                Outcome::Fresh => {
-                    this.vault = Some(vault);
-                    this.refresh_backups();
-                    if let Err(e) = result {
-                        let reason = delete_failure_reason(&e, &backup);
-                        this.show_toast(format!("Could not delete backup: {reason}"), cx);
-                    }
-                }
-            },
-        );
+            }
+            Ok(_) => self.show_toast(NOTHING_TO_REPAIR, cx),
+            Err(e) => self.show_toast(
+                format!(
+                    "Could not repair the vault package: {}",
+                    super::error_message(&e)
+                ),
+                cx,
+            ),
+        }
+        cx.notify();
     }
 
     /// After a successful restore: the vault is unlocked and clean, everything derived
@@ -759,6 +854,25 @@ fn unreadable_conflict_message(path: &Path) -> String {
     let name = disk_name(path);
     format!("Could not read the conflict copy \u{201c}{name}\u{201d}. It was left in place.")
 }
+
+/// Strip text for [`SyncError::UnsafePackageDir`] (L-05), by [`disk_name`].
+pub fn unsafe_package_dir_message(path: &Path) -> String {
+    let name = disk_name(path);
+    format!(
+        "Not saving: \u{201c}{name}\u{201d} inside the vault package is not a folder. Repair \
+         moves it aside."
+    )
+}
+
+/// The Settings backups list while `backups` is a planted non-folder (L-05, owner
+/// decision B): muted, instead of the raw `UnsafePackageDir` text.
+pub const BACKUPS_NEED_REPAIR: &str = "Backups are unavailable until the package is repaired.";
+
+/// Toast when Repair found nothing to move.
+pub const NOTHING_TO_REPAIR: &str = "Nothing to repair.";
+
+/// Toast when a restore is refused until the package is repaired (L-05).
+pub const REPAIR_FIRST: &str = "Repair the vault package first.";
 
 /// Status line and toast text for a refused save (03 §3).
 fn save_blocked_message(blocked: &SaveBlocked) -> &'static str {
@@ -1047,6 +1161,42 @@ mod tests {
         });
         let bytes = fs::read(&path).unwrap();
         assert!(vault_core::LockedVault::parse(&bytes).is_ok());
+    }
+
+    /// L-01 through the key-mismatch prompt: a wrong password after another device changed
+    /// the file's KDF costs names the change, as the unlock card does.
+    #[gpui::test]
+    fn key_mismatch_wrong_password_names_changed_kdf(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut other, _) = two_devices(dir.path(), cx);
+        state.update(cx, |s, _| {
+            let seen = super::super::KdfSeen::from(&KdfParams::for_tests());
+            s.settings.kdf_seen.insert(s.vault_id.unwrap(), seen);
+        });
+        let kdf = KdfParams {
+            t_cost: 2,
+            ..KdfParams::for_tests()
+        };
+        other
+            .edit(|v| v.change_password(&secret(PW), &secret(PW), kdf, 40))
+            .unwrap()
+            .unwrap();
+        // The key rotation is what the cached key notices (a password change alone keeps it).
+        other
+            .edit(|v| v.rotate_vault_key(&secret(PW), crate::text::now_millis()))
+            .unwrap()
+            .unwrap();
+        other.save().unwrap();
+        assert!(wait_for(&state, cx, |s| s.sync.key_mismatch));
+        state.update(cx, |s, cx| s.resolve_key_mismatch(secret("wrong"), cx));
+        cx.run_until_parked();
+        state.read_with(cx, |s, _| {
+            assert!(s.sync.key_mismatch, "prompt stays up");
+            assert_eq!(
+                s.sync.key_mismatch_error.as_deref(),
+                Some(super::super::security::KDF_CHANGED)
+            );
+        });
     }
 
     #[gpui::test]
@@ -1373,6 +1523,21 @@ mod tests {
             // Without a notice, a sync error reaches the status line as before.
             s.handle_sync_event(SyncEvent::Error("watcher failed".into()), cx);
             assert_eq!(s.sync_status, SyncStatus::Error("watcher failed".into()));
+            // A snapshot failure that is not L-05 toasts and reports like `Error`.
+            s.toast = None;
+            let message = "backup failed: disk full".to_owned();
+            s.handle_sync_event(
+                SyncEvent::BackupFailed {
+                    unsafe_dir: false,
+                    message: message.clone(),
+                },
+                cx,
+            );
+            assert_eq!(s.sync_status, SyncStatus::Error(message.clone().into()));
+            assert_eq!(
+                s.toast.as_ref().map(|t| t.message.to_string()),
+                Some(message)
+            );
 
             refuse(s, cx);
             s.close_vault(cx);
@@ -1759,11 +1924,10 @@ mod tests {
                 s.request_delete_backup(path.clone(), cx);
                 assert_eq!(s.sync.delete_confirm.as_ref(), Some(path));
                 s.confirm_delete_backup(cx);
-                assert_eq!(s.busy, Some(Busy::DeletingBackup));
-            });
-            cx.run_until_parked();
-            state.read_with(cx, |s, _| {
-                assert!(s.busy.is_none() && s.vault.is_some() && s.sync.delete_confirm.is_none());
+                // Synchronous, the vault never leaves the state: the list and detail
+                // render from it in the same frame (no blink).
+                assert!(s.vault.is_some() && s.busy.is_none());
+                assert!(s.sync.delete_confirm.is_none());
                 assert!(s.toast.is_none(), "no toast on success");
             });
             assert!(!path.exists(), "{} still on disk", path.display());
@@ -1801,7 +1965,6 @@ mod tests {
             s.request_delete_backup(outside.clone(), cx);
             s.confirm_delete_backup(cx);
         });
-        cx.run_until_parked();
         let message = state.read_with(cx, |s, _| s.toast.as_ref().unwrap().message.to_string());
         assert!(
             message.starts_with("Could not delete backup: "),
@@ -1814,29 +1977,25 @@ mod tests {
     }
 
     #[gpui::test]
-    fn lock_mid_delete_discards_the_result(cx: &mut TestAppContext) {
+    fn delete_while_locked_removes_the_backup(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (state, _other, _) = two_devices(dir.path(), cx);
         let (snapshot, _) = backups_with_conflict(&state, cx);
         state.update(cx, |s, cx| {
+            s.lock(cx);
             s.toast = None;
             s.request_delete_backup(snapshot.clone(), cx);
             s.confirm_delete_backup(cx);
-            // ⌘L lands while the vault is inside the task.
-            s.lock(cx);
-        });
-        cx.run_until_parked();
-        state.read_with(cx, |s, _| {
             assert!(s.locked && s.vault.is_some() && s.busy.is_none());
-            assert!(
-                s.vault.as_ref().unwrap().vault().is_none(),
-                "returned vault is locked"
-            );
             assert!(s.sync.delete_confirm.is_none());
-            assert!(s.toast.is_none(), "no toast after the lock");
+            assert!(
+                s.toast.is_none(),
+                "{:?}",
+                s.toast.as_ref().map(|t| &t.message)
+            );
         });
-        // The list matches the disk, whatever the task finished doing.
-        assert_eq!(listed(&state, &snapshot, cx), snapshot.exists());
+        assert!(!snapshot.exists());
+        assert!(!listed(&state, &snapshot, cx));
     }
 
     #[gpui::test]

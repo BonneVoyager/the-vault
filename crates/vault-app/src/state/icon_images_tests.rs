@@ -569,15 +569,118 @@ fn fake_chooser(
     let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let seen = calls.clone();
     state.update(cx, |s, _| {
-        s.icon_images.chooser = std::rc::Rc::new(move |exts: &[&str], prompt: &str| {
+        s.icon_images.chooser = std::rc::Rc::new(move |exts: &[&str], prompt: &str, done| {
             seen.borrow_mut().push((
                 exts.iter().map(|e| (*e).to_owned()).collect(),
                 prompt.to_owned(),
             ));
-            answer.clone()
+            // Answers at once, as AppKit may (inside a cancel); the app must cope.
+            done(answer.clone());
+            true
         });
     });
     calls
+}
+
+/// The callback of the panel that is "up" in [`held_chooser`].
+type HeldPanel = std::rc::Rc<std::cell::RefCell<Option<Box<dyn FnOnce(Option<PathBuf>)>>>>;
+
+/// A fake panel that stays up until the test answers through the returned slot, plus a
+/// counter of `cancel_chooser` calls (a cancel answers `None`, like AppKit).
+fn held_chooser(
+    state: &Entity<AppState>,
+    cx: &mut TestAppContext,
+) -> (HeldPanel, std::rc::Rc<std::cell::Cell<usize>>) {
+    let held: HeldPanel = std::rc::Rc::default();
+    let cancels = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (h, h2, c) = (held.clone(), held.clone(), cancels.clone());
+    state.update(cx, |s, _| {
+        s.icon_images.chooser = std::rc::Rc::new(move |_: &[&str], _: &str, done| {
+            if h.borrow().is_some() {
+                return false;
+            }
+            *h.borrow_mut() = Some(done);
+            true
+        });
+        s.icon_images.cancel_chooser = std::rc::Rc::new(move || {
+            c.set(c.get() + 1);
+            let done = h2.borrow_mut().take();
+            if let Some(done) = done {
+                done(None);
+            }
+        });
+    });
+    (held, cancels)
+}
+
+/// M-04: lock closes the panel; a file the panel reports after the lock is not used.
+#[gpui::test]
+fn lock_closes_the_panel_and_drops_a_late_pick(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, id, _) = setup(dir.path(), cx);
+    let path = image_file(dir.path(), "logo.png", [9, 9, 9, 255]);
+    let (held, cancels) = held_chooser(&state, cx);
+    state.update(cx, |s, cx| {
+        s.begin_edit(cx);
+        s.pick_icon_image(cx);
+        assert!(s.icon_images.choosing);
+    });
+    cx.run_until_parked();
+    assert!(held.borrow().is_some(), "panel up, nothing blocked");
+    state.update(cx, |s, cx| s.lock(cx));
+    assert_eq!(cancels.get(), 1, "lock cancels the panel");
+    assert!(held.borrow().is_none(), "the cancel answered");
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| assert!(!s.icon_images.choosing, "guard cleared"));
+
+    // A panel whose answer comes after the lock (the cancel raced a click on Choose).
+    state.update(cx, |s, cx| s.unlock(SecretString::new(PW.into()), cx));
+    cx.run_until_parked();
+    state.update(cx, |s, cx| {
+        s.icon_images.cancel_chooser = std::rc::Rc::new(|| {});
+        s.select(id, cx);
+        s.begin_edit(cx);
+        s.pick_icon_image(cx);
+    });
+    cx.run_until_parked();
+    let done = held.borrow_mut().take().expect("panel up");
+    state.update(cx, |s, cx| {
+        s.lock(cx);
+        s.unlock(SecretString::new(PW.into()), cx);
+    });
+    cx.run_until_parked();
+    state.update(cx, |s, cx| {
+        s.select(id, cx);
+        s.begin_edit(cx);
+    });
+    done(Some(path));
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| {
+        assert!(!s.icon_images.choosing);
+        assert!(s.busy.is_none(), "nothing read");
+        assert!(s.edit_buffer().unwrap().icon_added.is_empty());
+    });
+    assert!(stored(&state, id, cx).attachments.is_empty());
+}
+
+/// A panel that is not shown (another is up, or off macOS) leaves the button usable.
+#[gpui::test]
+fn refused_panel_leaves_the_guard_clear(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _, _) = setup(dir.path(), cx);
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+    let a = asked.clone();
+    state.update(cx, |s, cx| {
+        s.icon_images.chooser = std::rc::Rc::new(move |_: &[&str], _: &str, _done| {
+            a.set(a.get() + 1);
+            false
+        });
+        s.begin_edit(cx);
+        s.pick_icon_image(cx);
+        assert!(!s.icon_images.choosing);
+        s.pick_icon_image(cx);
+    });
+    assert_eq!(asked.get(), 2, "each click asks again");
 }
 
 #[gpui::test]

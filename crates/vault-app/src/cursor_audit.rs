@@ -370,6 +370,8 @@ fn rule(hit: &Hit) -> Expect {
         // Scroll containers and lists (the gaps between rows).
         "sidebar-sections" | "item-list" | "detail-scroll" | "detail-tags" | "editor-scroll"
         | "backups" | "backup-list" | "backup-detail" | "icon-grid" => Expect::NotPointer,
+        // A backups-list row vault-sync could not validate (L-04): a tooltip, no click.
+        "backup-unknown" => Expect::NotPointer,
         // Editor row and section backgrounds (drop targets, not click targets) and the
         // TOTP hint line.
         "edit-row" | "edit-tags" | "edit-tag-chips" | "attachments-edit" | "totp-hint" => {

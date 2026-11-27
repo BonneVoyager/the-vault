@@ -18,6 +18,11 @@ pub enum TotpError {
     Unsupported(String),
 }
 
+/// Longest accepted TOTP period in seconds (security review 2026-11-26 I-14): a longer step
+/// makes the code effectively static. [`Totp::parse_uri`] rejects anything outside
+/// `1..=MAX_PERIOD`; [`Totp::from_secret_base32`] always uses 30 s.
+pub const MAX_PERIOD: u32 = 300;
+
 /// Parsed TOTP configuration plus its secret.
 pub struct Totp {
     secret: Zeroizing<Vec<u8>>,
@@ -153,7 +158,7 @@ impl Totp {
         }
         let period = u32::try_from(period)
             .ok()
-            .filter(|p| *p >= 1)
+            .filter(|p| (1..=MAX_PERIOD).contains(p))
             .ok_or(TotpError::InvalidUri)?;
         Ok(Self {
             secret,

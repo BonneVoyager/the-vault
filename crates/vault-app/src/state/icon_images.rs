@@ -78,25 +78,55 @@ pub struct IconImages {
     pub(super) drops: Vec<(Uuid, Uuid)>,
     /// Blob decodes started (tests count them).
     pub(crate) decodes: usize,
-    /// The file panel ("Drop or choose image…"); tests swap in a fake.
+    /// The file panel ("Drop or choose image…", "Scan QR from image…"); tests swap in a
+    /// fake.
     pub(crate) chooser: FileChooser,
+    /// Closes the panel if one is up (called on lock); tests swap in a fake.
+    pub(crate) cancel_chooser: std::rc::Rc<dyn Fn()>,
     /// The panel is up: a second click must not open another.
     pub(crate) choosing: bool,
 }
 
-/// Shows a file panel limited to `extensions` with confirm button `prompt`; `None` on
-/// cancel. Runs on the main thread (the macOS panel is modal).
-pub type FileChooser = std::rc::Rc<dyn Fn(&[&str], &str) -> Option<PathBuf>>;
+/// Shows a file panel limited to `extensions` with confirm button `prompt` and returns at
+/// once; when it closes, the callback gets the chosen path (`None` on cancel), possibly
+/// synchronously inside [`IconImages::cancel_chooser`]. Returns false, never calling the
+/// callback, when no panel was shown (one is already up, or off macOS). Never a modal loop:
+/// one entered from a gpui task holds every other task, the auto-lock tick included (M-04).
+pub type FileChooser = std::rc::Rc<dyn Fn(&[&str], &str, Box<dyn FnOnce(Option<PathBuf>)>) -> bool>;
 
 /// Extensions "Drop or choose image…" accepts in its panel (the magic-byte check in
 /// `icon_image` still decides).
 pub const IMAGE_EXTENSIONS: [&str; 3] = ["png", "jpg", "jpeg"];
 
 fn native_chooser() -> FileChooser {
-    // A no-op off macOS: vault_macos::choose_file returns None there.
-    std::rc::Rc::new(|extensions: &[&str], prompt: &str| {
-        vault_macos::choose_file(extensions, prompt)
+    // Refuses off macOS: vault_macos::choose_file_async returns false there.
+    std::rc::Rc::new(|extensions: &[&str], prompt: &str, done| {
+        vault_macos::choose_file_async(extensions, prompt, done)
     })
+}
+
+/// Runs `chooser` from an entity update and hands its result to `then` in a later
+/// update of `this`. The callback may run inside AppKit's completion handler or
+/// synchronously inside a lock's `cancel_chooser` (while gpui holds the app), so it only
+/// spawns; the update happens on the next foreground turn. Returns `chooser`'s answer.
+pub(crate) fn open_chooser<T: 'static>(
+    chooser: &FileChooser,
+    cx: &mut Context<T>,
+    then: impl FnOnce(&mut T, Option<PathBuf>, &mut Context<T>) + 'static,
+) -> bool {
+    let this = cx.weak_entity();
+    let async_cx = cx.to_async();
+    chooser(
+        &IMAGE_EXTENSIONS,
+        "Choose",
+        Box::new(move |path| {
+            async_cx
+                .spawn(async move |cx| {
+                    this.update(cx, |this, cx| then(this, path, cx)).ok();
+                })
+                .detach();
+        }),
+    )
 }
 
 impl Default for IconImages {
@@ -111,6 +141,7 @@ impl Default for IconImages {
             drops: Vec::new(),
             decodes: 0,
             chooser: native_chooser(),
+            cancel_chooser: std::rc::Rc::new(vault_macos::cancel_open_panel),
             choosing: false,
         }
     }
@@ -410,34 +441,30 @@ impl AppState {
     }
 
     /// "Drop or choose image…": a native panel limited to PNG and JPEG
-    /// (`vault_macos::choose_file`), then [`Self::set_icon_image_file`], the path a
+    /// (`vault_macos::choose_file_async`), then [`Self::set_icon_image_file`], the path a
     /// dropped file takes. One panel at a time: a click while it is up does nothing.
     /// Cancel (or no panel, off macOS) changes nothing. The picker stays open.
     ///
-    /// The panel is modal (`runModal` spins a nested run loop), so it is shown from a
-    /// foreground task between `update`s, never while gpui holds the app borrowed.
+    /// The panel does not block: the auto-lock tick and timers keep running while it is
+    /// up (M-04), and a lock closes it. A result that arrives after a lock, a vault switch
+    /// or another edit session is dropped.
     pub fn pick_icon_image(&mut self, cx: &mut Context<Self>) {
         if !self.can_choose_icon_image() || self.icon_images.choosing {
             return;
         }
-        self.icon_images.choosing = true;
         let (lock_gen, epoch, session) = (self.lock_gen, self.epoch, self.edit_session);
         let chooser = self.icon_images.chooser.clone();
-        cx.spawn(async move |this, cx| {
-            let path = chooser(&IMAGE_EXTENSIONS, "Choose");
-            this.update(cx, |this, cx| {
-                this.icon_images.choosing = false;
-                let same = this.lock_gen == lock_gen
-                    && this.epoch == epoch
-                    && this.edit_session == session;
-                if same && let Some(path) = path {
-                    this.set_icon_image_file(path, cx);
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        let shown = open_chooser(&chooser, cx, move |this: &mut Self, path, cx| {
+            this.icon_images.choosing = false;
+            let same =
+                this.lock_gen == lock_gen && this.epoch == epoch && this.edit_session == session;
+            if same && let Some(path) = path {
+                this.set_icon_image_file(path, cx);
+            }
+            cx.notify();
+        });
+        // Not shown (a QR panel is up, or off macOS): nothing to wait for.
+        self.icon_images.choosing = shown;
     }
 
     /// Uses the image at `path` as the edited item's icon (open panel or drop on the tile).

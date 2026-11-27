@@ -214,6 +214,15 @@ mod tests {
             onboarding_dismissed: true,
             sidebar_hidden: true,
             show_in_dock: false,
+            kdf_seen: [(
+                vault_core::Uuid::new_v4(),
+                crate::state::KdfSeen {
+                    m_cost_kib: 65536,
+                    t_cost: 3,
+                    p_cost: 4,
+                },
+            )]
+            .into(),
         };
         save_settings_to(dir.path(), &settings);
         assert_eq!(load_settings_from(dir.path()), settings);
@@ -371,5 +380,40 @@ mod tests {
         assert!(!garbage.lock_on_sleep);
         assert_eq!(garbage.text_size, crate::state::TextSize::Large);
         assert!(Settings::default().show_in_dock);
+    }
+
+    /// `kdf_seen` (L-01): a malformed entry or key is dropped alone; a non-map value is an
+    /// empty map; the other settings survive either way.
+    #[test]
+    fn kdf_seen_settings_json_is_lenient() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |json: &str| {
+            fs::write(dir.path().join(SETTINGS_FILE), json).unwrap();
+            load_settings_from(dir.path())
+        };
+        let good = vault_core::Uuid::new_v4();
+        let bad = vault_core::Uuid::new_v4();
+        let json = format!(
+            r#"{{"lock_on_sleep": false, "kdf_seen": {{
+                "{good}": {{"m_cost_kib": 65536, "t_cost": 3, "p_cost": 4}},
+                "{bad}": {{"m_cost_kib": -1, "t_cost": 3, "p_cost": 4}},
+                "not-a-uuid": {{"m_cost_kib": 1, "t_cost": 1, "p_cost": 1}},
+                "{bad}x": "junk"}}}}"#
+        );
+        let s = load(&json);
+        assert!(!s.lock_on_sleep);
+        assert_eq!(s.kdf_seen.len(), 1, "{:?}", s.kdf_seen);
+        assert_eq!(
+            s.kdf_seen[&good],
+            crate::state::KdfSeen {
+                m_cost_kib: 65536,
+                t_cost: 3,
+                p_cost: 4
+            }
+        );
+        let s = load(r#"{"lock_on_sleep": false, "kdf_seen": [1, 2]}"#);
+        assert!(!s.lock_on_sleep);
+        assert!(s.kdf_seen.is_empty());
+        assert!(load(r#"{}"#).kdf_seen.is_empty());
     }
 }

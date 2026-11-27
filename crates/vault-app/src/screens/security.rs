@@ -30,6 +30,13 @@ use crate::ui::{self, Clickable as _};
 pub const ROTATE_WARNING: &str = "Rotating replaces the key that encrypts every item. \
      Other Macs must re-enter the master password, and Touch ID must be set up again.";
 
+/// Muted line under the change-password fields (security review 2026-11-26 L-03): a
+/// password change re-wraps the same vault key, so the old password still opens older
+/// copies, and with them the key.
+pub const OLD_PASSWORD_HINT: &str = "Changing the password does not revoke the old one for \
+     older copies of the vault (backups, cloud history). If the old password may be known \
+     to someone, also rotate the vault key below.";
+
 /// What a single-password prompt does with the password.
 type Submit = fn(&mut AppState, SecretString, &mut Context<AppState>);
 
@@ -394,6 +401,10 @@ impl SecurityView {
                 cx,
             ))
             .child(ui::input(&self.confirm).small().mask_toggle())
+            .child(
+                ui::muted(OLD_PASSWORD_HINT, cx)
+                    .debug_selector(|| format!("change-hint: {OLD_PASSWORD_HINT}")),
+            )
             .children(error_line(error, cx))
             .child(
                 ui::h_flex()
@@ -754,6 +765,25 @@ mod tests {
         let b = vcx.debug_bounds(key).expect(key);
         vcx.simulate_click(b.center(), Modifiers::none());
         vcx.run_until_parked();
+    }
+
+    /// The change form says the old password still opens older copies (L-03), in the
+    /// owner's exact two sentences.
+    #[gpui::test]
+    fn change_form_shows_the_old_password_hint(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_state, view, mut vcx) = window(dir.path(), cx);
+        let key: &'static str =
+            Box::leak(format!("change-hint: {OLD_PASSWORD_HINT}").into_boxed_str());
+        assert!(!shown(key, &mut vcx), "only with the form open");
+        open_form(&view, &mut vcx);
+        assert!(shown(key, &mut vcx));
+        assert_eq!(
+            OLD_PASSWORD_HINT,
+            "Changing the password does not revoke the old one for older copies of the vault \
+             (backups, cloud history). If the old password may be known to someone, also \
+             rotate the vault key below."
+        );
     }
 
     /// Same rules as Create: weak blocks the button and Enter, strong + matching changes

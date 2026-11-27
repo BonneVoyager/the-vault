@@ -33,7 +33,7 @@ impl Drop for Restore {
                 let _ = Clipboard::write_concealed(&SecretString::new(s));
             }
             Some(s) => {
-                let _ = Clipboard::write_plain(&s);
+                let _ = Clipboard::test_write_plain_as_other_app(&s);
             }
         }
     }
@@ -73,7 +73,8 @@ fn external_change_is_not_cleared() {
 
     let cc =
         Clipboard::write_concealed(&SecretString::new("ours".to_owned())).expect("write accepted");
-    let other = Clipboard::write_plain("someone else's copy").expect("write accepted");
+    let other =
+        Clipboard::test_write_plain_as_other_app("someone else's copy").expect("write accepted");
     assert_ne!(other, cc);
 
     Clipboard::clear_if_unchanged(cc);

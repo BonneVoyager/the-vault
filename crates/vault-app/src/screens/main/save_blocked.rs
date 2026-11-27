@@ -17,37 +17,57 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 
-use crate::state::{AppState, Filter};
+use crate::state::{AppState, Filter, SaveBlockedNotice};
 use crate::ui::{self, Clickable as _};
 
 /// The trailing link on the too-large strip.
 pub const SHOW_TRASH: &str = "Show Recently Deleted";
+/// The trailing action on the not-a-folder strip (L-05).
+pub const REPAIR: &str = "Repair";
 
 /// Text size of the strip, before the text-size preference scales it.
 const TEXT_SIZE: f32 = 13.;
 
+/// A trailing link-style action on the strip; the spacer copy gets no selector.
+fn action(
+    id: &'static str,
+    label: &'static str,
+    spacer: bool,
+    state: &Entity<AppState>,
+    run: fn(&mut AppState, &mut gpui::Context<AppState>),
+) -> gpui::Div {
+    let state = state.clone();
+    let button = Button::new(id)
+        .link()
+        .small()
+        .label(label)
+        .when(!spacer, |b| b.debug_selector(move || id.into()))
+        .clickable()
+        .on_click(move |_, _, cx| state.update(cx, run));
+    div().flex_none().child(button)
+}
+
 /// The strip itself; `spacer` builds an invisible copy that only takes up its room.
 fn strip(
-    message: gpui::SharedString,
-    offers_trash: bool,
+    notice: &SaveBlockedNotice,
     spacer: bool,
     state: &Entity<AppState>,
     cx: &App,
 ) -> gpui::Div {
     let theme = cx.theme();
-    let link = offers_trash.then(|| {
-        let state = state.clone();
-        Button::new("save-blocked-show-trash")
-            .link()
-            .small()
-            .label(SHOW_TRASH)
-            .when(!spacer, |b| {
-                b.debug_selector(|| "save-blocked-show-trash".into())
-            })
-            .clickable()
-            .on_click(move |_, _, cx| {
-                state.update(cx, |s, cx| s.set_filter(Filter::RecentlyDeleted, cx));
-            })
+    let trash = notice.offers_trash.then(|| {
+        action(
+            "save-blocked-show-trash",
+            SHOW_TRASH,
+            spacer,
+            state,
+            |s, cx| s.set_filter(Filter::RecentlyDeleted, cx),
+        )
+    });
+    let repair = notice.offers_repair.then(|| {
+        action("save-blocked-repair", REPAIR, spacer, state, |s, cx| {
+            s.repair_vault_package(cx)
+        })
     });
     ui::h_flex()
         .flex_none()
@@ -69,9 +89,10 @@ fn strip(
                 .when(!spacer, |d| {
                     d.debug_selector(|| "save-blocked-message".into())
                 })
-                .child(message),
+                .child(notice.message.clone()),
         )
-        .children(link.map(|l| div().flex_none().child(l)))
+        .children(trash)
+        .children(repair)
         .when(spacer, |el| el.invisible())
 }
 
@@ -92,13 +113,7 @@ pub(super) fn overlay(
             .top(super::header_height(cx))
             .left(px(-list_width))
             .right_0()
-            .child(strip(
-                notice.message.clone(),
-                notice.offers_trash,
-                false,
-                state,
-                cx,
-            ))
+            .child(strip(notice, false, state, cx))
             .into_any_element(),
     )
 }
@@ -122,13 +137,7 @@ pub(super) fn spacer(
                 Some(w) => el.w(px(w)),
                 None => el.ml(px(-reach_left)),
             })
-            .child(strip(
-                notice.message.clone(),
-                notice.offers_trash,
-                true,
-                state,
-                cx,
-            ))
+            .child(strip(notice, true, state, cx))
             .into_any_element(),
     )
 }

@@ -1,5 +1,6 @@
 use super::*;
-use gpui::{AppContext as _, TestAppContext};
+use gpui::{AppContext as _, Entity, TestAppContext};
+use security::KDF_CHANGED;
 use std::sync::Arc;
 use vault_core::{Item, SecretString};
 use vault_sync::NoopHooks;
@@ -58,11 +59,106 @@ fn auto_lock_uses_shorter_idle(cx: &mut TestAppContext) {
         // Recent in-app activity keeps it open even if the system says idle.
         s.tick(3600.0, cx);
         assert!(!s.locked);
-        s.last_activity = Instant::now() - Duration::from_secs(120);
+        // Input in another app 30 s ago is newer than our last activity.
+        let now = s.clock.now();
+        s.idle.idle_for(now, Duration::from_secs(120));
         s.tick(30.0, cx);
         assert!(!s.locked);
+        // No input anywhere for 61 s.
+        let now = s.clock.now();
+        s.idle.idle_for(now, Duration::from_secs(120));
         s.tick(61.0, cx);
         assert!(s.locked);
+    });
+}
+
+/// An unlocked vault with a 5-minute auto-lock and lock-on-sleep off (L-13).
+fn sleepy(dir: &Path, cx: &mut TestAppContext) -> Entity<AppState> {
+    let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+    state.update(cx, |s, cx| {
+        s.install(create(dir), false);
+        s.unlocked();
+        s.settings.auto_lock_minutes = Some(5);
+        s.settings.lock_on_sleep = false;
+        s.tick(0.0, cx);
+        assert!(!s.locked);
+    });
+    state
+}
+
+/// Monotonic time stops during sleep: a Mac asleep past the idle limit locks on the
+/// first tick after wake, whether or not the system idle time counted the sleep and
+/// even though the key press that woke it is the newest input.
+#[gpui::test]
+fn sleep_past_the_idle_limit_locks_on_wake(cx: &mut TestAppContext) {
+    for system_idle_after_wake in [0.0, 1.0, 400.0] {
+        let dir = tempfile::tempdir().unwrap();
+        let state = sleepy(dir.path(), cx);
+        state.update(cx, |s, cx| {
+            s.clock.sleep(Duration::from_secs(6 * 60));
+            s.tick(system_idle_after_wake, cx);
+            assert!(s.locked, "system idle {system_idle_after_wake}");
+        });
+    }
+}
+
+/// Two naps that together pass the limit lock too: the first wake does not reset the
+/// idle clock unless real input arrived after it.
+#[gpui::test]
+fn sleep_adds_up_across_wakes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = sleepy(dir.path(), cx);
+    state.update(cx, |s, cx| {
+        s.clock.sleep(Duration::from_secs(3 * 60));
+        s.tick(1.0, cx);
+        assert!(!s.locked, "3 of 5 minutes");
+        s.clock.sleep(Duration::from_secs(3 * 60));
+        s.tick(2.0, cx);
+        assert!(s.locked, "6 of 5 minutes");
+    });
+}
+
+/// In-app input that arrives after the wake but before the next tick locks instead of
+/// counting as activity, and reports it so the root stops the event.
+#[gpui::test]
+fn input_after_a_long_sleep_locks(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = sleepy(dir.path(), cx);
+    state.update(cx, |s, cx| {
+        s.clock.sleep(Duration::from_secs(10 * 60));
+        assert!(s.note_activity(cx));
+        assert!(s.locked);
+    });
+}
+
+/// A clock set back by an hour and then a sleep shorter than that hour still locks:
+/// idle time is summed step by step, so the set-back does not cancel the sleep.
+#[gpui::test]
+fn clock_set_back_then_sleep_still_locks(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = sleepy(dir.path(), cx);
+    state.update(cx, |s, cx| {
+        s.clock.set_back(Duration::from_secs(3600));
+        // No input since `sleepy`'s tick (system idle grows with it).
+        s.tick(1.0, cx);
+        assert!(!s.locked);
+        s.clock.sleep(Duration::from_secs(10 * 60));
+        s.tick(2.0, cx);
+        assert!(s.locked);
+    });
+}
+
+/// A wall clock set backwards counts as zero elapsed: never a lock.
+#[gpui::test]
+fn wall_clock_set_back_never_locks(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = sleepy(dir.path(), cx);
+    state.update(cx, |s, cx| {
+        s.clock.set_back(Duration::from_secs(24 * 3600));
+        assert!(!s.note_activity(cx));
+        s.tick(0.0, cx);
+        s.tick(10.0, cx);
+        assert!(!s.locked);
     });
 }
 
@@ -138,6 +234,11 @@ fn lock_during_create_wins(cx: &mut TestAppContext) {
         assert!(s.busy.is_none());
         assert!(s.vault.as_ref().is_some_and(|v| v.vault().is_none()));
         assert_eq!(s.recent_vaults, vec![path.clone()]);
+        let id = s.vault_id.unwrap();
+        assert!(
+            s.settings.kdf_seen.contains_key(&id),
+            "create records its costs"
+        );
     });
     assert!(path.exists());
 }
@@ -650,5 +751,258 @@ fn no_usable_slot_blocks_and_good_unlock_clears(cx: &mut TestAppContext) {
     state.read_with(cx, |s, _| {
         assert!(!s.locked && s.screen == Screen::Main);
         assert!(s.unlock_blocked.is_none());
+    });
+}
+
+/// A vault whose Argon2 costs are under the recommended floor gets one toast per unlock
+/// (L-20); a vault at the recommended costs gets none.
+#[gpui::test]
+fn weak_kdf_warns_once_per_unlock(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = create(dir.path()).path().to_owned();
+    let state = new_state(cx);
+    open_and_unlock(&state, &path, cx);
+    let toast = |state: &Entity<AppState>, cx: &mut TestAppContext| {
+        state.read_with(cx, |s, _| s.toast.as_ref().map(|t| t.message.to_string()))
+    };
+    assert_eq!(toast(&state, cx).as_deref(), Some(WEAK_KDF));
+    state.update(cx, |s, cx| {
+        s.toast = None;
+        s.tick(0.0, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(toast(&state, cx), None, "not repeated within the session");
+    state.update(cx, |s, cx| {
+        s.lock(cx);
+        s.toast = None;
+        s.unlock(SecretString::new(PW.into()), cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        toast(&state, cx).as_deref(),
+        Some(WEAK_KDF),
+        "again next unlock"
+    );
+
+    let strong_dir = tempfile::tempdir().unwrap();
+    let strong = SyncedVault::create(
+        &strong_dir.path().join("t.vault"),
+        &SecretString::new(PW.into()),
+        KdfParams::recommended(),
+        Uuid::new_v4(),
+        Arc::new(NoopHooks),
+    )
+    .unwrap();
+    let strong_path = strong.path().to_owned();
+    drop(strong);
+    let state = new_state(cx);
+    open_and_unlock(&state, &strong_path, cx);
+    assert_eq!(toast(&state, cx), None);
+}
+
+fn kdf_seen(state: &Entity<AppState>, cx: &mut TestAppContext) -> Option<KdfSeen> {
+    state.read_with(cx, |s, _| s.settings.kdf_seen.get(&s.vault_id?).copied())
+}
+
+fn on_disk_costs(path: &Path) -> KdfSeen {
+    let bytes = std::fs::read(path.join(VAULT_FILE_NAME)).unwrap();
+    KdfSeen::from(vault_core::LockedVault::parse(&bytes).unwrap().kdf_params())
+}
+
+/// Locks, tries `pw`, and returns the unlock card's error.
+fn relock_and_unlock(
+    state: &Entity<AppState>,
+    pw: &str,
+    cx: &mut TestAppContext,
+) -> Option<String> {
+    state.update(cx, |s, cx| s.lock(cx));
+    cx.run_until_parked();
+    state.update(cx, |s, cx| s.unlock(SecretString::new(pw.into()), cx));
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| s.error.as_ref().map(|e| e.to_string()))
+}
+
+/// L-01: a password unlock records the header's costs; a wrong password says the costs
+/// changed only when the file's differ from the recorded ones.
+#[gpui::test]
+fn wrong_password_names_changed_kdf_costs(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = create(dir.path()).path().to_owned();
+    let state = new_state(cx);
+    open_and_unlock(&state, &path, cx);
+    let first = on_disk_costs(&path);
+    assert_eq!(kdf_seen(&state, cx), Some(first));
+    let wrong = relock_and_unlock(&state, "wrong", cx);
+    assert_eq!(wrong.as_deref(), Some("Wrong password. Try again."));
+
+    // Another copy re-wraps the slot with other costs, as an edited header would carry.
+    let pw = SecretString::new(PW.into());
+    let mut other = SyncedVault::open(&path, Uuid::new_v4(), Arc::new(NoopHooks)).unwrap();
+    other.unlock(&pw).unwrap();
+    let kdf = KdfParams {
+        t_cost: 2,
+        ..KdfParams::for_tests()
+    };
+    other
+        .edit(|v| v.change_password(&pw, &pw, kdf, 1))
+        .unwrap()
+        .unwrap();
+    other.save().unwrap();
+    drop(other);
+    let changed = on_disk_costs(&path);
+    assert_ne!(changed, first);
+    let wrong = relock_and_unlock(&state, "wrong", cx);
+    assert_eq!(wrong.as_deref(), Some(KDF_CHANGED));
+    assert_eq!(
+        kdf_seen(&state, cx),
+        Some(first),
+        "a failed unlock records nothing"
+    );
+
+    // The correct password still opens it and records the new costs.
+    assert_eq!(relock_and_unlock(&state, PW, cx), None);
+    assert_eq!(kdf_seen(&state, cx), Some(changed));
+    let wrong = relock_and_unlock(&state, "wrong", cx);
+    assert_eq!(wrong.as_deref(), Some("Wrong password. Try again."));
+}
+
+#[test]
+fn kdf_changed_text() {
+    assert_eq!(
+        KDF_CHANGED,
+        "Wrong password. This vault's encryption settings changed since it was last unlocked \
+         on this Mac; if you did not re-calibrate them, the file may have been altered."
+    );
+}
+
+/// L-05: every opened vault gets the fallback folder, so a lock whose save fails while the
+/// package's `backups` is a planted file keeps the edits there, listed as an Unsaved backup.
+#[gpui::test]
+fn lock_with_planted_backups_keeps_edits_in_the_fallback_dir(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let fallback = tempfile::tempdir().unwrap();
+    let path = create(dir.path()).path().to_owned();
+    let state = new_state(cx);
+    state.update(cx, |s, _| s.set_unsaved_dir(fallback.path().to_owned()));
+    open_and_unlock(&state, &path, cx);
+    let planted = path.join("backups");
+    if planted.is_dir() {
+        std::fs::remove_dir_all(&planted).unwrap();
+    }
+    std::fs::write(&planted, b"x").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = |m| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(m)).unwrap();
+    // A read-only package: the save before the lock fails.
+    mode(0o500);
+    state.update(cx, |s, cx| {
+        let vault = s.vault.as_mut().unwrap();
+        let device = vault.device_id();
+        vault
+            .edit(|v| v.insert(Item::new("GitHub", device, 1), 1))
+            .unwrap();
+        s.lock(cx);
+        s.poll_sync(cx);
+        s.refresh_backups();
+    });
+    mode(0o700);
+    let id = state.read_with(cx, |s, _| s.vault_id.unwrap());
+    let copies: Vec<_> = std::fs::read_dir(fallback.path().join(id.to_string()))
+        .expect("fallback folder for this vault")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    // Opening the list while `backups` is planted: the list errors and the strip offers
+    // Repair (L-05); the fallback copy shows only after Repair.
+    state.update(cx, |s, cx| s.unlock(SecretString::new(PW.into()), cx));
+    cx.run_until_parked();
+    state.update(cx, |s, cx| {
+        assert!(!s.locked);
+        s.toast = None;
+        s.open_settings(true, cx);
+        // Owner decision B: a plain sentence, muted, not the raw vault-sync error.
+        assert_eq!(
+            s.sync.backups_error.as_deref(),
+            Some("Backups are unavailable until the package is repaired.")
+        );
+        assert_eq!(s.sync.backups_error.as_deref(), Some(BACKUPS_NEED_REPAIR));
+        assert!(s.sync.backups_unsafe && s.sync.backups.is_empty());
+        assert!(s.save_blocked().is_some_and(|n| n.offers_repair));
+    });
+    // The first save after the unlock wants a snapshot, which fails on the planted entry:
+    // the save itself succeeds, the typed `BackupFailed { unsafe_dir: true }` re-raises the
+    // strip, no toast.
+    state.update(cx, |s, cx| {
+        let vault = s.vault.as_mut().unwrap();
+        let device = vault.device_id();
+        vault
+            .edit(|v| v.insert(Item::new("Snapshot due", device, 3), 3))
+            .unwrap();
+        let result = vault.save();
+        assert!(result.is_ok(), "{result:?}");
+        s.autosave_finished(result, cx);
+        s.poll_sync(cx);
+        assert_eq!(s.sync.last_event.map(|(l, _)| l), Some("backup failed"));
+        let toast = s.toast.as_ref().map(|t| t.message.to_string());
+        assert!(toast.is_none(), "no backup-failed toast: {toast:?}");
+        assert!(s.save_blocked().is_some_and(|n| n.offers_repair));
+        assert!(s.sync.backups_unsafe);
+        assert_eq!(s.sync.backups_error.as_deref(), Some(BACKUPS_NEED_REPAIR));
+        // 05 §2.2: other sync errors still toast while the strip is up, and do not
+        // replace the status line.
+        let strip_text = s.save_blocked().unwrap().message.clone();
+        s.handle_sync_event(SyncEvent::Error("watcher failed".into()), cx);
+        assert_eq!(
+            s.toast.as_ref().map(|t| t.message.as_ref()),
+            Some("watcher failed")
+        );
+        assert_eq!(s.sync_status, SyncStatus::Error(strip_text));
+        assert!(s.save_blocked().is_some_and(|n| n.offers_repair));
+        s.toast = None;
+    });
+    state.update(cx, |s, cx| {
+        s.repair_vault_package(cx);
+        // Synchronous: the vault never leaves the state.
+        assert!(s.vault.is_some() && s.busy.is_none());
+        assert!(s.save_blocked().is_none() && s.sync.backups_error.is_none());
+        assert!(!s.sync.backups_unsafe);
+        let listed = s.sync.backups.iter().find(|b| b.path == copies[0]);
+        let listed = listed.expect("listed with the package's backups");
+        assert!(listed.validated && listed.kind == vault_sync::BackupKind::Unsaved);
+        assert!(s.listed_and_validated(&copies[0]), "Open and Restore apply");
+    });
+
+    // Planted again after the list loaded: restoring the copy is refused, strip and toast.
+    if planted.is_dir() {
+        std::fs::remove_dir_all(&planted).unwrap();
+    }
+    std::fs::write(&planted, b"x").unwrap();
+    state.update(cx, |s, cx| {
+        s.request_restore(copies[0].clone(), cx);
+        s.confirm_restore(cx);
+        s.restore_backup(SecretString::new(PW.into()), cx);
+    });
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| {
+        assert_eq!(
+            s.toast.as_ref().map(|t| t.message.as_ref()),
+            Some(REPAIR_FIRST)
+        );
+        assert_eq!(REPAIR_FIRST, "Repair the vault package first.");
+        assert!(s.save_blocked().is_some_and(|n| n.offers_repair));
+        assert!(s.sync.restore.is_none());
+    });
+
+    // Review note 8: the refusal set `save_failing`; the next save that works (none is due
+    // a snapshot, so `backups/` is not touched) clears the strip.
+    state.update(cx, |s, cx| {
+        let vault = s.vault.as_mut().unwrap();
+        let device = vault.device_id();
+        vault
+            .edit(|v| v.insert(Item::new("Later", device, 2), 2))
+            .unwrap();
+        let result = vault.save();
+        s.autosave_finished(result, cx);
+        assert!(s.save_blocked().is_none() && !s.sync.save_failing);
     });
 }

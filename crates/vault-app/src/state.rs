@@ -21,6 +21,7 @@ use crate::biometric::{self, Biometrics};
 use crate::clipboard::Clipboard;
 #[cfg(not(test))]
 use crate::clipboard::SystemPasteboard;
+use crate::clock::{Clock, IdleClock, Stamp};
 use crate::listing::{Counts, Listing};
 use crate::{cloud, persist};
 
@@ -52,8 +53,11 @@ pub use kdbx::KdbxImportUi;
 pub use prefs::{LoginRow, set_dock_icon};
 pub use qr::QrScanner;
 pub use security::{SECURITY_TAB, SecurityForm, SecurityUi};
+use security::{kdf_seen_of, on_disk_kdf};
 pub use session::{COPIED_TTL, CopyTarget, FocusTarget, parse_totp};
-pub use sync::{RestorePrompt, SYNC_TAB, SyncUi, TRANSFER_TAB, disk_name};
+#[cfg(test)]
+pub use sync::{BACKUPS_NEED_REPAIR, NOTHING_TO_REPAIR, REPAIR_FIRST};
+pub use sync::{RestorePrompt, SYNC_TAB, SaveBlockedNotice, SyncUi, TRANSFER_TAB, disk_name};
 pub use touch_id::{TouchAuto, TouchDenied, TouchIdPolicy, TouchUi};
 pub use transfer::{export_cloud_hint, write_private};
 pub use trash::{DELETE_RECOVERABLE, NO_DELETED_ITEMS, PURGE_CONFIRM, TRASH_INFO, expiry_text};
@@ -154,8 +158,6 @@ pub enum Busy {
     ReadingAttachment,
     /// Decrypting and importing a KeePass database.
     Importing,
-    /// Deleting a backup file or conflict package (Settings ▸ Sync & Backup).
-    DeletingBackup,
 }
 
 impl Busy {
@@ -177,7 +179,6 @@ impl Busy {
                 | Self::DisablingTouchId
                 | Self::Attaching
                 | Self::ReadingAttachment
-                | Self::DeletingBackup
         )
     }
 }
@@ -277,6 +278,44 @@ pub struct Settings {
     /// unparsable = shown.
     #[serde(default = "shown", deserialize_with = "lenient_shown")]
     pub show_in_dock: bool,
+    /// Argon2 costs each vault's header had at the last password unlock, create, password
+    /// change or re-calibration on this Mac (security review 2026-11-26 L-01). No secrets.
+    /// A malformed entry is dropped alone.
+    #[serde(deserialize_with = "lenient_kdf_seen")]
+    pub kdf_seen: BTreeMap<Uuid, KdfSeen>,
+}
+
+/// The Argon2 costs of a vault header as last seen on this Mac (no salt: a password change
+/// draws a new one, and only the costs make a correct password slow or fail).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KdfSeen {
+    pub m_cost_kib: u32,
+    pub t_cost: u32,
+    pub p_cost: u32,
+}
+
+impl From<&KdfParams> for KdfSeen {
+    fn from(p: &KdfParams) -> Self {
+        Self {
+            m_cost_kib: p.m_cost_kib,
+            t_cost: p.t_cost,
+            p_cost: p.p_cost,
+        }
+    }
+}
+
+/// `kdf_seen` keeping every entry whose key is a UUID and whose value parses; the others
+/// are dropped, and a value that is not a map at all is an empty map.
+fn lenient_kdf_seen<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<Uuid, KdfSeen>, D::Error> {
+    let serde_json::Value::Object(map) = serde_json::Value::deserialize(d)? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(map
+        .into_iter()
+        .filter_map(|(k, v)| Some((k.parse().ok()?, serde_json::from_value(v).ok()?)))
+        .collect())
 }
 
 fn shown() -> bool {
@@ -389,6 +428,7 @@ impl Default for Settings {
             onboarding_dismissed: false,
             sidebar_hidden: false,
             show_in_dock: true,
+            kdf_seen: BTreeMap::new(),
         }
     }
 }
@@ -405,7 +445,13 @@ pub struct AppState {
     pub toast: Option<Toast>,
     pub sync_status: SyncStatus,
     pub settings: Settings,
-    pub last_activity: Instant,
+    /// Time since the last user input known to us (in-app, or system-wide from the
+    /// tick), sleep included (L-13).
+    pub(crate) idle: IdleClock,
+    /// Monotonic and wall clocks; tests shift the wall clock to simulate sleep.
+    pub(crate) clock: Clock,
+    /// The previous auto-lock tick: a wall-clock jump since then means the Mac slept.
+    last_tick: Stamp,
     pub recent_vaults: Vec<PathBuf>,
     /// Recent entries that are plain files: the pre-package single-file layout, which
     /// cannot be opened (03 §1). Listed but not openable.
@@ -527,8 +573,15 @@ pub struct AppState {
     pub(crate) fake_work_time: Duration,
     /// False in tests so they never touch the user's recent.json or settings.json.
     persist_recent: bool,
+    /// Local folder for Unsaved copies when a package's `backups` is unusable (L-05):
+    /// `<support dir>/unsaved`, `None` when `persist_recent` is off (tests set their own).
+    unsaved_dir: Option<PathBuf>,
     clipboard: Clipboard,
     clipboard_clear: Option<Task<()>>,
+    /// When the last copy must be cleared, checked on every tick and input, so a deadline
+    /// that passed during sleep clears at once on wake (L-13). The timer above stays for
+    /// on-time clears while awake.
+    clipboard_deadline: Option<ClipboardDeadline>,
     /// Debounced autosave (03 §8); replacing it cancels the pending save.
     autosave: Option<Task<()>>,
     /// True from `schedule_autosave` until that save runs.
@@ -554,7 +607,9 @@ impl AppState {
             toast: None,
             sync_status: SyncStatus::default(),
             settings: Settings::default(),
-            last_activity: Instant::now(),
+            idle: IdleClock::new(Clock::default().now()),
+            clock: Clock::default(),
+            last_tick: Clock::default().now(),
             legacy_recents: legacy_files(&recent_vaults),
             recent_vaults,
             listing: Listing::default(),
@@ -628,6 +683,10 @@ impl AppState {
             #[cfg(test)]
             fake_work_time: Duration::ZERO,
             lock_gen: 0,
+            unsaved_dir: persist_recent
+                .then(persist::support_dir)
+                .flatten()
+                .map(|d| d.join("unsaved")),
             persist_recent,
             // Tests never touch the real pasteboard.
             #[cfg(not(test))]
@@ -635,6 +694,7 @@ impl AppState {
             #[cfg(test)]
             clipboard: Clipboard::new(Box::new(crate::clipboard::fake::FakePasteboard::default())),
             clipboard_clear: None,
+            clipboard_deadline: None,
             autosave: None,
             autosave_pending: false,
             background_done: None,
@@ -725,6 +785,15 @@ impl AppState {
         self.device_id
     }
 
+    /// Tests: the fallback folder for Unsaved copies, applied to the open vault too.
+    #[cfg(test)]
+    pub fn set_unsaved_dir(&mut self, dir: PathBuf) {
+        self.unsaved_dir = Some(dir);
+        if let Some(vault) = self.vault.as_mut() {
+            vault.set_fallback_dir(self.unsaved_dir.clone());
+        }
+    }
+
     #[cfg(test)]
     pub fn set_qr_scanner(&mut self, scanner: Arc<dyn QrScanner>) {
         self.qr = scanner;
@@ -752,7 +821,24 @@ impl AppState {
     }
 
     pub fn touch_activity(&mut self) {
-        self.last_activity = Instant::now();
+        let now = self.clock.now();
+        self.idle.reset(now);
+    }
+
+    /// In-app keyboard or mouse input. If the Mac slept since the last tick and the idle
+    /// limit passed meanwhile (sleep included), locks instead: the input that woke the
+    /// Mac must not keep the vault open (L-13). Returns whether it locked, so the caller
+    /// can stop the event. An overdue clipboard clear runs first.
+    pub fn note_activity(&mut self, cx: &mut Context<Self>) -> bool {
+        let now = self.clock.now();
+        self.expire_clipboard_if_due(now);
+        let idle = self.idle.advance(now);
+        if self.last_tick.slept_until(now) && self.idle_limit().is_some_and(|limit| idle >= limit) {
+            self.lock(cx);
+            return true;
+        }
+        self.idle.reset(now);
+        false
     }
 
     pub fn show_toast(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -922,15 +1008,19 @@ impl AppState {
                     this.remember(&path);
                     match outcome {
                         Outcome::Fresh => {
+                            let seen = kdf_seen_of(&vault);
                             this.install(vault, false);
+                            this.remember_kdf(seen, cx);
                             this.unlocked_cx(cx);
                             this.password_unlocked(true);
                             this.show_onboarding = true;
                         }
                         Outcome::Locked => {
+                            let seen = kdf_seen_of(&vault);
                             let outcome = vault.lock();
                             this.report_lock(None, &outcome);
                             this.install(vault, true);
+                            this.remember_kdf(seen, cx);
                             this.screen = Screen::Unlock;
                         }
                         // Dropping zeroizes the keys.
@@ -972,14 +1062,23 @@ impl AppState {
                     Ok(()) => upgrade_format(&mut vault, &password, &*bio, device_id, hooks),
                     Err(_) => None,
                 };
-                (vault, result, cleaned, upgraded)
+                // L-01: the costs the file asks for now, to compare with the last ones seen.
+                let on_disk = match result {
+                    Err(SyncError::Vault(VaultError::WrongPassword)) => on_disk_kdf(&vault),
+                    _ => None,
+                };
+                (vault, result, cleaned, upgraded, on_disk)
             },
-            |(_, result, _, _)| result.is_ok(),
-            |this, (mut vault, result, cleaned, upgraded), outcome, cx| match (outcome, result) {
+            |(_, result, ..)| result.is_ok(),
+            |this, (mut vault, result, cleaned, upgraded, on_disk), outcome, cx| match (
+                outcome, result,
+            ) {
                 // The user switched or closed the vault meanwhile; dropping zeroizes it.
                 (Outcome::Closed, _) => this.report_lock(None, &vault.lock()),
                 (Outcome::Fresh, Ok(())) => {
+                    let seen = kdf_seen_of(&vault);
                     this.vault = Some(vault);
+                    this.remember_kdf(seen, cx);
                     this.unlocked_cx(cx);
                     this.password_unlocked(true);
                     this.stale_cleaned(cleaned);
@@ -990,9 +1089,11 @@ impl AppState {
                     }
                 }
                 (Outcome::Locked, Ok(())) => {
+                    let seen = kdf_seen_of(&vault);
                     let outcome = vault.lock();
                     this.report_lock(None, &outcome);
                     this.vault = Some(vault);
+                    this.remember_kdf(seen, cx);
                     this.password_unlocked(false);
                     this.stale_cleaned(cleaned);
                     this.format_upgraded(upgraded);
@@ -1004,7 +1105,7 @@ impl AppState {
                 (_, Err(e)) => {
                     this.vault = Some(vault);
                     this.unlock_failures = this.unlock_failures.wrapping_add(1);
-                    this.error = Some(error_message(&e).into());
+                    this.error = Some(this.unlock_error_message(&e, on_disk).into());
                 }
             },
         );
@@ -1147,6 +1248,16 @@ impl AppState {
         if self.unlocked() > 0 {
             self.schedule_autosave(cx);
         }
+        // Once per unlock; a later toast of the same unlock (format upgrade, Touch ID
+        // slot gone) replaces it.
+        if self
+            .vault
+            .as_ref()
+            .and_then(SyncedVault::vault)
+            .is_some_and(|v| v.header().kdf.below_recommended())
+        {
+            self.set_toast(Toast::window(WEAK_KDF));
+        }
     }
 
     /// Shows the unlocked vault. Returns how many trashed items the sweep stripped (the
@@ -1179,6 +1290,9 @@ impl AppState {
     /// Safe to call at any time, including while locked or while an unlock is in flight.
     pub fn lock(&mut self, cx: &mut Context<Self>) {
         self.lock_gen = self.lock_gen.wrapping_add(1);
+        // A file panel opened in this session closes with it (M-04). Its callback only
+        // spawns, and the result is dropped by the `lock_gen` check.
+        (self.icon_images.cancel_chooser)();
         // Overlays of the unlocked session go first, so a "could not save" toast set
         // below survives onto the unlock screen. A standing danger toast stays.
         if !self.danger_toast_showing() {
@@ -1229,6 +1343,7 @@ impl AppState {
         self.reset_security_forms();
         self.clear_session();
         self.clipboard_clear = None;
+        self.clipboard_deadline = None;
         self.clipboard.clear_if_ours();
         if self.screen == Screen::Main {
             self.screen = Screen::Unlock;
@@ -1306,9 +1421,53 @@ impl AppState {
             self.toast = None;
             cx.notify();
         }
-        if self.should_auto_lock(system_idle_secs) {
+        let now = self.clock.now();
+        let slept = self.last_tick.slept_until(now);
+        self.last_tick = now;
+        self.expire_clipboard_if_due(now);
+        if self.should_auto_lock(system_idle_secs, now, slept) {
             self.lock(cx);
         }
+    }
+
+    /// Clears our copy if its deadline passed, sleep included (L-13).
+    fn expire_clipboard_if_due(&mut self, now: Stamp) {
+        if let Some(d) = self.clipboard_deadline
+            && d.copied.elapsed(now) >= d.ttl
+        {
+            self.clipboard_deadline = None;
+            self.clipboard.expire(d.generation);
+        }
+    }
+
+    /// The clear timer for `generation` fired.
+    pub(crate) fn clipboard_timer_fired(&mut self, generation: u64) {
+        if self
+            .clipboard_deadline
+            .is_some_and(|d| d.generation == generation)
+        {
+            self.clipboard_deadline = None;
+        }
+        self.clipboard.expire(generation);
+    }
+
+    /// Remembers when the copy `generation` must be cleared.
+    pub(crate) fn set_clipboard_deadline(&mut self, generation: u64, ttl: Duration) {
+        self.clipboard_deadline = Some(ClipboardDeadline {
+            generation,
+            copied: self.clock.now(),
+            ttl,
+        });
+    }
+
+    /// The auto-lock limit while an unlocked vault is open and auto-lock is on.
+    fn idle_limit(&self) -> Option<Duration> {
+        if self.locked || self.vault.is_none() {
+            return None;
+        }
+        self.settings
+            .auto_lock_minutes
+            .map(|m| Duration::from_secs(u64::from(m) * 60))
     }
 
     /// Reduce-motion setting as read by the tick (`vault_macos::reduce_motion_enabled`).
@@ -1321,20 +1480,26 @@ impl AppState {
         }
     }
 
-    /// Idle = the shorter of system-wide idle and time since our last recorded activity.
-    ///
-    /// Every in-app event is also system-wide input, so `min(system idle, app idle)` is
-    /// effectively system-idle driven: using another app keeps the vault unlocked.
-    /// `last_activity` only matters right after unlock, before any input arrives.
-    fn should_auto_lock(&self, system_idle_secs: f64) -> bool {
-        if self.locked || self.vault.is_none() {
-            return false;
-        }
-        let Some(minutes) = self.settings.auto_lock_minutes else {
+    /// Idle = time since the latest user input we know of: in-app input, or system-wide
+    /// input (`system_idle_secs` ago) newer than that. Using another app keeps the vault
+    /// unlocked. Idle time counts sleep ([`IdleClock`], L-13). After a sleep (`slept`),
+    /// the stretch up to the wake is judged before any input that woke the Mac is taken
+    /// in, so that input cannot rescue a vault whose limit passed during sleep.
+    fn should_auto_lock(&mut self, system_idle_secs: f64, now: Stamp, slept: bool) -> bool {
+        // Advanced on every tick, also while locked or with auto-lock off, so each step
+        // stays one tick long.
+        let idle = self.idle.advance(now);
+        let Some(limit) = self.idle_limit() else {
             return false;
         };
-        let app_idle = self.last_activity.elapsed().as_secs_f64();
-        system_idle_secs.min(app_idle) >= f64::from(minutes) * 60.0
+        if slept && idle >= limit {
+            return true;
+        }
+        if system_idle_secs.is_finite() && system_idle_secs >= 0.0 {
+            self.idle
+                .input(now, Duration::from_secs_f64(system_idle_secs.min(1e9)));
+        }
+        self.idle.advance(now) >= limit
     }
 
     fn install(&mut self, mut vault: SyncedVault, locked: bool) {
@@ -1366,11 +1531,29 @@ impl AppState {
     }
 }
 
+/// The pending clear of the last copy: its generation, when it was copied and after how
+/// long it is cleared.
+#[derive(Debug, Clone, Copy)]
+struct ClipboardDeadline {
+    generation: u64,
+    copied: Stamp,
+    ttl: Duration,
+}
+
 /// A fresh in-memory attachment store for render tests.
 #[cfg(test)]
 pub fn attachments_fake() -> Arc<attachments::fake::FakeStore> {
     attachments::fake::FakeStore::new()
 }
+
+/// Toast after an unlock of a vault whose Argon2 costs are under the recommended floor
+/// (security review 2026-11-26 L-20; `KdfParams::below_recommended`).
+pub const WEAK_KDF: &str = "This vault's encryption settings are below the recommended \
+     minimum. Change the master password to re-calibrate.";
+
+/// Tooltip of an "Unknown file" row in the Settings backups list, and the toast if such
+/// an entry is asked to open (L-04).
+pub const NOT_THIS_VAULT: &str = "Not a backup of this vault";
 
 /// Shown once after a password unlock moved a version 1 file to the current format.
 pub const UPGRADED: &str = "Vault upgraded to format 2. Touch ID needs to be enabled again.";

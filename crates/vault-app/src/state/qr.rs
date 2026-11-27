@@ -12,8 +12,8 @@ use gpui::Context;
 use vault_core::{ExposeSecret as _, FieldKind, SecretString, Totp};
 use vault_macos::MacError;
 
+use super::icon_images::open_chooser;
 use super::{AppState, Mode};
-use crate::ui;
 
 /// Decodes every QR code in an image file.
 pub trait QrScanner: Send + Sync {
@@ -48,6 +48,42 @@ struct ScanTarget {
     epoch: u64,
 }
 
+/// Whether `head` (the file's first bytes) starts with the PNG signature or the JPEG SOI
+/// marker. Nothing else reaches the system image decoder (security review 2026-11-26
+/// L-08; vault-macos repeats the check).
+pub fn is_png_or_jpeg(head: &[u8]) -> bool {
+    head.starts_with(b"\x89PNG\r\n\x1a\n") || head.starts_with(&[0xFF, 0xD8, 0xFF])
+}
+
+/// Reads the first bytes of the regular file at `path` and checks them with
+/// [`is_png_or_jpeg`]. `Ok(false)` for a non-image or a non-regular file. A symlink is
+/// not followed and counts as non-regular, like the icon picker's regular-file check
+/// (`symlink_metadata`); the descriptor actually opened is checked again (fstat), so a
+/// path swapped to a directory or device meanwhile is not read.
+fn has_image_magic(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read as _;
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Ok(false);
+    }
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Ok(false);
+    }
+    let mut head = Vec::with_capacity(8);
+    file.take(8).read_to_end(&mut head)?;
+    Ok(is_png_or_jpeg(&head))
+}
+
+/// [`QrScanner::scan_file`] behind the magic-byte check: a file that is not PNG or JPEG
+/// gives no payloads ("No TOTP QR code found") without the scanner seeing it.
+fn scan_checked(scanner: &dyn QrScanner, path: &Path) -> Result<Vec<SecretString>, MacError> {
+    match has_image_magic(path) {
+        Ok(true) => scanner.scan_file(path),
+        Ok(false) => Ok(Vec::new()),
+        Err(e) => Err(MacError::Other(format!("could not read image: {e}"))),
+    }
+}
+
 /// The first payload that is a valid `otpauth://totp` URI.
 pub fn totp_payload(payloads: Vec<SecretString>) -> Option<SecretString> {
     payloads.into_iter().find(|p| {
@@ -66,13 +102,12 @@ impl AppState {
         }
         // Taken before the panel opens: the user may cancel the edit meanwhile.
         let target = self.scan_target(key);
-        let pick = ui::pick_path(false, "Choose", cx);
-        cx.spawn(async move |this, cx| {
-            let path = pick.await;
-            this.update(cx, |this, cx| this.image_picked(target, path, cx))
-                .ok();
-        })
-        .detach();
+        // The icon picker's panel, limited to PNG and JPEG (L-08). Non-blocking; at most
+        // one is up (the chooser refuses a second), and a lock closes it.
+        let chooser = self.icon_images.chooser.clone();
+        open_chooser(&chooser, cx, move |this: &mut Self, path, cx| {
+            this.image_picked(target, path, cx)
+        });
     }
 
     /// The open panel closed: decode the chosen file, unless it was cancelled, another
@@ -122,7 +157,7 @@ impl AppState {
         let scanner = self.qr.clone();
         let task = cx
             .background_executor()
-            .spawn(async move { scanner.scan_file(&path) });
+            .spawn(async move { scan_checked(&*scanner, &path) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
@@ -248,6 +283,13 @@ mod tests {
         (state, key)
     }
 
+    /// A file in `dir` that starts with the PNG signature (the fake scanner decodes it).
+    fn png(dir: &Path) -> PathBuf {
+        let path = dir.join("qr.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nnot really an image").unwrap();
+        path
+    }
+
     fn field_value(state: &Entity<AppState>, cx: &mut TestAppContext) -> String {
         state.read_with(cx, |st, _| {
             st.edit_buffer().unwrap().item.fields[0]
@@ -269,13 +311,127 @@ mod tests {
         assert!(totp_payload(vec![s("hello")]).is_none());
     }
 
+    #[test]
+    fn only_png_and_jpeg_magic_pass() {
+        assert!(is_png_or_jpeg(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"));
+        assert!(is_png_or_jpeg(&[0xFF, 0xD8, 0xFF, 0xE0]));
+        assert!(is_png_or_jpeg(&[0xFF, 0xD8, 0xFF, 0xDB]));
+        for other in [
+            &b"GIF89a"[..],
+            b"%PDF-1.7",
+            b"II*\0",
+            b"\0\0\0\x18ftypheic",
+            b"\x89PNG\r\n",
+            &[0xFF, 0xD8],
+            b"",
+        ] {
+            assert!(!is_png_or_jpeg(other), "{other:?}");
+        }
+    }
+
+    /// A file that is not PNG or JPEG never reaches the decoder: it is refused like an
+    /// image without a code. PNG and JPEG files are handed on.
+    #[gpui::test]
+    fn non_image_is_refused_before_the_decoder(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, key) = editing(dir.path(), cx);
+        let gif = dir.path().join("qr.gif");
+        std::fs::write(&gif, b"GIF89a\x01\0\x01\0").unwrap();
+        let named_png = dir.path().join("fake.png");
+        std::fs::write(&named_png, b"<svg xmlns='http://www.w3.org/2000/svg'/>").unwrap();
+        for path in [gif, named_png, dir.path().to_owned()] {
+            let fake = FakeScanner::returning(Ok(vec![s(VALID)]));
+            state.update(cx, |st, cx| {
+                st.set_qr_scanner(fake.clone());
+                st.scan_totp_qr_image(key, path.clone(), cx);
+            });
+            cx.run_until_parked();
+            assert!(
+                fake.last_file.lock().unwrap().is_none(),
+                "{path:?} not decoded"
+            );
+            assert_eq!(toast(&state, cx), "No TOTP QR code found in the image");
+            assert_eq!(field_value(&state, cx), "");
+        }
+
+        let jpeg = dir.path().join("qr.jpg");
+        std::fs::write(&jpeg, [0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10]).unwrap();
+        for path in [jpeg, png(dir.path())] {
+            let fake = FakeScanner::returning(Ok(Vec::new()));
+            state.update(cx, |st, cx| {
+                st.set_qr_scanner(fake.clone());
+                st.scan_totp_qr_image(key, path.clone(), cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                fake.last_file.lock().unwrap().as_deref(),
+                Some(path.as_path())
+            );
+        }
+    }
+
+    /// A symlink is not followed, even to a real PNG with a code: the decoder never sees
+    /// it, as for any non-regular file (the icon picker refuses symlinks the same way).
+    #[gpui::test]
+    fn symlink_to_a_png_is_refused(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, key) = editing(dir.path(), cx);
+        let real = png(dir.path());
+        let link = dir.path().join("link.png");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let fake = FakeScanner::returning(Ok(vec![s(VALID)]));
+        state.update(cx, |st, cx| {
+            st.set_qr_scanner(fake.clone());
+            st.scan_totp_qr_image(key, link, cx);
+        });
+        cx.run_until_parked();
+        assert!(fake.last_file.lock().unwrap().is_none(), "link not decoded");
+        assert_eq!(toast(&state, cx), "No TOTP QR code found in the image");
+        assert_eq!(field_value(&state, cx), "");
+
+        // Control: the real file behind it is decoded.
+        state.update(cx, |st, cx| st.scan_totp_qr_image(key, real.clone(), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            fake.last_file.lock().unwrap().as_deref(),
+            Some(real.as_path())
+        );
+        assert_eq!(field_value(&state, cx), VALID);
+    }
+
+    /// "Scan QR from image…" opens the icon picker's panel, limited to PNG and JPEG.
+    #[gpui::test]
+    fn picker_is_limited_to_png_and_jpeg(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, key) = editing(dir.path(), cx);
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let fake = FakeScanner::returning(Ok(vec![s(VALID)]));
+        let picked = png(dir.path());
+        state.update(cx, |st, cx| {
+            st.set_qr_scanner(fake.clone());
+            let asked = asked.clone();
+            let picked = picked.clone();
+            st.icon_images.chooser = std::rc::Rc::new(move |exts: &[&str], _prompt: &str, done| {
+                asked
+                    .borrow_mut()
+                    .extend(exts.iter().map(|e| (*e).to_owned()));
+                done(Some(picked.clone()));
+                true
+            });
+            st.scan_totp_qr_file(key, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(*asked.borrow(), ["png", "jpg", "jpeg"]);
+        assert_eq!(field_value(&state, cx), VALID);
+    }
+
     #[gpui::test]
     fn late_result_never_lands_in_another_edit(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (state, key) = editing(dir.path(), cx);
         state.update(cx, |st, cx| {
             st.set_qr_scanner(FakeScanner::returning(Ok(vec![s(VALID)])));
-            st.scan_totp_qr_image(key, PathBuf::from("/tmp/qr.png"), cx);
+            st.scan_totp_qr_image(key, png(dir.path()), cx);
             // Cancel, then edit another item whose TOTP field has the same row key.
             st.mode = Mode::View;
             let mut other = Item::new("Other", st.device_id(), 1);
@@ -310,7 +466,7 @@ mod tests {
             k
         });
         let fake = FakeScanner::returning(Ok(vec![s("hello"), s(VALID)]));
-        let path = PathBuf::from("/tmp/qr.png");
+        let path = png(dir.path());
         state.update(cx, |st, cx| {
             st.set_qr_scanner(fake.clone());
             st.scan_totp_qr_image(key, path.clone(), cx);
@@ -343,7 +499,7 @@ mod tests {
         let long = format!("{VALID}&x={}", "a".repeat(limit));
         state.update(cx, |st, cx| {
             st.set_qr_scanner(FakeScanner::returning(Ok(vec![s(&long)])));
-            st.scan_totp_qr_image(key, PathBuf::from("/tmp/qr.png"), cx);
+            st.scan_totp_qr_image(key, png(dir.path()), cx);
         });
         cx.run_until_parked();
         assert_eq!(field_value(&state, cx), long[..limit]);
@@ -359,7 +515,7 @@ mod tests {
     fn image_scan_none_found_unreadable_and_stale(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (state, key) = editing(dir.path(), cx);
-        let path = PathBuf::from("/tmp/qr.png");
+        let path = png(dir.path());
 
         state.update(cx, |st, cx| {
             st.set_qr_scanner(FakeScanner::returning(Ok(vec![s("https://x.example")])));
@@ -404,7 +560,7 @@ mod tests {
                     } else {
                         Err(MacError::NotAvailable)
                     }));
-                    st.scan_totp_qr_image(key, PathBuf::from("/tmp/qr.png"), cx);
+                    st.scan_totp_qr_image(key, png(dir.path()), cx);
                     // Lock before the background scan delivers. Put a same-keyed edit
                     // back afterwards so a write would be observable.
                     st.lock(cx);
@@ -439,7 +595,7 @@ mod tests {
             // Panel resolves after a lock.
             let target = st.scan_target(key);
             st.lock(cx);
-            st.image_picked(target, Some(PathBuf::from("/tmp/qr.png")), cx);
+            st.image_picked(target, Some(png(dir.path())), cx);
             assert!(!st.qr_scanning, "no decode started");
         });
         cx.run_until_parked();
@@ -453,7 +609,7 @@ mod tests {
         state.update(cx, |st, cx| {
             st.set_qr_scanner(fake.clone());
             let target = st.scan_target(key);
-            st.image_picked(target, Some(PathBuf::from("/tmp/qr.png")), cx);
+            st.image_picked(target, Some(png(dir.path())), cx);
         });
         cx.run_until_parked();
         assert_eq!(field_value(&state, cx), VALID);

@@ -16,14 +16,15 @@ use gpui_component::menu::DropdownMenu as _;
 use gpui_component::switch::Switch;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::tag::Tag;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _};
 use gpui_kit_assets::IconName;
 use vault_sync::{BackupInfo, BackupKind};
 
 use super::security::SecurityView;
 use crate::state::{
-    AppState, Appearance, Busy, LoginRow, RestorePrompt, SECURITY_TAB, SYNC_TAB, Settings,
-    SyncStatus, TRANSFER_TAB, TextSize,
+    AppState, Appearance, Busy, LoginRow, NOT_THIS_VAULT, RestorePrompt, SECURITY_TAB, SYNC_TAB,
+    Settings, SyncStatus, TRANSFER_TAB, TextSize,
 };
 use crate::ui::Clickable as _;
 use crate::{cloud, text, ui};
@@ -39,6 +40,10 @@ const TABS: [&str; 5] = [
 /// Text of the red export confirm.
 pub const EXPORT_WARNING: &str = "The CSV file contains every password in plain text. \
      Anyone who can read the file can read your passwords.";
+
+/// Tag shown instead of the kind on a backups-list row vault-sync could not validate
+/// (L-04).
+pub const UNKNOWN_FILE: &str = "Unknown file";
 
 pub struct SettingsView {
     state: Entity<AppState>,
@@ -532,6 +537,10 @@ impl SettingsView {
 
     fn backups(&self, s: &AppState, cx: &App) -> gpui::AnyElement {
         if let Some(e) = s.sync.backups_error.clone() {
+            // L-05: the state already reworded it; the Repair strip carries the action.
+            if s.sync.backups_unsafe {
+                return ui::muted(e, cx).into_any_element();
+            }
             return div()
                 .text_sm()
                 .text_color(cx.theme().danger)
@@ -559,7 +568,12 @@ impl SettingsView {
         let restore = s.sync.restore.as_ref().filter(|r| r.backup == b.path);
         let confirming = s.sync.delete_confirm.as_ref() == Some(&b.path);
         let date = text::date_time(b.taken_at);
+        if !b.validated {
+            return self.unknown_backup_row(ix, b, date, confirming, s, cx);
+        }
         let line = ui::h_flex()
+            .w_full()
+            .min_w_0()
             .py(px(6.))
             .gap(px(8.))
             .child(div().text_sm().child(date.clone()))
@@ -568,16 +582,70 @@ impl SettingsView {
                 BackupKind::Conflict => row.child(Tag::warning().small().child("Conflict copy")),
                 BackupKind::Unsaved => row.child(Tag::info().small().child("Unsaved edits")),
             })
-            .child(div().flex_1())
-            .child(ui::muted(text::file_size(b.size), cx));
+            .child(div().flex_1());
+        // While confirming, the size gives way to the question so the buttons fit.
         let line = if confirming {
             self.delete_confirm(line, cx)
         } else {
+            let line = line.child(ui::muted(text::file_size(b.size), cx));
             self.backup_actions(line, ix, b, date, s)
         };
         ui::v_flex()
             .child(line)
             .children(restore.map(|r| self.restore_prompt(r, s, cx)))
+    }
+
+    /// A file in `backups/` that vault-sync could not tie to this vault (L-04): a muted
+    /// "Unknown file" tag instead of the kind, no Open or Restore, the tooltip
+    /// [`NOT_THIS_VAULT`] over the row. It can still be deleted.
+    fn unknown_backup_row(
+        &self,
+        ix: usize,
+        b: &BackupInfo,
+        date: String,
+        confirming: bool,
+        s: &AppState,
+        cx: &App,
+    ) -> gpui::Div {
+        let info = ui::h_flex()
+            .id(("backup-unknown", ix))
+            .debug_selector(move || format!("backup-unknown {ix}"))
+            .gap(px(8.))
+            .child(div().text_sm().child(date.clone()))
+            .child(Tag::secondary().small().child(UNKNOWN_FILE))
+            .tooltip(|window, cx| Tooltip::new(NOT_THIS_VAULT).build(window, cx));
+        let line = ui::h_flex()
+            .w_full()
+            .min_w_0()
+            .py(px(6.))
+            .gap(px(8.))
+            .child(info)
+            .child(div().flex_1());
+        if confirming {
+            self.delete_confirm(line, cx)
+        } else {
+            line.child(ui::muted(text::file_size(b.size), cx))
+                .child(self.delete_backup_button(ix, b, date, s.busy.is_some()))
+        }
+    }
+
+    /// The trash button at the right of a backup row.
+    fn delete_backup_button(
+        &self,
+        ix: usize,
+        b: &BackupInfo,
+        date: impl std::fmt::Display,
+        busy: bool,
+    ) -> Button {
+        let state = self.state.clone();
+        let path = b.path.clone();
+        ui::icon_button(("delete-backup", ix), IconName::Trash, "Delete backup")
+            .accessibility_label(format!("Delete backup from {date}"))
+            .disabled(busy)
+            .clickable_when(!busy)
+            .on_click(move |_, _, cx| {
+                state.update(cx, |s, cx| s.request_delete_backup(path.clone(), cx))
+            })
     }
 
     /// Open, Restore… and the trash button at the right of a backup row.
@@ -603,34 +671,32 @@ impl SettingsView {
             .clickable_when(!s.locked && !busy)
             .when(s.locked, |b| b.tooltip("Unlock the vault to restore")),
         )
-        .child({
-            let state = self.state.clone();
-            let path = b.path.clone();
-            ui::icon_button(("delete-backup", ix), IconName::Trash, "Delete backup")
-                .accessibility_label(format!("Delete backup from {date}"))
-                .disabled(busy)
-                .clickable_when(!busy)
-                .on_click(move |_, _, cx| {
-                    state.update(cx, |s, cx| s.request_delete_backup(path.clone(), cx))
-                })
-        })
+        .child(self.delete_backup_button(ix, b, date, busy))
     }
 
-    /// The row's actions replaced by "Delete this backup?" with Cancel / Delete.
+    /// The row's size and actions replaced by "Delete this backup?" with Cancel / Delete.
+    /// The question truncates first at narrow widths; the buttons never shrink.
     fn delete_confirm(&self, line: gpui::Div, cx: &App) -> gpui::Div {
         line.debug_selector(|| "backup-delete-confirm".into())
-            .child(ui::muted("Delete this backup?", cx))
+            .child(
+                ui::muted("Delete this backup?", cx)
+                    .min_w_0()
+                    .flex_shrink(1.)
+                    .truncate(),
+            )
             .child(
                 state_button("backup-delete-cancel", "Cancel", &self.state, |s, cx| {
                     s.cancel_delete_backup(cx)
                 })
-                .ghost(),
+                .ghost()
+                .flex_none(),
             )
             .child(
                 state_button("backup-delete-ok", "Delete", &self.state, |s, cx| {
                     s.confirm_delete_backup(cx)
                 })
-                .danger(),
+                .danger()
+                .flex_none(),
             )
     }
 
@@ -1160,6 +1226,82 @@ mod tests {
         );
         assert!(hint(&mut vcx, EIGHTEEN_MONTHS));
         assert!(!hint(&mut vcx, THREE_YEARS));
+    }
+
+    /// A backups-list entry vault-sync could not validate (L-04) shows the "Unknown
+    /// file" tag, and neither a click on its row nor a direct request opens or restores it.
+    #[gpui::test]
+    fn unvalidated_backup_shows_unknown_and_does_not_open(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = SyncedVault::create(
+            &dir.path().join("t.vault"),
+            &SecretString::new("pw".into()),
+            KdfParams::for_tests(),
+            Uuid::new_v4(),
+            Arc::new(NoopHooks),
+        )
+        .unwrap();
+        vault.backup_now().unwrap();
+        cx.update(gpui_component::init);
+        let state = cx.new(|_| AppState::new(Uuid::new_v4(), Vec::new(), false));
+        let window = cx.add_window(|window, cx| {
+            theme::apply(window, cx);
+            let view = cx.new(|cx| SettingsView::new(state.clone(), window, cx));
+            Root::new(view, window, cx)
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        state.update(&mut vcx, |s, cx| {
+            s.install_unlocked_for_tests(vault);
+            s.refresh_backups();
+            assert_eq!(s.sync.backups.len(), 1);
+            assert!(s.sync.backups[0].validated, "a real snapshot validates");
+            s.open_settings(true, cx);
+        });
+        show_tab(SYNC_TAB, &state, &mut vcx);
+        assert!(
+            vcx.debug_bounds("backup-unknown 0").is_none(),
+            "validated row"
+        );
+
+        let path = state.update(&mut vcx, |s, cx| {
+            s.sync.backups[0].validated = false;
+            cx.notify();
+            s.sync.backups[0].path.clone()
+        });
+        vcx.run_until_parked();
+        let row = vcx.debug_bounds("backup-unknown 0").expect("unknown row");
+        let windows = vcx.update(|_, cx| cx.windows().len());
+        vcx.simulate_click(row.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        assert_eq!(vcx.update(|_, cx| cx.windows().len()), windows, "no viewer");
+        state.update(&mut vcx, |s, cx| {
+            assert!(s.sync.restore.is_none());
+            s.request_restore(path.clone(), cx);
+            assert!(s.sync.restore.is_none(), "no restore prompt");
+            s.open_backup(path.clone(), cx);
+            assert_eq!(
+                s.toast.as_ref().map(|t| t.message.as_ref()),
+                Some(crate::state::NOT_THIS_VAULT)
+            );
+        });
+        vcx.run_until_parked();
+        assert_eq!(vcx.update(|_, cx| cx.windows().len()), windows, "no viewer");
+
+        // A path that is not in the list at all is refused the same way.
+        let unlisted = dir.path().join("elsewhere.vault.bin");
+        std::fs::copy(&path, &unlisted).unwrap();
+        state.update(&mut vcx, |s, cx| {
+            s.toast = None;
+            s.request_restore(unlisted.clone(), cx);
+            assert!(s.sync.restore.is_none(), "no restore prompt");
+            s.open_backup(unlisted.clone(), cx);
+            assert_eq!(
+                s.toast.as_ref().map(|t| t.message.as_ref()),
+                Some(crate::state::NOT_THIS_VAULT)
+            );
+        });
+        vcx.run_until_parked();
+        assert_eq!(vcx.update(|_, cx| cx.windows().len()), windows, "no viewer");
     }
 
     #[test]

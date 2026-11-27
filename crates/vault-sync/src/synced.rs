@@ -10,7 +10,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender};
 use vault_core::{
@@ -193,6 +193,9 @@ pub struct SyncedVault {
     backup_checks: Mutex<backup::Checks>,
     /// App policy run on the in-memory vault right before it is serialised for a write.
     before_write: Option<BeforeWrite>,
+    /// Local folder for Unsaved copies when `backups/` is unusable (L-05); copies go into
+    /// its `<vault_id>/` subdirectory. `None` (the default): no fallback.
+    fallback_dir: Option<PathBuf>,
 }
 
 impl fmt::Debug for SyncedVault {
@@ -263,6 +266,7 @@ impl SyncedVault {
             orphan_pass: None,
             backup_checks: Mutex::default(),
             before_write: None,
+            fallback_dir: None,
         };
         let written = match this.write(&bytes, Mode::NoReplace) {
             Ok(durable) => durable.map_err(|e| (e, true)),
@@ -372,6 +376,7 @@ impl SyncedVault {
             orphan_pass: None,
             backup_checks: Mutex::default(),
             before_write: None,
+            fallback_dir: None,
         })
     }
 
@@ -610,8 +615,25 @@ impl SyncedVault {
             return Ok(path);
         }
         let bytes = vault.serialize();
-        let (path, durable) =
-            self.snapshot_unconfirmed(&bytes, SystemTime::now(), BackupKind::Unsaved)?;
+        let now = SystemTime::now();
+        let (path, durable) = match self.snapshot_unconfirmed(&bytes, now, BackupKind::Unsaved) {
+            Ok(written) => written,
+            Err(e) => {
+                // L-05: a planted `backups` entry (or any other failure there) must not cost
+                // the session's edits; keep them in the local fallback folder instead.
+                let Some(dir) = self.fallback_vault_dir() else {
+                    return Err(e);
+                };
+                tracing::warn!(error = %e, "unsaved backup in the package failed; writing the local fallback copy");
+                match self.write_fallback(&dir, &bytes, now) {
+                    Ok(written) => written,
+                    Err(fallback) => {
+                        tracing::error!(error = %fallback, "local fallback copy failed too");
+                        return Err(e);
+                    }
+                }
+            }
+        };
         if let Err(e) = durable {
             tracing::warn!(path = %path.display(), error = %e, "unsaved backup written but not confirmed durable");
             self.emit(SyncEvent::Error(format!(
@@ -628,7 +650,7 @@ impl SyncedVault {
     /// nonces. Any failure to read or open it counts as "not covered", and so does an evicted
     /// (cloud-only) file: `lock` must not block on a download, so it writes a new one.
     fn newest_unsaved_covering(&self, vault: &UnlockedVault) -> Option<PathBuf> {
-        let list = backup::list_backups(&self.path, &self.expect(None), false).ok()?;
+        let list = self.all_backups(&self.expect(None), false).ok()?;
         let newest = list.into_iter().find(|b| b.kind == BackupKind::Unsaved)?;
         if self.hooks.is_evicted(&newest.path) {
             return None;
@@ -864,7 +886,7 @@ impl SyncedVault {
     /// 03 §2 step 7 / §4: snapshot `bytes` (just written) if the newest snapshot is an hour
     /// old, the item count dropped since the last save, or this is the first save after
     /// unlock. The save has already succeeded, so a failure here is logged and emitted as
-    /// [`SyncEvent::Error`], never returned.
+    /// [`SyncEvent::BackupFailed`], never returned.
     fn maybe_backup(&mut self, bytes: &[u8], item_count: usize, first_save_after_unlock: bool) {
         // A trigger whose snapshot failed last time (any of the three) fires again now.
         let decreased = self.last_item_count.is_some_and(|prev| item_count < prev)
@@ -889,7 +911,10 @@ impl SyncedVault {
             // Retry on the next save rather than losing the triggered snapshot.
             self.snapshot_retry = true;
             tracing::warn!(error = %e, "backup after save failed");
-            self.emit(SyncEvent::Error(format!("backup failed: {e}")));
+            self.emit(SyncEvent::BackupFailed {
+                unsafe_dir: matches!(e, SyncError::UnsafePackageDir(_)),
+                message: format!("backup failed: {e}"),
+            });
         }
     }
 
@@ -939,8 +964,145 @@ impl SyncedVault {
     /// Snapshots, unsaved copies and absorbed conflict packages in `<name>.vault/backups/`:
     /// validated entries newest first, then unvalidated ones ([`BackupInfo::validated`])
     /// newest first. Names alone never make an entry look current (L-04).
+    ///
+    /// With a fallback folder set ([`SyncedVault::set_fallback_dir`]), its Unsaved copies of
+    /// this vault are listed too, sorted in with the rest; they are validated the same way and
+    /// never pruned (a fallback folder that cannot be listed, a symlinked `<vault_id>/` included,
+    /// is logged and contributes nothing). If `backups/` itself cannot be listed (a planted
+    /// file or symlink there: [`SyncError::UnsafePackageDir`]), that error is returned and no
+    /// fallback copy is listed; the app raises its Repair strip on it
+    /// ([`SyncedVault::repair_package`]), after which the listing works again.
     pub fn backups(&self) -> Result<Vec<BackupInfo>, SyncError> {
-        backup::list_backups(&self.path, &self.expect(None), false)
+        self.all_backups(&self.expect(None), true)
+    }
+
+    /// [`SyncedVault::backups`] with the given validation. With `strict` false, a failing
+    /// package listing counts as empty (used by `newest_unsaved_covering`, so repeated locks
+    /// while `backups/` is planted reuse a covering fallback copy).
+    fn all_backups(
+        &self,
+        expect: &backup::Expect,
+        strict: bool,
+    ) -> Result<Vec<BackupInfo>, SyncError> {
+        let in_package = backup::list_backups(&self.path, expect, false);
+        let Some(dir) = self.fallback_vault_dir() else {
+            return in_package;
+        };
+        let mut list = match in_package {
+            Ok(list) => list,
+            Err(e) if strict => return Err(e),
+            Err(_) => Vec::new(),
+        };
+        let fallback = backup::list_fallback(&dir, expect).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not list the local fallback copies");
+            Vec::new()
+        });
+        list.extend(fallback);
+        list.sort_by_key(BackupInfo::order_key);
+        Ok(list)
+    }
+
+    /// Where Unsaved copies go when the package's `backups/` is unusable (security review
+    /// 2026-11-26, L-05): a local folder outside the sync location, chosen by the app. Copies
+    /// are written to `<dir>/<vault_id>/` (created 0700; `dir` itself is created if missing)
+    /// with the same names as in `backups/`, files 0600, never pruned. Any failure of the
+    /// package snapshot (a planted entry, a full disk, an I/O error) falls back here. Growth is
+    /// bounded by the covering check: a new copy is written only when no existing Unsaved copy
+    /// (in either place) already holds the edits. `None` (the default)
+    /// turns the fallback off. Listed by [`backups`](SyncedVault::backups), and accepted by
+    /// [`restore_from`](SyncedVault::restore_from) and
+    /// [`delete_backup`](SyncedVault::delete_backup).
+    pub fn set_fallback_dir(&mut self, dir: Option<PathBuf>) {
+        self.fallback_dir = dir;
+    }
+
+    /// `<fallback dir>/<vault_id>` if a fallback folder is set.
+    fn fallback_vault_dir(&self) -> Option<PathBuf> {
+        let id = self.locked.vault_id().to_string();
+        self.fallback_dir.as_ref().map(|d| d.join(id))
+    }
+
+    /// Write `bytes` as an Unsaved copy into the fallback folder `dir` (from
+    /// [`SyncedVault::fallback_vault_dir`]) and announce it. No retention.
+    fn write_fallback(
+        &self,
+        dir: &Path,
+        bytes: &[u8],
+        now: SystemTime,
+    ) -> Result<(PathBuf, Result<(), SyncError>), SyncError> {
+        use std::os::unix::fs::DirBuilderExt;
+        if let Some(base) = dir.parent() {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(base)
+                .map_err(|e| SyncError::io(base, e))?;
+        }
+        package::ensure_dir(dir)?;
+        let name = package::vault_name(&self.path);
+        let written = backup::write_snapshot_in(dir, &name, bytes, now, BackupKind::Unsaved)?;
+        self.emit(SyncEvent::BackupTaken(written.0.clone()));
+        Ok(written)
+    }
+
+    /// The canonical directory holding `backup` if that is `backups/` or the fallback folder
+    /// (`true` for the latter), resolving only the parent: the entry itself is never
+    /// followed. [`SyncError::NotABackup`] for anything else. A fallback `<vault_id>/` that is
+    /// itself a symlink or not a directory is [`SyncError::UnsafePackageDir`].
+    fn backup_home(&self, backup: &Path) -> Result<(PathBuf, bool), SyncError> {
+        let refuse = || SyncError::NotABackup(backup.to_owned());
+        backup.file_name().ok_or_else(refuse)?;
+        let parent = match backup.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let canonical_parent = fs::canonicalize(parent).map_err(|e| match e.kind() {
+            ErrorKind::NotFound => refuse(),
+            _ => SyncError::io(parent, e),
+        })?;
+        let homes = [
+            Some(package::backups_dir(&self.path)),
+            self.fallback_vault_dir(),
+        ];
+        for (i, home) in homes.iter().enumerate() {
+            let Some(home) = home else { continue };
+            if fs::canonicalize(home).ok().as_ref() == Some(&canonical_parent) {
+                if i == 1 {
+                    // Like `backups/` (03 §1): never act through a linked vault-id folder.
+                    package::check_dir(home)?;
+                }
+                return Ok((canonical_parent, i == 1));
+            }
+        }
+        Err(refuse())
+    }
+
+    /// Move a planted `backups` or `attachments` entry that is not a real directory (a plain
+    /// file, or a symlink of any kind) out of the way (security review 2026-11-26, L-05): it
+    /// is renamed within the package to `<name>.quarantined-<unix seconds>` (`-2`, `-3`, ...
+    /// on collision). A symlink is renamed itself, never followed; nothing is deleted, and
+    /// nothing else in the package (`vault.bin` included) is touched. Returns the new paths of
+    /// what was moved, empty if nothing needed it. Works locked or unlocked; takes the save
+    /// lock. The next save recreates the directories.
+    pub fn repair_package(&mut self) -> Result<Vec<PathBuf>, SyncError> {
+        let _lock = PackageLock::exclusive(&self.path)?;
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut moved = Vec::new();
+        for name in [package::BACKUPS_DIR, package::ATTACHMENTS_DIR] {
+            let entry = self.path.join(name);
+            match fs::symlink_metadata(&entry) {
+                Ok(m) if m.file_type().is_dir() => continue,
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => return Err(SyncError::io(&entry, e)),
+            }
+            let dest = quarantine_entry(&entry, &format!("{name}.quarantined-{secs}"))?;
+            tracing::warn!(from = %entry.display(), to = %dest.display(), "quarantined a package entry that is not a directory");
+            moved.push(dest);
+        }
+        Ok(moved)
     }
 
     /// Delete one backup (user-initiated, 03 §8): a snapshot or unsaved file, or an absorbed
@@ -949,7 +1111,8 @@ impl SyncedVault {
     /// retention never prunes. Works while locked.
     ///
     /// `backup`'s parent directory is resolved through symlinks and must be
-    /// `<name>.vault/backups/`; the entry itself must be one of [`backups`] and must not be a
+    /// `<name>.vault/backups/` or the fallback folder's `<vault_id>/` (L-05); the entry itself
+    /// must be one of [`backups`] and must not be a
     /// symlink (never followed, so it cannot redirect the delete to another file). Anything
     /// else (the primary, the package, a file outside `backups/`, any symlink, an unrecognised
     /// name, a missing path) is refused with [`SyncError::NotABackup`] and nothing is
@@ -972,24 +1135,8 @@ impl SyncedVault {
         let refuse = || SyncError::NotABackup(backup.to_owned());
         // Resolve only the directory: the entry itself is never followed, so a symlink named
         // like a backup cannot redirect the delete to another file (another backup included).
+        let (canonical_dir, in_fallback) = self.backup_home(backup)?;
         let name = backup.file_name().ok_or_else(refuse)?;
-        let parent = match backup.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        let canonical_parent = fs::canonicalize(parent).map_err(|e| match e.kind() {
-            ErrorKind::NotFound => refuse(),
-            _ => SyncError::io(parent, e),
-        })?;
-        let backups_dir = package::backups_dir(&self.path);
-        let canonical_dir = match fs::canonicalize(&backups_dir) {
-            Ok(d) => d,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Err(refuse()),
-            Err(e) => return Err(SyncError::io(&backups_dir, e)),
-        };
-        if canonical_parent != canonical_dir {
-            return Err(refuse());
-        }
         let target = canonical_dir.join(name);
         let meta = match fs::symlink_metadata(&target) {
             Ok(m) => m,
@@ -999,7 +1146,11 @@ impl SyncedVault {
         if meta.file_type().is_symlink() {
             return Err(refuse());
         }
-        let info = backup::list_backups(&self.path, &self.expect(None), false)?
+        let listed = match self.fallback_vault_dir() {
+            Some(dir) if in_fallback => backup::list_fallback(&dir, &self.expect(None))?,
+            _ => backup::list_backups(&self.path, &self.expect(None), false)?,
+        };
+        let info = listed
             .into_iter()
             .find(|b| {
                 b.path
@@ -1039,7 +1190,10 @@ impl SyncedVault {
 
     /// Replace the vault with the backup at `backup` (03 §4 "Restore"): a `.vault.bin`
     /// snapshot file, or a package directory (an absorbed `conflict-…` package), whose
-    /// `vault.bin` is used.
+    /// `vault.bin` is used. The entry must sit directly in `backups/` or in the fallback
+    /// folder's `<vault_id>/` (parent resolved, entry never followed; L-05), else
+    /// [`SyncError::NotABackup`]. A `backups` entry that is not a real directory refuses the
+    /// restore ([`SyncError::UnsafePackageDir`]) until [`SyncedVault::repair_package`].
     ///
     /// `password` must unlock the backup (it may differ from the current password if that has
     /// since changed); the backup must be of this vault (same `vault_id`). The current primary
@@ -1077,6 +1231,8 @@ impl SyncedVault {
         // Our own `backups/` must not be a link (03 §1): a backup read through it, and the
         // pre-restore snapshot written into it, would live outside the package.
         package::check_dir(&package::backups_dir(&self.path))?;
+        // Only entries of `backups/` or the local fallback folder (L-05).
+        self.backup_home(backup)?;
         // Never through a symlink: neither the entry itself nor (by `read_parsed`) the file.
         let source = match fs::symlink_metadata(backup) {
             Ok(m) if m.file_type().is_symlink() => {
@@ -1360,6 +1516,25 @@ pub(crate) fn check_vault_size(bytes: &[u8]) -> Result<(), SyncError> {
         });
     }
     Ok(())
+}
+
+/// Rename `entry` to `<dir of entry>/<base>`, or `<base>-N` if taken, without replacing
+/// anything; the new path.
+fn quarantine_entry(entry: &Path, base: &str) -> Result<PathBuf, SyncError> {
+    let dir = entry.parent().unwrap_or(Path::new("."));
+    for n in 1..=1000u32 {
+        let dest = if n == 1 {
+            dir.join(base)
+        } else {
+            dir.join(format!("{base}-{n}"))
+        };
+        match crate::atomic::rename_no_replace(entry, &dest) {
+            Ok(()) => return Ok(dest),
+            Err(SyncError::AlreadyExists(_)) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(SyncError::AlreadyExists(dir.join(base)))
 }
 
 fn not_found(path: &Path) -> SyncError {

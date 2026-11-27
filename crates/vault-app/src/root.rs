@@ -352,10 +352,6 @@ impl VaultRoot {
             persist::save_window_state(&geometry);
         }));
     }
-
-    fn touch(&mut self, cx: &mut Context<Self>) {
-        self.state.update(cx, |s, _| s.touch_activity());
-    }
 }
 
 impl Render for VaultRoot {
@@ -416,6 +412,9 @@ impl Render for VaultRoot {
             .toast
             .as_ref()
             .filter(|t| self.screen != Screen::Main || t.place == ToastPlace::Window)
+            // Not over the unlock card while the unlock finish plays: the unlock's own
+            // toasts (weak KDF, format upgrade) show with the items.
+            .filter(|_| state.unlock_finish.is_none())
             .map(|t| (t.message.clone(), t.danger));
         let theme = cx.theme();
 
@@ -446,8 +445,8 @@ impl Render for VaultRoot {
             })
             .text_color(theme.foreground)
             .text_size(theme.font_size)
-            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.touch(cx)))
-            .capture_key_down(cx.listener(|this, _, _, cx| this.touch(cx)))
+            // Activity gate (L-13); keys go through `autolock::gate_keys`.
+            .map(|root| autolock::gate_mouse(root, &self.state))
             // The window claims its titlebar (`app_owns_titlebar_drag`), so it moves only by
             // a drag band painted under the content. The main screen draws its own.
             .when(self.screen != Screen::Main, |root| {
@@ -457,6 +456,7 @@ impl Render for VaultRoot {
             .when_some(toast, |root, (message, danger)| {
                 root.child(
                     ui::h_flex()
+                        .debug_selector(|| "window-toast".into())
                         .absolute()
                         .bottom(px(20.))
                         .left_0()

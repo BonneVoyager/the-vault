@@ -355,6 +355,8 @@ impl Render for ItemWindow {
         ui::clear_focus_ring_on_click(div())
             .id("item-window")
             .debug_selector(|| "item-window".into())
+            // Activity gate (L-13): a click after a long sleep locks, never copies.
+            .map(|el| crate::autolock::gate_mouse(el, &self.state))
             .track_focus(&self.focus)
             // Hold ⌥ to reveal (05 §2.3), this window only.
             .on_modifiers_changed(

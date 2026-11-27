@@ -95,29 +95,29 @@ Severity is rated against the project's own threat model.
 | M-01 | Medium | vault-core | Spliced item record passes the manifest check after a merge | Confirmed, reproduced. **Fixed 2026-11-26** (symmetric restamp, 02 guarantee 6) |
 | M-02 | Medium | vault-sync | Rolled-back vault file causes permanent deletion of attachment blobs | Confirmed, reproduced. **Fixed 2026-11-26** (quarantine under `attachments/orphaned/`, 30-day grace, move-back on reappearance) |
 | M-03 | Medium | vault-app | Touch ID policy state is unauthenticated and fails open on a future timestamp | Confirmed. **Partly fixed 2026-11-26** (future timestamp beyond 5 min denied); Keychain-held policy and boot-session id still open |
-| M-04 | Medium | vault-app | Lock triggers and clipboard timer stall during the modal icon file panel | Plausible. **Not reproduced 2026-11-26** (owner: screen lock with the icon panel open locked the vault); idle timeout and clipboard timer with the panel open still unchecked |
+| M-04 | Medium | vault-app | Lock triggers and clipboard timer stall during the modal icon file panel | **Reproduced by the owner 2026-11-27** (auto-lock 1 min, panel open, 2 min idle, no lock; screen lock still worked). Cause: `runModal` inside a gpui foreground task starves the main dispatch queue. **Fixed 2026-11-27** (`choose_file_async` via `beginWithCompletionHandler`, lock cancels the panel; evidence in `vault-macos/tests/modal_queue.rs`). Earlier note: not reproduced 2026-11-26 (owner: screen lock with the icon panel open locked the vault); idle timeout and clipboard timer with the panel open still unchecked |
 | M-05 | Medium | importers | KDBX import inflates gzip data without a bound | Confirmed, measured. **Fixed 2026-11-27** (vendored keepass with a 256 MiB inflate cap under `vendor/keepass`, mapped to `TooLarge`; advisory draft in `docs/qa/keepass-rs-advisory-draft.md`, upstream advisory submitted 2026-11-27, PR pending maintainer response) |
-| L-01 | Low | vault-core | Edited KDF costs make the correct password read as wrong | Confirmed, measured |
+| L-01 | Low | vault-core | Edited KDF costs make the correct password read as wrong | Confirmed, measured. **Addressed 2026-11-27** (app remembers each vault's KDF costs in settings.json; a wrong password against changed costs says the settings changed; owner option A) |
 | L-02 | Low | vault-core | Legacy unstamped header: a key-less slot edit is merged and saved | Confirmed, reproduced. **Fixed 2026-11-27** (unstamped peer header never adopted; first save stamps with 1; Touch ID open of an unstamped vault blocks saving until a password unlock) |
-| L-03 | Low | vault-core, app | Changing the master password does not revoke an old password | Confirmed (by design) |
-| L-04 | Low | vault-sync | Backups are identified by file name only | Confirmed, reproduced. **Fixed 2026-11-27** (header check for listing and the hourly rule; full authentication before any deletion). Residual: a planted name still holds off hourly snapshots for its hour |
-| L-05 | Low | vault-sync | Planted entries block all saving; edits are dropped at lock | Confirmed, reproduced |
+| L-03 | Low | vault-core, app | Changing the master password does not revoke an old password | Confirmed (by design). **Addressed 2026-11-27** (hint under the change-password fields pointing at key rotation) |
+| L-04 | Low | vault-sync | Backups are identified by file name only | Confirmed, reproduced. **Fixed 2026-11-27** (header check for listing and the hourly rule; full authentication before any deletion). Residual: a planted name still holds off hourly snapshots for its hour. App labels unvalidated entries "Unknown file" (2026-11-27) |
+| L-05 | Low | vault-sync | Planted entries block all saving; edits are dropped at lock | Confirmed, reproduced. **Fixed 2026-11-27** (Unsaved copy falls back to a local folder outside the sync location; quarantine-only Repair for a planted `backups`/`attachments` entry; owner option B) |
 | L-06 | Low | vault-sync | Unbounded directory work on the save path | Confirmed by reading. **Fixed 2026-11-27** (10,000-entry listing cap, 16 KiB header reads memoised per session, orphan pass only on reference change or daily) |
 | L-07 | Low | vault-macos | A malformed QR image aborts the app | Confirmed in a harness. **Fixed 2026-11-26** (`catch_unwind`, seeded reproduction test) |
-| L-08 | Low | vault-macos | The QR picker hands any file to ImageIO | Confirmed path |
+| L-08 | Low | vault-macos | The QR picker hands any file to ImageIO | Confirmed path. **Fixed 2026-11-27** (PNG/JPEG signature required on both sides; panel filtered) |
 | L-09 | Low | vault-app | Settings files are world-readable and carry security state | Confirmed. **Fixed 2026-11-26** (0600 files, 0700 directory) |
 | L-10 | Low | vault-app | Tag filter survives lock and vault switch | Confirmed. **Fixed 2026-11-26** |
 | L-11 | Low | vault-app | File names from the sync folder reach toasts and titles unsanitised | Confirmed. **Fixed 2026-11-26** (sanitised, cut at 60 chars) |
 | L-12 | Low | vault-app | Plaintext export starts in `~/Documents` | Confirmed. **Fixed 2026-11-26** (starts in `~/Downloads`; cloud-synced pick asks a second confirm) |
-| L-13 | Low | vault-app | Sleep time is not counted toward idle lock when lock-on-sleep is off | Plausible |
+| L-13 | Low | vault-app | Sleep time is not counted toward idle lock when lock-on-sleep is off | Plausible. **Fixed 2026-11-27** (wall-clock idle accumulation; post-sleep input gated before keys and clicks act) |
 | L-14 | Low | importers | 1PUX entry-count and ZIP64 guard can be bypassed | Confirmed, reproduced. **Fixed 2026-11-26** (window widened, count re-checked after open) |
 | L-15 | Low | importers | KDBX field de-duplication is quadratic | Confirmed, measured. **Fixed 2026-11-27** |
 | L-16 | Low | importers | CSV rows and the 1PUX JSON tree are unbounded in memory | Confirmed, measured. **Fixed 2026-11-27** (100,000 items / 64 MiB imported text; `export.data` 16 MiB). Residual: the 1PUX tree still peaks near 640 MB |
 | L-17 | Low | export | The CSV formula guard alters exported secrets | Confirmed. **Fixed 2026-11-27** (password and TOTP cells never guarded or stripped) |
 | L-18 | Low | vault-cli | Masked card number writes raw control characters to the terminal | Confirmed, reproduced. **Fixed 2026-11-26** |
 | L-19 | Low | vault-cli | A notes value can forge labelled output lines | Confirmed, reproduced. **Fixed 2026-11-26** (continuation lines indented) |
-| L-20 | Low | vault-cli, core | `--kdf-test-params` is public and there is no KDF floor | Confirmed, reproduced. **Fixed 2026-11-27** (hidden, needs `VAULT_DEV_KDF=1`; `below_recommended` floor 64 MiB / 3 passes with a CLI warning; app warning not yet) |
-| L-21 | Low | build | Dependency gate is failing | Confirmed |
+| L-20 | Low | vault-cli, core | `--kdf-test-params` is public and there is no KDF floor | Confirmed, reproduced. **Fixed 2026-11-27** (hidden, needs `VAULT_DEV_KDF=1`; `below_recommended` floor 64 MiB / 3 passes with a CLI warning and an app toast after unlock) |
+| L-21 | Low | build | Dependency gate is failing | Confirmed. **Fixed 2026-11-27** (url 2.5.9, form_urlencoded 1.2.3, heapless 0.9.4, async-executor 1.14.1; `cargo deny` clean, `cargo audit` only unmaintained warnings) |
 | L-22 | Low | build | Release build is not locked and embeds builder paths | Confirmed. **Fixed 2026-11-27** (`--locked`, deny gate, `--remap-path-prefix`, `VaultGitRevision` in Info.plist); not yet exercised by a release build |
 | L-23 | Low | build | Entitlement checker is a deny-list | Confirmed. **Fixed 2026-11-27** (equality with `scripts/entitlements.plist`) |
 | L-24 | Low | build | Integer overflow is unchecked in the shipped profile | Confirmed. **Fixed 2026-11-26** |
@@ -452,18 +452,18 @@ Safe today because every path that removes the window locks first. A future wind
 
 **I-09. The app is not sandboxed.** A memory-safety bug in any parser or system decoder runs with the user's full rights. This is the stated design for a Developer ID build.
 
-**I-10. Test-only and dead capabilities are compiled into release builds.**
+**I-10. Test-only and dead capabilities are compiled into release builds.** *Fixed 2026-11-27:* `write_plain` is now `test-support`-only (`test_write_plain_as_other_app`); the screen scan, its helpers and the CGWindow/CGDisplayConfiguration/CGError features are removed.
 `Clipboard::write_plain` writes unconcealed text; a whole-screen QR scan removed from the spec on 2026-10-29 is still exported. Neither is called by the app.
 
 **I-11. The UI toolkit is a third-party crates.io snapshot.**
 `gpui-pre =0.3.10` is a maintainer's snapshot of Zed's gpui, not Zed's own crate. Trust rests on that publisher's account and the lock checksums. The app graph has 581 packages, 58 build scripts and 43 procedural macros.
 
-**I-12. Fuzzing coverage is thin where it matters.**
+**I-12. Fuzzing coverage is thin where it matters.** *Addressed 2026-11-27:* targets `import_csv`, `totp_uri`, `attachment_blob`, `export_csv_roundtrip` added, committed seeds under `fuzz/seeds/`; QR decoding still unfuzzed (ImageIO, main thread); nothing runs automatically (I-13).
 Mutations of KDBX and 1PUX seeds rarely pass their integrity checks, so the mapping code is barely reached, and dependency panics are swallowed by `catch_unwind`. There are no targets for CSV import, TOTP URIs, attachment blobs or QR decoding. The corpus is not committed and nothing runs automatically.
 
 **I-13. No continuous integration.** The four checks, the dependency gate and the fuzzers run only when someone runs them. L-21 is the visible result.
 
-**I-14. Smaller items.**
+**I-14. Smaller items.** *2026-11-27:* revealed CLI output escapes backslash as `\\` and tab as `\t` (unambiguous), TOTP period capped at 300 s, `.gitignore` covers vault packages, CSV and signing material; the other bullets are accepted as documented (keychain-profile notary path, single-binary `codesign --deep`, importer-only KDBX KDF limits, pasteboard race nuisance, 50-bit check in UI/CLI by convention).
 
 - CLI secrets passed with `--set`, `--totp` and `--notes` are visible in `ps` and shell history (documented in the help).
 - `--reveal` output maps tab to space and does not escape backslashes, so a revealed secret can be ambiguous.
@@ -547,6 +547,8 @@ These were checked against the code and found to do what the specs say. They are
 | Controls for the unlocked window | Auto-lock has a suspected gap (M-04) and a minor one (L-13); zeroize on lock is good for key material and best effort elsewhere (I-05); hardened runtime is scripted but no signed build exists yet. |
 
 ### README statements that need correcting
+
+All five corrected on 2026-11-27 (README lines 16, 25, 33, 34, 37).
 
 | Statement | Issue |
 |---|---|

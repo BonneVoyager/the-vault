@@ -100,7 +100,7 @@ impl BackupInfo {
     }
 
     /// Validated entries first, then newest first.
-    fn order_key(&self) -> Reverse<(bool, SystemTime, u32)> {
+    pub(crate) fn order_key(&self) -> Reverse<(bool, SystemTime, u32)> {
         Reverse((self.validated, self.taken_at, self.seq))
     }
 }
@@ -664,10 +664,22 @@ pub(crate) fn write_snapshot(
     crate::synced::check_vault_size(bytes)?;
     let dir = backups_dir(package);
     ensure_dir(&dir)?;
-    let name = vault_name(package);
+    write_snapshot_in(&dir, &vault_name(package), bytes, now, kind)
+}
+
+/// [`write_snapshot`] into the existing directory `dir`, for the vault named `name`. Also
+/// writes the local fallback copies (L-05), which follow the same naming.
+pub(crate) fn write_snapshot_in(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    now: SystemTime,
+    kind: BackupKind,
+) -> Result<(PathBuf, Result<(), SyncError>), SyncError> {
+    crate::synced::check_vault_size(bytes)?;
     let stamp = format_stamp(now);
     for seq in 1..=1000 {
-        let path = dir.join(snapshot_file_name(&name, &stamp, kind, seq));
+        let path = dir.join(snapshot_file_name(name, &stamp, kind, seq));
         match write_atomic_stat(&path, bytes, Mode::NoReplace) {
             Ok(written) => {
                 tracing::info!(path = %path.display(), size = bytes.len(), "took backup");
@@ -678,8 +690,67 @@ pub(crate) fn write_snapshot(
         }
     }
     Err(SyncError::AlreadyExists(
-        dir.join(snapshot_file_name(&name, &stamp, kind, 1)),
+        dir.join(snapshot_file_name(name, &stamp, kind, 1)),
     ))
+}
+
+/// `(taken_at, seq)` of an Unsaved copy named `<any name>-<stamp>-unsaved[-N].vault.bin`. The
+/// local fallback directory is keyed by vault id, so a copy written before the package was
+/// renamed still lists.
+fn parse_fallback_name(file: &str) -> Option<(SystemTime, u32)> {
+    let file = package::nfc(file);
+    let rest = file.strip_suffix(SNAPSHOT_EXT)?;
+    let before = rest.get(..rest.rfind(UNSAVED_TAG)?)?;
+    let name = before.get(..before.len().checked_sub(STAMP_LEN + 1)?)?;
+    if name.is_empty() {
+        return None;
+    }
+    match parse_snapshot_name(&file, name)? {
+        (t, seq, BackupKind::Unsaved) => Some((t, seq)),
+        _ => None,
+    }
+}
+
+/// The Unsaved copies in the local fallback directory `dir` (L-05), unvalidated. Only regular
+/// files with a matching name; a missing directory is an empty list, a symlinked one is
+/// [`SyncError::UnsafePackageDir`]. Capped at [`MAX_DIR_ENTRIES`] like `backups/`.
+fn scan_fallback(dir: &Path) -> Result<Vec<BackupInfo>, SyncError> {
+    if !package::check_dir(dir)? {
+        return Ok(Vec::new());
+    }
+    let entries = fs::read_dir(dir).map_err(|e| SyncError::io(dir, e))?;
+    let mut out = Vec::new();
+    for entry in entries.take(MAX_DIR_ENTRIES) {
+        let entry = entry.map_err(|e| SyncError::io(dir, e))?;
+        let file = entry.file_name();
+        let Some((taken_at, seq)) = file.to_str().and_then(parse_fallback_name) else {
+            continue;
+        };
+        // An lstat: symlinks are skipped, never followed.
+        match entry.metadata() {
+            Ok(m) if m.is_file() => out.push(BackupInfo {
+                path: entry.path(),
+                taken_at,
+                size: m.len(),
+                seq,
+                kind: BackupKind::Unsaved,
+                validated: false,
+            }),
+            _ => continue,
+        }
+    }
+    Ok(out)
+}
+
+/// The Unsaved copies in the local fallback directory `dir`, validated like the package's
+/// backups, in listing order.
+pub(crate) fn list_fallback(dir: &Path, expect: &Expect) -> Result<Vec<BackupInfo>, SyncError> {
+    let mut out = scan_fallback(dir)?;
+    for info in &mut out {
+        info.validated = expect.admits(info);
+    }
+    out.sort_by_key(BackupInfo::order_key);
+    Ok(out)
 }
 
 /// Run [`retain`] over the backups directory and delete what it rejects, except `protect`

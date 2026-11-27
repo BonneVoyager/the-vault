@@ -313,11 +313,12 @@ impl AppState {
             return None;
         };
         let secs = self.settings.clipboard_clear_secs;
+        let ttl = Duration::from_secs(u64::from(secs));
+        // The timer clears on time while awake; the deadline catches a sleep (L-13).
+        self.set_clipboard_deadline(generation, ttl);
         self.clipboard_clear = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_secs(u64::from(secs)))
-                .await;
-            this.update(cx, |this, _| this.clipboard.expire(generation))
+            cx.background_executor().timer(ttl).await;
+            this.update(cx, |this, _| this.clipboard_timer_fired(generation))
                 .ok();
         }));
         Some(secs)
@@ -793,6 +794,35 @@ mod tests {
             assert!(s.listing.items.is_empty());
             assert!(s.selected_item().is_none());
         });
+    }
+
+    /// The clear timer runs on monotonic time, which stops during sleep: a deadline that
+    /// passed while the Mac slept clears on the first tick after wake (L-13).
+    #[gpui::test]
+    fn clipboard_deadline_passed_during_sleep_clears_on_wake(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, [gh, ..]) = state_with_items(dir.path(), cx);
+        let board = FakePasteboard::default();
+        state.update(cx, |s, cx| {
+            s.set_pasteboard(Box::new(board.clone()));
+            s.settings.clipboard_clear_secs = 30;
+            s.settings.auto_lock_minutes = None;
+            s.select(gh, cx);
+            s.copy(CopyTarget::Password, cx);
+            s.tick(0.0, cx);
+        });
+        assert_eq!(board.contents().as_deref(), Some("hunter2"));
+        state.update(cx, |s, cx| {
+            s.clock.sleep(Duration::from_secs(20));
+            s.tick(0.0, cx);
+        });
+        assert_eq!(board.contents().as_deref(), Some("hunter2"), "20 of 30 s");
+        state.update(cx, |s, cx| {
+            s.clock.sleep(Duration::from_secs(20));
+            s.tick(0.0, cx);
+            assert!(!s.locked, "auto-lock off: only the clipboard clears");
+        });
+        assert_eq!(board.contents(), None, "cleared on wake");
     }
 
     #[gpui::test]

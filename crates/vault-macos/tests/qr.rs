@@ -1,17 +1,9 @@
-//! QR decoding (spec 05 §2.3 "Scan QR from screen").
-//!
-//! The live screen test needs Screen Recording permission for the terminal
-//! that runs it, so it is ignored by default. To run it, grant the terminal
-//! app Screen Recording in System Settings > Privacy & Security, restart the
-//! terminal, put an otpauth QR code on screen, and run:
-//!
-//!     cargo test -p vault-macos --test qr -- --ignored --nocapture
-//!
-//! It prints only the payload count and whether each starts with `otpauth://`.
+//! QR decoding (spec 05 §2.3 "Scan QR from image"): the gray decoder and
+//! `scan_qr_from_image_file`. Needs no permissions.
 
 use qrcode::{Color, QrCode};
 use secrecy::ExposeSecret;
-use vault_macos::{decode_qr_from_gray, scan_qr_from_screen, screen_capture_permitted};
+use vault_macos::decode_qr_from_gray;
 
 const URI: &str = "otpauth://totp/Test:a?secret=JBSWY3DPEHPK3PXP&issuer=Test";
 const URI2: &str = "otpauth://totp/Other:b?secret=GEZDGNBVGY3TQOJQ&issuer=Other";
@@ -184,28 +176,6 @@ fn decoder_panic_is_no_code() {
     assert!(decode_qr_from_gray(side, side, &px).is_empty());
 }
 
-#[test]
-fn permission_check_does_not_panic() {
-    let _ = screen_capture_permitted();
-}
-
-#[test]
-#[ignore = "needs Screen Recording permission and a QR code on screen"]
-fn scan_live_screen() {
-    match scan_qr_from_screen() {
-        Ok(found) => {
-            println!("found {} payload(s)", found.len());
-            for p in &found {
-                println!("otpauth: {}", p.expose_secret().starts_with("otpauth://"));
-            }
-        }
-        Err(e) => println!(
-            "scan error: {e} (permitted = {})",
-            screen_capture_permitted()
-        ),
-    }
-}
-
 /// `scan_qr_from_image_file`: fixtures are rendered and encoded at test time,
 /// so these need no permissions and no checked-in images.
 #[cfg(target_os = "macos")]
@@ -219,8 +189,8 @@ mod image_file {
     use objc2_core_graphics::{
         CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGImageAlphaInfo,
     };
-    use objc2_foundation::{NSDictionary, NSString};
-    use vault_macos::{MacError, scan_qr_from_image_file};
+    use objc2_foundation::{NSData, NSDictionary, NSString};
+    use vault_macos::{MacError, scan_qr_from_image_file, test_image_decoder_calls};
 
     use super::{URI, URI2, canvas, draw, exposed, rendered_side};
 
@@ -285,8 +255,9 @@ mod image_file {
             "code.png",
             &encode(side, side, buf, NSBitmapImageFileType::PNG),
         );
-        let got = scan_qr_from_image_file(&path).unwrap();
-        assert_eq!(exposed(&got), vec![URI]);
+        let (got, calls) = scan_counted(&path);
+        assert_eq!(calls, 1);
+        assert_eq!(exposed(&got.unwrap()), vec![URI]);
     }
 
     #[test]
@@ -318,19 +289,88 @@ mod image_file {
         assert!(scan_qr_from_image_file(&path).unwrap().is_empty());
     }
 
+    /// Scan `path` and return the result with the number of ImageIO calls it made.
+    fn scan_counted(path: &Path) -> (Result<Vec<secrecy::SecretString>, MacError>, u64) {
+        let before = test_image_decoder_calls();
+        let result = scan_qr_from_image_file(path);
+        (result, test_image_decoder_calls() - before)
+    }
+
+    /// L-08: anything without the PNG or JPEG magic is "no code found" and never
+    /// reaches ImageIO, even when the content is a format ImageIO would decode.
     #[test]
-    fn non_image_file_is_other_error() {
+    fn non_png_jpeg_files_are_refused_before_decoding() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write(dir.path(), "notes.png", b"this is not an image\n");
-        assert_read_error(
-            scan_qr_from_image_file(&path),
-            "not a supported image format",
-        );
-        let empty = write(dir.path(), "empty.png", b"");
-        assert_read_error(
-            scan_qr_from_image_file(&empty),
-            "not a supported image format",
-        );
+        let (side, buf) = qr_canvas(URI);
+        // Real images ImageIO reads, each holding the QR code.
+        let gif = encode(side, side, buf.clone(), NSBitmapImageFileType::GIF);
+        let tiff = encode(side, side, buf.clone(), NSBitmapImageFileType::TIFF);
+        let bmp = encode(side, side, buf, NSBitmapImageFileType::BMP);
+        assert!(gif.starts_with(b"GIF8"));
+        let mut random = vec![0u8; 4096];
+        let mut rng = super::XorShift(0x5EED_1234);
+        for b in &mut random {
+            *b = rng.next() as u8;
+        }
+        random[0] = 0x00; // never a PNG or JPEG first byte
+        let cases: [(&str, &[u8]); 7] = [
+            ("code.gif", &gif),
+            ("code.tiff", &tiff),
+            ("code.bmp", &bmp),
+            (
+                "doc.pdf",
+                b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+            ),
+            ("random.png", &random),
+            ("empty.png", b""),
+            ("notes.png", b"this is not an image\n"),
+        ];
+        for (name, bytes) in cases {
+            let path = write(dir.path(), name, bytes);
+            let (result, calls) = scan_counted(&path);
+            assert_eq!(calls, 0, "{name} reached ImageIO");
+            match result {
+                Ok(found) => assert!(found.is_empty(), "{name} decoded a code"),
+                Err(e) => panic!("{name}: expected no code found, got {e}"),
+            }
+        }
+    }
+
+    /// A file with the PNG or JPEG magic goes to ImageIO; if it then fails to decode,
+    /// that is still a read error.
+    #[test]
+    fn magic_without_valid_image_is_other_error() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("bad.png", &b"\x89PNG\r\n\x1a\nnot really a png"[..]),
+            ("bad.jpg", &b"\xFF\xD8\xFF\xE0not really a jpeg"[..]),
+        ] {
+            let path = write(dir.path(), name, bytes);
+            let (result, calls) = scan_counted(&path);
+            assert_eq!(calls, 1, "{name}");
+            assert_read_error(result, "not a supported image format");
+        }
+    }
+
+    /// A single-code JPEG made from the PNG fixture through ImageIO decodes.
+    #[test]
+    fn jpeg_from_png_fixture_decodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (side, buf) = qr_canvas(URI);
+        let png = encode(side, side, buf, NSBitmapImageFileType::PNG);
+        let rep = NSBitmapImageRep::imageRepWithData(&NSData::with_bytes(&png)).unwrap();
+        let props = NSDictionary::<NSString, AnyObject>::new();
+        // SAFETY: an empty dictionary trivially has the documented
+        // NSBitmapImageRepPropertyKey -> value types.
+        let jpeg =
+            unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::JPEG, &props) }
+                .unwrap()
+                .to_vec();
+        assert!(jpeg.starts_with(&[0xFF, 0xD8, 0xFF]));
+        let path = write(dir.path(), "code.jpg", &jpeg);
+        let (result, calls) = scan_counted(&path);
+        assert_eq!(calls, 1);
+        assert_eq!(exposed(&result.unwrap()), vec![URI]);
     }
 
     #[test]

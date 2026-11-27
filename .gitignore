@@ -2,3 +2,13 @@ target/
 .DS_Store
 qa/spec-checks/tmp/
 qa/spec-checks/target/
+
+# Vault packages, exports and signing material (security review 2026-11-26 I-14). Tracked
+# fixtures under crates/vault-core/tests/fixtures/ are single files, not packages.
+*.vault/
+*.csv
+*.p12
+*.cer
+*.mobileprovision
+*.provisionprofile
+notary-*.json
