@@ -151,7 +151,7 @@ fn cf01_per_file_garbage_once_per_content() {
 }
 
 /// 03 §6 step 1: "carries an unsupported format version → … UnreadableConflict"; 03 §8: "(any
-/// value, 0 included)". Version 0, version 3 and 0xFFFF copies of our own file and a truncated
+/// value, 0 included)". Version 0, version 4 (newer) and 0xFFFF copies of our own file and a truncated
 /// copy: each reported once, left in place, primary untouched, and a newer *copy* never blocks
 /// saves (SaveBlocked is about the primary, §3).
 #[test]
@@ -162,7 +162,7 @@ fn cf02_unsupported_version_and_truncated_copies() {
     let ours = std::fs::read(primary(&pkg)).unwrap();
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("vault 2.bin", with_version(&ours, 0)),
-        ("vault 3.bin", with_version(&ours, 3)),
+        ("vault 3.bin", with_version(&ours, 4)),
         ("vault 4.bin", with_version(&ours, 0xFFFF)),
         ("vault 5.bin", ours[..ours.len() / 2].to_vec()),
         (
@@ -200,7 +200,7 @@ fn cf02_unsupported_version_and_truncated_copies() {
 }
 
 /// 03 §6 step 1 applies to "the candidate" of both shapes (03 §1: "Conflict copies come in two
-/// shapes"): a whole sibling package whose vault.bin is garbage or version 3.
+/// shapes"): a whole sibling package whose vault.bin is garbage or version 4 (newer than ours).
 #[test]
 fn cf03_sibling_package_unreadable() {
     let d = tempdir();
@@ -209,7 +209,7 @@ fn cf03_sibling_package_unreadable() {
     let ours = std::fs::read(primary(&pkg)).unwrap();
     for (n, b) in [
         ("w 2.vault", garbage(3, 4000)),
-        ("w 3.vault", with_version(&ours, 3)),
+        ("w 3.vault", with_version(&ours, 4)),
     ] {
         let sp = st.path().join(format!("{n}-staging"));
         std::fs::create_dir_all(sp.join("attachments")).unwrap();
@@ -785,9 +785,9 @@ fn cf15_primary_version0_vs_newer_unlocked_and_locked() {
     let mut info = vec![];
     for (ver, locked) in [
         (0u16, false),
-        (3, false),
+        (4, false),
         (0, true),
-        (3, true),
+        (4, true),
         (0xFFFF, true),
     ] {
         let d = tempdir();
@@ -868,7 +868,7 @@ fn cf15_primary_version0_vs_newer_unlocked_and_locked() {
 #[test]
 fn cf16_restore_over_version0_and_newer_primary() {
     let mut bad = vec![];
-    for ver in [0u16, 3] {
+    for ver in [0u16, 4] {
         let d = tempdir();
         let st = tempdir();
         let (pkg, mut a) = setup(d.path(), "q.vault");
@@ -904,12 +904,12 @@ fn cf16_restore_over_version0_and_newer_primary() {
         } else {
             if !format!("{:?}", r).contains("NewerVersion") {
                 bad.push(format!(
-                    "version 3 primary: restore result {:?}, want NewerVersion",
+                    "version 4 primary: restore result {:?}, want NewerVersion",
                     r.err()
                 ));
             }
             if disk != altered {
-                bad.push("version 3 primary overwritten by restore".into());
+                bad.push("version 4 primary overwritten by restore".into());
             }
         }
     }
@@ -1132,7 +1132,7 @@ fn cf22_newer_primary_arrives_unlocked_then_lock_unlock() {
     let st = tempdir();
     let (pkg, mut a) = setup(d.path(), "h.vault");
     let ours = std::fs::read(primary(&pkg)).unwrap();
-    let newer = with_version(&ours, 3);
+    let newer = with_version(&ours, 4);
     deliver(st.path(), &primary(&pkg), &newer);
     a.wait_for(5, |e| has(e, "SaveBlocked"));
     let at_detection = count(&a.seen, "SaveBlocked");

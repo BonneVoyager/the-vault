@@ -244,6 +244,51 @@ fn two_devices_converge_on_field_edits() {
     assert!(!a.is_dirty() && !b.is_dirty());
 }
 
+/// I-02: `Freshness` reads the plaintext stamps of a parsed file, and `Merged` carries the
+/// merged-in file's values.
+#[test]
+fn merged_carries_the_peer_freshness() {
+    let (_dir, path, mut a, mut b, id) = two_devices();
+    let disk = on_disk(&path);
+    let fresh = vault_sync::Freshness::of(&disk);
+    let (_, item_at) = disk.item_summaries().next().unwrap();
+    assert_eq!(fresh.item_count, 1);
+    assert_eq!(fresh.max_item_modified_at, Some(item_at));
+    assert!(fresh.slots_modified_at.is_some());
+    assert_eq!(fresh.slots_modified_at, disk.header().slots_modified_at);
+    assert_eq!(a.on_disk_freshness(), Some(fresh));
+    assert_eq!(b.on_disk_freshness(), Some(fresh));
+
+    b.start_watching().unwrap();
+    let mut eb = Events::new(&b);
+    let user = fid(&a, id, "username");
+    a.edit(|v| v.set_field(id, user, secret("alice@a"), T0 + 7_000))
+        .unwrap()
+        .unwrap();
+    a.edit(|v| v.insert(Item::new("second", Uuid::nil(), T0 + 8_000), T0 + 8_000))
+        .unwrap();
+    a.save().unwrap();
+    let written = a.on_disk_freshness().unwrap();
+    assert_eq!(written, vault_sync::Freshness::of(&on_disk(&path)));
+    assert_eq!(written.item_count, 2);
+    assert!(written.max_item_modified_at >= Some(T0 + 8_000));
+    assert!(wait_until(|| {
+        b.poll();
+        eb.pump();
+        eb.any(merged)
+    }));
+    let peer = eb
+        .seen
+        .iter()
+        .find_map(|e| match e {
+            SyncEvent::Merged(m) => Some(m.peer),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(peer, written);
+    assert_eq!(b.on_disk_freshness(), Some(written));
+}
+
 fn delete_vs_edit(delete_at: u64, edit_at: u64) -> (SyncedVault, SyncedVault, Uuid, Uuid, TempDir) {
     let (dir, _path, mut a, mut b, id) = two_devices();
     let pass = fid(&a, id, "password");

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use vault_core::MergeReport;
+use vault_core::{LockedVault, MergeReport};
 
 use crate::error::SaveBlocked;
 
@@ -11,7 +11,9 @@ use crate::error::SaveBlocked;
 /// locked), always on the caller's thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
-    Merged(MergeReport),
+    /// An external version of `vault.bin` was merged into the unlocked vault (03 §3 step 6),
+    /// or adopted after a re-verified key mismatch.
+    Merged(MergeEvent),
     ChangedWhileLocked,
     ConflictAbsorbed(PathBuf),
     CorruptOnDisk,
@@ -90,4 +92,51 @@ pub enum SyncEvent {
     /// [`crate::MAX_VAULT_FILE_SIZE`]) is [`SyncEvent::Error`]. The path is as received from the
     /// filesystem (not sanitised).
     UnreadableConflict(PathBuf),
+}
+
+/// Plaintext freshness facts of a vault file, readable without unlocking: the newest item
+/// record stamp, the header's slot stamp and the record count (security review 2026-11-26
+/// I-02). The app compares them with what this Mac has seen to recognise a rolled-back file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Freshness {
+    /// Largest `modified_at` over every item record (tombstones included); `None` when the
+    /// file holds no records.
+    pub max_item_modified_at: Option<u64>,
+    /// The header's `slots_modified_at`; `None` for a never-stamped header.
+    pub slots_modified_at: Option<u64>,
+    /// Item records in the file, tombstones included.
+    pub item_count: usize,
+}
+
+impl Freshness {
+    /// The freshness of a parsed (still locked) vault file.
+    pub fn of(locked: &LockedVault) -> Self {
+        let (max, count) = locked
+            .item_summaries()
+            .fold((None, 0), |(max, n), (_, at)| (max.max(Some(at)), n + 1));
+        Self {
+            max_item_modified_at: max,
+            slots_modified_at: locked.header().slots_modified_at,
+            item_count: count,
+        }
+    }
+}
+
+/// Payload of [`SyncEvent::Merged`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MergeEvent {
+    /// What the merge changed in the in-memory vault.
+    pub report: MergeReport,
+    /// The external file that was merged in, as read from disk.
+    pub peer: Freshness,
+}
+
+impl From<MergeReport> for MergeEvent {
+    /// A report with an empty peer (for tests that feed events by hand).
+    fn from(report: MergeReport) -> Self {
+        Self {
+            report,
+            peer: Freshness::default(),
+        }
+    }
 }

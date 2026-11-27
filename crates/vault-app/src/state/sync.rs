@@ -17,9 +17,10 @@ use std::time::SystemTime;
 
 use gpui::{Context, SharedString};
 use vault_core::{Item, SecretString};
-use vault_sync::{BackupInfo, SaveBlocked, SyncError, SyncEvent, SyncedVault};
+use vault_sync::{BackupInfo, Freshness, SaveBlocked, SyncError, SyncEvent, SyncedVault};
 
 use super::{AppState, Busy, Mode, Navigation, Outcome, SyncStatus, TOAST_TTL, Toast, ToastPlace};
+use crate::persist;
 use crate::text;
 
 /// Index of the Sync & Backup tab in the settings sheet.
@@ -77,7 +78,25 @@ pub struct SyncUi {
     /// The last sync event's short label ([`sync_event_label`]) and when it arrived, for
     /// Copy diagnostics (05 §2.5).
     pub last_event: Option<(&'static str, SystemTime)>,
+    /// The vault file opened or merged last was older than this Mac's freshness anchor
+    /// (I-02). Cleared by the next successful save (and with the rest on vault switch).
+    pub stale_file: Option<StaleFile>,
 }
+
+/// A rolled-back vault file, as detected (I-02).
+#[derive(Debug, Clone, Copy)]
+pub struct StaleFile {
+    /// The file's stamps.
+    pub peer: Freshness,
+}
+
+/// Toast when the file just unlocked is older than this Mac's anchor (I-02).
+pub const STALE_ON_UNLOCK: &str = "This vault file is older than the version last seen on \
+    this Mac. A backup may hold the newer state.";
+/// Toast when a merged file is older than this Mac's anchor (I-02). Ours won the merge and
+/// the write-back restores it on disk.
+pub const STALE_ON_MERGE: &str =
+    "An older vault file arrived from another device; your newer state was kept.";
 
 /// A short, fixed label per event: never a path or error text (diagnostics prints it).
 pub fn sync_event_label(event: &SyncEvent) -> &'static str {
@@ -221,10 +240,61 @@ impl AppState {
         self.autosave_finished(result, cx);
     }
 
+    /// I-02: whether `file` is older than this vault's anchor. Sets `sync.stale_file` if so,
+    /// and returns true unless the same file was already flagged (one toast per file).
+    pub(super) fn check_freshness(&mut self, file: Option<Freshness>) -> bool {
+        let (Some(id), Some(peer)) = (self.vault_id, file) else {
+            return false;
+        };
+        let stale = self
+            .settings
+            .freshness_seen
+            .get(&id)
+            .is_some_and(|seen| seen.is_newer_than(&peer));
+        if !stale {
+            return false;
+        }
+        let repeat = self.sync.stale_file.is_some_and(|f| f.peer == peer);
+        self.sync.stale_file = Some(StaleFile { peer });
+        !repeat
+    }
+
+    /// I-02: raises this vault's anchor to the file it last read or wrote, which it has
+    /// authenticated or written (never to unsaved in-memory edits, which no file holds yet).
+    /// Written straight to settings.json: nothing else changes, so nothing to apply.
+    pub(super) fn raise_freshness(&mut self) {
+        let file = self.vault.as_ref().and_then(SyncedVault::on_disk_freshness);
+        self.anchor_freshness(file, false);
+    }
+
+    /// [`Self::raise_freshness`] to `file` instead of the file as last read.
+    pub(super) fn raise_freshness_to(&mut self, file: Option<Freshness>) {
+        self.anchor_freshness(file, false);
+    }
+
+    /// Raises the anchor to `file`, or with `reset` makes it exactly `file` (a restore is a
+    /// deliberate rollback, the one case that lowers it).
+    fn anchor_freshness(&mut self, file: Option<Freshness>, reset: bool) {
+        let (Some(id), Some(file)) = (self.vault_id, file) else {
+            return;
+        };
+        let seen = self.settings.freshness_seen.entry(id).or_default();
+        let base = if reset { Default::default() } else { *seen };
+        let raised = base.raised(&file);
+        if raised != *seen {
+            *seen = raised;
+            if self.persist_recent {
+                persist::save_settings(&self.settings);
+            }
+        }
+    }
+
     /// Bookkeeping after any save attempt by the app. Returns the error message, if any.
     pub(super) fn record_save(&mut self, result: Result<(), SyncError>) -> Option<String> {
         match result {
             Ok(()) => {
+                self.sync.stale_file = None;
+                self.raise_freshness();
                 self.sync.save_failing = false;
                 self.sync.save_blocked = None;
                 self.sync.corrupt = false;
@@ -364,7 +434,7 @@ impl AppState {
     pub fn handle_sync_event(&mut self, event: SyncEvent, cx: &mut Context<Self>) {
         self.sync.last_event = Some((sync_event_label(&event), SystemTime::now()));
         match event {
-            SyncEvent::Merged(report) => {
+            SyncEvent::Merged(vault_sync::MergeEvent { report, peer }) => {
                 self.sync.key_mismatch = false;
                 self.sync.key_mismatch_error = None;
                 self.vault_changed();
@@ -377,6 +447,12 @@ impl AppState {
                 if self.recheck_touch_slot() {
                     self.show_toast(super::touch_id::SLOT_GONE, cx);
                 }
+                // A peer that brought something in is a device that was offline, not a
+                // rollback, even when its newest stamp is older than ours.
+                if !report.changed() && self.check_freshness(Some(peer)) {
+                    self.show_toast(STALE_ON_MERGE, cx);
+                }
+                self.raise_freshness();
                 // vault-sync saves the merge itself; a clean vault means that save worked.
                 if self.vault.as_ref().is_some_and(|v| !v.is_dirty()) {
                     self.sync.corrupt = false;
@@ -826,6 +902,8 @@ impl AppState {
             ..SyncUi::default()
         };
         self.sync_status = SyncStatus::Idle;
+        let file = self.vault.as_ref().and_then(SyncedVault::on_disk_freshness);
+        self.anchor_freshness(file, true);
         self.vault_changed();
         // A backup may hold trash past its 30 days: swept as after an unlock. That
         // leaves the vault dirty, and the next tick's `needs_save` schedules the write.
@@ -1109,7 +1187,7 @@ mod tests {
                 .edit(|v| v.update(id, 30, |it| it.title = "Theirs".into()))
                 .unwrap()
                 .unwrap();
-            s.handle_sync_event(SyncEvent::Merged(changed), cx);
+            s.handle_sync_event(SyncEvent::Merged(changed.into()), cx);
             let b = s.edit_buffer().unwrap();
             assert!(b.remote_title);
             assert!(b.remote_fields.is_empty());
@@ -1117,7 +1195,7 @@ mod tests {
             // During New: nothing to compare, nothing marked, no panic.
             s.cancel_edit(cx);
             s.begin_new(crate::templates::Template::Note, String::new(), cx);
-            s.handle_sync_event(SyncEvent::Merged(changed), cx);
+            s.handle_sync_event(SyncEvent::Merged(changed.into()), cx);
             assert!(s.edit_buffer().unwrap().remote_fields.is_empty());
         });
     }
@@ -1517,7 +1595,7 @@ mod tests {
 
             // A merge that leaves the vault clean: vault-sync's save worked.
             s.vault.as_mut().unwrap().save().unwrap();
-            s.handle_sync_event(SyncEvent::Merged(MergeReport::default()), cx);
+            s.handle_sync_event(SyncEvent::Merged(MergeReport::default().into()), cx);
             assert!(s.save_blocked().is_none() && s.sync.save_blocked.is_none());
             assert_eq!(s.sync_status, SyncStatus::Idle);
             // Without a notice, a sync error reaches the status line as before.
@@ -1569,13 +1647,20 @@ mod tests {
         assert_eq!(toast.message.as_ref(), super::super::LOCK_LOST);
     }
 
+    /// A `Merged` whose peer is the file as last read (an empty peer would read as a
+    /// rolled-back file once the anchor is recorded, I-02).
+    fn merged(s: &AppState, report: MergeReport) -> SyncEvent {
+        let peer = s.vault.as_ref().unwrap().on_disk_freshness().unwrap();
+        SyncEvent::Merged(vault_sync::MergeEvent { report, peer })
+    }
+
     #[gpui::test]
     fn save_failing_resets_and_conflicts_autosave(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let (state, _other, id) = two_devices(dir.path(), cx);
         state.update(cx, |s, cx| {
             s.sync.save_failing = true;
-            s.handle_sync_event(SyncEvent::Merged(MergeReport::default()), cx);
+            s.handle_sync_event(SyncEvent::Merged(MergeReport::default().into()), cx);
             assert!(
                 !s.sync.save_failing,
                 "a clean merge means saving works again"
@@ -1604,13 +1689,13 @@ mod tests {
                 added: 1,
                 ..MergeReport::default()
             };
-            s.handle_sync_event(SyncEvent::Merged(changed), cx);
+            s.handle_sync_event(merged(s, changed), cx);
             assert!(!s.sync.key_mismatch);
             assert_eq!(
                 s.toast.as_ref().unwrap().message.as_ref(),
                 KEY_ROTATED_RESOLVED
             );
-            s.handle_sync_event(SyncEvent::Merged(changed), cx);
+            s.handle_sync_event(merged(s, changed), cx);
             assert_eq!(
                 s.toast.as_ref().unwrap().message.as_ref(),
                 "Vault updated from another device"
@@ -1719,7 +1804,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let every = |p: &Path| {
             vec![
-                SyncEvent::Merged(MergeReport::default()),
+                SyncEvent::Merged(MergeReport::default().into()),
                 SyncEvent::ChangedWhileLocked,
                 SyncEvent::ConflictAbsorbed(p.join("conflict-x.vault")),
                 SyncEvent::CorruptOnDisk,

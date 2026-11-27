@@ -22,7 +22,17 @@ Required environment variables (checked before building, all missing ones listed
 
 Flags: `--skip-sign` (also skips notarization) and `--skip-notarize` drop the matching
 variables. `--dry-run` prints codesign, notarytool and hdiutil commands without running
-them; secrets are never printed. `entitlements.plist` is empty until gpui needs more.
+them; secrets are never printed.
+
+Entitlements: without `VAULT_TEAM_ID` the app is signed with `entitlements.plist` (empty), exactly
+as before. With `VAULT_TEAM_ID` (10-character Team ID) and `VAULT_PROVISION_PROFILE` (path to a
+Developer ID `.provisionprofile` for the bundle id), the script renders `entitlements.plist.in`
+(application identifier, team identifier, keychain access group: what Touch ID's data-protection
+keychain needs), embeds the profile as `Contents/embedded.provisionprofile` and signs. It fails
+before building if the profile is missing or its team, App ID or keychain group do not match.
+`--skip-sign` ignores both variables. `check-entitlements.sh --render <out>` writes the expected
+entitlements (rendered for `VAULT_TEAM_ID`, or the empty file); the check itself requires the
+signed app's entitlements to equal that file. Setup and Touch ID verification: `docs/signing.md`.
 
 With the Apple ID path the script first runs `notarytool store-credentials` for a temporary profile (random name); the password is in that call's argv for milliseconds only, and every `submit --wait` uses `--keychain-profile`. An EXIT trap deletes the profile (best-effort: `security delete-generic-password -s com.apple.gke.notary.tool -a <name>`; if a run is killed, remove a leftover `vault-package-*` entry that way). A preconfigured keychain profile avoids even the brief exposure.
 

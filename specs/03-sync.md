@@ -34,7 +34,7 @@ Every file in `backups/` is a complete, independently-openable vault file; absor
 - Cleanup never deletes a blob from `attachments/`. An orphan past the 24 h grace (`ORPHAN_GRACE`) is moved, with a no-replace rename, into `attachments/orphaned/` (0700, created on demand; the blob keeps its 0600 file) under its own name. The directory is inside the package, so it syncs and the symlink/regular-file rules of §1 apply (a symlinked `orphaned/` is refused and nothing is moved). No leading dot, so providers that skip hidden entries still sync it; the name cannot clash with a blob name. If `<id>.bin` is taken there, the lowest free `<id>.bin.<n>` (1-16) is used; past 16 the blob stays in place (logged). `SyncEvent::AttachmentsPruned(n)` now counts blobs moved into quarantine.
 - **Second grace period** `QUARANTINE_GRACE` = 30 days (matching Recently Deleted): a quarantined file is deleted once it has been in quarantine longer than that, measured like the first grace from `max(mtime, ctime)`; the move refreshes ctime, so the age runs from the move on this device (from arrival on a peer). Each pass restores first, then expires, then quarantines, so nothing is quarantined and deleted in one pass.
 - **Restore:** a quarantined blob whose id the unlocked vault references (live or tombstoned) is moved back (no-replace; a blob already in `attachments/` wins and the quarantined copy expires) at every cleanup pass, after every unlock (always, also when the pass below is skipped), after a merge that changed our state, after a key re-adoption, after `restore_from`, and by `attachment_state` / `open_attachment` before they would report the blob missing. Per id the lowest copy number whose size equals the sealed length implied by the reference is taken; a wrong-sized copy is never restored. While locked nothing is restored (references unknown) and a quarantined blob reads as `Missing`.
-- **Skip rule:** the unlock-time pass (not the restore) is skipped when the `vault.bin` being opened replaced, unverified, the last version this process verified, i.e. it changed while locked (`locked_fallback` is set). The next save, or the next unlock over the same now-verified file, runs cleanup as before. A fresh process has verified nothing and runs the pass on its first unlock; quarantine covers that case. Residual: a rollback planted while the app is closed still quarantines on the first unlock, and any later save quarantines against the adopted state; the blobs stay recoverable for 30 days by restoring the newest snapshot (or by a peer's newer state merging in). A local freshness anchor (review I-02) remains future work.
+- **Skip rule:** the unlock-time pass (not the restore) is skipped when the `vault.bin` being opened replaced, unverified, the last version this process verified, i.e. it changed while locked (`locked_fallback` is set). The next save, or the next unlock over the same now-verified file, runs cleanup as before. A fresh process has verified nothing and runs the pass on its first unlock; quarantine covers that case. Residual: a rollback planted while the app is closed still quarantines on the first unlock, and any later save quarantines against the adopted state; the blobs stay recoverable for 30 days by restoring the newest snapshot (or by a peer's newer state merging in). A local freshness anchor exists since 2026-11-27 (review I-02): see the `Freshness` paragraph in §8 and 05 §2.2.
 
 **Recently Deleted and backups (owner decision 2026-11-03):** snapshots are byte copies of the vault file, so an item in the trash is inside any snapshot taken during its window and comes back *into the trash* when that snapshot is restored; after the window it is stripped from the file and absent from later snapshots. Snapshots are not scrubbed.
 
@@ -89,7 +89,7 @@ On a debounced event for `<name>.vault/vault.bin`:
    a. unlock on-disk copy with cached vault_key (LockedVault::unlock_with_key, core exposes this for sync only, behind a `sync` feature)
    b. report = ours.merge_from(&theirs)
    c. if report changed ours → save()   (which writes the merged result back; the other device will merge it idempotently)
-   d. emit SyncEvent::Merged(report)
+   d. emit SyncEvent::Merged(MergeEvent { report, peer }) — `peer` is the external file's Freshness before the merge (2026-11-27)
    e. if ours has anything the on-disk copy lacks (an item, a newer field, a tombstone) → save() as well. Without this write-back two devices never converge when only one side changed. Side effect: unsaved edits can reach disk before the autosave timer.
 ```
 
@@ -233,7 +233,6 @@ impl SyncedVault {
 }
 
 pub enum SyncEvent {
-    Merged(MergeReport),
     ChangedWhileLocked,
     ConflictAbsorbed(PathBuf),
     WaitingForBlobs(PathBuf),    // whole-package conflict merged, move into backups/ deferred for missing blobs (§6 step 4)
@@ -249,10 +248,13 @@ pub enum SyncEvent {
     KeyRotatedOnDisk,            // vault_key rotated elsewhere; must re-unlock with the password
     SaveBlocked(SaveBlocked),     // NewerVersion | ForeignVault; in-memory state kept; emitted once at first detection and once per refused save
     Error(String),
+    Merged(MergeEvent),                                   // 2026-11-27: `MergeEvent { report: MergeReport, peer: Freshness }`; `peer` describes the external file before the merge
     BackupFailed { unsafe_dir: bool, message: String },   // a snapshot could not be written ("backup failed: <error>"); unsafe_dir = the error was UnsafePackageDir (a planted backups entry, §4 L-05): the app shows no toast and re-raises its Repair strip, the CLI prints it like Error (2026-11-27)
 }
 
 pub enum BackupKind { Snapshot, Unsaved, Conflict }
+
+pub struct Freshness { pub max_item_modified_at: Option<u64>, pub slots_modified_at: Option<u64>, pub item_count: usize }   // 2026-11-27 (I-02): from a LockedVault's plaintext (id, modified_at) pairs (tombstones included) and header stamp; `Freshness::of(&LockedVault)`; `SyncedVault::on_disk_freshness()` = the file as last read or written (None only while vault.bin is known missing)
 
 pub const DOWNLOAD_TIMEOUT: Duration;     // 30 s; how long open waits for the provider to materialise the file (§7)
 pub const MAX_VAULT_FILE_SIZE: u64;       // 64 MiB read/write cap (§2)

@@ -27,7 +27,7 @@ use crate::attachments;
 use crate::backup;
 use crate::cloud::CloudError;
 use crate::error::{SaveBlocked, SyncError};
-use crate::event::SyncEvent;
+use crate::event::{Freshness, MergeEvent, SyncEvent};
 use crate::package;
 use crate::watch::{
     CANDIDATES_PER_POLL, ConflictKind, MAX_PENDING_CANDIDATES, WatchSignal, Watcher, classify,
@@ -391,7 +391,9 @@ impl SyncedVault {
         if report.changed() {
             self.restore_quarantined_blobs();
         }
-        self.emit(SyncEvent::Merged(report));
+        // `locked` is the file just merged (set by the caller).
+        let peer = Freshness::of(&self.locked);
+        self.emit(SyncEvent::Merged(MergeEvent { report, peer }));
         report.changed() || disk_behind
     }
 
@@ -744,6 +746,8 @@ impl SyncedVault {
             }
         };
         let was_dirty = self.dirty;
+        // `locked` is the on-disk version that `theirs` was opened from.
+        let peer = Freshness::of(&self.locked);
         self.install(theirs);
         self.locked_fallback = None;
         // The adopted file may reference blobs that cleanup quarantined (M-02).
@@ -751,7 +755,7 @@ impl SyncedVault {
         // Our items that the disk lacked still need writing.
         self.dirty = was_dirty || report.changed();
         tracing::warn!("adopted the on-disk vault's keys after a key mismatch");
-        self.emit(SyncEvent::Merged(report));
+        self.emit(SyncEvent::Merged(MergeEvent { report, peer }));
     }
 
     fn open_with_current_key(&self, theirs: &LockedVault) -> Result<UnlockedVault, VaultError> {

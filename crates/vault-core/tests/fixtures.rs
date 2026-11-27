@@ -73,6 +73,27 @@
 //! one with `"icon": null` (written through `Field.extras`, the only way this build emits a
 //! null; the reader folds it into `None`). Same password and KDF. Built by
 //! `regenerate_v2_field_icon_fixture`.
+//!
+//! # Format version 3 (every plaintext byte authenticated, I-04, 2026-11-27)
+//!
+//! `FORMAT_VERSION` is 3: no CBOR shape changes, but the manifest AAD's `header_digest`
+//! covers the whole header (so `created_at` and unknown header keys are bound), the AAD
+//! also binds the manifest record's unknown keys, and each manifest entry carries a digest
+//! of its item record's unknown plaintext keys (01 §4, `format::PLAINTEXT_BINDING_VERSION`).
+//! **Every `v2-*.vault` above is frozen** like the v1 ones: a plain save keeps them at
+//! version 2 with the v1.1 binding, `upgrade_format` moves them to 3, and their
+//! regenerators are historical (`v2_regenerators_are_historical`).
+//!
+//! `v3-basic.vault`: two items (a login with a TOTP field and a note), no unknown keys
+//! anywhere, stamped header (created at version 3). Password `correct horse battery
+//! staple` (`PASSWORD`), KDF `KdfParams::for_tests()`. Built by `regenerate_v3_basic_fixture`.
+//!
+//! `v3-meta.vault`: `v1-forward.vault` unlocked, upgraded with `upgrade_format` (which
+//! drops the opaque slot) and saved, so it carries unknown keys at the seven remaining sites
+//! (header, `header.kdf`, the password slot, the item record, the item payload with the
+//! legacy `kind`, the field with its unknown kind, and the manifest record), every one of
+//! them bound by the version 3 manifest. Same password and KDF. Built by
+//! `regenerate_v3_meta_fixture`; the tamper tests on it are in `tests/v3_binding.rs`.
 
 use std::io::Cursor;
 
@@ -157,6 +178,27 @@ const V2I_KEYED: [u8; 16] = [0x2A; 16];
 const V2I_ABSENT: [u8; 16] = [0x2B; 16];
 const V2I_NULL: [u8; 16] = [0x2C; 16];
 const V2I_AT: u64 = T0 + 100;
+
+/// `v3-basic.vault`: the two items and the login's field ids, in field order.
+const V3_LOGIN_ID: [u8; 16] = [0x15; 16];
+const V3_NOTE_ID: [u8; 16] = [0x16; 16];
+const V3_USERNAME: [u8; 16] = [0x2D; 16];
+const V3_PASSWORD: [u8; 16] = [0x2E; 16];
+const V3_TOTP: [u8; 16] = [0x2F; 16];
+const V3_NOTES: [u8; 16] = [0x30; 16];
+const V3_AT: u64 = T0 + 120;
+/// `v3-meta.vault`: the stamp `upgrade_format` gave the header.
+const V3M_AT: u64 = T0 + 130;
+
+/// Every `v2-*.vault` is frozen too (see the module docs): `new_vault()` creates a version
+/// 3 vault now, so a v2 regenerator must never run again. Each one calls this first.
+fn v2_regenerators_are_historical() {
+    if FORMAT_VERSION != 2 {
+        panic!(
+            "historical: this regenerator built a v2 fixture; FORMAT_VERSION is now {FORMAT_VERSION} and the v2 fixtures are frozen (01 §9)"
+        );
+    }
+}
 
 /// Every `v1-*.vault` is frozen (see the module docs): `new_vault()` creates a version 2
 /// vault now, so a v1 regenerator must never run again. Each one calls this first.
@@ -672,11 +714,12 @@ fn v1_meta_opens_with_created_at_and_section_heading() {
     );
 }
 
-/// Builds `v2-basic.vault` (see the module docs). The first version 2 fixture; the only
-/// regenerator that may still run.
+/// Builds `v2-basic.vault` (see the module docs). The first version 2 fixture (historical
+/// since version 3).
 #[test]
 #[ignore]
 fn regenerate_v2_basic_fixture() {
+    v2_regenerators_are_historical();
     let mut vault = new_vault();
     assert_eq!(vault.header().format_version, 2);
 
@@ -819,6 +862,7 @@ fn v2_basic_opens_with_ids_duplicates_empty_name_marker_and_history_id() {
 #[test]
 #[ignore]
 fn regenerate_v2_meta_fixture() {
+    v2_regenerators_are_historical();
     let mut vault = new_vault();
     let mut stamped = Item::new("Stamped attributes", device(), V2M_AT);
     stamped.id = Uuid::from_bytes(V2M_STAMPED_ID);
@@ -924,6 +968,7 @@ fn v2_meta_opens_with_and_without_attribute_stamps() {
 #[test]
 #[ignore]
 fn regenerate_v2_field_icon_fixture() {
+    v2_regenerators_are_historical();
     let mut vault = new_vault();
     let mut item = Item::new("Field icons", device(), V2I_AT);
     item.id = Uuid::from_bytes(V2I_ITEM_ID);
@@ -1003,6 +1048,180 @@ fn v2_field_icon_opens_with_all_three_shapes() {
         None
     );
     assert!(item2.fields.iter().all(|f| f.extras.is_empty()));
+}
+
+/// Builds `v3-basic.vault` (see the module docs). The first version 3 fixture.
+#[test]
+#[ignore]
+fn regenerate_v3_basic_fixture() {
+    let mut vault = new_vault();
+    assert_eq!(vault.header().format_version, 3);
+    let with_id = |id: [u8; 16], name: &str, kind: FieldKind, value: &str| -> Field {
+        let mut f = field(name, kind, value, V3_AT);
+        f.id = Uuid::from_bytes(id);
+        f
+    };
+    let mut login = Item::new("Login with TOTP", device(), V3_AT);
+    login.id = Uuid::from_bytes(V3_LOGIN_ID);
+    login.tags = vec!["login".into()];
+    login.fields = vec![
+        with_id(
+            V3_USERNAME,
+            "username",
+            FieldKind::Text,
+            "chris@example.com",
+        ),
+        with_id(V3_PASSWORD, "password", FieldKind::Password, "hunter2"),
+        with_id(
+            V3_TOTP,
+            "totp",
+            FieldKind::Totp,
+            "otpauth://totp/Example:chris?secret=JBSWY3DPEHPK3PXP&issuer=Example",
+        ),
+    ];
+    vault.insert(login, V3_AT);
+    let mut note = Item::new("Plain note", device(), V3_AT);
+    note.id = Uuid::from_bytes(V3_NOTE_ID);
+    note.tags = vec!["note".into()];
+    note.fields = vec![with_id(
+        V3_NOTES,
+        "notes",
+        FieldKind::Notes,
+        "nothing special",
+    )];
+    vault.insert(note, V3_AT);
+    std::fs::write(format!("{FIXTURE_DIR}/v3-basic.vault"), vault.serialize()).unwrap();
+}
+
+#[test]
+fn v3_basic_opens_and_a_save_keeps_everything_at_version_3() {
+    let bytes = std::fs::read(format!("{FIXTURE_DIR}/v3-basic.vault")).unwrap();
+    assert_eq!(&bytes[4..6], &[0, 3], "prefix version 3");
+    let locked = LockedVault::parse(&bytes).unwrap();
+    check_kdf(&locked);
+    let header = locked.header();
+    assert_eq!(header.format_version, 3);
+    assert_eq!(header.created_at, 1_700_000_000);
+    assert_eq!(header.slots_modified_at, Some(1_700_000_000_000));
+    assert_eq!(header.slots_device_id, Some(device()));
+    assert!(header.extras.is_empty());
+    assert!(
+        header.digest().is_some(),
+        "version 3 is always digest-bound"
+    );
+    let file = VaultFile::parse(&bytes).unwrap();
+    assert_eq!(file.items.len(), 2);
+    assert!(file.items.iter().all(|r| r.extras.is_empty()));
+    assert!(file.manifest.extras.is_empty());
+
+    let vault = locked.unlock(&pw()).unwrap();
+    assert_eq!(vault.items().count(), 2);
+    let login = vault.get(Uuid::from_bytes(V3_LOGIN_ID)).unwrap();
+    assert_eq!(login.title, "Login with TOTP");
+    assert_eq!(login.modified_at, V3_AT);
+    assert!(login.extras.is_empty());
+    assert_eq!(
+        login.fields.iter().map(|f| f.id).collect::<Vec<_>>(),
+        [V3_USERNAME, V3_PASSWORD, V3_TOTP].map(Uuid::from_bytes)
+    );
+    assert_fields(
+        login,
+        &[
+            ("username", FieldKind::Text, "chris@example.com"),
+            ("password", FieldKind::Password, "hunter2"),
+            (
+                "totp",
+                FieldKind::Totp,
+                "otpauth://totp/Example:chris?secret=JBSWY3DPEHPK3PXP&issuer=Example",
+            ),
+        ],
+    );
+    let note = vault.get(Uuid::from_bytes(V3_NOTE_ID)).unwrap();
+    assert_eq!(note.fields.len(), 1);
+    assert_eq!(note.fields[0].id, Uuid::from_bytes(V3_NOTES));
+    assert_eq!(note.fields[0].value.expose_secret(), "nothing special");
+
+    // A save by this build keeps everything exactly, at version 3.
+    let again = vault.serialize();
+    assert_eq!(&again[4..6], &[0, 3]);
+    let reopened = LockedVault::parse(&again).unwrap().unlock(&pw()).unwrap();
+    assert_eq!(reopened.header(), vault.header());
+    let l2 = reopened.get(Uuid::from_bytes(V3_LOGIN_ID)).unwrap();
+    assert_eq!(
+        l2.fields.iter().map(|f| f.id).collect::<Vec<_>>(),
+        login.fields.iter().map(|f| f.id).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        l2.field("totp").unwrap().value.expose_secret(),
+        login.field("totp").unwrap().value.expose_secret()
+    );
+}
+
+/// Builds `v3-meta.vault` (see the module docs): `v1-forward.vault` upgraded in place.
+/// `upgrade_format` keeps every unknown key the reader preserved (header, kdf, password
+/// slot, item record, item payload, field, manifest record) and drops the opaque slot; the
+/// save then binds all of them under version 3.
+#[test]
+#[ignore]
+fn regenerate_v3_meta_fixture() {
+    let mut vault = LockedVault::parse(FORWARD).unwrap().unlock(&pw()).unwrap();
+    vault.set_device_id(device());
+    vault.upgrade_format(&pw(), V3M_AT).unwrap();
+    assert_eq!(vault.header().format_version, 3);
+    assert_eq!(vault.header().slots_modified_at, Some(V3M_AT));
+    std::fs::write(format!("{FIXTURE_DIR}/v3-meta.vault"), vault.serialize()).unwrap();
+}
+
+/// The seven unknown-key sites of `v3-meta.vault` (everything `v1-forward` had but the
+/// opaque slot), as the parser hands them back.
+fn assert_v3_meta_plaintext(file: &VaultFile) {
+    let header = &file.header;
+    assert_eq!(header.format_version, 3);
+    assert_eq!(header.extras, vec![header_extra()], "header");
+    assert_eq!(header.kdf_extras, vec![kdf_extra()], "kdf");
+    assert_eq!(
+        header.slots.len(),
+        1,
+        "the opaque slot was dropped by the upgrade"
+    );
+    assert!(header.slots[0].is_key_of(SlotKind::Password));
+    assert_eq!(
+        header.slots[0].as_key().unwrap().extras,
+        vec![key_slot_extra()],
+        "known slot"
+    );
+    assert_eq!(header.slots_modified_at, Some(V3M_AT));
+    assert_eq!(header.slots_device_id, Some(device()));
+    assert_forward_records(file);
+}
+
+#[test]
+fn v3_meta_opens_with_every_unknown_key_intact_and_bound() {
+    let bytes = std::fs::read(format!("{FIXTURE_DIR}/v3-meta.vault")).unwrap();
+    assert_eq!(&bytes[4..6], &[0, 3]);
+    let file = VaultFile::parse(&bytes).unwrap();
+    assert_v3_meta_plaintext(&file);
+    let locked = LockedVault::parse(&bytes).unwrap();
+    check_kdf(&locked);
+    let vault = locked.unlock(&pw()).unwrap();
+    let item = future_item(&vault);
+    assert_eq!(item.modified_at, T0 + 31);
+
+    // A save keeps all seven sites and the version; the reopened file is identical in
+    // every plaintext respect but the nonces and ciphertexts.
+    let again = vault.serialize();
+    assert_eq!(&again[4..6], &[0, 3]);
+    let file2 = VaultFile::parse(&again).unwrap();
+    assert_v3_meta_plaintext(&file2);
+    assert_eq!(
+        file2.header, file.header,
+        "header bytes unchanged by a save"
+    );
+    let reopened = LockedVault::parse(&again).unwrap().unlock(&pw()).unwrap();
+    let b = future_item(&reopened);
+    assert_eq!(item.extras, b.extras);
+    assert_eq!(item.fields[0].extras, b.fields[0].extras);
+    assert_eq!(reopened.header(), vault.header());
 }
 
 fn check_kdf(locked: &LockedVault) {
@@ -1262,13 +1481,15 @@ fn every_fixture_in_the_directory_opens() {
         .collect();
     names.sort();
     assert!(
-        names.len() >= 11,
-        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-icon, v1-meta, v1-stamped, v2-basic, v2-meta, v2-trash-legacy, v2-field-icon; found {names:?}"
+        names.len() >= 13,
+        "expected at least v1-attach, v1-basic, v1-empty, v1-forward, v1-icon, v1-meta, v1-stamped, v2-basic, v2-meta, v2-trash-legacy, v2-field-icon, v3-basic, v3-meta; found {names:?}"
     );
     assert!(names.iter().any(|n| n.starts_with("v1-")));
     assert!(names.iter().any(|n| n.starts_with("v2-")));
+    assert!(names.iter().any(|n| n.starts_with("v3-")));
     // Written after the item-kind removal (no legacy `kind` extra) and after stamp-at-create
-    // (header carries `slots_modified_at`).
+    // (header carries `slots_modified_at`). `v3-meta` is the upgraded `v1-forward`, so it
+    // keeps that file's legacy `kind` extra but carries a stamp.
     let post_removal = |name: &str| {
         matches!(
             name,
@@ -1279,8 +1500,10 @@ fn every_fixture_in_the_directory_opens() {
                 | "v2-meta.vault"
                 | "v2-trash-legacy.vault"
                 | "v2-field-icon.vault"
+                | "v3-basic.vault"
         )
     };
+    let stamped = |name: &str| post_removal(name) || name == "v3-meta.vault";
     for name in &names {
         let bytes = std::fs::read(format!("{FIXTURE_DIR}/{name}")).unwrap();
         // The name's version is the file's prefix version, and every version this build
@@ -1346,8 +1569,13 @@ fn every_fixture_in_the_directory_opens() {
         let committed = (file.header.slots_modified_at, file.header.slots_device_id);
         assert_eq!(
             committed.0.is_some(),
-            post_removal(name),
+            stamped(name),
             "{name}: committed stamp"
+        );
+        assert_eq!(
+            file.header.digest().is_some(),
+            stamped(name) || named_version >= 3,
+            "{name}: digest-bound iff stamped (v1/v2) or version 3"
         );
         // Extras survive a save by this build. A save never changes the prefix version (a v1
         // file stays v1; see `FORMAT_VERSION`).

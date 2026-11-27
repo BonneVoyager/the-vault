@@ -299,7 +299,6 @@ mod tests {
 
         assert_eq!(keys(&text), expected(false), "{text}");
         for line in [
-            "format version: 2",
             "macOS version: 15.1.1",
             "Mac model: Mac15,6",
             "location: Dropbox",
@@ -313,6 +312,9 @@ mod tests {
         ] {
             assert!(text.lines().any(|l| l == line), "{line:?} in\n{text}");
         }
+        // A fresh vault is written at the current format version; the line reports the file's.
+        let format_line = format!("format version: {}", vault_core::FORMAT_VERSION);
+        assert!(text.lines().any(|l| l == format_line), "{text}");
         assert!(text.contains(&format!("\nbackups: {backups}\n")), "{text}");
         assert!(text.contains("last save: ") && text.contains("(2m ago), result: ok"));
         let event_line = format!(

@@ -223,6 +223,15 @@ mod tests {
                 },
             )]
             .into(),
+            freshness_seen: [(
+                vault_core::Uuid::new_v4(),
+                crate::state::FreshnessSeen {
+                    max_item_modified_at: 1_700_000_000_123,
+                    slots_modified_at: 1_700_000_000_000,
+                    item_count: 3,
+                },
+            )]
+            .into(),
         };
         save_settings_to(dir.path(), &settings);
         assert_eq!(load_settings_from(dir.path()), settings);
@@ -415,5 +424,35 @@ mod tests {
         assert!(!s.lock_on_sleep);
         assert!(s.kdf_seen.is_empty());
         assert!(load(r#"{}"#).kdf_seen.is_empty());
+    }
+
+    /// `freshness_seen` (I-02): lenient like `kdf_seen`; the other settings survive.
+    #[test]
+    fn freshness_seen_settings_json_is_lenient() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |json: &str| {
+            fs::write(dir.path().join(SETTINGS_FILE), json).unwrap();
+            load_settings_from(dir.path())
+        };
+        let (good, bad) = (vault_core::Uuid::new_v4(), vault_core::Uuid::new_v4());
+        let s = load(&format!(
+            r#"{{"lock_on_sleep": false, "freshness_seen": {{
+                "{good}": {{"max_item_modified_at": 5, "slots_modified_at": 7}},
+                "{bad}": {{"max_item_modified_at": -1, "slots_modified_at": 7}},
+                "not-a-uuid": {{"max_item_modified_at": 1, "slots_modified_at": 1}}}}}}"#
+        ));
+        assert!(!s.lock_on_sleep);
+        assert_eq!(s.freshness_seen.len(), 1, "{:?}", s.freshness_seen);
+        assert_eq!(
+            s.freshness_seen[&good],
+            crate::state::FreshnessSeen {
+                max_item_modified_at: 5,
+                slots_modified_at: 7,
+                item_count: 0,
+            },
+            "an entry from before item_count reads it as 0"
+        );
+        let s = load(r#"{"lock_on_sleep": false, "freshness_seen": "junk"}"#);
+        assert!(!s.lock_on_sleep && s.freshness_seen.is_empty());
     }
 }

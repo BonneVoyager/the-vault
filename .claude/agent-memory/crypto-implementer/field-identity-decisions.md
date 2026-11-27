@@ -21,6 +21,8 @@ None; bad -> Malformed). Importers push history with `field_id: None` (lead: "no
 changes"); `set_field` on a Password field records `Some(field.id)`. `uuid` gained the `v5`
 feature (only `sha1_smol`, already in the lockfile).
 
+(FORMAT_VERSION is 3 since 2026-11-27, see [[v3-plaintext-binding-decisions]]; the version-2 statements below are historical, the rules still hold.)
+
 **Format (01 §4/§9):** field map key `"id": bytes(16)` ALWAYS written (canonical order:
 `id, kind, name, value, section, modified_at`); item key `removed_fields: [{id, removed_at}]`
 sorts between `attachments` and `removed_history`. `FORMAT_VERSION = 2`, `MIN_FORMAT_VERSION

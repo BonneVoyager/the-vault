@@ -12,7 +12,7 @@ Decisions settled while implementing `crates/vault-core` P2 (2026-10-28). Later 
 - slot: `b"RVLT" || version u16 || vault_id(16) || slot.id(16) || kind utf8 ("password" etc, no terminator)` = 46 bytes for password.
   Spec wrote `format_version` without width; chose the u16 prefix width (stricter reading).
 - item: `vault_id(16) || item.id(16) || modified_at u64(8) || version u16(2)`.
-- manifest: `vault_id(16) || item_count u32(4) || version u16(2)`; count = number of ItemRecords incl. tombstones.
+- manifest: `vault_id(16) || item_count u32(4) || version u16(2)`; count = number of ItemRecords incl. tombstones. (+ header_digest(32) for stamped v1/v2 files, W1; v3 = 86 bytes, see [[v3-plaintext-binding-decisions]].)
 - `version` is the one READ FROM THE FILE PREFIX (stored as `Header.format_version`), not the
   compile-time const — security review (2026-10-28) required this. Builders
   `format::{slot_aad,item_aad,manifest_aad}` take it as first arg. Version 0 -> `UnsupportedVersion(0)`.

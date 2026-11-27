@@ -99,7 +99,7 @@ fn b02_cli_upgrade() {
     let (rc, out) = cli(&p, FIXTURE_PW, &["upgrade", "--allow-weak"]);
     assert_eq!(rc, 0, "{out}");
     let after = std::fs::read(p.join("vault.bin")).unwrap();
-    assert_eq!(version_of(&after), 2, "upgrade writes version 2: {out}");
+    assert_eq!(version_of(&after), 3, "upgrade writes version 3: {out}");
     let u = LockedVault::parse(&after)
         .unwrap()
         .unlock(&pw(FIXTURE_PW))
@@ -115,7 +115,7 @@ fn b02_cli_upgrade() {
     );
     let (rc, out2) = cli(&p, FIXTURE_PW, &["upgrade", "--allow-weak"]);
     assert_eq!(rc, 0, "second upgrade is a no-op, not an error: {out2}");
-    assert_eq!(version_of(&std::fs::read(p.join("vault.bin")).unwrap()), 2);
+    assert_eq!(version_of(&std::fs::read(p.join("vault.bin")).unwrap()), 3);
     eprintln!("INFO upgrade output: {out:?} / second run: {out2:?}");
     let (rc, out) = cli(&p, FIXTURE_PW, &["list"]);
     assert_eq!(rc, 0, "{out}");
@@ -351,8 +351,8 @@ fn b08_cli_add_sets_created_at() {
     }
     assert_eq!(
         version_of(&std::fs::read(p.join("vault.bin")).unwrap()),
-        2,
-        "init writes version 2"
+        3,
+        "init writes version 3"
     );
 }
 
@@ -419,8 +419,8 @@ fn b09_concurrent_upgrade_and_adds() {
     let n = u.items().filter(|i| i.title.starts_with("race")).count();
     assert_eq!(
         (n, version_of(&disk)),
-        (6, 2),
-        "items kept and version 2; process errors {errs:?}"
+        (6, 3),
+        "items kept and version 3; process errors {errs:?}"
     );
     assert!(errs.is_empty(), "{errs:?}");
 }

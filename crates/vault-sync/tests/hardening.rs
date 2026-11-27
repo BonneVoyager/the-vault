@@ -307,6 +307,16 @@ fn key_mismatch_refuses_clean_save_kek_unlock_and_preserves_on_lock() {
         matches!(after.as_slice(), [SyncEvent::Merged(_), ..]),
         "{after:?}"
     );
+    // I-02: the report describes the adopted (rotated) file.
+    let SyncEvent::Merged(m) = &after[0] else {
+        unreachable!()
+    };
+    let rotated_file = LockedVault::parse(&rotated).unwrap();
+    assert_eq!(m.peer, vault_sync::Freshness::of(&rotated_file));
+    assert_eq!(
+        m.peer.slots_modified_at,
+        rotated_file.header().slots_modified_at
+    );
     assert!(!after.contains(&SyncEvent::KeyRotatedOnDisk));
     c.save().unwrap();
     assert_eq!(titles(&c), ["from b", "mail"]);

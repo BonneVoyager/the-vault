@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for a Team-ID signed build (Touch ID; security review I-01, docs/signing.md).
+  Rendered only when VAULT_TEAM_ID is set, by `scripts/check-entitlements.sh --render`:
+  @TEAM_ID@ becomes VAULT_TEAM_ID, @BUNDLE_ID@ becomes CFBundleIdentifier from
+  scripts/Info.plist. Without VAULT_TEAM_ID, scripts/entitlements.plist (empty) is used as is.
+  These three keys let the data-protection keychain and the Secure Enclave key in
+  crates/vault-macos/src/biometric.rs work; they must match the embedded Developer ID
+  provisioning profile (App ID <TEAMID>.<bundle id> with Keychain Sharing).
+  scripts/check-entitlements.sh requires the signed app's entitlements to EQUAL the rendered
+  file (both normalised with plutil); any extra, missing or changed key fails packaging. So every
+  entitlement the app ships with must be added here deliberately, in review.
+  Never add any of these: each weakens the hardened runtime by allowing code injection or
+  debugger attach to a process that holds the unlocked vault key:
+    com.apple.security.get-task-allow
+    com.apple.security.cs.disable-library-validation
+    com.apple.security.cs.allow-dyld-environment-variables
+    com.apple.security.cs.allow-unsigned-executable-memory
+    com.apple.security.cs.disable-executable-page-protection
+    com.apple.security.cs.allow-jit
+    com.apple.security.cs.debugger
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.application-identifier</key>
+	<string>@TEAM_ID@.@BUNDLE_ID@</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>@TEAM_ID@</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>@TEAM_ID@.@BUNDLE_ID@</string>
+	</array>
+</dict>
+</plist>

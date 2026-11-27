@@ -719,13 +719,15 @@ fn upgrade_v1_fixture_then_noop() {
     let before = vault(&f, PW, &["list"]);
     assert!(before.status.success());
     let hint = String::from_utf8_lossy(&before.stderr);
-    assert!(
-        hint.contains("Vault is format 1; run `vault upgrade`"),
-        "{hint}"
+    let expected = format!(
+        "Vault is format 1; upgrade available (to {}): run `vault upgrade`",
+        vault_core::FORMAT_VERSION
     );
+    assert!(hint.contains(&expected), "{hint}");
 
     let up = ok(&vault(&f, PW, &["upgrade"]));
-    assert!(up.contains("upgraded to version 2"), "{up}");
+    let upgraded = format!("upgraded to version {}", vault_core::FORMAT_VERSION);
+    assert!(up.contains(&upgraded), "{up}");
     assert!(up.contains("Touch ID"), "{up}");
 
     let after = vault(&f, PW, &["list"]);
@@ -741,7 +743,8 @@ fn upgrade_v1_fixture_then_noop() {
         bytes_before,
         "no-op upgrade must not rewrite the file"
     );
-    assert!(again.contains("already at version 2"), "{again}");
+    let already = format!("already at version {}", vault_core::FORMAT_VERSION);
+    assert!(again.contains(&already), "{again}");
 }
 
 fn core_item(pkg: &Path, title: &str) -> vault_core::Item {

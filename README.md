@@ -93,7 +93,7 @@ Output goes to `target/package/` as `Vault.app`, a `.dmg`, and `Vault.app.dSYM` 
 ## Known limitations
 
 - Attachments are not backed up. A restored backup may reference blobs that no longer exist, and the app shows them as missing.
-- Vault format 2 (fields identified by id; duplicate and empty field names allowed) is written for new vaults. A format 1 vault keeps its version until it is upgraded, which the app does automatically on the next password unlock (Touch ID must then be enabled again) and the CLI does with `vault upgrade`. Until then, an older build opening the same format 1 file still merges fields by name and can drop a second field with the same name.
+- Vault format 3 (since 2026-11-27: every plaintext header key and every record's unknown keys are bound into the manifest, on top of format 2's fields identified by id with duplicate and empty field names allowed) is written for new vaults. A format 1 or 2 vault keeps its version until it is upgraded, which the app does automatically on the next password unlock (Touch ID must then be enabled again) and the CLI does with `vault upgrade`. After the upgrade a device still running an older build cannot open the file until it is updated. Until the upgrade, an older build opening the same format 1 file still merges fields by name and can drop a second field with the same name.
 - HEIC images have no in-app preview.
 - A vault file is limited to 64 MiB and each field value to 1 MiB; the app refuses to save past the limit and shows a banner until large notes are removed (also from Recently Deleted). 1Password exports are read up to 1 GiB; CSV files up to 64 MiB; KeePass databases up to 100 MiB.
 - No leaked-password checks, because the app never uses the network.

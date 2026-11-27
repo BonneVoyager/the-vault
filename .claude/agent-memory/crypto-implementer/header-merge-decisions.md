@@ -61,7 +61,7 @@ stamp AND author AND slots -> keep ours (idempotence; two never-stamped headers 
 `UnlockedVault::device_id` is deliberately NOT used: vault-sync opens the disk copy with the
 local device id, so both sides always carry the same one and the tie would never fire. Less ->
 keep ours. Top-level
-header extras, vault_id, created_at, format_version never change. **Keys travel with the
+header extras, vault_id, created_at, format_version never change (SUPERSEDED: format_version adopted since H1 2026-10-31, header extras adopted since 2026-11-27 — see [[v3-plaintext-binding-decisions]]). **Keys travel with the
 header:** when theirs wins, `self.keys = Keys::from_vault_key(other.keys.vault_key.clone())`
 (no-op unless a rotation happened). Reason: slots wrapping key X with items under key Y is a
 file nobody can open; `other` is an UnlockedVault so it holds the key its slots wrap, and no

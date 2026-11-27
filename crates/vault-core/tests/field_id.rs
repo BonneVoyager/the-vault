@@ -473,17 +473,17 @@ fn v1_migration_is_deterministic_and_matches_the_uuid_v5_formula() {
 }
 
 #[test]
-fn new_vaults_are_version_2_and_version_1_still_reads() {
-    assert_eq!(FORMAT_VERSION, 2);
+fn new_vaults_are_current_version_and_version_1_still_reads() {
+    assert_eq!(FORMAT_VERSION, 3);
     assert_eq!(MIN_FORMAT_VERSION, 1);
     let v = new_vault();
-    assert_eq!(v.header().format_version, 2);
+    assert_eq!(v.header().format_version, 3);
     let bytes = v.serialize();
-    assert_eq!(&bytes[4..6], &[0, 2], "prefix version 2");
-    assert_eq!(VaultFile::parse(&bytes).unwrap().header.format_version, 2);
+    assert_eq!(&bytes[4..6], &[0, 3], "prefix version 3");
+    assert_eq!(VaultFile::parse(&bytes).unwrap().header.format_version, 3);
     assert!(unlock(&bytes).is_ok());
 
-    // Version 1 still parses and unlocks; a save keeps it at 1; version 3 is refused.
+    // Version 1 still parses and unlocks; a save keeps it at 1; version 4 is refused.
     let mut v1 = unstamped_vault();
     assert_eq!(v1.header().format_version, 1);
     let id = v1.insert(sample_item(3, 10), 10);
@@ -493,11 +493,11 @@ fn new_vaults_are_version_2_and_version_1_still_reads() {
     assert_eq!(re.header().format_version, 1);
     assert_vaults_eq(&v1, &re);
     assert_eq!(re.get(id).unwrap().fields.len(), 5);
-    let mut v3 = again.clone();
-    v3[5] = 3;
+    let mut v4 = again.clone();
+    v4[5] = 4;
     assert_eq!(
-        LockedVault::parse(&v3).unwrap_err(),
-        VaultError::UnsupportedVersion(3)
+        LockedVault::parse(&v4).unwrap_err(),
+        VaultError::UnsupportedVersion(4)
     );
 }
 
@@ -520,7 +520,7 @@ fn upgrade_format_rewraps_password_slots_drops_the_rest_and_is_idempotent() {
     assert_eq!(v.slots().count(), 2);
 
     v.upgrade_format(&pw(), 30).unwrap();
-    assert_eq!(v.header().format_version, 2);
+    assert_eq!(v.header().format_version, FORMAT_VERSION);
     assert_eq!(
         v.slots().map(|(_, k)| k).collect::<Vec<_>>(),
         [vault_core::SlotKind::Password],
@@ -528,7 +528,7 @@ fn upgrade_format_rewraps_password_slots_drops_the_rest_and_is_idempotent() {
     );
     assert!(v.header().slots_stamp() > stamp_before, "header stamped");
     let bytes = v.serialize();
-    assert_eq!(&bytes[4..6], &[0, 2]);
+    assert_eq!(&bytes[4..6], &FORMAT_VERSION.to_be_bytes());
     let locked = LockedVault::parse(&bytes).unwrap();
     assert_eq!(
         locked.unlock(&secret("nope")).unwrap_err(),
@@ -539,7 +539,7 @@ fn upgrade_format_rewraps_password_slots_drops_the_rest_and_is_idempotent() {
         VaultError::Malformed(_)
     ));
     let re = locked.unlock(&pw()).unwrap();
-    assert_eq!(re.header().format_version, 2);
+    assert_eq!(re.header().format_version, FORMAT_VERSION);
     assert_vaults_eq(&v, &re);
     assert_eq!(
         re.get(id)

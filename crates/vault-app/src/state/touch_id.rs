@@ -736,6 +736,62 @@ mod tests {
         );
     }
 
+    /// I-02: a Touch ID unlock records the anchor and flags a rolled-back file like the
+    /// password path.
+    #[gpui::test]
+    fn touch_unlock_records_and_checks_the_freshness_anchor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _, path) = setup(dir.path(), cx);
+        enable(&state, cx);
+        let file = path.join("vault.bin");
+        let old = std::fs::read(&file).unwrap();
+        let touch = |state: &Entity<AppState>, cx: &mut TestAppContext| {
+            lock(state, cx);
+            state.update(cx, |s, cx| {
+                s.toast = None;
+                s.touch_unlock(cx);
+            });
+            cx.run_until_parked();
+            state.read_with(cx, |s, _| assert!(!s.locked, "{:?}", s.error));
+        };
+        let anchor = |state: &Entity<AppState>, cx: &mut TestAppContext| {
+            state.read_with(cx, |s, _| s.settings.freshness_seen[&s.vault_id.unwrap()])
+        };
+        state.update(cx, |s, _| s.settings.freshness_seen.clear());
+        touch(&state, cx);
+        let on_disk = state.read_with(cx, |s, _| {
+            s.vault.as_ref().unwrap().on_disk_freshness().unwrap()
+        });
+        assert_eq!(
+            anchor(&state, cx),
+            crate::state::FreshnessSeen::of(&on_disk)
+        );
+
+        // A newer state saved here, then the file put back to the copy with the slot.
+        state.update(cx, |s, cx| {
+            let vault = s.vault.as_mut().unwrap();
+            let (device, now) = (vault.device_id(), crate::text::now_millis());
+            vault
+                .edit(|v| v.insert(Item::new("Newer", device, now), now))
+                .unwrap();
+            s.save_now(cx);
+        });
+        let seen = anchor(&state, cx);
+        lock(&state, cx);
+        std::fs::write(path.join(".planted"), &old).unwrap();
+        std::fs::rename(path.join(".planted"), &file).unwrap();
+        touch(&state, cx);
+        state.read_with(cx, |s, _| {
+            assert_eq!(
+                s.toast.as_ref().map(|t| t.message.as_ref()),
+                Some(crate::state::sync::STALE_ON_UNLOCK)
+            );
+            assert!(s.sync.stale_file.is_some());
+            assert_eq!(s.item_count(), 1);
+        });
+        assert_eq!(anchor(&state, cx), seen, "never lowered");
+    }
+
     /// A blocked unlock card (05 §2.2) is the only thing stopping Touch ID here: the
     /// enrollment and policy are fine. Manual and automatic attempts both wait, and the
     /// automatic trigger stays pending.

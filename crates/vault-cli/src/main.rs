@@ -459,7 +459,7 @@ fn sync_report(events: impl Iterator<Item = vault_sync::SyncEvent>) -> SyncRepor
                     sanitize_line(&p.display().to_string())
                 ));
             }
-            SyncEvent::Merged(m) => r.lines.push(format!(
+            SyncEvent::Merged(vault_sync::MergeEvent { report: m, .. }) => r.lines.push(format!(
                 "merged: {} added, {} updated, {} deleted, {} unchanged{}",
                 m.added,
                 m.updated,
@@ -497,8 +497,14 @@ fn sync_report(events: impl Iterator<Item = vault_sync::SyncEvent>) -> SyncRepor
 }
 
 /// Hint for `list`/`get` when the vault file is older than this build writes.
-fn format_hint(v: &UnlockedVault) -> Option<&'static str> {
-    (v.header().format_version < FORMAT_VERSION).then_some("Vault is format 1; run `vault upgrade`")
+/// Names the file's actual version and the version an upgrade would write; `None` when current.
+fn format_hint(v: &UnlockedVault) -> Option<String> {
+    let version = v.header().format_version;
+    (version < FORMAT_VERSION).then(|| {
+        format!(
+            "Vault is format {version}; upgrade available (to {FORMAT_VERSION}): run `vault upgrade`"
+        )
+    })
 }
 
 /// What `get` prints for a field: secrets are masked unless `reveal` is set.

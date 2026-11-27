@@ -9,10 +9,15 @@
 //! 2. Every item record is decrypted with its AAD, in file order; the first tag failure ->
 //!    `Tampered(Item(id))`. This runs *before* the manifest check so that a record moved in from
 //!    another vault is reported as `Item`, not `Manifest`.
-//! 3. The manifest is decrypted with `item_count` (and, for a stamped header, the
-//!    `header_digest` of 01 §4) bound in the AAD -> `Tampered(Manifest)`.
-//! 4. The manifest pairs must equal the records' `(id, modified_at)` sorted by id, exactly
+//! 3. The manifest is decrypted with `item_count` and the `header_digest` of 01 §4 (for a
+//!    version 3 file over the whole header plus the manifest record's own unknown keys; for
+//!    a version 1 or 2 file only when stamped and only over `kdf`/`slots`/stamp) bound in
+//!    the AAD -> `Tampered(Manifest)`.
+//! 4. The manifest entries must equal the records' `(id, modified_at)` sorted by id, exactly
 //!    (the manifest is required to already be in sorted order) -> `Tampered(Manifest)`.
+//! 5. Version 3 only: each entry's digest of the record's unknown plaintext keys must match
+//!    the record (absent digest == no unknown keys) -> `Tampered(Item(id))`, first mismatch
+//!    in id order. Below version 3 an entry with a digest is `Malformed` (no writer emits one).
 //!
 //! `unlock_with_kek` replaces step 1 with a single named slot and shares steps 2-4.
 //! `unlock_with_key` (feature `sync`) skips step 1 entirely and shares steps 2-4; because no
@@ -315,14 +320,23 @@ impl LockedVault {
         let item_count = u32::try_from(self.file.items.len())
             .map_err(|_| VaultError::Malformed("more than u32::MAX item records".into()))?;
         let manifest = &self.file.manifest;
-        // A stamped header is bound into the manifest AAD (01 §4 `header_digest`): a header
-        // that was stripped, re-stamped, replaced or spliced fails the manifest step as
-        // Tampered(Manifest) on every unlock path (`unlock_with_key` included; on a vault
-        // with no item records that path reports it as WrongPassword, see `key_unverified`).
-        // Computed once, up front: the same bytes serve the manifest step and, on the key
-        // path only, the probe run when the very first record fails.
+        // The header is bound into the manifest AAD (01 §4 `header_digest`; the whole header
+        // under version 3, `kdf`/`slots`/stamp of a stamped header below): a header that was
+        // stripped, re-stamped, replaced, spliced or (version 3) edited anywhere fails the
+        // manifest step as Tampered(Manifest) on every unlock path (`unlock_with_key`
+        // included; on a vault with no item records that path reports it as WrongPassword,
+        // see `key_unverified`). Version 3 also binds the manifest record's own unknown
+        // plaintext keys here. Computed once, up front: the same bytes serve the manifest
+        // step and, on the key path only, the probe run when the very first record fails.
         let digest = header.digest();
-        let aad_manifest = manifest_aad(version, vault_id, item_count, digest.as_ref());
+        let record_digest = format::manifest_record_digest(version, &manifest.extras);
+        let aad_manifest = manifest_aad(
+            version,
+            vault_id,
+            item_count,
+            digest.as_ref(),
+            record_digest.as_ref(),
+        );
         let open_manifest = || {
             crypto::open(
                 &keys.manifest_key,
@@ -359,8 +373,32 @@ impl LockedVault {
         let plain = open_manifest().ok_or(on_fail)?;
         let expected = format::decode_manifest(&plain)?;
         pairs.sort_unstable();
-        if expected != pairs {
+        if expected.len() != pairs.len()
+            || expected
+                .iter()
+                .zip(&pairs)
+                .any(|(e, p)| (e.id, e.modified_at) != *p)
+        {
             return Err(VaultError::Tampered(TamperKind::Manifest));
+        }
+        // Version 3 (01 §4, I-04): the unknown plaintext keys of every item record are
+        // vouched for by the manifest. An absent digest means "no unknown keys", so an
+        // injected, altered or removed key is a mismatch and names the record. Checked after
+        // the pair comparison so a dropped or rolled-back record still reports Manifest.
+        // Below version 3 no writer emits a digest: one present is structural damage.
+        if version >= format::PLAINTEXT_BINDING_VERSION {
+            for e in &expected {
+                let actual = record_extras
+                    .get(&e.id)
+                    .and_then(|x| format::item_record_digest(version, x));
+                if actual != e.extras_digest {
+                    return Err(VaultError::Tampered(TamperKind::Item(e.id)));
+                }
+            }
+        } else if expected.iter().any(|e| e.extras_digest.is_some()) {
+            return Err(VaultError::Malformed(format!(
+                "manifest: record digest in a version {version} file"
+            )));
         }
 
         Ok(UnlockedVault {
@@ -430,6 +468,9 @@ impl UnlockedVault {
     /// 1)` and `slots_device_id = device_id`, so every new vault carries the `header_digest`
     /// binding (01 §4) from its first `serialize` and a by-hand edit of its slots or KDF is
     /// `Tampered(Manifest)` on every unlock path. Only files written before v1.1 are unstamped.
+    /// New vaults are [`FORMAT_VERSION`] (3): the digest covers the whole header and every
+    /// record's unknown plaintext keys are bound too, so any by-hand edit of the plaintext
+    /// is `Tampered(Manifest)` (header, manifest record) or `Tampered(Item(id))` (item record).
     ///
     /// # Panics
     ///
@@ -1229,8 +1270,12 @@ impl UnlockedVault {
     /// even run the KDF.
     ///
     /// Payload-wise there is nothing to migrate: the reader already derived stable field ids
-    /// for a version 1 file and the writer emits them under either version. An older build
-    /// refuses the upgraded file with `UnsupportedVersion`.
+    /// for a version 1 file and the writer emits them under every version, and version 3
+    /// changes no CBOR shape at all; what the upgrade buys is the version 3 binding of every
+    /// plaintext byte (header `created_at` and unknown keys, record-level unknown keys) into
+    /// the manifest ([`format::PLAINTEXT_BINDING_VERSION`]), which the next `serialize`
+    /// writes. Until then a version 1 or 2 file keeps its weaker binding, including through
+    /// plain saves. An older build refuses the upgraded file with `UnsupportedVersion`.
     ///
     /// # Errors
     ///
@@ -1502,38 +1547,53 @@ impl UnlockedVault {
     /// an unknown kind and fields of an unknown kind are written back with their original
     /// kind string. A header without `slots_modified_at` is written stamped (see
     /// [`UnlockedVault::header_for_write`]), so every file this build saves is digest-bound.
-    /// Never fails.
+    /// The file keeps `header.format_version`; under version 3 the manifest additionally
+    /// records a digest of each item record's unknown plaintext keys and its AAD one of the
+    /// manifest record's (01 §4), recomputed here from what is in memory, so a merge never
+    /// needs to know about them. Never fails.
     pub fn serialize(&self) -> Vec<u8> {
         let header = self.header_for_write();
         let vault_id = header.vault_id;
         let version = header.format_version;
         let mut records = Vec::with_capacity(self.items.len());
-        let mut pairs = Vec::with_capacity(self.items.len());
+        let mut entries = Vec::with_capacity(self.items.len());
         for (id, item) in &self.items {
             let plain = format::encode_item_plain(item);
             let nonce = crypto::random_nonce();
             let aad = item_aad(version, vault_id, *id, item.modified_at);
             let ct = crypto::seal(&self.keys.item_key, &nonce, &aad, &plain);
+            let extras = self.record_extras.get(id).cloned().unwrap_or_default();
+            entries.push(format::ManifestEntry {
+                id: *id,
+                modified_at: item.modified_at,
+                extras_digest: format::item_record_digest(version, &extras),
+            });
             records.push(ItemRecord {
                 id: *id,
                 modified_at: item.modified_at,
                 nonce,
                 ct,
-                extras: self.record_extras.get(id).cloned().unwrap_or_default(),
+                extras,
             });
-            pairs.push((*id, item.modified_at));
         }
 
         // BTreeMap iteration is already sorted by id (Uuid orders by bytes).
         let item_count = u32::try_from(records.len()).expect("more than u32::MAX items");
         let nonce = crypto::random_nonce();
         let digest = header.digest();
-        let aad = manifest_aad(version, vault_id, item_count, digest.as_ref());
+        let record_digest = format::manifest_record_digest(version, &self.manifest_extras);
+        let aad = manifest_aad(
+            version,
+            vault_id,
+            item_count,
+            digest.as_ref(),
+            record_digest.as_ref(),
+        );
         let ct = crypto::seal(
             &self.keys.manifest_key,
             &nonce,
             &aad,
-            &format::encode_manifest(&pairs),
+            &format::encode_manifest_entries(&entries),
         );
         let manifest = ManifestRecord {
             nonce,

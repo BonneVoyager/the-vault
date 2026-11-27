@@ -15,7 +15,7 @@ use crossbeam_channel::Receiver;
 use gpui::{Context, SharedString, Task};
 use serde::{Deserialize, Serialize};
 use vault_core::{KdfParams, SecretString, Uuid, VaultError};
-use vault_sync::{LockOutcome, SyncError, SyncEvent, SyncedVault, VAULT_FILE_NAME};
+use vault_sync::{Freshness, LockOutcome, SyncError, SyncEvent, SyncedVault, VAULT_FILE_NAME};
 
 use crate::biometric::{self, Biometrics};
 use crate::clipboard::Clipboard;
@@ -281,8 +281,55 @@ pub struct Settings {
     /// Argon2 costs each vault's header had at the last password unlock, create, password
     /// change or re-calibration on this Mac (security review 2026-11-26 L-01). No secrets.
     /// A malformed entry is dropped alone.
-    #[serde(deserialize_with = "lenient_kdf_seen")]
+    #[serde(deserialize_with = "lenient_map")]
     pub kdf_seen: BTreeMap<Uuid, KdfSeen>,
+    /// Newest item and slot stamps of each vault's file as this Mac last unlocked, merged or
+    /// saved it (security review 2026-11-26 I-02). Never lowered. No secrets. A malformed
+    /// entry is dropped alone.
+    #[serde(deserialize_with = "lenient_map")]
+    pub freshness_seen: BTreeMap<Uuid, FreshnessSeen>,
+}
+
+/// The freshness anchor of one vault: the largest stamps and record count of a file version
+/// this Mac authenticated or wrote (0 = none seen; a missing key reads as 0).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FreshnessSeen {
+    pub max_item_modified_at: u64,
+    pub slots_modified_at: u64,
+    pub item_count: u64,
+}
+
+impl FreshnessSeen {
+    fn of(f: &Freshness) -> Self {
+        Self {
+            max_item_modified_at: f.max_item_modified_at.unwrap_or(0),
+            slots_modified_at: f.slots_modified_at.unwrap_or(0),
+            item_count: f.item_count as u64,
+        }
+    }
+
+    /// Whether `peer` lacks a state this anchor has seen: either stamp is older (a missing
+    /// stamp counts as 0, which is older only than a recorded one), or it holds fewer item
+    /// records. Records never leave a file today: deletes keep a tombstone record, and
+    /// core's `purge_tombstones_older_than` (which would drop them) is unused. If it is ever
+    /// called, the count must stop counting here or every purge reads as a rollback.
+    pub fn is_newer_than(&self, peer: &Freshness) -> bool {
+        let peer = Self::of(peer);
+        peer.max_item_modified_at < self.max_item_modified_at
+            || peer.slots_modified_at < self.slots_modified_at
+            || peer.item_count < self.item_count
+    }
+
+    /// Each stamp raised to `f`'s where that is newer.
+    pub fn raised(self, f: &Freshness) -> Self {
+        let f = Self::of(f);
+        Self {
+            max_item_modified_at: self.max_item_modified_at.max(f.max_item_modified_at),
+            slots_modified_at: self.slots_modified_at.max(f.slots_modified_at),
+            item_count: self.item_count.max(f.item_count),
+        }
+    }
 }
 
 /// The Argon2 costs of a vault header as last seen on this Mac (no salt: a password change
@@ -304,11 +351,13 @@ impl From<&KdfParams> for KdfSeen {
     }
 }
 
-/// `kdf_seen` keeping every entry whose key is a UUID and whose value parses; the others
-/// are dropped, and a value that is not a map at all is an empty map.
-fn lenient_kdf_seen<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> Result<BTreeMap<Uuid, KdfSeen>, D::Error> {
+/// A per-vault map keeping every entry whose key is a UUID and whose value parses; the
+/// others are dropped, and a value that is not a map at all is an empty map.
+fn lenient_map<'de, D, T>(d: D) -> Result<BTreeMap<Uuid, T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
     let serde_json::Value::Object(map) = serde_json::Value::deserialize(d)? else {
         return Ok(BTreeMap::new());
     };
@@ -429,6 +478,7 @@ impl Default for Settings {
             sidebar_hidden: false,
             show_in_dock: true,
             kdf_seen: BTreeMap::new(),
+            freshness_seen: BTreeMap::new(),
         }
     }
 }
@@ -1051,6 +1101,11 @@ impl AppState {
             cx,
             move || {
                 let result = vault.unlock(&password);
+                // I-02: the file as opened, before the cleanup or upgrade below rewrite it.
+                let opened = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|()| vault.on_disk_freshness());
                 // A stale Touch ID setup goes now, while the password is fresh (04 §2).
                 let cleaned = match result {
                     Ok(()) => touch_id::clean_stale(&mut vault, &*bio, stale),
@@ -1067,10 +1122,10 @@ impl AppState {
                     Err(SyncError::Vault(VaultError::WrongPassword)) => on_disk_kdf(&vault),
                     _ => None,
                 };
-                (vault, result, cleaned, upgraded, on_disk)
+                (vault, result, cleaned, upgraded, on_disk, opened)
             },
             |(_, result, ..)| result.is_ok(),
-            |this, (mut vault, result, cleaned, upgraded, on_disk), outcome, cx| match (
+            |this, (mut vault, result, cleaned, upgraded, on_disk, opened), outcome, cx| match (
                 outcome, result,
             ) {
                 // The user switched or closed the vault meanwhile; dropping zeroizes it.
@@ -1079,12 +1134,13 @@ impl AppState {
                     let seen = kdf_seen_of(&vault);
                     this.vault = Some(vault);
                     this.remember_kdf(seen, cx);
-                    this.unlocked_cx(cx);
+                    // The stale-file toast wins: the upgrade and slot-gone toasts are dropped.
+                    let stale = this.unlocked_from(opened, cx);
                     this.password_unlocked(true);
                     this.stale_cleaned(cleaned);
-                    this.format_upgraded(upgraded);
+                    this.format_upgraded(upgraded, stale);
                     // The unlock merged the file on disk: our enclave slot may be gone.
-                    if this.recheck_touch_slot() {
+                    if this.recheck_touch_slot() && !stale {
                         this.set_toast(Toast::window(touch_id::SLOT_GONE));
                     }
                 }
@@ -1096,7 +1152,7 @@ impl AppState {
                     this.remember_kdf(seen, cx);
                     this.password_unlocked(false);
                     this.stale_cleaned(cleaned);
-                    this.format_upgraded(upgraded);
+                    this.format_upgraded(upgraded, false);
                 }
                 (_, Err(e)) if let Some(blocked) = unlock_blocked(&e) => {
                     this.vault = Some(vault);
@@ -1244,7 +1300,15 @@ impl AppState {
 
     /// [`Self::unlocked`] from a context that can schedule work: content the unlock sweep
     /// stripped is written by the next autosave, not left on disk until the next edit.
-    fn unlocked_cx(&mut self, cx: &mut Context<Self>) {
+    /// Returns whether the stale-file toast was shown (I-02).
+    fn unlocked_cx(&mut self, cx: &mut Context<Self>) -> bool {
+        let on_disk = self.vault.as_ref().and_then(SyncedVault::on_disk_freshness);
+        self.unlocked_from(on_disk, cx)
+    }
+
+    /// [`Self::unlocked_cx`] judging `opened`, the file as the unlock opened it (a password
+    /// unlock may rewrite it before this runs: format upgrade, stale Touch ID cleanup).
+    fn unlocked_from(&mut self, opened: Option<Freshness>, cx: &mut Context<Self>) -> bool {
         if self.unlocked() > 0 {
             self.schedule_autosave(cx);
         }
@@ -1258,6 +1322,14 @@ impl AppState {
         {
             self.set_toast(Toast::window(WEAK_KDF));
         }
+        // I-02: judge the file just opened against this Mac's anchor, then raise the
+        // anchor to it (a rewrite by the unlock itself counts from the next save).
+        let stale = self.check_freshness(opened);
+        if stale {
+            self.set_toast(Toast::window(sync::STALE_ON_UNLOCK));
+        }
+        self.raise_freshness_to(opened);
+        stale
     }
 
     /// Shows the unlocked vault. Returns how many trashed items the sweep stripped (the
@@ -1651,7 +1723,8 @@ impl AppState {
 
     /// The unlock thread's format upgrade finished: on success forget this Mac's Touch ID
     /// setup (its slot is gone) and say so once; on failure only say so.
-    fn format_upgraded(&mut self, result: Option<Upgrade>) {
+    /// `quiet`: the success toast is dropped (a stale-file toast is showing, I-02).
+    fn format_upgraded(&mut self, result: Option<Upgrade>, quiet: bool) {
         match result {
             None => {}
             Some(done @ (Upgrade::Done | Upgrade::DoneReopened)) => {
@@ -1659,7 +1732,9 @@ impl AppState {
                     self.resubscribe();
                 }
                 self.touch_rotated();
-                self.set_toast(Toast::window(UPGRADED));
+                if !quiet {
+                    self.set_toast(Toast::window(UPGRADED));
+                }
             }
             Some(Upgrade::Failed { error, locked }) => {
                 match locked {

@@ -178,11 +178,15 @@ pub mod indep {
         a.extend_from_slice(&version.to_be_bytes());
         a
     }
+    /// 01 §4 manifest AAD: `vault_id || item_count_be32 || version_be16 [|| header_digest(32)
+    /// [|| manifest_record_digest(32)]]`. Versions 1/2: 22 or 54 bytes (no record digest);
+    /// version 3: always 86 bytes (both digests present).
     pub fn manifest_aad(
         vault_id: &[u8],
         count: u32,
         version: u16,
         digest: Option<&[u8]>,
+        record_digest: Option<&[u8]>,
     ) -> Vec<u8> {
         let mut a = vault_id.to_vec();
         a.extend_from_slice(&count.to_be_bytes());
@@ -190,11 +194,22 @@ pub mod indep {
         if let Some(d) = digest {
             a.extend_from_slice(d);
         }
+        if let Some(d) = record_digest {
+            a.extend_from_slice(d);
+        }
         a
     }
-    /// 01 §4 header_digest over canonical { kdf, slots, slots_modified_at, slots_device_id? }.
-    pub fn header_digest(header: &Value) -> Option<Vec<u8>> {
+    /// First format version whose manifest binds every plaintext byte (I-04).
+    pub const BINDING_VERSION: u16 = 3;
+    /// 01 §4 header_digest, version-dependent:
+    /// - v3+: SHA-256 of the whole canonical header map (always present);
+    /// - v1/v2 (v1.1 rule): SHA-256 of canonical { kdf, slots, slots_modified_at,
+    ///   slots_device_id? }, only when `slots_modified_at` is present.
+    pub fn header_digest(version: u16, header: &Value) -> Option<Vec<u8>> {
         use sha2::Digest;
+        if version >= BINDING_VERSION {
+            return Some(sha2::Sha256::digest(enc(&canon(header.clone()))).to_vec());
+        }
         let sma = get(header, "slots_modified_at")?.clone();
         let mut entries = vec![
             (
@@ -213,6 +228,26 @@ pub mod indep {
         entries.sort_by_key(|(k, _)| enc(k));
         Some(sha2::Sha256::digest(enc(&Value::Map(entries))).to_vec())
     }
+    /// 01 §4 (v3): SHA-256 of the canonical CBOR map of a record's unknown keys (`0xa0` when
+    /// there are none).
+    pub fn extras_digest(extras: &[(Value, Value)]) -> Vec<u8> {
+        use sha2::Digest;
+        sha2::Sha256::digest(enc(&canon(Value::Map(extras.to_vec())))).to_vec()
+    }
+    /// Keys of 01 §4 records the spec names; everything else is an unknown (extra) key.
+    pub const ITEM_RECORD_KEYS: [&str; 5] = ["t", "id", "modified_at", "nonce", "ct"];
+    pub const MANIFEST_RECORD_KEYS: [&str; 3] = ["t", "nonce", "ct"];
+    /// The unknown keys of a record map (keys not in `known`).
+    pub fn record_extras(rec: &Value, known: &[&str]) -> Vec<(Value, Value)> {
+        match rec {
+            Value::Map(e) => e
+                .iter()
+                .filter(|(k, _)| !k.as_text().is_some_and(|k| known.contains(&k)))
+                .cloned()
+                .collect(),
+            _ => vec![],
+        }
+    }
 
     pub struct Opened {
         pub vault_key: Vec<u8>,
@@ -226,6 +261,33 @@ pub mod indep {
     /// Opens a file with a password using only the spec. Panics with a message naming the
     /// spec step that failed.
     pub fn open_file(bytes: &[u8], password: &str) -> Opened {
+        try_open_file(bytes, password).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Item record failing the v3 extras binding, or another spec step failure.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum OpenError {
+        /// A spec step failed (message names it); maps to WrongPassword / Tampered(Manifest).
+        Step(&'static str),
+        /// v3: the item record's unknown keys do not match its manifest entry digest.
+        ItemExtras(Vec<u8>),
+    }
+    impl std::fmt::Display for OpenError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                OpenError::Step(s) => f.write_str(s),
+                OpenError::ItemExtras(id) => {
+                    write!(
+                        f,
+                        "01 §4 (v3): item record {id:02x?} extras digest mismatch"
+                    )
+                }
+            }
+        }
+    }
+
+    /// Like [`open_file`] but reports the failing step instead of panicking.
+    pub fn try_open_file(bytes: &[u8], password: &str) -> Result<Opened, OpenError> {
         let raw = split(bytes);
         let h = &raw.header;
         let vault_id = bytes_of(get(h, "vault_id").unwrap());
@@ -259,10 +321,13 @@ pub mod indep {
                 break;
             }
         }
-        let vault_key = vault_key.expect("01 §2: no password slot unwrapped with the spec AAD");
+        let vault_key = vault_key.ok_or(OpenError::Step(
+            "01 §2: no password slot unwrapped with the spec AAD",
+        ))?;
         let item_key = hkdf(&vault_key, &vault_id, "vault/item/v1");
         let manifest_key = hkdf(&vault_key, &vault_id, "vault/manifest/v1");
         let mut items = Vec::new();
+        let mut extras_of = Vec::new();
         let n = raw.body.len();
         for r in &raw.body[..n - 1] {
             assert_eq!(get(r, "t").unwrap().as_text(), Some("item"));
@@ -275,7 +340,10 @@ pub mod indep {
                 &bytes_of(get(r, "ct").unwrap()),
                 &aad,
             )
-            .expect("01 §4: item did not open with the spec AAD and HKDF item key");
+            .ok_or(OpenError::Step(
+                "01 §4: item did not open with the spec AAD and HKDF item key",
+            ))?;
+            extras_of.push((id.clone(), record_extras(r, &ITEM_RECORD_KEYS)));
             items.push((id, ma, ciborium::from_reader(&pt[..]).unwrap()));
         }
         let m = &raw.body[n - 1];
@@ -284,24 +352,66 @@ pub mod indep {
             Some("manifest"),
             "01 §4 manifest last"
         );
-        let digest = header_digest(h);
-        let aad = manifest_aad(&vault_id, (n - 1) as u32, raw.version, digest.as_deref());
+        let digest = header_digest(raw.version, h);
+        let record_digest = (raw.version >= BINDING_VERSION)
+            .then(|| extras_digest(&record_extras(m, &MANIFEST_RECORD_KEYS)));
+        let aad = manifest_aad(
+            &vault_id,
+            (n - 1) as u32,
+            raw.version,
+            digest.as_deref(),
+            record_digest.as_deref(),
+        );
         let pt = open(
             &manifest_key,
             &bytes_of(get(m, "nonce").unwrap()),
             &bytes_of(get(m, "ct").unwrap()),
             &aad,
         )
-        .expect("01 §4: manifest did not open with the spec AAD");
-        let manifest = ciborium::from_reader(&pt[..]).unwrap();
-        Opened {
+        .ok_or(OpenError::Step(
+            "01 §4: manifest did not open with the spec AAD",
+        ))?;
+        let manifest: Value = ciborium::from_reader(&pt[..]).unwrap();
+        // 01 §4 entries: [id, modified_at] or (v3 only) [id, modified_at, extras_digest(32)].
+        let entries = manifest.as_array().expect("01 §4 manifest is an array");
+        for e in entries {
+            let e = e.as_array().expect("01 §4 manifest entry is an array");
+            let id = bytes_of(&e[0]);
+            let listed = match e.len() {
+                2 => None,
+                3 => {
+                    if raw.version < BINDING_VERSION {
+                        return Err(OpenError::Step(
+                            "01 §4: manifest entry digest below version 3",
+                        ));
+                    }
+                    let d = bytes_of(&e[2]);
+                    if d.len() != 32 {
+                        return Err(OpenError::Step("01 §4: manifest entry digest not 32 bytes"));
+                    }
+                    Some(d)
+                }
+                _ => return Err(OpenError::Step("01 §4: manifest entry has 2 or 3 elements")),
+            };
+            if raw.version >= BINDING_VERSION {
+                let actual = extras_of
+                    .iter()
+                    .find(|(i, _)| *i == id)
+                    .filter(|(_, x)| !x.is_empty())
+                    .map(|(_, x)| extras_digest(x));
+                if actual != listed {
+                    return Err(OpenError::ItemExtras(id));
+                }
+            }
+        }
+        Ok(Opened {
             vault_key,
             item_key,
             manifest_key,
             vault_id,
             items,
             manifest,
-        }
+        })
     }
 }
 
@@ -685,7 +795,7 @@ pub fn item_plain(title: &str, device: [u8; 16], fields: Vec<Value>) -> Value {
 }
 
 /// Independent writer: seals items and the manifest with the spec AADs under `vault_key`, for the
-/// given header (kept byte-for-byte; the digest is recomputed from it when it is stamped).
+/// given header (kept byte-for-byte; the version-dependent header digest is recomputed from it).
 pub fn build_file(
     version: u16,
     header: &Value,
@@ -723,14 +833,23 @@ pub fn build_file(
             .map(|(id, ma)| Value::Array(vec![Value::Bytes(id.to_vec()), i(*ma)]))
             .collect(),
     );
-    let digest = indep::header_digest(header);
+    // Records written here carry no unknown keys: no entry digests, and (v3) the manifest
+    // record digest is that of the empty map.
+    let digest = indep::header_digest(version, header);
+    let record_digest = (version >= indep::BINDING_VERSION).then(|| indep::extras_digest(&[]));
     let mut nonce = [0u8; 24];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let ct = indep::seal(
         &manifest_key,
         &nonce,
         &enc(&man),
-        &indep::manifest_aad(&vault_id, items.len() as u32, version, digest.as_deref()),
+        &indep::manifest_aad(
+            &vault_id,
+            items.len() as u32,
+            version,
+            digest.as_deref(),
+            record_digest.as_deref(),
+        ),
     );
     body.push(canon(map(vec![
         ("t", t("manifest")),
@@ -741,8 +860,11 @@ pub fn build_file(
 }
 
 /// Starting points for hand-built files: (version, header, vault_key) of an empty file.
-/// v1: the committed unstamped `v1-empty.vault`; v2: a fresh core-made vault (stamped).
+/// v1: the committed unstamped `v1-empty.vault`; v3: a fresh core-made vault (stamped);
+/// v2: the same fresh vault with its password slots re-wrapped under the version 2 slot AAD
+/// (2026-11-27: core creates version 3 now; v2 stays covered as a supported read version).
 pub fn empty_base(version: u16) -> (u16, Value, Vec<u8>) {
+    use rand::RngCore;
     let b = if version == 1 {
         fixture("v1-empty.vault")
     } else {
@@ -754,9 +876,39 @@ pub fn empty_base(version: u16) -> (u16, Value, Vec<u8>) {
         .serialize()
     };
     let raw = split(&b);
-    assert_eq!(raw.version, version);
     let o = indep::open_file(&b, FIXTURE_PW);
-    (raw.version, raw.header, o.vault_key)
+    let mut header = raw.header;
+    if raw.version != version {
+        assert!(version == 2 && raw.version == 3, "empty_base({version})");
+        let vault_id = bytes_of(get(&header, "vault_id").unwrap());
+        let kdf = get(&header, "kdf").unwrap().clone();
+        let kek = indep::kek_password(
+            FIXTURE_PW,
+            &bytes_of(get(&kdf, "salt").unwrap()),
+            u64_of(get(&kdf, "m_cost").unwrap()) as u32,
+            u64_of(get(&kdf, "t_cost").unwrap()) as u32,
+            u64_of(get(&kdf, "p_cost").unwrap()) as u32,
+        );
+        if let Some(Value::Array(slots)) = get_mut(&mut header, "slots") {
+            for s in slots.iter_mut() {
+                if get(s, "kind").unwrap().as_text() != Some("password") {
+                    continue;
+                }
+                let sid = bytes_of(get(s, "id").unwrap());
+                let mut nonce = [0u8; 24];
+                rand::rngs::OsRng.fill_bytes(&mut nonce);
+                let wk = indep::seal(
+                    &kek,
+                    &nonce,
+                    &o.vault_key,
+                    &indep::slot_aad(version, &vault_id, &sid, "password"),
+                );
+                set(s, "nonce", Value::Bytes(nonce.to_vec()));
+                set(s, "wrapped_key", Value::Bytes(wk));
+            }
+        }
+    }
+    (version, header, o.vault_key)
 }
 
 pub fn version_of(bytes: &[u8]) -> u16 {

@@ -10,9 +10,12 @@ use vault_core::format::VaultFile;
 use vault_core::vault::FIELD_TOMBSTONE_CAP;
 use vault_core::vault::merge::merge_items;
 use vault_core::{
-    ExposeSecret, Field, FieldKind, Item, LockedVault, SecretVec, SlotKind, TamperKind,
-    UnlockedVault, Uuid, VaultError,
+    ExposeSecret, FORMAT_VERSION, Field, FieldKind, Item, LockedVault, SecretVec, SlotKind,
+    TamperKind, UnlockedVault, Uuid, VaultError,
 };
+
+/// The prefix bytes of a file written at the current version.
+const CURRENT: [u8; 2] = FORMAT_VERSION.to_be_bytes();
 
 fn dev_a() -> Uuid {
     Uuid::from_u128(0xAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA)
@@ -58,7 +61,7 @@ fn v1_holder_merging_an_upgraded_copy_adopts_version_2_and_the_file_opens() {
     let kek = SecretVec::new(vec![0x42; 32]);
     let enclave = a.add_enclave_slot(&kek, 5_000);
     b.upgrade_format(&pw(), 3_000).unwrap();
-    assert_eq!(b.header().format_version, 2);
+    assert_eq!(b.header().format_version, FORMAT_VERSION);
     assert!(a.header().slots_stamp() > b.header().slots_stamp());
     // Some item traffic on both sides so the merge is not header-only.
     a.set_field_named(id, "username", secret("from-a"), 6_000)
@@ -72,7 +75,7 @@ fn v1_holder_merging_an_upgraded_copy_adopts_version_2_and_the_file_opens() {
     assert_eq!(report.updated, 1);
     assert_eq!(
         a.header().format_version,
-        2,
+        FORMAT_VERSION,
         "version travels with the slots"
     );
     assert_eq!(a.header().slots_modified_at, b.header().slots_modified_at);
@@ -83,9 +86,9 @@ fn v1_holder_merging_an_upgraded_copy_adopts_version_2_and_the_file_opens() {
     );
 
     let bytes = a.serialize();
-    assert_eq!(&bytes[4..6], &[0, 2], "written at version 2");
+    assert_eq!(&bytes[4..6], &CURRENT, "written at the current version");
     let reopened = opens(&bytes);
-    assert_eq!(reopened.header().format_version, 2);
+    assert_eq!(reopened.header().format_version, FORMAT_VERSION);
     assert_eq!(
         reopened
             .get(id)
@@ -161,11 +164,11 @@ fn v2_holder_merging_a_newer_v1_header_keeps_version_2_and_its_slots() {
         "a newer version 1 header never wins"
     );
     assert_eq!(report.updated, 1, "items still merge");
-    assert_eq!(a.header().format_version, 2);
+    assert_eq!(a.header().format_version, FORMAT_VERSION);
     assert_eq!(a.header().slots, v2_slots, "version 2 slots untouched");
     assert_eq!(a.header().slots_modified_at, Some(3_000));
     let bytes = a.serialize();
-    assert_eq!(&bytes[4..6], &[0, 2]);
+    assert_eq!(&bytes[4..6], &CURRENT);
     let reopened = opens(&bytes);
     assert_eq!(
         reopened
@@ -193,9 +196,9 @@ fn v2_holder_merging_a_newer_v1_header_keeps_version_2_and_its_slots() {
     let a_snap = unlock(&bytes).unwrap();
     let report = b.merge_from(&a_snap).unwrap();
     assert!(report.header_updated);
-    assert_eq!(b.header().format_version, 2);
+    assert_eq!(b.header().format_version, FORMAT_VERSION);
     assert_eq!(b.header().slots, v2_slots);
-    assert!(opens(&b.serialize()).header().format_version == 2);
+    assert!(opens(&b.serialize()).header().format_version == FORMAT_VERSION);
     assert_eq!(b.header(), a.header());
 }
 
@@ -225,7 +228,7 @@ fn version_adoption_is_idempotent_and_commutative_and_never_lowers() {
         b1.header(),
         "both orders end on the same header"
     );
-    assert_eq!(a1.header().format_version, 2);
+    assert_eq!(a1.header().format_version, FORMAT_VERSION);
     assert!(
         !a1.merge_from(&b_snap).unwrap().header_updated,
         "idempotent"
@@ -276,7 +279,7 @@ fn stale_v1_handle_merging_an_upgraded_disk_copy_writes_an_openable_file() {
         assert!(report.header_updated, "{shape}");
         let bytes = handle.serialize();
         let v = opens(&bytes);
-        assert_eq!(v.header().format_version, 2, "{shape}");
+        assert_eq!(v.header().format_version, FORMAT_VERSION, "{shape}");
         assert_eq!(
             v.get(id)
                 .unwrap()
@@ -297,7 +300,10 @@ fn stale_v1_handle_merging_an_upgraded_disk_copy_writes_an_openable_file() {
             "unsaved edit",
             "{shape}"
         );
-        assert_eq!(VaultFile::parse(&bytes).unwrap().header.format_version, 2);
+        assert_eq!(
+            VaultFile::parse(&bytes).unwrap().header.format_version,
+            FORMAT_VERSION
+        );
     }
     // And the stale handle itself, never merged, still writes a valid version 1 file.
     stale.set_field_named(id, "url", secret("x"), 1).unwrap();

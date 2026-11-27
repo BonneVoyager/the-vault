@@ -376,7 +376,7 @@ fn s09_save_blocked() {
     let id = a.add_login("x", now_ms());
     a.s.save().unwrap();
     let mut b = std::fs::read(primary(&pkg)).unwrap();
-    b[4..6].copy_from_slice(&3u16.to_be_bytes());
+    b[4..6].copy_from_slice(&4u16.to_be_bytes());
     std::fs::write(primary(&pkg), &b).unwrap();
     a.s.edit(|v| v.set_field_named(id, "username", pw("blocked"), now_ms()))
         .unwrap()
@@ -414,7 +414,7 @@ fn s09b_save_blocked_is_an_event() {
     a.s.start_watching().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(700));
     let mut b = std::fs::read(primary(&pkg)).unwrap();
-    b[4..6].copy_from_slice(&3u16.to_be_bytes());
+    b[4..6].copy_from_slice(&4u16.to_be_bytes());
     std::fs::write(primary(&pkg), &b).unwrap();
     a.wait_for(4, |_| false);
     a.s.edit(|v| v.set_field_named(id, "username", pw("x2"), now_ms()))
@@ -440,7 +440,7 @@ fn s10_lock_with_unsaved_edits() {
     // then lock: unsaved edit must land in a backup.
     let id = a.add_login("unsaved-item", now_ms());
     let mut b = std::fs::read(primary(&pkg)).unwrap();
-    b[4..6].copy_from_slice(&3u16.to_be_bytes());
+    b[4..6].copy_from_slice(&4u16.to_be_bytes());
     std::fs::write(primary(&pkg), &b).unwrap();
     let _ = a.s.lock();
     assert!(a.s.vault().is_none());

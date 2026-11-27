@@ -42,7 +42,10 @@ fn f01_layout_matches_spec() {
     let raw = split(&b);
     // Rewritten 2026-10-31: 01 §9 "Version 2 (2026-10-31) adds the required field id"; README
     // "Vault format 2 ... is written for new vaults". (01 §1 still says "currently 1"; see report.)
-    assert_eq!(raw.version, 2, "01 §9 new vaults are format_version 2");
+    assert_eq!(
+        raw.version, 3,
+        "01 §9 new vaults are format_version 3 (I-04, 2026-11-27)"
+    );
     let h = &raw.header;
     assert_eq!(bytes_of(get(h, "vault_id").unwrap()).len(), 16);
     let kdf = get(h, "kdf").unwrap();
@@ -169,10 +172,10 @@ fn f03_parser_rejections() {
     m[0] = b'X';
     assert!(matches!(LockedVault::parse(&m), Err(VaultError::BadMagic)));
     let mut m = b.clone();
-    m[4..6].copy_from_slice(&3u16.to_be_bytes());
+    m[4..6].copy_from_slice(&4u16.to_be_bytes());
     assert!(matches!(
         LockedVault::parse(&m),
-        Err(VaultError::UnsupportedVersion(3))
+        Err(VaultError::UnsupportedVersion(4))
     ));
     let mut m = b.clone();
     m[6..10].copy_from_slice(&(b.len() as u32).to_be_bytes());

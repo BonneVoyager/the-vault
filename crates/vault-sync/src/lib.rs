@@ -41,7 +41,7 @@ pub use backup::{
 };
 pub use cloud::{CloudError, CloudHooks, NoopHooks, SyncLocation, classify_location};
 pub use error::{SaveBlocked, SyncError};
-pub use event::SyncEvent;
+pub use event::{Freshness, MergeEvent, SyncEvent};
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use lock::shorten_lock_timeout_for_tests;

@@ -5,7 +5,7 @@ mod common;
 use ciborium::Value;
 use common::*;
 use vault_core::format::{PREFIX_LEN, VaultFile};
-use vault_core::{LockedVault, VaultError};
+use vault_core::{FORMAT_VERSION, LockedVault, VaultError};
 
 fn parse(bytes: &[u8]) -> Result<LockedVault, VaultError> {
     LockedVault::parse(bytes)
@@ -34,13 +34,13 @@ fn bad_magic() {
 #[test]
 fn unsupported_version() {
     let mut b = good();
-    b[4] = 0;
-    b[5] = 3;
-    assert_eq!(parse(&b).unwrap_err(), VaultError::UnsupportedVersion(3));
+    let next = FORMAT_VERSION + 1;
+    b[4..6].copy_from_slice(&next.to_be_bytes());
+    assert_eq!(parse(&b).unwrap_err(), VaultError::UnsupportedVersion(next));
     b[4] = 0xFF;
     assert_eq!(
         parse(&b).unwrap_err(),
-        VaultError::UnsupportedVersion(0xFF03)
+        VaultError::UnsupportedVersion(0xFF00 | next)
     );
     // Version 0 never existed; the AADs bind the prefix version so it must be rejected early.
     b[4] = 0;

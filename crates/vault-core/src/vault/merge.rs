@@ -116,10 +116,13 @@ impl UnlockedVault {
     /// vault-sync opens the on-disk copy with the local device id, so the two
     /// `UnlockedVault`s always carry the same one. A password change, re-calibration, slot
     /// add/remove or key rotation on one device therefore survives the other device's next
-    /// save instead of being reverted by it. Top-level header extras, `vault_id` and
-    /// `created_at` are never touched. The next `serialize` seals every item and the
-    /// manifest under the adopted version's AADs and binds the adopted header's digest
-    /// (01 §4), so the manifest binding holds after adoption.
+    /// save instead of being reverted by it. Top-level header extras (unknown keys) are
+    /// adopted with the winning header (2026-11-27, I-04: from format version 3 on the
+    /// whole header is one authenticated unit); `vault_id` and `created_at` are never
+    /// touched. The next `serialize` seals every item and the manifest under the adopted
+    /// version's AADs and binds the adopted header's digest (01 §4), so the manifest
+    /// binding holds after adoption; the digests themselves are never merged, only
+    /// recomputed by the writer.
     ///
     /// **Key rotation.** Their slots wrap *their* `vault_key`, so whenever their header wins
     /// our in-memory keys are replaced by theirs too (a no-op when both sides hold the same
@@ -234,6 +237,10 @@ impl UnlockedVault {
             self.header.kdf_extras = other.header.kdf_extras.clone();
             self.header.slots_modified_at = other.header.slots_modified_at;
             self.header.slots_device_id = other.header.slots_device_id;
+            // Unknown top-level header keys travel with the header too (2026-11-27, I-04):
+            // from format version 3 on the whole header is one authenticated unit, so the
+            // winning header carries its own unknown keys, like `kdf_extras` always did.
+            self.header.extras = other.header.extras.clone();
             // Dropping the previous `Keys` zeroizes them. Same key in all but the rotation
             // case; see the docs above.
             self.keys = Keys::from_vault_key(other.keys.vault_key.clone(), self.header.vault_id);

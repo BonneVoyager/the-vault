@@ -67,7 +67,7 @@ fn u01_upgrade_drops_non_password_slots() {
     let key_before = indep::open_file(&before, FPW).vault_key;
     v.upgrade_format(&pw(FPW), 5_000).unwrap();
     let after = v.serialize();
-    assert_eq!(version_of(&after), 2, "upgraded file is version 2");
+    assert_eq!(version_of(&after), 3, "upgraded file is version 3");
     assert_eq!(
         slot_kinds(&after),
         vec!["password"],
@@ -154,7 +154,7 @@ fn u04_upgrade_fixture() {
         v.upgrade_format(&pw(FPW), 1_900_000_000_000)
             .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         let out = v.serialize();
-        assert_eq!(version_of(&out), 2, "{name}");
+        assert_eq!(version_of(&out), 3, "{name}");
         let u = LockedVault::parse(&out)
             .unwrap()
             .unlock(&pw(FPW))
@@ -209,7 +209,7 @@ fn u05_merge_across_versions_stays_openable() {
     let out = up.serialize();
     match LockedVault::parse(&out).and_then(|l| l.unlock(&pw(FPW))) {
         Ok(u) => {
-            if version_of(&out) != 2 {
+            if version_of(&out) != 3 {
                 bad.push(format!(
                     "v2 <- v1: went back to version {}",
                     version_of(&out)
@@ -260,9 +260,9 @@ fn u05_merge_across_versions_stays_openable() {
         ("v2 <- newer v1 header", up2.serialize()),
         ("v1 (newer header) <- v2", c.serialize()),
     ] {
-        if version_of(&out) != 2 {
+        if version_of(&out) != 3 {
             bad.push(format!(
-                "{label}: merged file is version {}, want 2",
+                "{label}: merged file is version {}, want 3",
                 version_of(&out)
             ));
         }
@@ -329,7 +329,10 @@ fn metadata_block_case(upgraded: bool) {
             .unwrap();
         a.s.save().unwrap();
     }
-    assert_eq!(version_of(&std::fs::read(primary(&pkg)).unwrap()), 2);
+    // 2026-11-27: upgraded -> 3; the u06b variant keeps the v2 fixture's version (a save never
+    // changes it).
+    let want = if upgraded { 3 } else { 2 };
+    assert_eq!(version_of(&std::fs::read(primary(&pkg)).unwrap()), want);
     b.s.edit(|v| v.update(id, now_ms(), |it| it.title = "edited on B".into()))
         .unwrap()
         .unwrap();
@@ -341,7 +344,7 @@ fn metadata_block_case(upgraded: bool) {
         b.seen
     );
     let disk = std::fs::read(primary(&pkg)).unwrap();
-    assert_eq!(version_of(&disk), 2, "version 2 survives B's save");
+    assert_eq!(version_of(&disk), want, "version {want} survives B's save");
     let u = LockedVault::parse(&disk)
         .unwrap()
         .unlock(&pw(FPW))
@@ -409,7 +412,7 @@ fn u07_sync_upgrade_seen_by_watcher() {
     let disk = std::fs::read(primary(&pkg)).unwrap();
     let u = LockedVault::parse(&disk).and_then(|l| l.unlock(&pw(FPW)));
     assert!(
-        r.is_ok() && u.is_ok() && version_of(&disk) == 2,
+        r.is_ok() && u.is_ok() && version_of(&disk) == 3,
         "save {r:?}; version {}; opens {:?}; events {:?}",
         version_of(&disk),
         u.as_ref().err(),

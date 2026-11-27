@@ -27,6 +27,17 @@
 //! Fields carry a required `id` (`bytes(16)`); a version 1 file's fields get deterministic
 //! derived ids on read ([`Field::derived_id`]) and explicit ones on the next save. The
 //! version in the prefix is otherwise unchanged by a save (see [`FORMAT_VERSION`]).
+//!
+//! # Format version 3 (every plaintext byte is authenticated, I-04)
+//!
+//! Nothing in the CBOR shapes changes. What changes is what the manifest vouches for
+//! ([`PLAINTEXT_BINDING_VERSION`]): the `header_digest` in the manifest AAD covers the
+//! **whole** header map (`vault_id`, `created_at`, `kdf`, `slots`, the stamp keys and every
+//! unknown key) instead of only `kdf`/`slots`/stamp, the manifest AAD also carries a digest
+//! of the manifest record's own unknown plaintext keys, and each manifest entry carries a
+//! digest of its item record's unknown plaintext keys (`[id, modified_at, digest]`; the
+//! digest is omitted for a record without unknown keys, so the manifest does not grow).
+//! See [`Header::digest`], [`manifest_aad`], [`ManifestEntry`] and [`extras_digest`].
 
 use std::collections::BTreeSet;
 
@@ -60,12 +71,33 @@ pub const MAGIC: [u8; 4] = *b"RVLT";
 /// required) and items may carry `removed_fields` tombstones; history entries may carry a
 /// `field_id`. The writer emits all three shapes regardless of the file's version, so a
 /// version 1 file saved by this build is still version 1 (older builds keep the new keys as
-/// extras) and only gains ids on disk; it is **not** silently relabelled as version 2,
+/// extras) and only gains ids on disk; it is **not** silently relabelled as a newer version,
 /// because the prefix version is bound into every slot AAD (01 §2) and re-wrapping an
-/// `enclave` slot needs a KEK the core does not hold. New vaults start at version 2;
+/// `enclave` slot needs a KEK the core does not hold.
+///
+/// **Version 3 (security review 2026-11-26 I-04, 2026-11-27):** every plaintext byte of the
+/// file is authenticated, see [`PLAINTEXT_BINDING_VERSION`]. Nothing in the CBOR shapes
+/// changes, so a version 1 or 2 file reads exactly as before and a plain save keeps its
+/// version (and its weaker, version-dependent binding). New vaults start at version 3;
 /// [`UnlockedVault::upgrade_format`](crate::UnlockedVault::upgrade_format) moves an
-/// older file up explicitly.
-pub const FORMAT_VERSION: u16 = 2;
+/// older file up explicitly (the app runs it on the next password unlock, 01 §9).
+pub const FORMAT_VERSION: u16 = 3;
+/// From this format version on, every plaintext byte of the file is bound into an AEAD tag
+/// (security review 2026-11-26 I-04):
+///
+/// - the manifest AAD carries [`Header::digest`] over the **whole** canonical header map
+///   (`vault_id`, `created_at`, `kdf` with its unknown keys, every slot, the stamp keys and
+///   every unknown header key), unconditionally (no longer only for a stamped header);
+/// - the manifest AAD also carries [`extras_digest`] of the manifest record's own unknown
+///   plaintext keys;
+/// - every manifest entry carries [`extras_digest`] of its item record's unknown plaintext
+///   keys when the record has any ([`ManifestEntry::extras_digest`]).
+///
+/// Below this version the v1.1 rules apply: the header digest covers only `kdf`, `slots`
+/// and the stamp keys, and only when the header is stamped; record-level unknown keys are
+/// unauthenticated. `magic` and `format_version` stay outside the digest: the version is
+/// already in every AAD and the magic is fixed.
+pub const PLAINTEXT_BINDING_VERSION: u16 = 3;
 /// `magic(4) || format_version(2) || header_len(4)`.
 pub const PREFIX_LEN: usize = 10;
 /// The only KDF algorithm the format knows.
@@ -122,29 +154,70 @@ pub fn item_aad(
 /// AAD for the manifest record (01 §4):
 ///
 /// ```text
-/// vault_id(16) || item_count_be32(4) || format_version_be16(2)
+/// vault_id(16) || item_count_be32(4) || format_version_be16(2) [|| header_digest(32) [|| manifest_record_digest(32)]]
 /// ```
 ///
 /// `format_version` is the version from the file prefix; `item_count` is the number of
-/// `ItemRecord`s in the body (tombstones included).
+/// `ItemRecord`s in the body (tombstones included). `header_digest` is [`Header::digest`]:
+/// under version 3 ([`PLAINTEXT_BINDING_VERSION`]) always present, over the whole header;
+/// under versions 1 and 2 present only for a stamped header, over `kdf`/`slots`/stamp (v1.1).
+/// `record_digest` is [`manifest_record_digest`]: under version 3 always present, the
+/// [`extras_digest`] of the manifest record's own unknown plaintext keys (the digest of an
+/// empty map when it has none, so the version 3 AAD has a fixed length of 86 bytes); never
+/// present below version 3, where the AAD is 22 or 54 bytes. The AAD is not stored, so the
+/// fixed-size form costs nothing. Callers pass what the version-aware helpers return and
+/// never decide the version rule themselves.
 pub fn manifest_aad(
     format_version: u16,
     vault_id: Uuid,
     item_count: u32,
-    header_digest: Option<&[u8; HEADER_DIGEST_LEN]>,
+    header_digest: Option<&[u8; DIGEST_LEN]>,
+    record_digest: Option<&[u8; DIGEST_LEN]>,
 ) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(16 + 4 + 2 + HEADER_DIGEST_LEN);
+    let mut aad = Vec::with_capacity(16 + 4 + 2 + 2 * DIGEST_LEN);
     aad.extend_from_slice(vault_id.as_bytes());
     aad.extend_from_slice(&item_count.to_be_bytes());
     aad.extend_from_slice(&format_version.to_be_bytes());
     if let Some(d) = header_digest {
         aad.extend_from_slice(d);
     }
+    if let Some(d) = record_digest {
+        aad.extend_from_slice(d);
+    }
     aad
 }
 
-/// Length of [`Header::digest`] (SHA-256).
-pub const HEADER_DIGEST_LEN: usize = 32;
+/// Length of every digest in the format (SHA-256): [`Header::digest`], [`extras_digest`].
+pub const DIGEST_LEN: usize = 32;
+/// Length of [`Header::digest`]; the same as [`DIGEST_LEN`] (older name, kept).
+pub const HEADER_DIGEST_LEN: usize = DIGEST_LEN;
+
+/// SHA-256 of the canonical CBOR encoding of `extras` as a map (`0xa0`, the empty map, when
+/// there are none). The binding of a record's unknown plaintext keys under version 3
+/// ([`PLAINTEXT_BINDING_VERSION`]): a manifest entry carries it for its item record
+/// ([`ManifestEntry::extras_digest`]) and the manifest AAD carries it for the manifest record
+/// ([`manifest_record_digest`]). Keys and values are hashed as this build's writer emits
+/// them (canonical re-encoding of the preserved entries, so entry order never matters).
+pub fn extras_digest(extras: &Extras) -> [u8; DIGEST_LEN] {
+    let map = canonicalize(Value::Map(extras.clone()));
+    Sha256::digest(encode(&map)).into()
+}
+
+/// The digest a version 3 manifest entry carries for an item record: `Some` only under
+/// [`PLAINTEXT_BINDING_VERSION`] **and** when the record has unknown plaintext keys; a record
+/// without them has no third element (absence means "none", so the manifest does not grow
+/// for ordinary items). Always `None` below version 3 (such entries are two elements).
+pub fn item_record_digest(format_version: u16, extras: &Extras) -> Option<[u8; DIGEST_LEN]> {
+    (format_version >= PLAINTEXT_BINDING_VERSION && !extras.is_empty())
+        .then(|| extras_digest(extras))
+}
+
+/// The digest the manifest AAD carries for the manifest record's own unknown plaintext keys:
+/// `Some` under [`PLAINTEXT_BINDING_VERSION`] whether or not there are any (the digest of the
+/// empty map otherwise, keeping the AAD fixed-size), `None` below.
+pub fn manifest_record_digest(format_version: u16, extras: &Extras) -> Option<[u8; DIGEST_LEN]> {
+    (format_version >= PLAINTEXT_BINDING_VERSION).then(|| extras_digest(extras))
+}
 
 /// AAD for chunk `index` of an attachment blob (01 §4 "Attachments (v1.1)"):
 ///
@@ -712,17 +785,36 @@ impl Header {
         )
     }
 
-    /// `header_digest` (01 §4): present **only when `slots_modified_at` is `Some`**, in which
-    /// case it is `SHA-256(canonical CBOR of {"kdf": <kdf map>, "slots": [<slot maps in
-    /// header order, opaque slots included>], "slots_modified_at": u64,
-    /// "slots_device_id": bytes(16) if present})`. Appended to [`manifest_aad`] by the writer
-    /// and by every unlock path, so a stripped, re-stamped, replaced or spliced header fails
-    /// the manifest tag (`Tampered(Manifest)`): only a holder of the vault key can produce a
-    /// header that verifies, which is what makes the header merge (03 §5) safe against a
-    /// file-writing attacker. The input is built from the same values the writer emits and
-    /// run through the same canonicaliser, so digest input == bytes on disk. Files without
-    /// the stamp (every v1.0 file) keep the exact old AAD.
-    pub fn digest(&self) -> Option<[u8; HEADER_DIGEST_LEN]> {
+    /// `header_digest` (01 §4), appended to [`manifest_aad`] by the writer and by every
+    /// unlock path, so a stripped, re-stamped, replaced or spliced header fails the manifest
+    /// tag (`Tampered(Manifest)`): only a holder of the vault key can produce a header that
+    /// verifies, which is what makes the header merge (03 §5) safe against a file-writing
+    /// attacker. The rule depends on `format_version`:
+    ///
+    /// - **Version 3 and up** ([`PLAINTEXT_BINDING_VERSION`]): always `Some`, the SHA-256 of
+    ///   [`Header::to_bytes`], i.e. of the **canonical re-encoding of the parsed header
+    ///   map**, which covers the whole of it: `vault_id`, `created_at`, `kdf` (with
+    ///   `kdf_extras`), every slot (opaque included, in order), `slots_modified_at` and
+    ///   `slots_device_id` when present, and every unknown header key. The input is *not*
+    ///   the raw bytes at offsets `10..10 + header_len`: the two coincide only for a
+    ///   canonical header (every file this build writes); a non-canonical header with the
+    ///   same content (keys in another order) has the same digest, so the digest binds
+    ///   content, not byte layout. The prefix (`magic`, `format_version`) is not included:
+    ///   the version is in every AAD already.
+    /// - **Versions 1 and 2** (v1.1 rule): `Some` only when `slots_modified_at` is `Some`,
+    ///   then `SHA-256(canonical CBOR of {"kdf": <kdf map>, "slots": [<slot maps in header
+    ///   order, opaque slots included>], "slots_modified_at": u64, "slots_device_id":
+    ///   bytes(16) if present})`; `vault_id`, `created_at` and header extras are not bound.
+    ///   Files without the stamp (every v1.0 file) keep the exact old 22-byte AAD.
+    ///
+    /// Either way the input is built from the same values the writer emits and run through
+    /// the same canonicaliser, so the digest input equals what this build's writer puts on
+    /// disk, and a reader recomputes it from the parsed header regardless of how the file
+    /// laid the map out.
+    pub fn digest(&self) -> Option<[u8; DIGEST_LEN]> {
+        if self.format_version >= PLAINTEXT_BINDING_VERSION {
+            return Some(Sha256::digest(self.to_bytes()).into());
+        }
         let stamp = self.slots_modified_at?;
         let mut entries = vec![
             (text("kdf"), self.kdf_value()),
@@ -844,7 +936,8 @@ pub struct ItemRecord {
     pub nonce: Nonce,
     /// `XChaCha20-Poly1305(CBOR(ItemPlain))` under `item_key`.
     pub ct: Vec<u8>,
-    /// Unknown record-level keys. Note these are plaintext and *not* authenticated.
+    /// Unknown record-level keys. Plaintext; from format version 3 on bound into the
+    /// manifest through [`ManifestEntry::extras_digest`], unauthenticated below that.
     pub extras: Extras,
 }
 
@@ -883,7 +976,8 @@ pub struct ManifestRecord {
     pub nonce: Nonce,
     /// `XChaCha20-Poly1305(CBOR([[id, modified_at], ...]))` under `manifest_key`.
     pub ct: Vec<u8>,
-    /// Unknown record-level keys. Plaintext, not authenticated.
+    /// Unknown record-level keys. Plaintext; from format version 3 on bound into the
+    /// manifest AAD through [`manifest_record_digest`], unauthenticated below that.
     pub extras: Extras,
 }
 
@@ -1453,29 +1547,80 @@ pub fn decode_item_plain(
     })
 }
 
-/// Canonical CBOR of the manifest payload: `[[id, modified_at], ...]` in the order given.
-/// Callers must pass pairs sorted by id (01 §4).
+/// One entry of the manifest payload (01 §4): what the manifest vouches for about one item
+/// record. On disk `[id, modified_at]` or, from version 3 on and only for a record with
+/// unknown plaintext keys, `[id, modified_at, extras_digest]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManifestEntry {
+    pub id: Uuid,
+    pub modified_at: Millis,
+    /// [`item_record_digest`] of the record's unknown plaintext keys (`ItemRecord::extras`).
+    /// `None` on disk means the record has none; the unlock check treats a record with
+    /// unknown keys but no digest (or vice versa) as `Tampered(Item(id))` under version 3.
+    pub extras_digest: Option<[u8; DIGEST_LEN]>,
+}
+
+/// Canonical CBOR of the manifest payload: `[[id, modified_at], ...]` in the order given,
+/// no digests (the version 1 and 2 shape; also what version 3 writes for records without
+/// unknown keys). Callers must pass pairs sorted by id (01 §4).
 pub fn encode_manifest(pairs: &[(Uuid, Millis)]) -> Vec<u8> {
-    let arr = pairs
+    let entries: Vec<ManifestEntry> = pairs
         .iter()
-        .map(|(id, m)| Value::Array(vec![bytes(id.as_bytes()), Value::from(*m)]))
+        .map(|&(id, modified_at)| ManifestEntry {
+            id,
+            modified_at,
+            extras_digest: None,
+        })
+        .collect();
+    encode_manifest_entries(&entries)
+}
+
+/// Canonical CBOR of the manifest payload: `[[id, modified_at(, extras_digest)], ...]` in
+/// the order given; the third element is written only when `Some`. Callers must pass
+/// entries sorted by id (01 §4) and must pass `extras_digest: None` throughout below
+/// version 3 (see [`item_record_digest`]).
+pub fn encode_manifest_entries(entries: &[ManifestEntry]) -> Vec<u8> {
+    let arr = entries
+        .iter()
+        .map(|e| {
+            let mut v = vec![bytes(e.id.as_bytes()), Value::from(e.modified_at)];
+            if let Some(d) = &e.extras_digest {
+                v.push(bytes(d));
+            }
+            Value::Array(v)
+        })
         .collect();
     encode(&Value::Array(arr))
 }
 
-/// Decode a decrypted manifest payload, preserving its order.
-pub fn decode_manifest(plain: &[u8]) -> Result<Vec<(Uuid, Millis)>, VaultError> {
+/// Decode a decrypted manifest payload, preserving its order. Each entry is `[id,
+/// modified_at]` or `[id, modified_at, bytes(32)]`; anything else is `Malformed`. The
+/// version rule for the third element (never below version 3) is enforced by the unlock
+/// check, which knows the file's version.
+pub fn decode_manifest(plain: &[u8]) -> Result<Vec<ManifestEntry>, VaultError> {
     as_array(decode_exact(plain, "manifest")?, "manifest")?
         .into_iter()
-        .map(|pair| {
-            let mut pair = as_array(pair, "manifest[]")?.into_iter();
-            let (Some(id), Some(m), None) = (pair.next(), pair.next(), pair.next()) else {
-                return Err(malformed("manifest[]: expected [id, modified_at]"));
+        .map(|entry| {
+            let mut parts = as_array(entry, "manifest[]")?.into_iter();
+            let (Some(id), Some(m)) = (parts.next(), parts.next()) else {
+                return Err(malformed(
+                    "manifest[]: expected [id, modified_at(, digest)]",
+                ));
             };
-            Ok((
-                as_uuid(id, "manifest[].id")?,
-                as_u64(m, "manifest[].modified_at")?,
-            ))
+            let extras_digest = match (parts.next(), parts.next()) {
+                (None, _) => None,
+                (Some(d), None) => Some(as_fixed::<DIGEST_LEN>(d, "manifest[].digest")?),
+                (Some(_), Some(_)) => {
+                    return Err(malformed(
+                        "manifest[]: expected [id, modified_at(, digest)]",
+                    ));
+                }
+            };
+            Ok(ManifestEntry {
+                id: as_uuid(id, "manifest[].id")?,
+                modified_at: as_u64(m, "manifest[].modified_at")?,
+                extras_digest,
+            })
         })
         .collect()
 }
@@ -1484,6 +1629,10 @@ pub fn decode_manifest(plain: &[u8]) -> Result<Vec<(Uuid, Millis)>, VaultError> 
 mod tests {
     use super::*;
     use crate::attachment::ATTACHMENT_VERSION;
+
+    fn hex(d: &[u8]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
 
     #[test]
     fn canonicalize_sorts_by_encoded_key_bytes() {
@@ -1524,8 +1673,8 @@ mod tests {
         assert!(MapReader::new("x", dup).is_err());
     }
 
-    /// `header_digest` input: exactly {kdf, slots, slots_modified_at[, slots_device_id]},
-    /// canonical, hashed with SHA-256; none without the stamp.
+    /// Versions 1 and 2 `header_digest` input: exactly {kdf, slots, slots_modified_at[,
+    /// slots_device_id]}, canonical, hashed with SHA-256; none without the stamp.
     #[test]
     fn header_digest_known_answer() {
         let slot = KeySlot {
@@ -1537,7 +1686,7 @@ mod tests {
             extras: vec![(text("x"), Value::Bool(true))],
         };
         let mut header = Header {
-            format_version: FORMAT_VERSION,
+            format_version: 2,
             vault_id: Uuid::from_u128(0x11),
             created_at: 1,
             kdf: KdfParams {
@@ -1588,6 +1737,15 @@ mod tests {
             panic!()
         };
         let digest_with_id = header.digest().unwrap();
+        // Pinned vector (derived once, 2026-11-27): the v2 digest of exactly this header.
+        // Every stamped v1/v2 file's manifest AAD depends on this value, so a change to the
+        // canonicaliser, the slot/kdf encoding or the digest input would make every such
+        // file `Tampered(Manifest)`; this assertion turns that into a test failure first.
+        assert_eq!(
+            hex(&digest_with_id),
+            "5d9c9a97183bed1d72dc62c2c1d0ed29c7eb7b6084f6d757201dfd7d0186f94f",
+            "v2 header_digest known-answer vector moved"
+        );
         assert_eq!(
             digest_with_id,
             expected(Value::Map(
@@ -1610,12 +1768,198 @@ mod tests {
         let mut h = header.clone();
         h.extras.clear();
         assert_eq!(h.digest().unwrap(), digest_with_id, "header extras are not");
+        let mut h = header.clone();
+        h.created_at = 2;
+        assert_eq!(
+            h.digest().unwrap(),
+            digest_with_id,
+            "created_at is not (v2)"
+        );
+        let mut h = header.clone();
+        h.format_version = 1;
+        assert_eq!(
+            h.digest().unwrap(),
+            digest_with_id,
+            "same rule for v1 and v2"
+        );
+    }
+
+    /// Version 3 `header_digest`: SHA-256 of the whole canonical header map (the exact
+    /// bytes `to_bytes` writes), stamp or no stamp, and every key moves it.
+    #[test]
+    fn header_digest_v3_covers_the_whole_header() {
+        assert_eq!(PLAINTEXT_BINDING_VERSION, 3);
+        let header = Header {
+            format_version: 3,
+            vault_id: Uuid::from_u128(0x11),
+            created_at: 1,
+            kdf: KdfParams {
+                m_cost_kib: 8192,
+                t_cost: 1,
+                p_cost: 1,
+                salt: [3; 32],
+            },
+            kdf_extras: vec![(text("x_kdf"), Value::Integer(1.into()))],
+            slots: vec![Slot::Key(KeySlot {
+                id: Uuid::from_u128(0x22),
+                kind: SlotKind::Password,
+                nonce: [7; NONCE_LEN],
+                wrapped_key: [9; WRAPPED_KEY_LEN],
+                created_at: 5,
+                extras: Vec::new(),
+            })],
+            slots_modified_at: None,
+            slots_device_id: None,
+            extras: vec![(text("x_header"), Value::Null)],
+        };
+        let unstamped = header.digest().expect("v3: digest even without a stamp");
+        let expected: [u8; DIGEST_LEN] = Sha256::digest(header.to_bytes()).into();
+        assert_eq!(
+            unstamped, expected,
+            "digest == SHA-256(canonical re-encoding of the header map)"
+        );
+        // Pinned vector (derived once, 2026-11-27): the v3 digest of exactly this header;
+        // same rationale as the v2 vector in `header_digest_known_answer`.
+        assert_eq!(
+            hex(&unstamped),
+            "a8d81ca138e2b49fb6018ca62e8f294b1549965872ada441f99bb78c5bc3f73f",
+            "v3 header_digest known-answer vector moved"
+        );
+        assert!(is_canonical(
+            &decode_exact(&header.to_bytes(), "h").unwrap()
+        ));
+
+        let moved = |f: &dyn Fn(&mut Header)| {
+            let mut h = header.clone();
+            f(&mut h);
+            let d = h.digest().unwrap();
+            let raw: [u8; DIGEST_LEN] = Sha256::digest(h.to_bytes()).into();
+            assert_eq!(d, raw);
+            d
+        };
+        let all = [
+            moved(&|h| h.created_at = 2),
+            moved(&|h| h.vault_id = Uuid::from_u128(0x12)),
+            moved(&|h| h.extras.clear()),
+            moved(&|h| h.extras.push((text("x_other"), Value::Bool(true)))),
+            moved(&|h| h.kdf_extras.clear()),
+            moved(&|h| h.kdf.t_cost = 2),
+            moved(&|h| h.slots_modified_at = Some(1)),
+            moved(&|h| h.slots_device_id = Some(Uuid::nil())),
+            moved(&|h| {
+                h.slots.push(Slot::Opaque(
+                    OpaqueSlot::new(Uuid::from_u128(0x33), "future", vec![]).unwrap(),
+                ));
+            }),
+            moved(&|h| h.slots[0].as_key_mut().unwrap().created_at = 6),
+        ];
+        for (i, d) in all.iter().enumerate() {
+            assert_ne!(*d, unstamped, "edit {i} moves the digest");
+            assert!(all[..i].iter().all(|e| e != d), "edit {i} is distinct");
+        }
+        // The version itself is not in the map, so the same header at version 2 (stamped)
+        // digests under the v1.1 rule instead: a different input, a different value.
+        let mut v2 = header.clone();
+        v2.format_version = 2;
+        v2.slots_modified_at = Some(1);
+        let mut v3 = header.clone();
+        v3.slots_modified_at = Some(1);
+        assert_ne!(v2.digest().unwrap(), v3.digest().unwrap());
+    }
+
+    /// `extras_digest`: SHA-256 of the canonical map; order-insensitive; the empty map is
+    /// `0xa0`. `item_record_digest` is absent for no extras or below version 3;
+    /// `manifest_record_digest` is present under version 3 even for no extras.
+    #[test]
+    fn extras_digest_known_answers_and_version_gates() {
+        let empty: [u8; DIGEST_LEN] = Sha256::digest([0xa0u8]).into();
+        assert_eq!(extras_digest(&Vec::new()), empty);
+        let a = vec![
+            (text("b"), Value::Integer(1.into())),
+            (text("a"), Value::Null),
+        ];
+        let b = vec![
+            (text("a"), Value::Null),
+            (text("b"), Value::Integer(1.into())),
+        ];
+        assert_eq!(extras_digest(&a), extras_digest(&b), "canonical order");
+        assert_ne!(extras_digest(&a), empty);
+        let mut c = a.clone();
+        c[0].1 = Value::Integer(2.into());
+        assert_ne!(extras_digest(&c), extras_digest(&a), "values are bound");
+        let input = encode(&canonicalize(Value::Map(a.clone())));
+        assert_eq!(extras_digest(&a), <[u8; 32]>::from(Sha256::digest(&input)));
+
+        for v in [1, 2] {
+            assert_eq!(item_record_digest(v, &a), None);
+            assert_eq!(manifest_record_digest(v, &a), None);
+            assert_eq!(manifest_record_digest(v, &Vec::new()), None);
+        }
+        assert_eq!(
+            item_record_digest(3, &Vec::new()),
+            None,
+            "absence means none"
+        );
+        assert_eq!(item_record_digest(3, &a), Some(extras_digest(&a)));
+        assert_eq!(manifest_record_digest(3, &Vec::new()), Some(empty));
+        assert_eq!(manifest_record_digest(3, &a), Some(extras_digest(&a)));
+        assert_eq!(item_record_digest(4, &a), Some(extras_digest(&a)), "and up");
     }
 
     #[test]
     fn manifest_roundtrip() {
         let pairs = vec![(Uuid::from_u128(1), 5u64), (Uuid::from_u128(2), 7)];
-        assert_eq!(decode_manifest(&encode_manifest(&pairs)).unwrap(), pairs);
+        let plain = encode_manifest(&pairs);
+        let decoded = decode_manifest(&plain).unwrap();
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|e| (e.id, e.modified_at))
+                .collect::<Vec<_>>(),
+            pairs
+        );
+        assert!(decoded.iter().all(|e| e.extras_digest.is_none()));
+        // Three-element entries: the digest is written only when Some, so the bytes of a
+        // digest-less entry are exactly the two-element bytes.
+        let entries = vec![
+            ManifestEntry {
+                id: Uuid::from_u128(1),
+                modified_at: 5,
+                extras_digest: Some([0xAB; DIGEST_LEN]),
+            },
+            ManifestEntry {
+                id: Uuid::from_u128(2),
+                modified_at: 7,
+                extras_digest: None,
+            },
+        ];
+        let mixed = encode_manifest_entries(&entries);
+        assert_eq!(decode_manifest(&mixed).unwrap(), entries);
+        assert_eq!(
+            encode_manifest_entries(&entries[1..]),
+            encode_manifest(&pairs[1..])
+        );
+        assert_eq!(mixed.len(), plain.len() + 2 + DIGEST_LEN);
+        // A digest of the wrong length, or a fourth element, is structural damage.
+        let bad = Value::Array(vec![Value::Array(vec![
+            bytes(&[1; 16]),
+            Value::from(5u64),
+            bytes(&[0; 31]),
+        ])]);
+        assert!(matches!(
+            decode_manifest(&encode(&bad)),
+            Err(VaultError::Malformed(_))
+        ));
+        let four = Value::Array(vec![Value::Array(vec![
+            bytes(&[1; 16]),
+            Value::from(5u64),
+            bytes(&[0; 32]),
+            Value::Null,
+        ])]);
+        assert!(matches!(
+            decode_manifest(&encode(&four)),
+            Err(VaultError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -1625,8 +1969,8 @@ mod tests {
         let aad = slot_aad(FORMAT_VERSION, vid, sid, &SlotKind::Password);
         assert_eq!(aad.len(), 4 + 2 + 16 + 16 + 8);
         assert_eq!(&aad[..4], b"RVLT");
-        assert_eq!(FORMAT_VERSION, 2);
-        assert_eq!(&aad[4..6], &[0, 2]);
+        assert_eq!(FORMAT_VERSION, 3);
+        assert_eq!(&aad[4..6], &[0, 3]);
         assert_eq!(&slot_aad(1, vid, sid, &SlotKind::Password)[4..6], &[0, 1]);
         assert_eq!(&aad[6..22], vid.as_bytes());
         assert_eq!(&aad[22..38], sid.as_bytes());
@@ -1635,20 +1979,31 @@ mod tests {
         let aad = item_aad(FORMAT_VERSION, vid, sid, 0x0102);
         assert_eq!(aad.len(), 16 + 16 + 8 + 2);
         assert_eq!(&aad[32..40], &[0, 0, 0, 0, 0, 0, 1, 2]);
-        assert_eq!(&aad[40..], &[0, 2]);
+        assert_eq!(&aad[40..], &[0, 3]);
         assert_eq!(&item_aad(1, vid, sid, 0x0102)[40..], &[0, 1]);
 
-        let aad = manifest_aad(FORMAT_VERSION, vid, 3, None);
+        // Versions 1 and 2: vault_id || item_count_be32 || version_be16 (22 bytes), plus
+        // header_digest(32) for stamped files only (54 bytes).
+        let aad = manifest_aad(2, vid, 3, None, None);
         assert_eq!(aad.len(), 16 + 4 + 2);
         assert_eq!(&aad[16..20], &[0, 0, 0, 3]);
         assert_eq!(&aad[20..], &[0, 2]);
-        assert_eq!(&manifest_aad(1, vid, 3, None)[20..], &[0, 1]);
-        // vault_id || item_count_be32 || version_be16 || header_digest(32), stamped files only.
-        let digest = [0xAB; HEADER_DIGEST_LEN];
-        let with = manifest_aad(FORMAT_VERSION, vid, 3, Some(&digest));
+        assert_eq!(&manifest_aad(1, vid, 3, None, None)[20..], &[0, 1]);
+        let digest = [0xAB; DIGEST_LEN];
+        let with = manifest_aad(2, vid, 3, Some(&digest), None);
         assert_eq!(with.len(), 16 + 4 + 2 + 32);
         assert_eq!(&with[..22], &aad[..]);
         assert_eq!(&with[22..], &digest);
+        // Version 3: vault_id || item_count_be32 || version_be16 || header_digest(32) ||
+        // manifest_record_digest(32), always 86 bytes.
+        let record = [0xCD; DIGEST_LEN];
+        let v3 = manifest_aad(FORMAT_VERSION, vid, 3, Some(&digest), Some(&record));
+        assert_eq!(v3.len(), 16 + 4 + 2 + 32 + 32);
+        assert_eq!(&v3[..16], vid.as_bytes());
+        assert_eq!(&v3[16..20], &[0, 0, 0, 3]);
+        assert_eq!(&v3[20..22], &[0, 3]);
+        assert_eq!(&v3[22..54], &digest);
+        assert_eq!(&v3[54..], &record);
 
         // vault_id || ref.id || index_be32 || chunk_count_be32 || attachment_version_be16
         assert_eq!(ATTACHMENT_VERSION, 1);

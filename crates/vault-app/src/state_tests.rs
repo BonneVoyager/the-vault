@@ -1006,3 +1006,369 @@ fn lock_with_planted_backups_keeps_edits_in_the_fallback_dir(cx: &mut TestAppCon
         assert!(s.save_blocked().is_none() && !s.sync.save_failing);
     });
 }
+
+// I-02: the freshness anchor.
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// Adds an item through the app and saves it like autosave does.
+fn add_and_save(state: &Entity<AppState>, title: &str, cx: &mut TestAppContext) {
+    state.update(cx, |s, cx| {
+        let vault = s.vault.as_mut().unwrap();
+        let (device, now) = (vault.device_id(), wall_ms());
+        vault
+            .edit(|v| v.insert(Item::new(title, device, now), now))
+            .unwrap();
+        s.save_now(cx);
+        assert!(!s.vault.as_ref().unwrap().is_dirty());
+    });
+}
+
+fn anchor(state: &Entity<AppState>, cx: &mut TestAppContext) -> FreshnessSeen {
+    state.read_with(cx, |s, _| s.settings.freshness_seen[&s.vault_id.unwrap()])
+}
+
+/// Puts `bytes` in place as `vault.bin`, renamed in so a watcher never reads half of it.
+fn plant(file: &Path, bytes: &[u8]) {
+    let tmp = file.with_file_name(".planted.tmp");
+    std::fs::write(&tmp, bytes).unwrap();
+    std::fs::rename(&tmp, file).unwrap();
+}
+
+fn poll_until(state: &Entity<AppState>, cx: &mut TestAppContext, done: impl Fn(&AppState) -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !state.read_with(cx, |s, _| done(s)) {
+        assert!(std::time::Instant::now() < deadline, "no merge seen");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        state.update(cx, |s, cx| s.poll_sync(cx));
+    }
+}
+
+#[gpui::test]
+fn unlock_records_the_freshness_anchor(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = create(dir.path()).path().to_owned();
+    let state = new_state(cx);
+    open_and_unlock(&state, &path, cx);
+    let file = state.read_with(cx, |s, _| {
+        s.vault.as_ref().unwrap().on_disk_freshness().unwrap()
+    });
+    let seen = anchor(&state, cx);
+    assert_eq!(seen, FreshnessSeen::of(&file));
+    assert!(seen.slots_modified_at > 0);
+    // A save raises it to the file written.
+    add_and_save(&state, "GitHub", cx);
+    let after = anchor(&state, cx);
+    assert!(after.max_item_modified_at > 0);
+    assert!(after.slots_modified_at >= seen.slots_modified_at);
+    state.read_with(cx, |s, _| assert!(s.sync.stale_file.is_none()));
+}
+
+#[gpui::test]
+fn rolled_back_file_is_flagged_at_unlock(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = create(dir.path()).path().to_owned();
+    let state = new_state(cx);
+    open_and_unlock(&state, &path, cx);
+    let file = state.read_with(cx, |s, _| s.vault.as_ref().unwrap().vault_file().to_owned());
+    let old = std::fs::read(&file).unwrap();
+    add_and_save(&state, "GitHub", cx);
+    state.update(cx, |s, cx| s.lock(cx));
+    plant(&file, &old);
+    state.update(cx, |s, cx| s.unlock(SecretString::new(PW.into()), cx));
+    cx.run_until_parked();
+    let seen = anchor(&state, cx);
+    state.read_with(cx, |s, _| {
+        assert!(!s.locked);
+        assert_eq!(
+            s.toast.as_ref().unwrap().message.as_ref(),
+            sync::STALE_ON_UNLOCK
+        );
+        let stale = s.sync.stale_file.unwrap();
+        assert!(seen.is_newer_than(&stale.peer));
+        assert_eq!(stale.peer.item_count, 0);
+    });
+    // Never lowered by the stale unlock.
+    assert!(seen.max_item_modified_at > 0);
+    // The same file again: flagged, but no second toast.
+    state.update(cx, |s, cx| {
+        s.lock(cx);
+        s.toast = None;
+        s.unlock(SecretString::new(PW.into()), cx);
+    });
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| {
+        assert!(s.sync.stale_file.is_some());
+        assert!(
+            s.toast
+                .as_ref()
+                .is_none_or(|t| t.message.as_ref() != sync::STALE_ON_UNLOCK)
+        );
+    });
+    // Switching vaults clears the flag.
+    state.update(cx, |s, cx| s.close_vault(cx));
+    state.read_with(cx, |s, _| assert!(s.sync.stale_file.is_none()));
+}
+
+#[gpui::test]
+fn rolled_back_file_arriving_by_merge_is_flagged_until_a_save(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = create(dir.path()).path().to_owned();
+    let state = new_state(cx);
+    open_and_unlock(&state, &path, cx);
+    let file = state.read_with(cx, |s, _| s.vault.as_ref().unwrap().vault_file().to_owned());
+    let old = std::fs::read(&file).unwrap();
+    add_and_save(&state, "GitHub", cx);
+    let seen = anchor(&state, cx);
+    plant(&file, &old);
+    poll_until(&state, cx, |s| s.sync.stale_file.is_some());
+    state.read_with(cx, |s, _| {
+        assert_eq!(
+            s.toast.as_ref().unwrap().message.as_ref(),
+            sync::STALE_ON_MERGE
+        );
+        assert_eq!(s.item_count(), 1, "our newer state was kept");
+    });
+    assert_eq!(anchor(&state, cx), seen);
+    add_and_save(&state, "Mail", cx);
+    state.read_with(cx, |s, _| assert!(s.sync.stale_file.is_none()));
+}
+
+#[gpui::test]
+fn newer_file_is_never_flagged(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = create(dir.path()).path().to_owned();
+    let state = new_state(cx);
+    open_and_unlock(&state, &path, cx);
+    let mut other = SyncedVault::open(&path, Uuid::new_v4(), Arc::new(NoopHooks)).unwrap();
+    other.unlock(&SecretString::new(PW.into())).unwrap();
+    let add = |other: &mut SyncedVault, title: &str| {
+        let (device, now) = (other.device_id(), wall_ms());
+        other
+            .edit(|v| v.insert(Item::new(title, device, now), now))
+            .unwrap();
+        other.save().unwrap();
+    };
+    // By merge.
+    add(&mut other, "From the other Mac");
+    poll_until(&state, cx, |s| s.item_count() == 1);
+    let merged = anchor(&state, cx);
+    state.read_with(cx, |s, _| {
+        assert!(s.sync.stale_file.is_none());
+        assert_eq!(
+            merged,
+            FreshnessSeen::of(&s.vault.as_ref().unwrap().on_disk_freshness().unwrap())
+        );
+    });
+    // By unlock.
+    state.update(cx, |s, cx| s.lock(cx));
+    add(&mut other, "Second");
+    state.update(cx, |s, cx| s.unlock(SecretString::new(PW.into()), cx));
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| {
+        assert_eq!(s.item_count(), 2);
+        assert!(s.sync.stale_file.is_none());
+        assert!(
+            s.toast
+                .as_ref()
+                .is_none_or(|t| t.message.as_ref() != sync::STALE_ON_UNLOCK)
+        );
+    });
+    assert!(anchor(&state, cx).max_item_modified_at > merged.max_item_modified_at);
+}
+
+#[test]
+fn freshness_compares_stamps_and_record_count() {
+    let seen = FreshnessSeen {
+        max_item_modified_at: 10,
+        slots_modified_at: 20,
+        item_count: 3,
+    };
+    let file = |item: Option<u64>, slots: Option<u64>, count| Freshness {
+        max_item_modified_at: item,
+        slots_modified_at: slots,
+        item_count: count,
+    };
+    assert!(!seen.is_newer_than(&file(Some(10), Some(20), 3)));
+    assert!(!seen.is_newer_than(&file(Some(11), Some(21), 4)));
+    assert!(seen.is_newer_than(&file(Some(9), Some(20), 3)));
+    assert!(seen.is_newer_than(&file(Some(10), Some(19), 3)));
+    assert!(
+        seen.is_newer_than(&file(Some(10), Some(20), 2)),
+        "fewer records"
+    );
+    assert!(seen.is_newer_than(&file(None, None, 3)));
+    // Missing stamps only count against a recorded value.
+    assert!(!FreshnessSeen::default().is_newer_than(&file(None, None, 0)));
+    let raised = seen.raised(&file(Some(5), Some(30), 1));
+    assert_eq!(
+        raised,
+        FreshnessSeen {
+            max_item_modified_at: 10,
+            slots_modified_at: 30,
+            item_count: 3,
+        }
+    );
+}
+
+const V2_BASIC: &[u8] = include_bytes!("../../vault-core/tests/fixtures/v2-basic.vault");
+/// The password of core's fixtures (vault-core/tests/fixtures.rs).
+const FIXTURE_PW: &str = "correct horse battery staple";
+
+fn fixture_unlock(state: &Entity<AppState>, pw: &str, cx: &mut TestAppContext) {
+    state.update(cx, |s, cx| s.unlock(SecretString::new(pw.into()), cx));
+    cx.run_until_parked();
+    state.read_with(cx, |s, _| assert!(!s.locked, "{:?}", s.error));
+}
+
+/// The stale check judges the file as the unlock opened it, not the copy the format upgrade
+/// rewrites right after; its toast replaces the upgrade toast, and the anchor only moves
+/// past the rolled-back file with the next save.
+#[gpui::test]
+fn rolled_back_old_format_file_is_judged_before_the_upgrade(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("t.vault");
+    std::fs::create_dir(&pkg).unwrap();
+    let file = pkg.join(VAULT_FILE_NAME);
+    std::fs::write(&file, V2_BASIC).unwrap();
+    let state = new_state(cx);
+    state.update(cx, |s, cx| {
+        s.set_biometrics(crate::biometric::fake::FakeBiometrics::new());
+        s.open_vault(pkg.clone(), cx);
+    });
+    cx.run_until_parked();
+    fixture_unlock(&state, FIXTURE_PW, cx);
+    state.read_with(cx, |s, _| {
+        assert_eq!(s.toast.as_ref().unwrap().message.as_ref(), UPGRADED);
+        assert!(s.sync.stale_file.is_none());
+    });
+
+    // Another copy changes the password; this Mac sees that file at its next unlock.
+    let mut other = SyncedVault::open(&pkg, Uuid::new_v4(), Arc::new(NoopHooks)).unwrap();
+    other.unlock(&SecretString::new(FIXTURE_PW.into())).unwrap();
+    other
+        .edit(|v| {
+            v.change_password(
+                &SecretString::new(FIXTURE_PW.into()),
+                &SecretString::new(PW.into()),
+                KdfParams::for_tests(),
+                wall_ms(),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    other.save().unwrap();
+    state.update(cx, |s, cx| s.lock(cx));
+    fixture_unlock(&state, PW, cx);
+    let seen = anchor(&state, cx);
+
+    // Rolled back to the version 2 file: the old password opens it and upgrades it.
+    state.update(cx, |s, cx| s.lock(cx));
+    plant(&file, V2_BASIC);
+    fixture_unlock(&state, FIXTURE_PW, cx);
+    state.read_with(cx, |s, _| {
+        assert_eq!(
+            s.toast.as_ref().unwrap().message.as_ref(),
+            sync::STALE_ON_UNLOCK
+        );
+        let peer = s.sync.stale_file.unwrap().peer;
+        let fixture = vault_sync::Freshness::of(&vault_core::LockedVault::parse(V2_BASIC).unwrap());
+        assert_eq!(peer, fixture, "judged the file as opened");
+        let v = s.unlocked_vault().unwrap();
+        assert_eq!(v.header().format_version, vault_core::FORMAT_VERSION);
+    });
+    assert_eq!(anchor(&state, cx), seen, "not raised to the upgraded copy");
+    add_and_save(&state, "After", cx);
+    let after = anchor(&state, cx);
+    assert!(after.max_item_modified_at > seen.max_item_modified_at);
+    state.read_with(cx, |s, _| assert!(s.sync.stale_file.is_none()));
+}
+
+/// The merge path flags only a file that brought nothing in: a device that was offline
+/// has older stamps but new items.
+#[gpui::test]
+fn merge_flags_only_a_file_that_brought_nothing_in(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = create(dir.path()).path().to_owned();
+    let state = new_state(cx);
+    open_and_unlock(&state, &path, cx);
+    let file = path.join(VAULT_FILE_NAME);
+    // An offline device: a copy of the package as it is now, edited apart.
+    let peer_pkg = dir.path().join("peer.vault");
+    std::fs::create_dir(&peer_pkg).unwrap();
+    std::fs::copy(&file, peer_pkg.join(VAULT_FILE_NAME)).unwrap();
+    let mut peer = SyncedVault::open(&peer_pkg, Uuid::new_v4(), Arc::new(NoopHooks)).unwrap();
+    peer.unlock(&SecretString::new(PW.into())).unwrap();
+    let device = peer.device_id();
+    peer.edit(|v| v.insert(Item::new("Offline", device, 1_000), 1_000))
+        .unwrap();
+    peer.save().unwrap();
+    let peer_bytes = std::fs::read(peer_pkg.join(VAULT_FILE_NAME)).unwrap();
+
+    add_and_save(&state, "Mine", cx);
+    let seen = anchor(&state, cx);
+    let peer_file =
+        vault_sync::Freshness::of(&vault_core::LockedVault::parse(&peer_bytes).unwrap());
+    assert!(seen.is_newer_than(&peer_file), "older stamp, fewer records");
+
+    plant(&file, &peer_bytes);
+    poll_until(&state, cx, |s| s.item_count() == 2);
+    state.read_with(cx, |s, _| {
+        assert!(s.sync.stale_file.is_none());
+        assert!(
+            s.toast
+                .as_ref()
+                .is_none_or(|t| t.message.as_ref() != sync::STALE_ON_MERGE)
+        );
+    });
+    // The same file again brings nothing new: now it is a rollback.
+    plant(&file, &peer_bytes);
+    poll_until(&state, cx, |s| s.sync.stale_file.is_some());
+    state.read_with(cx, |s, _| {
+        assert_eq!(
+            s.toast.as_ref().unwrap().message.as_ref(),
+            sync::STALE_ON_MERGE
+        );
+        assert_eq!(s.item_count(), 2);
+    });
+}
+
+/// A restore is a deliberate rollback: the anchor becomes the restored file.
+#[gpui::test]
+fn restore_resets_the_freshness_anchor(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = create(dir.path()).path().to_owned();
+    let state = new_state(cx);
+    open_and_unlock(&state, &path, cx);
+    let backup = state.update(cx, |s, cx| {
+        s.backup_now(cx);
+        s.sync.backups[0].path.clone()
+    });
+    add_and_save(&state, "GitHub", cx);
+    add_and_save(&state, "Mail", cx);
+    let before = anchor(&state, cx);
+    assert_eq!(before.item_count, 2);
+    state.update(cx, |s, cx| {
+        s.request_restore(backup, cx);
+        s.confirm_restore(cx);
+        s.restore_backup(SecretString::new(PW.into()), cx);
+    });
+    cx.run_until_parked();
+    let after = anchor(&state, cx);
+    state.read_with(cx, |s, _| {
+        assert_eq!(s.item_count(), 0, "{:?}", s.toast);
+        let file = s.vault.as_ref().unwrap().on_disk_freshness().unwrap();
+        assert_eq!(after, FreshnessSeen::of(&file));
+    });
+    assert_eq!(after.item_count, 0);
+    assert!(after.max_item_modified_at < before.max_item_modified_at);
+    // And the next unlock of the restored file does not flag it.
+    state.update(cx, |s, cx| s.lock(cx));
+    fixture_unlock(&state, PW, cx);
+    state.read_with(cx, |s, _| assert!(s.sync.stale_file.is_none()));
+}

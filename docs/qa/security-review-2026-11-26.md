@@ -419,10 +419,10 @@ It rejects six named keys. `com.apple.security.cs.disable-executable-page-protec
 
 ## 6. Informational findings
 
-**I-01. Touch ID has never run on real hardware, and the packaged app most likely cannot use it.**
+**I-01. Touch ID has never run on real hardware, and the packaged app most likely cannot use it.** *Groundwork 2026-11-27:* entitlements template, provisioning-profile embedding and `docs/signing.md`; the signed build and the Touch ID checklist wait on the owner's identity.
 Every Keychain call uses the data-protection keychain (`crates/vault-macos/src/biometric.rs:287`, `:301`, `:407`), which needs a keychain access group entitlement and a provisioning profile. `scripts/entitlements.plist` is empty and the spec says to keep it empty. The project's own history records the real path as unverified, and the integration test passes vacuously on unsigned builds. It fails closed, so there is no exposure, but every claim in this report about Touch ID rests on code reading alone. The error mapping for an invalidated key and the prompt-per-unlock behaviour are untested. This is the largest assurance gap in the project.
 
-**I-02. No local freshness anchor.**
+**I-02. No local freshness anchor.** *Fixed 2026-11-27:* per-vault `freshness_seen` in settings.json (item stamp, slots stamp, item count), stale-file toasts on unlock and on a no-op merge; forged higher stamps (key holder) remain out of scope.
 Whole-file rollback is an accepted limit. A small record kept outside the sync folder (highest slot stamp and item timestamp seen, last KDF parameters, per vault) would let a device that has seen a newer state recognise a stale file. It would address the accepted rollback on known devices and reduce M-02 and L-01.
 
 **I-03. The file reveals more than the README lists.**
@@ -436,7 +436,7 @@ The README says the file leaks only item count, item ids, modification times and
 
 None of this is a break, but the documentation should match.
 
-**I-04. Some plaintext is not authenticated.**
+**I-04. Some plaintext is not authenticated.** *Fixed 2026-11-27:* format version 3 binds the whole header and every record's unknown keys through the manifest (01 §4); v1/v2 read as before and upgrade on the next password unlock.
 The header `created_at`, unknown header keys, and unknown record-level keys are preserved and re-emitted but bound to nothing. An attacker can alter the first and inject the others, which persist across saves. The code comments note this.
 
 **I-05. Secrets in memory are dropped, not always wiped.**

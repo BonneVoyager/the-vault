@@ -477,7 +477,7 @@ fn fi08_v1_file_and_upgrade() {
     assert_eq!(icons(&kept), vec![Some("key".to_string()), None], "v1 save");
     v.upgrade_format(&pw(FIXTURE_PW), 2000).unwrap();
     let out = v.serialize();
-    assert_eq!(version_of(&out), 2);
+    assert_eq!(version_of(&out), 3);
     assert_eq!(
         icons(&unlock(&out).unwrap()),
         vec![Some("key".to_string()), None],
@@ -855,7 +855,7 @@ fn fi14_cli_upgrade_and_sync() {
     let (rc, o) = cli(&pkg, FIXTURE_PW, &["upgrade"]);
     assert_eq!(rc, 0, "{o}");
     let nb = std::fs::read(pkg.join("vault.bin")).unwrap();
-    assert_eq!(version_of(&nb), 2);
+    assert_eq!(version_of(&nb), 3);
     let v = unlock(&nb).unwrap();
     let item = Uuid::from_bytes(id);
     assert_eq!(

@@ -917,7 +917,8 @@ mod tests {
             .and_then(|item| item.text())
             .expect("clipboard text");
         assert!(copied.starts_with("app version: "), "{copied}");
-        assert!(copied.contains("format version: 2\n"), "{copied}");
+        let format_line = format!("format version: {}\n", vault_core::FORMAT_VERSION);
+        assert!(copied.contains(&format_line), "{copied}");
         state.read_with(&vcx, |s, _| {
             assert_eq!(
                 s.toast.as_ref().unwrap().message.as_ref(),

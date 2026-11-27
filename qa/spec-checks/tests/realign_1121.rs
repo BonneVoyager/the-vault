@@ -1370,7 +1370,7 @@ fn ra23_newer_version_written_while_locked() {
             a.wait_for(5, |e| e.iter().any(|x| x.starts_with("ChangedWhileLocked")));
         }
         let mut b = std::fs::read(primary(&pkg)).unwrap();
-        b[4..6].copy_from_slice(&3u16.to_be_bytes());
+        b[4..6].copy_from_slice(&4u16.to_be_bytes());
         let tmp = pkg.join("staged");
         std::fs::write(&tmp, &b).unwrap();
         std::fs::rename(&tmp, primary(&pkg)).unwrap();

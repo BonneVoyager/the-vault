@@ -300,7 +300,12 @@ fn delete_permanently_errors() {
 
 #[test]
 fn delete_permanently_drops_record_extras() {
-    let (mut v, id) = loaded_vault();
+    // Record-level unknown keys can be planted by hand only below format version 3 (from 3
+    // on the manifest binds them, 01 §4, and the plant would be `Tampered(Item)`), so this
+    // uses the version 1 fixture; the save keeps it at version 1.
+    let mut v = unstamped_vault();
+    v.set_device_id(dev_a());
+    let id = v.insert(sample_item(7, 1_000), 1_000);
     v.delete(id, 2_000).unwrap();
     // Plant an unknown plaintext record-level key (01 §9) the way an older build preserves it.
     let bytes = rewrite(&v.serialize(), |f| {

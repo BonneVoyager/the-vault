@@ -54,7 +54,9 @@ pub enum TamperKind {
     /// [`VaultError::Malformed`], so this variant is currently never produced by this crate.
     Header,
     /// The item record with this id failed its AEAD tag (modified, swapped between vaults,
-    /// or its plaintext `modified_at` was edited).
+    /// or its plaintext `modified_at` was edited), or (format version 3) its unknown
+    /// plaintext keys differ from what the manifest recorded for it (injected, altered or
+    /// removed; 01 §4).
     Item(Uuid),
     /// The manifest failed its tag or its `(id, modified_at)` pairs do not match the records.
     Manifest,

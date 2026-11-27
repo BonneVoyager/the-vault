@@ -22,7 +22,7 @@ use crate::attachments::prune_stale_vault_tmp;
 use crate::backup::{self, BackupInfo, BackupKind};
 use crate::cloud::CloudHooks;
 use crate::error::{SaveBlocked, SyncError};
-use crate::event::SyncEvent;
+use crate::event::{Freshness, SyncEvent};
 use crate::lock::PackageLock;
 use crate::package;
 use crate::watch::Watcher;
@@ -1434,6 +1434,13 @@ impl SyncedVault {
             vault_id: self.locked.vault_id(),
             slots: self.locked.slots().collect(),
         }
+    }
+
+    /// [`Freshness`] of `vault.bin` as last read or written (the version the next unlock
+    /// opens; after an unlock, the version it opened). `None` while the primary is known to
+    /// be missing.
+    pub fn on_disk_freshness(&self) -> Option<Freshness> {
+        (!self.primary_missing).then(|| Freshness::of(&self.locked))
     }
 
     /// Fingerprint of the last bytes this instance wrote to or read from `vault.bin`. Exposed

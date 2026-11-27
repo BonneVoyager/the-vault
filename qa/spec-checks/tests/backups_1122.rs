@@ -464,7 +464,7 @@ fn bk07_backups_disabled() {
     );
     // Unsaved copy on lock while disabled
     let mut b = std::fs::read(primary(&pkg)).unwrap();
-    b[4..6].copy_from_slice(&3u16.to_be_bytes());
+    b[4..6].copy_from_slice(&4u16.to_be_bytes());
     std::fs::write(primary(&pkg), &b).unwrap();
     let kept = a.add_login("unsaved while backups off", now_ms());
     let out = a.s.lock();
@@ -561,7 +561,7 @@ fn rs01_every_listed_kind_restores() {
     a.wait_for(10, |e| count(e, "ConflictAbsorbed") >= 2);
     // Unsaved copy
     let mut b = std::fs::read(primary(&pkg)).unwrap();
-    b[4..6].copy_from_slice(&3u16.to_be_bytes());
+    b[4..6].copy_from_slice(&4u16.to_be_bytes());
     let good = std::fs::read(primary(&pkg)).unwrap();
     std::fs::write(primary(&pkg), &b).unwrap();
     a.s.stop_watching();
@@ -1015,7 +1015,7 @@ fn sb01_save_blocked_survives_lock_unlock_and_clears() {
     settle();
     let good = std::fs::read(primary(&pkg)).unwrap();
     let mut newer = good.clone();
-    newer[4..6].copy_from_slice(&3u16.to_be_bytes());
+    newer[4..6].copy_from_slice(&4u16.to_be_bytes());
     let tmp = st.path().join("n");
     std::fs::write(&tmp, &newer).unwrap();
     std::fs::rename(&tmp, primary(&pkg)).unwrap();
@@ -1141,7 +1141,7 @@ fn sb03_newer_primary_while_locked_then_reverted() {
     a.s.save().unwrap();
     let good = std::fs::read(primary(&pkg)).unwrap();
     let mut newer = good.clone();
-    newer[4..6].copy_from_slice(&3u16.to_be_bytes());
+    newer[4..6].copy_from_slice(&4u16.to_be_bytes());
     let _ = a.s.lock();
     std::fs::write(primary(&pkg), &newer).unwrap();
     let un = a.s.unlock(&pw(PW));

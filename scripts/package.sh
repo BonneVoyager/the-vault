@@ -48,6 +48,72 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   exit 1
 fi
 
+# Team-ID signed build (Touch ID needs the data-protection keychain; review I-01,
+# docs/signing.md). Only with VAULT_TEAM_ID set; without it nothing below changes the build.
+TEAM_ID="${VAULT_TEAM_ID:-}"
+if [[ -n "$TEAM_ID" && $SKIP_SIGN -eq 1 ]]; then
+  echo "note: --skip-sign ignores VAULT_TEAM_ID and VAULT_PROVISION_PROFILE (unsigned build)"
+  TEAM_ID=""
+fi
+if [[ -n "$TEAM_ID" ]]; then
+  if [[ ! "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
+    echo "error: VAULT_TEAM_ID must be the 10-character Team ID (A-Z, 0-9)" >&2
+    exit 1
+  fi
+  PROFILE="${VAULT_PROVISION_PROFILE:-}"
+  if [[ -z "$PROFILE" || ! -f "$PROFILE" ]]; then
+    echo "error: VAULT_TEAM_ID is set, so VAULT_PROVISION_PROFILE must name an existing" >&2
+    echo "       Developer ID .provisionprofile for this bundle id (see docs/signing.md)" >&2
+    exit 1
+  fi
+  BUNDLE_ID="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" scripts/Info.plist)"
+  # The profile is CMS-signed; read its team and App ID (keys contain dots, so PlistBuddy).
+  profile_plist="$(mktemp)"
+  if ! security cms -D -i "$PROFILE" > "$profile_plist" 2> /dev/null; then
+    rm -f "$profile_plist"
+    echo "error: VAULT_PROVISION_PROFILE is not a readable provisioning profile" >&2
+    exit 1
+  fi
+  profile_team="$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" "$profile_plist" 2> /dev/null || true)"
+  profile_app_id="$(/usr/libexec/PlistBuddy \
+    -c "Print :Entitlements:com.apple.application-identifier" "$profile_plist" 2> /dev/null || true)"
+  profile_kag="$(/usr/libexec/PlistBuddy \
+    -c "Print :Entitlements:keychain-access-groups" "$profile_plist" 2> /dev/null || true)"
+  rm -f "$profile_plist"
+  if [[ "$profile_team" != "$TEAM_ID" ]]; then
+    echo "error: provisioning profile team is '${profile_team:-none}', VAULT_TEAM_ID is $TEAM_ID" >&2
+    exit 1
+  fi
+  if [[ "$profile_app_id" != "$TEAM_ID.$BUNDLE_ID" ]]; then
+    echo "error: provisioning profile App ID is '${profile_app_id:-none}', expected $TEAM_ID.$BUNDLE_ID" >&2
+    echo "       (create the profile for the explicit App ID $BUNDLE_ID, not a wildcard)" >&2
+    exit 1
+  fi
+  # PlistBuddy prints the array one entry per line; the group must be allowed exactly or by
+  # the team wildcard.
+  if ! sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<< "$profile_kag" \
+    | grep -qxF -e "$TEAM_ID.$BUNDLE_ID" -e "$TEAM_ID.*"; then
+    echo "error: provisioning profile does not allow keychain group $TEAM_ID.$BUNDLE_ID; enable Keychain Sharing" >&2
+    echo "       on the App ID and regenerate the profile (see docs/signing.md)" >&2
+    exit 1
+  fi
+  # Best effort: the identity's certificate subject carries the team as OU. A SHA-1 identity
+  # or a name `security` cannot match is not fatal; check-entitlements.sh verifies the
+  # signature's TeamIdentifier after signing either way.
+  cert_ou=""
+  if cert_pem="$(security find-certificate -c "$VAULT_SIGN_IDENTITY" -p 2> /dev/null)" \
+    && [[ -n "$cert_pem" ]]; then
+    cert_ou="$(openssl x509 -noout -subject <<< "$cert_pem" 2> /dev/null \
+      | grep -Eo 'OU ?= ?[A-Z0-9]{10}' | head -n 1 | grep -Eo '[A-Z0-9]{10}$' || true)"
+  fi
+  if [[ -z "$cert_ou" ]]; then
+    echo "warning: could not read the team of VAULT_SIGN_IDENTITY; it is checked after signing" >&2
+  elif [[ "$cert_ou" != "$TEAM_ID" ]]; then
+    echo "error: VAULT_SIGN_IDENTITY belongs to team $cert_ou, VAULT_TEAM_ID is $TEAM_ID" >&2
+    exit 1
+  fi
+fi
+
 parse_version() {
   if command -v python3 > /dev/null 2>&1; then
     cargo metadata --no-deps --format-version 1 | python3 -c \
@@ -190,9 +256,21 @@ if [[ $SKIP_SIGN -eq 1 ]]; then
   echo "==> Skipping codesign"
   echo "SKIP: entitlements check (unsigned build)"
 else
+  ENTITLEMENTS=scripts/entitlements.plist
+  if [[ -n "$TEAM_ID" ]]; then
+    # Rendered by check-entitlements.sh, the same code that later checks equality with it.
+    ENTITLEMENTS="$PKG_DIR/entitlements.rendered.plist"
+    echo "==> Rendering entitlements for team $TEAM_ID; embedding provisioning profile"
+    scripts/check-entitlements.sh --render "$ENTITLEMENTS"
+    cp "$PROFILE" "$APP/Contents/embedded.provisionprofile"
+    chmod 644 "$APP/Contents/embedded.provisionprofile"
+  fi
   echo "==> Signing"
+  # --deep is fine while the bundle holds one Mach-O (Contents/MacOS/vault-app). Once it gains
+  # nested code (Frameworks, helpers, XPC services, login items), sign each item inside-out
+  # with its own entitlements and drop --deep (review I-14).
   run_guarded codesign --deep --options runtime --timestamp \
-    --entitlements scripts/entitlements.plist \
+    --entitlements "$ENTITLEMENTS" \
     --sign "$VAULT_SIGN_IDENTITY" "$APP"
   echo "==> Checking entitlements and hardened runtime"
   # The spctl assessment only passes once notarized, so it is skipped before notarization.

@@ -90,7 +90,7 @@ fn ex02_constants_match_other_spec_sentences() {
         vault_core::attachment::ATTACHMENT_VERSION as u64,
         1,
     );
-    // 01 §1 magic; §9 current version 2
+    // 01 §1 magic; §9 current version 3 (I-04)
     eq(
         "format::MAGIC == RVLT",
         (vault_core::format::MAGIC[..] == b"RVLT"[..]) as u64,
@@ -99,7 +99,7 @@ fn ex02_constants_match_other_spec_sentences() {
     eq(
         "format::FORMAT_VERSION",
         vault_core::format::FORMAT_VERSION as u64,
-        2,
+        3,
     );
     // 02 FieldKind: ALL has 10 entries; is_sensitive = Password | Pin | Totp | Other
     eq("FieldKind::ALL.len()", FieldKind::ALL.len() as u64, 10);
