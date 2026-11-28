@@ -439,9 +439,13 @@ pub struct UnlockedVault {
     keys: Keys,
     device_id: Uuid,
     items: BTreeMap<Uuid, Item>,
-    /// Unknown plaintext keys read from each item record, re-emitted on serialize.
+    /// Unknown plaintext keys read from each item record, re-emitted on serialize. No entry
+    /// means none. In a merge they travel with the item winner ([`UnlockedVault::merge_from`],
+    /// "Extras").
     record_extras: BTreeMap<Uuid, Extras>,
-    /// Unknown plaintext keys read from the manifest record.
+    /// Unknown plaintext keys read from the manifest record, re-emitted on serialize. Never
+    /// merged: every vault keeps its own, and loses them when it moves from below version
+    /// 3 to 3 (nothing bound them there).
     manifest_extras: Extras,
 }
 
@@ -1269,12 +1273,41 @@ impl UnlockedVault {
     /// `header().format_version < FORMAT_VERSION`; otherwise it is a no-op that does not
     /// even run the KDF.
     ///
+    /// **Every plaintext unknown key is dropped too** when the vault comes from below
+    /// [`format::PLAINTEXT_BINDING_VERSION`] (owner decisions 2026-11-27). Version 3 binds
+    /// every plaintext key into the manifest, and a key that anyone able to write the old
+    /// file could have planted must not come out of the upgrade looking as if a key
+    /// holder had written it. Dropped:
+    ///
+    /// - the record-level unknown keys of every `ItemRecord`, live or tombstone (never
+    ///   bound below 3; once bound they would win exact ties on every peer, 03 §5);
+    /// - the `ManifestRecord`'s own unknown keys (never bound below 3);
+    /// - the top-level unknown keys of the header (never bound below 3);
+    /// - the unknown keys inside the `kdf` map and inside the slot maps that are kept,
+    ///   **whether or not the header is stamped**. A stamped version 1 or 2 header does
+    ///   have its `kdf` and slot maps under the digest in the manifest AAD
+    ///   ([`format::Header::digest`], v1.1 rule), but that says only that *some* save by a
+    ///   key holder wrote them, not that a key holder chose them: the first save of an
+    ///   unstamped file stamps the header exactly as it was read (L-02), planted keys
+    ///   included, and so does any slot change. A pre-3 stamp cannot tell that blind save
+    ///   from a deliberate write, so nothing it covers is trusted here.
+    ///
+    /// `vault_id` and `created_at` are known keys and stay, as do the known keys of the
+    /// `kdf` map and of the kept slots (they are what the password just unlocked with).
+    /// No item is restamped: the old records were sealed under the old version's AAD and
+    /// cannot be spliced into the upgraded file, and a peer below 3 never reads
+    /// record-level keys from us. A vault already at version 3 keeps everything (it is all
+    /// bound, by writers that had the key *and* this rule). [`UnlockedVault::merge_from`]
+    /// applies the same idea when it adopts a version 3 header into an older vault: the
+    /// header then comes whole from the peer, and ours' record-level and manifest-record
+    /// keys are dropped.
+    ///
     /// Payload-wise there is nothing to migrate: the reader already derived stable field ids
     /// for a version 1 file and the writer emits them under every version, and version 3
     /// changes no CBOR shape at all; what the upgrade buys is the version 3 binding of every
-    /// plaintext byte (header `created_at` and unknown keys, record-level unknown keys) into
-    /// the manifest ([`format::PLAINTEXT_BINDING_VERSION`]), which the next `serialize`
-    /// writes. Until then a version 1 or 2 file keeps its weaker binding, including through
+    /// plaintext byte (header `created_at` and unknown keys, and from then on any
+    /// record-level unknown key a version 3 writer adds) into the manifest
+    /// ([`format::PLAINTEXT_BINDING_VERSION`]), which the next `serialize` writes. Until then a version 1 or 2 file keeps its weaker binding, including through
     /// plain saves. An older build refuses the upgraded file with `UnsupportedVersion`.
     ///
     /// # Errors
@@ -1299,6 +1332,17 @@ impl UnlockedVault {
             let aad = slot_aad(FORMAT_VERSION, vault_id, slot.id, &slot.kind);
             slot.wrapped_key = crypto::wrap_key(&kek, &nonce, &aad, &self.keys.vault_key);
             slot.nonce = nonce;
+        }
+        if self.header.format_version < format::PLAINTEXT_BINDING_VERSION {
+            // No unknown key of a pre-3 file is bound by the version 3 manifest (see
+            // above); a stamp does not exempt the kdf and slot maps.
+            self.record_extras.clear();
+            self.manifest_extras.clear();
+            self.header.extras.clear();
+            self.header.kdf_extras.clear();
+            for slot in self.header.slots.iter_mut().filter_map(Slot::as_key_mut) {
+                slot.extras.clear();
+            }
         }
         self.header.format_version = FORMAT_VERSION;
         self.bump_slots_stamp(now);

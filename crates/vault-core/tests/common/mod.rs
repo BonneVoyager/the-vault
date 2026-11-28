@@ -185,3 +185,180 @@ pub fn rewrite(bytes: &[u8], edit: impl FnOnce(&mut VaultFile)) -> Vec<u8> {
     edit(&mut file);
     file.to_bytes()
 }
+
+/// `file` with the record for `id` replaced by the record for `id` in `donor`.
+pub fn splice(file: &[u8], donor: &[u8], id: Uuid) -> Vec<u8> {
+    let donor = VaultFile::parse(donor).unwrap();
+    let record = donor.items.iter().find(|r| r.id == id).unwrap().clone();
+    rewrite(file, |f| {
+        let victim = f.items.iter_mut().find(|r| r.id == id).unwrap();
+        *victim = record;
+    })
+}
+
+/// `v` saved with `keys` as the record-level unknown keys of item `id` (01 §9), reopened as
+/// `device`. Below format version 3 nothing authenticates these keys, so this is the
+/// plaintext edit anyone can make to the file. From version 3 on the manifest vouches for
+/// them (01 §4), so it is what a newer writer *holding the vault key* does
+/// ([`rewrite_with_key`]). There is no API that sets these keys, and `upgrade_format` drops
+/// unbound ones, so this is the only way a version 3 vault with record-level keys comes
+/// about in the tests.
+pub fn with_record_keys(
+    v: &UnlockedVault,
+    id: Uuid,
+    keys: &[(&str, u64)],
+    device: Uuid,
+) -> UnlockedVault {
+    let plant = |file: &mut VaultFile| {
+        let rec = file.items.iter_mut().find(|r| r.id == id).expect("record");
+        rec.extras = keys
+            .iter()
+            .map(|(k, n)| {
+                (
+                    ciborium::Value::Text((*k).to_owned()),
+                    ciborium::Value::Integer((*n).into()),
+                )
+            })
+            .collect();
+    };
+    let bytes = v.serialize();
+    let bytes = if v.header().format_version >= vault_core::format::PLAINTEXT_BINDING_VERSION {
+        rewrite_with_key(&bytes, plant)
+    } else {
+        rewrite(&bytes, plant)
+    };
+    let mut v = unlock(&bytes).expect("planted file opens");
+    v.set_device_id(device);
+    v
+}
+
+/// [`rewrite`] by a writer that holds the vault key: `edit` is applied to the parsed file
+/// and the manifest is sealed again over the result, so whatever plaintext the file's
+/// version binds through the manifest (01 §4: the header digest, from version 3 the digest
+/// of each record's unknown keys and of the manifest record's own) is vouched for. Item
+/// ciphertexts are untouched. This is how the tests obtain plaintext keys that are *bound*,
+/// as opposed to planted by a plain [`rewrite`].
+pub fn rewrite_with_key(bytes: &[u8], edit: impl FnOnce(&mut VaultFile)) -> Vec<u8> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use vault_core::format::{self, ManifestEntry};
+
+    let key = manifest_key(bytes);
+    let mut file = VaultFile::parse(bytes).expect("parse for rewrite");
+    edit(&mut file);
+    let version = file.header.format_version;
+    let mut entries: Vec<ManifestEntry> = file
+        .items
+        .iter()
+        .map(|r| ManifestEntry {
+            id: r.id,
+            modified_at: r.modified_at,
+            extras_digest: format::item_record_digest(version, &r.extras),
+        })
+        .collect();
+    entries.sort_by_key(|e| e.id);
+    let aad = format::manifest_aad(
+        version,
+        file.header.vault_id,
+        u32::try_from(entries.len()).unwrap(),
+        file.header.digest().as_ref(),
+        format::manifest_record_digest(version, &file.manifest.extras).as_ref(),
+    );
+    let mut nonce = [0u8; 24];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    file.manifest.ct = chacha20poly1305::XChaCha20Poly1305::new_from_slice(&*key)
+        .unwrap()
+        .encrypt(
+            chacha20poly1305::XNonce::from_slice(&nonce),
+            Payload {
+                msg: &format::encode_manifest_entries(&entries),
+                aad: &aad,
+            },
+        )
+        .expect("manifest seals");
+    file.manifest.nonce = nonce;
+    file.to_bytes()
+}
+
+/// The `manifest_key` of the vault in `bytes` (01 §3: HKDF-SHA256 of the vault key, salt
+/// `vault_id`, info `vault/manifest/v1`), for the test-side writer and reader of manifests.
+/// The vault key comes out of an enclave slot added to a throwaway copy under a KEK chosen
+/// here, which is the public API's own way for a KEK holder to reach it.
+pub fn manifest_key(bytes: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+
+    let kek = vault_core::SecretVec::new(vec![0x4B; 32]);
+    let mut probe = unlock(bytes).expect("file opens");
+    let slot_id = probe.add_enclave_slot(&kek, 1);
+    let header = probe.header();
+    let slot = header
+        .slots
+        .iter()
+        .find(|s| s.id() == slot_id)
+        .and_then(|s| s.as_key())
+        .expect("the slot just added");
+    let aad =
+        vault_core::format::slot_aad(header.format_version, header.vault_id, slot.id, &slot.kind);
+    let vault_key = zeroize::Zeroizing::new(
+        chacha20poly1305::XChaCha20Poly1305::new_from_slice(kek.expose_secret())
+            .unwrap()
+            .decrypt(
+                chacha20poly1305::XNonce::from_slice(&slot.nonce),
+                Payload {
+                    msg: &slot.wrapped_key,
+                    aad: &aad,
+                },
+            )
+            .expect("slot unwraps"),
+    );
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    hkdf::Hkdf::<sha2::Sha256>::new(Some(header.vault_id.as_bytes()), &vault_key)
+        .expand(b"vault/manifest/v1", key.as_mut())
+        .expect("32 bytes");
+    key
+}
+
+/// The decrypted manifest entries of the file in `bytes` (`key` from [`manifest_key`]): a
+/// third element (`extras_digest`) is present iff the manifest vouches for record-level
+/// unknown keys of that record (01 §4, version 3).
+pub fn manifest_entries(key: &[u8; 32], bytes: &[u8]) -> Vec<vault_core::format::ManifestEntry> {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use vault_core::format;
+
+    let file = VaultFile::parse(bytes).expect("file parses");
+    let version = file.header.format_version;
+    let aad = format::manifest_aad(
+        version,
+        file.header.vault_id,
+        u32::try_from(file.items.len()).unwrap(),
+        file.header.digest().as_ref(),
+        format::manifest_record_digest(version, &file.manifest.extras).as_ref(),
+    );
+    let plain = chacha20poly1305::XChaCha20Poly1305::new_from_slice(key)
+        .unwrap()
+        .decrypt(
+            chacha20poly1305::XNonce::from_slice(&file.manifest.nonce),
+            Payload {
+                msg: &file.manifest.ct,
+                aad: &aad,
+            },
+        )
+        .expect("manifest opens");
+    format::decode_manifest(&plain).expect("manifest decodes")
+}
+
+/// The record-level unknown keys `v` writes for item `id`, as `(name, integer)` pairs in
+/// file order (the inverse of [`with_record_keys`]).
+pub fn record_keys(v: &UnlockedVault, id: Uuid) -> Vec<(String, u64)> {
+    let file = VaultFile::parse(&v.serialize()).expect("own file parses");
+    let rec = file.items.iter().find(|r| r.id == id).expect("record");
+    rec.extras
+        .iter()
+        .map(|(k, n)| {
+            let n = n.as_integer().expect("integer value");
+            (
+                k.as_text().expect("text key").to_owned(),
+                u64::try_from(n).expect("u64 value"),
+            )
+        })
+        .collect()
+}

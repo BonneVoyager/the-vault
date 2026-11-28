@@ -376,13 +376,85 @@ fn v2_fixture_unlocks_saves_as_v2_and_upgrades_to_v3() {
     assert_eq!(up.header().slots_modified_at, Some(before_stamp + 10));
 }
 
+/// How many unknown keys a file carries at the four plaintext sites outside the item
+/// records: `[header, kdf map, first key slot, manifest record]`.
+fn unknown_key_sites(file: &VaultFile) -> [usize; 4] {
+    let slot = file.header.slots.iter().find_map(|s| s.as_key()).unwrap();
+    [
+        file.header.extras.len(),
+        file.header.kdf_extras.len(),
+        slot.extras.len(),
+        file.manifest.extras.len(),
+    ]
+}
+
+fn one_key(name: &str) -> Vec<(Value, Value)> {
+    vec![(t(name), Value::Integer(7.into()))]
+}
+
+fn assert_opens_on_both_paths(bytes: &[u8], v: &UnlockedVault) {
+    assert_vaults_eq(&unlock(bytes).unwrap(), v);
+    #[cfg(feature = "sync")]
+    LockedVault::parse(bytes)
+        .unwrap()
+        .unlock_with_key(&v.export_vault_key(), device())
+        .unwrap();
+}
+
+fn evil_anywhere(file: &VaultFile) -> bool {
+    let evil = |keys: &[(Value, Value)]| keys.iter().any(|(k, _)| k.as_text() == Some("evil"));
+    evil(&file.header.extras)
+        || evil(&file.header.kdf_extras)
+        || evil(&file.manifest.extras)
+        || file
+            .header
+            .slots
+            .iter()
+            .any(|s| s.as_key().is_some_and(|k| evil(&k.extras)))
+        || file.items.iter().any(|r| evil(&r.extras))
+}
+
+/// `bytes` (below version 3) with `evil` at all five plaintext sites. On an unstamped file
+/// a plain edit does it; a stamped one has its kdf and slot maps under the v1.1 digest, so
+/// those two are written the way a blind first save binds them: by a key holder.
+fn evil_everywhere(bytes: &[u8]) -> Vec<u8> {
+    let stamped = VaultFile::parse(bytes)
+        .unwrap()
+        .header
+        .slots_modified_at
+        .is_some();
+    let maps = |f: &mut VaultFile| {
+        f.header.kdf_extras = one_key("evil");
+        let slot = f.header.slots.iter_mut().find_map(|s| s.as_key_mut());
+        slot.unwrap().extras = one_key("evil");
+    };
+    let bytes = if stamped {
+        rewrite_with_key(bytes, maps)
+    } else {
+        rewrite(bytes, maps)
+    };
+    rewrite(&bytes, |f| {
+        f.header.extras = one_key("evil");
+        f.manifest.extras = one_key("evil");
+        for rec in &mut f.items {
+            rec.extras = one_key("evil");
+        }
+    })
+}
+
 /// Version 1: a plain save of an unstamped legacy file stamps it with 1 (L-02) but keeps
-/// version 1 and its binding; the v1-forward unknown keys survive the upgrade to 3 (that
-/// is how `v3-meta.vault` was built) and are then bound.
+/// version 1, its binding and every unknown key. The upgrade to 3 binds every plaintext
+/// key from then on, so it drops every unknown key of the old file instead of vouching
+/// for it (owner decisions 2026-11-27): header, kdf map, slot map, item record, manifest
+/// record. That holds after the first save too: the stamp that save wrote puts the kdf
+/// and slot maps under the v1.1 digest, but it stamped them as they were read, so it says
+/// nothing about who chose their keys. (`v3-meta.vault` was built by this upgrade before
+/// those decisions and carries all of them, bound.)
 #[test]
-fn v1_forward_stays_v1_on_a_plain_save_and_its_unknown_keys_are_bound_after_upgrade() {
+fn v1_forward_stays_v1_on_a_plain_save_and_the_upgrade_drops_every_unknown_key() {
     let v1 = unlock(V1_FORWARD).unwrap();
     assert_eq!(v1.header().format_version, 1);
+    assert_eq!(v1.header().slots_modified_at, None, "unstamped fixture");
     let saved = v1.serialize();
     assert_eq!(&saved[4..6], &[0, 1]);
     let file = VaultFile::parse(&saved).unwrap();
@@ -391,38 +463,274 @@ fn v1_forward_stays_v1_on_a_plain_save_and_its_unknown_keys_are_bound_after_upgr
         Some(1),
         "L-02 first-save stamp"
     );
+    assert_eq!(unknown_key_sites(&file), [1, 1, 1, 1], "a save keeps all");
     assert_eq!(file.items[0].extras.len(), 1);
     let hole = rewrite(&saved, |f| f.items[0].extras[0].1 = Value::Null);
     assert!(unlock(&hole).is_ok(), "v1: record keys unbound");
 
-    let mut up = unlock(&saved).unwrap();
-    up.set_device_id(device());
-    up.upgrade_format(&pw(), 5_000).unwrap();
-    let v3 = up.serialize();
+    // Straight from the unstamped file, and from the file its first save stamped.
+    for (name, bytes) in [("unstamped", V1_FORWARD), ("first save", saved.as_slice())] {
+        let mut up = unlock(bytes).unwrap();
+        up.set_device_id(device());
+        up.upgrade_format(&pw(), 5_000).unwrap();
+        let v3 = up.serialize();
+        assert_eq!(&v3[4..6], &[0, 3], "{name}");
+        let f3 = VaultFile::parse(&v3).unwrap();
+        assert_eq!(unknown_key_sites(&f3), [0, 0, 0, 0], "{name}");
+        assert!(f3.items[0].extras.is_empty(), "{name}");
+        assert_eq!(f3.header.slots.len(), 1, "{name}: opaque slot dropped too");
+        assert_eq!(f3.header.vault_id, file.header.vault_id);
+        assert_eq!(f3.header.created_at, file.header.created_at, "known key");
+        assert_vaults_eq(&v1, &unlock(&v3).unwrap());
+        assert_opens_on_both_paths(&v3, &up);
+        // Version 3 binds what is left: none of the dropped keys can be put back by hand.
+        let id = f3.items[0].id;
+        let closed = rewrite(&v3, |f| f.items[0].extras = file.items[0].extras.clone());
+        assert_eq!(unlock(&closed).unwrap_err(), item(id), "{name}");
+        let closed = rewrite(&v3, |f| f.header.extras = file.header.extras.clone());
+        assert_eq!(unlock(&closed).unwrap_err(), manifest(), "{name}");
+        let closed = rewrite(&v3, |f| {
+            f.header.kdf_extras = file.header.kdf_extras.clone()
+        });
+        assert_eq!(unlock(&closed).unwrap_err(), manifest(), "{name}");
+        let closed = rewrite(&v3, |f| f.manifest.extras = file.manifest.extras.clone());
+        assert_eq!(unlock(&closed).unwrap_err(), manifest(), "{name}");
+    }
+}
+
+/// The version 2 fixture has a stamped header, so its kdf and slot maps are under the v1.1
+/// digest and only a holder of the vault key can write unknown keys into them. The upgrade
+/// drops those as well, with the keys planted at the sites version 2 binds to nothing: a
+/// pre-3 stamp can come from a blind first save, so it does not make a key trustworthy.
+/// The upgraded file opens on both paths and the version 3 tamper map holds on it.
+#[test]
+fn upgrade_from_a_stamped_v2_header_drops_every_unknown_key_too() {
+    let stamp = unlock(V2_BASIC).unwrap().header().slots_modified_at;
+    assert!(stamp.is_some(), "stamped fixture");
+    let planted = evil_everywhere(V2_BASIC);
+    let before = VaultFile::parse(&planted).unwrap();
+    assert_eq!(unknown_key_sites(&before), [1, 1, 1, 1]);
+    assert!(before.items.iter().all(|r| r.extras.len() == 1));
+    let mut v = unlock(&planted).unwrap();
+    v.set_device_id(device());
+    assert_eq!(v.header().format_version, 2);
+
+    v.upgrade_format(&pw(), stamp.unwrap() + 10).unwrap();
+    let v3 = v.serialize();
     assert_eq!(&v3[4..6], &[0, 3]);
     let f3 = VaultFile::parse(&v3).unwrap();
-    assert_eq!(f3.header.extras, file.header.extras, "header extra kept");
-    assert_eq!(f3.header.kdf_extras, file.header.kdf_extras);
+    assert!(!evil_anywhere(&f3));
+    assert_eq!(unknown_key_sites(&f3), [0, 0, 0, 0]);
+    assert_opens_on_both_paths(&v3, &v);
+
+    let tampered = rewrite(&v3, |f| f.header.extras = one_key("evil"));
+    assert_eq!(unlock(&tampered).unwrap_err(), manifest());
+    let tampered = rewrite(&v3, |f| f.header.kdf_extras = one_key("evil"));
+    assert_eq!(unlock(&tampered).unwrap_err(), manifest());
+    let tampered = rewrite(&v3, |f| f.manifest.extras = one_key("evil"));
+    assert_eq!(unlock(&tampered).unwrap_err(), manifest());
+}
+
+/// Security review 2026-11-27, round 3. `v1-basic` is unstamped; keys are planted at all
+/// five sites without the vault key. Whatever a key holder does before the upgrade (a
+/// save and a fresh unlock by password or by key, a password change, a key rotation, an
+/// enclave enrolment: each of them stamps the header with the planted kdf and slot keys
+/// inside the digest), the version 3 file the upgrade leads to carries none of them and
+/// opens on both paths.
+#[test]
+fn no_step_before_the_upgrade_gets_a_planted_key_into_a_v3_file() {
+    const V1_BASIC: &[u8] = include_bytes!("fixtures/v1-basic.vault");
+    let planted = evil_everywhere(V1_BASIC);
+    let before = VaultFile::parse(&planted).unwrap();
+    assert_eq!(before.header.slots_modified_at, None, "unstamped fixture");
+    assert_eq!(unknown_key_sites(&before), [1, 1, 1, 1]);
+    assert!(!before.items.is_empty() && before.items.iter().all(|r| r.extras.len() == 1));
+
+    type Step = fn(UnlockedVault) -> UnlockedVault;
+    let steps: [(&str, Step); 5] = [
+        ("save, unlock by password", |v| {
+            unlock(&v.serialize()).unwrap()
+        }),
+        ("save, unlock by key", |v| {
+            #[cfg(feature = "sync")]
+            let v = LockedVault::parse(&v.serialize())
+                .unwrap()
+                .unlock_with_key(&v.export_vault_key(), device())
+                .unwrap();
+            v
+        }),
+        ("change_password", |mut v| {
+            v.change_password(&pw(), &pw(), KdfParams::for_tests(), 50)
+                .unwrap();
+            v
+        }),
+        ("rotate_vault_key", |mut v| {
+            v.rotate_vault_key(&pw(), 50).unwrap();
+            v
+        }),
+        ("add_enclave_slot", |mut v| {
+            v.add_enclave_slot(&vault_core::SecretVec::new(vec![7; 32]), 50);
+            v
+        }),
+    ];
+    for (name, step) in steps {
+        let mut v = step(unlock(&planted).unwrap());
+        v.set_device_id(device());
+        let stamped = VaultFile::parse(&v.serialize()).unwrap();
+        assert_eq!(stamped.header.format_version, 1, "{name}");
+        assert!(stamped.header.slots_modified_at.is_some(), "{name}");
+        assert!(evil_anywhere(&stamped), "{name}: still there below 3");
+
+        v.upgrade_format(&pw(), 5_000).unwrap();
+        let v3 = v.serialize();
+        assert_eq!(&v3[4..6], &[0, 3], "{name}");
+        let f3 = VaultFile::parse(&v3).unwrap();
+        assert!(!evil_anywhere(&f3), "{name}");
+        assert_eq!(unknown_key_sites(&f3), [0, 0, 0, 0], "{name}");
+        assert!(f3.items.iter().all(|r| r.extras.is_empty()), "{name}");
+        assert_opens_on_both_paths(&v3, &v);
+    }
+}
+
+/// A pre-3 header stamp cannot be forged, extended or removed without the vault key
+/// (01 §4, v1.1 digest), on either unlock path: adding `slots_modified_at` to an
+/// unstamped file (with or without a kdf or slot key planted alongside), and planting a
+/// kdf or slot key in, or stripping the stamp from, a stamped version 1 or 2 file are all
+/// `Tampered(Manifest)`. (The password path of several of these is also covered by
+/// `header_merge.rs::stamped_header_is_bound_into_the_manifest`, `legacy_header.rs::
+/// legacy_file_is_stamped_by_its_first_save_and_the_manifest_then_covers_the_slots` and
+/// the `v1-stamped` fixture test; this adds the key path, the slot map, version 2 and the
+/// self-stamp variants.) So the only way planted kdf or slot keys end up under a stamp is
+/// a key holder's own blind save, which is why the upgrade does not trust the stamp.
+#[test]
+fn a_pre_v3_header_stamp_cannot_be_added_stripped_or_extended_without_the_key() {
+    const V1_BASIC: &[u8] = include_bytes!("fixtures/v1-basic.vault");
+    type Edit = fn(&mut VaultFile);
+    let kdf_key: Edit = |f| f.header.kdf_extras = one_key("evil");
+    let slot_key: Edit = |f| {
+        let slot = f.header.slots.iter_mut().find_map(|s| s.as_key_mut());
+        slot.unwrap().extras = one_key("evil");
+    };
+    let nothing: Edit = |_| {};
+    let assert_rejected = |original: &[u8], tampered: &[u8], what: &str| {
+        assert_eq!(unlock(tampered).unwrap_err(), manifest(), "{what}");
+        #[cfg(feature = "sync")]
+        assert_eq!(
+            LockedVault::parse(tampered)
+                .unwrap()
+                .unlock_with_key(&unlock(original).unwrap().export_vault_key(), device())
+                .unwrap_err(),
+            manifest(),
+            "{what}: key path"
+        );
+        let _ = original;
+    };
+
+    // Self-stamping an unstamped file.
     assert_eq!(
-        f3.items[0].extras, file.items[0].extras,
-        "record extra kept"
+        VaultFile::parse(V1_BASIC).unwrap().header.slots_modified_at,
+        None
     );
-    assert_eq!(
-        f3.manifest.extras, file.manifest.extras,
-        "manifest extra kept"
-    );
-    assert_eq!(
-        f3.header.slots.len(),
-        1,
-        "opaque slot dropped by the upgrade"
-    );
-    let re = unlock(&v3).unwrap();
-    assert_vaults_eq(&v1, &re);
-    let id = f3.items[0].id;
-    let closed = rewrite(&v3, |f| f.items[0].extras[0].1 = Value::Null);
-    assert_eq!(unlock(&closed).unwrap_err(), item(id));
-    let closed = rewrite(&v3, |f| f.manifest.extras.clear());
-    assert_eq!(unlock(&closed).unwrap_err(), manifest());
+    for stamp in [1, 9_000_000_000_000, u64::MAX] {
+        for device_id in [None, Some(device())] {
+            for (plant_name, plant) in [("no key", nothing), ("kdf", kdf_key), ("slot", slot_key)] {
+                let tampered = rewrite(V1_BASIC, |f| {
+                    f.header.slots_modified_at = Some(stamp);
+                    f.header.slots_device_id = device_id;
+                    plant(f);
+                });
+                let what = format!("self-stamp {stamp} {device_id:?} {plant_name}");
+                assert_rejected(V1_BASIC, &tampered, &what);
+            }
+        }
+    }
+
+    // A stamped version 1 file (the first save of the fixture) and the version 2 fixture.
+    let v1_stamped = unlock(V1_BASIC).unwrap().serialize();
+    for (name, stamped) in [("v1", v1_stamped.as_slice()), ("v2", V2_BASIC)] {
+        assert!(
+            VaultFile::parse(stamped)
+                .unwrap()
+                .header
+                .slots_modified_at
+                .is_some()
+        );
+        let strip: Edit = |f| {
+            f.header.slots_modified_at = None;
+            f.header.slots_device_id = None;
+        };
+        for (edit_name, edit) in [
+            ("kdf key", kdf_key),
+            ("slot key", slot_key),
+            ("strip", strip),
+        ] {
+            let tampered = rewrite(stamped, edit);
+            assert_rejected(stamped, &tampered, &format!("{name} {edit_name}"));
+        }
+    }
+}
+
+/// The merge route to version 3. Ours is below 3 with keys planted in the header's top
+/// level and in the manifest record; the peer is at 3 with bound keys of its own at both
+/// sites. The header merge adopts the peer's header whole, its unknown keys included, and
+/// ours' manifest-record keys are dropped: they are not merged by any rule, so the vault
+/// then has none (not the peer's). Nothing moves afterwards in either direction.
+#[test]
+fn adopting_a_v3_header_takes_the_peer_header_keys_and_drops_our_manifest_record_keys() {
+    for (name, snapshot) in [("v1", unstamped_bytes()), ("v2", V2_BASIC)] {
+        let planted = rewrite(snapshot, |f| {
+            f.header.extras = one_key("evil");
+            f.manifest.extras = one_key("evil");
+        });
+        let mut ours = unlock(&planted).unwrap();
+        ours.set_device_id(device());
+        assert_eq!(ours.header().extras, one_key("evil"), "{name}");
+
+        let mut peer = unlock(snapshot).unwrap();
+        peer.set_device_id(Uuid::from_u128(0xB));
+        peer.upgrade_format(&pw(), 9_000_000_000_000).unwrap();
+        let peer_bytes = rewrite_with_key(&peer.serialize(), |f| {
+            f.header.extras = one_key("x_peer");
+            f.manifest.extras = one_key("x_peer");
+        });
+        let mut peer = unlock(&peer_bytes).unwrap();
+        peer.set_device_id(Uuid::from_u128(0xB));
+
+        let report = ours.merge_from(&peer).unwrap();
+        assert!(report.header_updated, "{name}");
+        let saved = ours.serialize();
+        assert_eq!(&saved[4..6], &[0, 3], "{name}");
+        let file = VaultFile::parse(&saved).unwrap();
+        assert_eq!(file.header.extras, one_key("x_peer"), "{name}");
+        assert!(file.manifest.extras.is_empty(), "{name}");
+        assert_opens_on_both_paths(&saved, &ours);
+
+        assert!(!peer.merge_from(&unlock(&saved).unwrap()).unwrap().changed());
+        let peer_file = VaultFile::parse(&peer.serialize()).unwrap();
+        assert_eq!(peer_file.manifest.extras, one_key("x_peer"), "{name}");
+        assert!(!ours.merge_from(&peer).unwrap().changed(), "{name}");
+        let again = VaultFile::parse(&ours.serialize()).unwrap();
+        assert!(again.manifest.extras.is_empty(), "{name}");
+    }
+}
+
+/// A vault already at version 3 keeps every unknown key (they are all bound) through a
+/// no-op `upgrade_format` and a merge with its own copy.
+#[test]
+fn a_v3_vault_keeps_every_unknown_key_through_a_no_op_upgrade_and_a_self_merge() {
+    let before = VaultFile::parse(V3_META).unwrap();
+    assert_eq!(unknown_key_sites(&before), [1, 1, 1, 1]);
+    assert_eq!(before.items[0].extras.len(), 1);
+    let mut v = unlock(V3_META).unwrap();
+    v.set_device_id(device());
+    v.upgrade_format(&pw(), 9_000_000_000_000).unwrap();
+    assert!(!v.merge_from(&unlock(V3_META).unwrap()).unwrap().changed());
+    let saved = v.serialize();
+    let after = VaultFile::parse(&saved).unwrap();
+    assert_eq!(after.header, before.header);
+    assert_eq!(after.manifest.extras, before.manifest.extras);
+    assert_eq!(after.items[0].extras, before.items[0].extras);
+    assert!(unlock(&saved).is_ok());
 }
 
 /// Header merge: unknown header keys travel with the winning header (whole header = one

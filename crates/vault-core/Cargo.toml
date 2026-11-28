@@ -59,3 +59,7 @@ proptest = "^1.12.0"
 [[test]]
 name = "sync_feature"
 required-features = ["sync"]
+
+[[test]]
+name = "record_keys_props"
+required-features = ["sync"]

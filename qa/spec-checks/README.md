@@ -115,6 +115,30 @@ cargo fmt --all -- --check                     # formatting is part of the manua
   `conflict` (bk10/bk11, added after the source read)), and a `run_all.sh` 2026-11-22 section
   (`vault sync` with each special entry, 10 concurrent adds vs backups openable and 0600, a
   symlinked `backups/` reported by `add`).
+- 2026-11-27 additions (format 3 and the 2026-11-26 security-review waves): `v3_format_1127`
+  (an independent v3 writer with record-level unknown keys; SHA-256 of the raw header bytes; the
+  01 §4 tamper map on both unlock paths; duplicate header keys; relabels to 1/2/4/0xFFFF; entry
+  shapes incl. a three-element entry in a v2 file; record order; every-bit flips on the key path
+  and header flips on the password path; every cut of v3 files; `upgrade_format` no-op on v3 and
+  v2 → 3 dropping opaque slots; hostile KDF in a v3 header), `merge_g6_1127` (02 guarantee 6 per
+  merge over 60 random 2-/3-device scripts with a coarse shared clock, a per-device pair ledger,
+  equal-stamp conflicts in both directions, the `created_at` carry, the 03 §5 header merge guard
+  with unstamped v3 vs stamped v2 headers, L-02 stamp-on-save, guarantee 11), `backups_1127`
+  (Unsaved fallback copies: path, modes, event, listing, restore, delete, path rules, symlinked
+  vault-id folder; `repair_package` cases incl. links, FIFOs, name collisions and a newer stub;
+  authenticated retention: unvalidated entries, forged-body holders, rotated-key snapshots,
+  >10,000 entries), `freshness_1127` (`Freshness::of`, `on_disk_freshness`, the `Merged` event's
+  `peer`, a stale primary written back), `quarantine_1127` (restore from `attachments/orphaned/`
+  at unlock, `attachment_state` and `open_attachment`; copy selection by size; existing blob wins;
+  symlinked `orphaned/`; fresh orphans stay), `caps_1127` (CSV/1PUX 100 000-item and 64 MiB text
+  caps, 10 000 zip entries, a hand-made ZIP64 directory, a 17 MiB and a lying `export.data`, a
+  KDBX gzip bomb, `below_recommended` edges, TOTP period spellings), `sync_v3_1127` (record
+  unknown keys through a merge, a v2 per-file copy, a header-tampered v3 sibling, a v2 rollback and
+  a relabelled primary under an unlocked device), `src/lib.rs` `w1127` (writer, slot re-wrap, fast
+  record decryptor), and a `run_all.sh` 2026-11-27 section (reveal escaping against `vault get
+  --help` incl. every Cf code point, C1/bidi titles, the `VAULT_DEV_KDF` gate and one-line
+  warning, the TOTP period cap through `add`, `vault list`/`upgrade` on a v2 file, a planted
+  `backups` file).
 - Temp files go under `tmp/` (git-ignored) and are removed by each test.
 
 A passing check shows the behaviour on those inputs only. It is not a proof.

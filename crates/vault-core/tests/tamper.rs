@@ -231,16 +231,6 @@ fn two_devices_one_login() -> (UnlockedVault, UnlockedVault, Uuid, Uuid, Uuid) {
     (o, t, id, user_field, pw_field)
 }
 
-/// `file` with the record for `id` replaced by the record for `id` in `donor`.
-fn splice(file: &[u8], donor: &[u8], id: Uuid) -> Vec<u8> {
-    let donor = VaultFile::parse(donor).unwrap();
-    let record = donor.items.iter().find(|r| r.id == id).unwrap().clone();
-    rewrite(file, |f| {
-        let victim = f.items.iter_mut().find(|r| r.id == id).unwrap();
-        *victim = record;
-    })
-}
-
 /// Appendix A of the review. O changes the password at 8; T edits the username at 10 and
 /// its file is visible in the sync folder. O merges T's file: the result keeps T's
 /// `modified_at` (10) with content T never wrote (O's new password). Before the symmetric
@@ -380,4 +370,43 @@ fn guarantee_6_holds_when_only_created_at_is_carried() {
         unlock(&file_o).unwrap().get(id).unwrap().created_at,
         Some(0)
     );
+}
+
+/// The record-level variant (bug hunt 2026-11-27 N10). O and T hold the same item at the
+/// same stamp in version 3 files and differ only in the record's plaintext unknown keys;
+/// T's are the item winner's, so O takes them. That is a change of the persisted record at
+/// a pair O's own record used, so it is stamped past both inputs: neither T's record nor
+/// O's pre-merge record (same id, both at the old stamp) can replace the saved one. (Below
+/// version 3 such keys are never merge input; see `record_extras_merge.rs`.)
+#[test]
+fn guarantee_6_holds_when_only_record_level_keys_are_taken() {
+    let (dev_o, dev_t) = (Uuid::from_u128(0x0A), Uuid::from_u128(0x0B));
+    let mut base = unstamped_vault();
+    base.set_device_id(dev_o);
+    let id = base.insert(sample_item(1, 1_000), 1_000);
+    let stamp = base.get(id).unwrap().modified_at;
+    // Version 3 first, then the keys, written by a holder of the vault key (an upgrade
+    // drops keys a pre-3 file carried, and nothing below 3 binds them).
+    let mut o = with_record_keys(&base, id, &[], dev_o);
+    let mut t = with_record_keys(&base, id, &[], dev_t);
+    o.upgrade_format(&pw(), 5_000).unwrap();
+    t.upgrade_format(&pw(), 5_001).unwrap();
+    let mut o = with_record_keys(&o, id, &[("x", 1)], dev_o);
+    let t = with_record_keys(&t, id, &[("x", 2)], dev_t);
+    let (pre_merge_o, file_t) = (o.serialize(), t.serialize());
+    assert_eq!(&file_t[4..6], &[0, 3]);
+
+    let report = o.merge_from(&unlock(&file_t).unwrap()).unwrap();
+    assert_eq!(report.updated, 1);
+    assert_eq!(o.get(id).unwrap().modified_at, stamp + 1);
+    assert_eq!(record_keys(&o, id), [("x".to_owned(), 2)]);
+    let file_o = o.serialize();
+
+    for donor in [&file_t, &pre_merge_o] {
+        assert_eq!(
+            unlock(&splice(&file_o, donor, id)).unwrap_err(),
+            VaultError::Tampered(TamperKind::Manifest)
+        );
+    }
+    assert_eq!(record_keys(&unlock(&file_o).unwrap(), id).len(), 1);
 }

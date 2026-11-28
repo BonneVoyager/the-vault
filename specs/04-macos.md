@@ -2,7 +2,7 @@
 
 The only crate allowed `unsafe` and macOS-only dependencies. Everything here is behind a small trait or function so `vault-app` can be built with stub impls on CI machines without a Secure Enclave.
 
-Dependencies: `vault-core` (path), `thiserror` (`MacError`), `uuid` (device id, v4), `dirs` (Application Support path), `tracing` (device-id fallback warning), `secrecy` (`write_concealed` input), `ciborium` (Touch ID Keychain payload, §2.1d), `rqrr` (QR decoding, no `img` feature), and on macOS only `objc2`, `objc2-foundation`, `objc2-app-kit`, `objc2-local-authentication`, `objc2-security` (Keychain, Secure Enclave), `objc2-core-foundation`, `objc2-core-graphics`, `objc2-service-management`, `libc`, `zeroize` (QR scan buffers) (spec aligned to code 2026-11-19; completed 2026-11-21, bug hunt L4). Pin all with `=` (this crate overrides the CLAUDE.md caret rule).
+Dependencies: `vault-core` (path), `thiserror` (`MacError`), `uuid` (device id, v4), `dirs` (Application Support path), `tracing` (device-id fallback warning), `secrecy` (`write_concealed` input), `ciborium` (Touch ID Keychain payload, §2.1d), `rqrr` (QR decoding, no `img` feature), and on macOS only `objc2`, `objc2-foundation`, `objc2-app-kit`, `objc2-local-authentication`, `objc2-security` (Keychain, Secure Enclave), `objc2-core-foundation`, `objc2-core-graphics`, `objc2-service-management`, `block2` (open-panel completion handler, §3b), `libc`, `zeroize` (QR scan buffers) (spec aligned to code 2026-11-19; completed 2026-11-21, bug hunt L4; `block2` added 2026-11-27, bug hunt L2). Pin all with `=` (this crate overrides the CLAUDE.md caret rule).
 
 Minimum target: macOS 15 (passkey PRF needs it; `LSMinimumSystemVersion 15.0`).
 

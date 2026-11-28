@@ -460,10 +460,11 @@ fn as_key(v: Value, what: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> 
     let mut b = as_bytes(v, what)?;
     let mut key = Zeroizing::new([0u8; KEY_LEN]);
     if b.len() != KEY_LEN {
+        // `Vec::zeroize` also truncates, so the length (not secret) is read first.
+        let got = b.len();
         b.zeroize();
         return Err(malformed(format!(
-            "{what}: expected {KEY_LEN} bytes, got {}",
-            b.len()
+            "{what}: expected {KEY_LEN} bytes, got {got}"
         )));
     }
     key.copy_from_slice(&b);
@@ -1632,6 +1633,21 @@ mod tests {
 
     fn hex(d: &[u8]) -> String {
         d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Bug hunt 2026-11-27 N9: the wrong-length error names the real length (`Vec::zeroize`
+    /// truncates, so it used to say 0) and never the bytes.
+    #[test]
+    fn as_key_reports_the_real_length_of_a_wrong_length_key() {
+        for len in [0usize, 31, 33, 64] {
+            let err = as_key(Value::Bytes(vec![0xAB; len]), "attachment.key").unwrap_err();
+            let VaultError::Malformed(msg) = err else {
+                panic!("expected Malformed for length {len}");
+            };
+            assert_eq!(msg, format!("attachment.key: expected 32 bytes, got {len}"));
+        }
+        let key = as_key(Value::Bytes(vec![0xAB; KEY_LEN]), "attachment.key").unwrap();
+        assert_eq!(*key, [0xAB; KEY_LEN]);
     }
 
     #[test]

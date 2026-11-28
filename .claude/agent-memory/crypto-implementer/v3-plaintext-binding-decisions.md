@@ -93,6 +93,12 @@ v1.1 digest); vault-cli status text says "format 1; run `vault upgrade`" for any
 version; fuzz crate compiles unchanged (`decode_manifest` result ignored, `encode_manifest`
 kept). vault-sync/app/cli build and use `FORMAT_VERSION` generically.
 
+**2026-11-27 later:** `upgrade_format` no longer carries record-level keys (dropped, see
+[[record-extras-merge-decisions]]); `regenerate_v3_meta_fixture` is historical and
+`v3_binding.rs` test rewritten. Later the same day the header-top-level and manifest-record
+keys and the kdf/slot keys (stamped header or not) are dropped by the upgrade too; the
+"v3-meta = v1-forward upgraded, 7 sites" provenance above is history, the fixture is frozen.
+
 **Why:** an attacker could alter `created_at` and inject unknown keys that persisted across
 saves; a version bump is the clean way to make the stricter digest unconditional.
 **How to apply:** any new plaintext key anywhere in a v3 file is bound automatically

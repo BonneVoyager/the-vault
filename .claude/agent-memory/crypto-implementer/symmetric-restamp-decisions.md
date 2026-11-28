@@ -31,7 +31,8 @@ rule; the seed is pinned in `tests/merge_props.proptest-regressions` (tracked fi
 stashed):** Appendix A shape (result at the peer's stamp with our content); live item
 resurrecting over a peer's stripped tombstone with a higher stamp; `created_at` carry with
 our stamp ahead. Attachment reorder and the equal-stamp adoption fall under the same rule.
-Record-level plaintext `record_extras` are outside `same_record` (TODO(M-01) on the fn).
+Record-level plaintext `record_extras` are inside `same_record` since 2026-11-27 (it now
+takes both key sets; see [[record-extras-merge-decisions]]).
 
 **Behaviour to remember:**
 - `created_at` carry is no longer silent: `updated`, `changed() == true`, restamp (at an

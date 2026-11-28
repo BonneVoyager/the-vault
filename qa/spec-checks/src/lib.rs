@@ -914,3 +914,156 @@ pub fn empty_base(version: u16) -> (u16, Value, Vec<u8>) {
 pub fn version_of(bytes: &[u8]) -> u16 {
     u16::from_be_bytes([bytes[4], bytes[5]])
 }
+
+// ---------------------------------------------------------------------------
+// 2026-11-27 additions: independent v1/v2/v3 writer with record-level unknown keys, slot
+// re-wrapping to another version, and a fast record decryptor (vault key known).
+// ---------------------------------------------------------------------------
+pub mod w1127 {
+    use super::*;
+    use rand::RngCore;
+
+    #[derive(Clone, Debug)]
+    pub struct Rec {
+        pub id: Vec<u8>,
+        pub ma: u64,
+        pub plain: Value,
+        pub extras: Vec<(Value, Value)>,
+    }
+
+    /// 01 §4 writer: items sealed with the item AAD; manifest entries `[id, ma]` or (v3, record
+    /// has unknown keys) `[id, ma, extras_digest]`; manifest AAD with the version-dependent header
+    /// digest and (v3) the manifest record's own extras digest.
+    pub fn seal_file(
+        version: u16,
+        header: &Value,
+        vault_key: &[u8],
+        recs: &[Rec],
+        manifest_extras: &[(Value, Value)],
+    ) -> Vec<u8> {
+        let vault_id = bytes_of(get(header, "vault_id").unwrap());
+        let item_key = indep::hkdf(vault_key, &vault_id, "vault/item/v1");
+        let manifest_key = indep::hkdf(vault_key, &vault_id, "vault/manifest/v1");
+        let mut body = vec![];
+        for r in recs {
+            let mut nonce = [0u8; 24];
+            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            let ct = indep::seal(
+                &item_key,
+                &nonce,
+                &enc(&canon(r.plain.clone())),
+                &indep::item_aad(&vault_id, &r.id, r.ma, version),
+            );
+            let mut m = vec![
+                (t("t"), t("item")),
+                (t("id"), Value::Bytes(r.id.clone())),
+                (t("modified_at"), i(r.ma)),
+                (t("nonce"), Value::Bytes(nonce.to_vec())),
+                (t("ct"), Value::Bytes(ct)),
+            ];
+            m.extend(r.extras.iter().cloned());
+            body.push(canon(Value::Map(m)));
+        }
+        let mut sorted = recs.to_vec();
+        sorted.sort_by(|a, b| a.id.cmp(&b.id));
+        let man = Value::Array(
+            sorted
+                .iter()
+                .map(|r| {
+                    let mut e = vec![Value::Bytes(r.id.clone()), i(r.ma)];
+                    if version >= 3 && !r.extras.is_empty() {
+                        e.push(Value::Bytes(indep::extras_digest(&r.extras)));
+                    }
+                    Value::Array(e)
+                })
+                .collect(),
+        );
+        let digest = indep::header_digest(version, header);
+        let rd = (version >= 3).then(|| indep::extras_digest(manifest_extras));
+        let mut nonce = [0u8; 24];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let ct = indep::seal(
+            &manifest_key,
+            &nonce,
+            &enc(&man),
+            &indep::manifest_aad(
+                &vault_id,
+                recs.len() as u32,
+                version,
+                digest.as_deref(),
+                rd.as_deref(),
+            ),
+        );
+        let mut m = vec![
+            (t("t"), t("manifest")),
+            (t("nonce"), Value::Bytes(nonce.to_vec())),
+            (t("ct"), Value::Bytes(ct)),
+        ];
+        m.extend(manifest_extras.iter().cloned());
+        body.push(canon(Value::Map(m)));
+        join(version, &canon(header.clone()), &body)
+    }
+
+    /// Re-wraps every `password` slot of `header` under the slot AAD of `version` (01 §2).
+    pub fn rewrap_password_slots(
+        header: &mut Value,
+        vault_key: &[u8],
+        version: u16,
+        password: &str,
+    ) {
+        let vault_id = bytes_of(get(header, "vault_id").unwrap());
+        let kdf = get(header, "kdf").unwrap().clone();
+        let kek = indep::kek_password(
+            password,
+            &bytes_of(get(&kdf, "salt").unwrap()),
+            u64_of(get(&kdf, "m_cost").unwrap()) as u32,
+            u64_of(get(&kdf, "t_cost").unwrap()) as u32,
+            u64_of(get(&kdf, "p_cost").unwrap()) as u32,
+        );
+        if let Some(Value::Array(slots)) = get_mut(header, "slots") {
+            for s in slots.iter_mut() {
+                if get(s, "kind").unwrap().as_text() != Some("password") {
+                    continue;
+                }
+                let sid = bytes_of(get(s, "id").unwrap());
+                let mut nonce = [0u8; 24];
+                rand::rngs::OsRng.fill_bytes(&mut nonce);
+                let wk = indep::seal(
+                    &kek,
+                    &nonce,
+                    vault_key,
+                    &indep::slot_aad(version, &vault_id, &sid, "password"),
+                );
+                set(s, "nonce", Value::Bytes(nonce.to_vec()));
+                set(s, "wrapped_key", Value::Bytes(wk));
+            }
+        }
+    }
+
+    /// Decrypts every item record of `bytes` with a known vault key (no Argon2): id → (ma, canonical
+    /// ItemPlain bytes, ItemPlain).
+    pub fn records(
+        bytes: &[u8],
+        vault_key: &[u8],
+    ) -> std::collections::BTreeMap<Vec<u8>, (u64, Vec<u8>, Value)> {
+        let raw = split(bytes);
+        let vault_id = bytes_of(get(&raw.header, "vault_id").unwrap());
+        let item_key = indep::hkdf(vault_key, &vault_id, "vault/item/v1");
+        let n = raw.body.len();
+        let mut out = std::collections::BTreeMap::new();
+        for r in &raw.body[..n - 1] {
+            let id = bytes_of(get(r, "id").unwrap());
+            let ma = u64_of(get(r, "modified_at").unwrap());
+            let pt = indep::open(
+                &item_key,
+                &bytes_of(get(r, "nonce").unwrap()),
+                &bytes_of(get(r, "ct").unwrap()),
+                &indep::item_aad(&vault_id, &id, ma, raw.version),
+            )
+            .expect("record opens with the spec AAD");
+            let v: Value = ciborium::from_reader(&pt[..]).unwrap();
+            out.insert(id, (ma, enc(&canon(v.clone())), v));
+        }
+        out
+    }
+}

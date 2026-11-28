@@ -34,6 +34,13 @@
 //! "ours". `device_id` is compared as
 //! raw bytes (`Uuid`'s `Ord`), which is what the spec means by "greater `device_id` bytes".
 //!
+//! **Record-level unknown keys** (the plaintext extras of an `ItemRecord`, 01 §4 and §9) are
+//! unstamped item-level data: they travel whole with the item winner (`item_winner`) and
+//! are part of the record comparison that decides a restamp (`same_record`), but only when
+//! both files are of a version whose manifest binds them (3); a vault below that never
+//! contributes its keys, and loses them when it moves to 3. See "Extras" and "The gate" on
+//! [`UnlockedVault::merge_from`].
+//!
 //! **Header merge** (03 §5): the slot set and KDF parameters are last-writer-wins as a unit,
 //! keyed by `header.slots_modified_at`; see [`UnlockedVault::merge_from`].
 
@@ -49,8 +56,8 @@ use crate::crypto::Keys;
 use crate::error::VaultError;
 use crate::format;
 use crate::item::{
-    AttachmentRef, AttachmentTombstone, Field, FieldKind, FieldTombstone, HistoryEntry, Item,
-    Millis,
+    AttachmentRef, AttachmentTombstone, Extras, Field, FieldKind, FieldTombstone, HistoryEntry,
+    Item, Millis,
 };
 
 /// Whether a field of this kind keeps its previous values in the item's `history`:
@@ -139,7 +146,8 @@ impl UnlockedVault {
     ///
     /// **A record that replaces ours gets a stamp no earlier record shares** (security
     /// review 2026-11-26 M-01). For an id on both sides the merged result is compared with
-    /// *both* input records ([`same_record`]: content, stamps, `device_id` and `created_at`):
+    /// *both* input records ([`same_record`]: content, stamps, `device_id`, `created_at`
+    /// and the record-level unknown keys):
     ///
     /// - equal to ours: nothing changes (`unchanged`);
     /// - equal to theirs, and `theirs.modified_at > ours.modified_at`: theirs' record is
@@ -172,9 +180,63 @@ impl UnlockedVault {
     /// under the normal `(modified_at, device_id)` tie-break, and both sides converge on the
     /// same outcome either way.
     ///
-    /// **Extras.** For an id present on both sides, ours' plaintext `record_extras` are kept
-    /// and theirs ignored. Inside the item, the metadata loser's `ItemPlain` extras are
-    /// dropped; only the winner's survive.
+    /// **Extras** (bug hunt 2026-11-27 N10). Unknown keys carry no stamp, so they follow
+    /// the item winner as a whole (03 §5 "unknown extras and anything without a stamp"),
+    /// never key by key: inside the item, the loser's `ItemPlain` extras are dropped and
+    /// only the winner's survive; the record-level plaintext keys (`record_extras`, the ones
+    /// format version 3 binds through the manifest entry's `extras_digest`) come from the
+    /// same side, see `item_winner`. That side is the tombstone-or-live winner when one
+    /// input is a tombstone, otherwise the greater `(modified_at, device_id, item payload
+    /// bytes)`; if even the payload bytes are equal (the same item on both sides) the
+    /// greater canonical CBOR bytes of the record-level keys win, so two devices that differ
+    /// in nothing else still pick the same set. A record adopted verbatim therefore brings
+    /// its record-level keys, and a winner without any removes the loser's. The keys are
+    /// part of the comparison above: a merge whose only effect is to take the peer's keys
+    /// is a change (`updated`), stamped by the same rule, so no pair `(id, modified_at)` is
+    /// ever saved with record-level keys other than the ones an input record carried under
+    /// that pair. A strip ([`UnlockedVault::delete_permanently`]) still drops them, and the
+    /// stripped tombstone, being the winner, takes them off the peer's copy too.
+    ///
+    /// **The gate** (security review 2026-11-27). Record-level keys are merge input only
+    /// when a manifest vouched for them, that is when the vault holding them is at
+    /// [`format::PLAINTEXT_BINDING_VERSION`] or later; below it they are plaintext anyone
+    /// can edit without a key. By version of ours / the peer:
+    ///
+    /// - 3 / 3: everything above.
+    /// - any / below 3: the peer's keys are never read. For an id on both sides ours are
+    ///   kept, the peer's ignored and left out of the comparison (no restamp, no
+    ///   `updated`, however they differ; otherwise a planted key would be saved under our
+    ///   version 3 manifest, or would move an authenticated `modified_at` once per plant
+    ///   until a genuine tombstone lost). An id only the peer holds arrives without them
+    ///   when ours is at 3, and with them when ours is below 3 too (unbound either way).
+    /// - below 3 / 3: ours' keys are never read either (owner decision 2026-11-27). All of
+    ///   them are dropped before the items are merged, so every id merges as if ours had
+    ///   none: the peer's bound keys come by the rule above, an id only ours holds keeps
+    ///   its item and loses its keys. The header merge adopts the peer's version 3 header
+    ///   in the same call, so the vault that results holds no key a manifest never
+    ///   vouched for, exactly as after [`UnlockedVault::upgrade_format`]. The same holds
+    ///   for the other plaintext a pre-3 file left unbound: the adopted header, unknown
+    ///   keys included, is the peer's authenticated one, and ours' `ManifestRecord`
+    ///   unknown keys are dropped (they are never merged, so the vault then has none,
+    ///   whatever the peer's manifest record carries). (Should the
+    ///   header not be adopted, which needs a version 3 peer without a header stamp, a
+    ///   thing no writer of this crate produces, ours stays below 3 with only the keys
+    ///   taken from the peer; nothing is bound, because nothing is below 3.)
+    ///
+    /// Hence the invariant that makes the header version a sufficient test: a vault whose
+    /// header is at version 3 holds only record-level keys that a version 3 manifest
+    /// authenticated, because both ways to reach version 3 in memory (`upgrade_format`,
+    /// header adoption here) drop the others in the same call. Both versions are read
+    /// before the header merge, which can raise ours; `other` is never written.
+    ///
+    /// **Caller contract.** The peer's version is `other`'s header version as passed in.
+    /// Callers pass a vault fresh from `unlock` (the on-disk copy, a conflict copy) or
+    /// their own live vault, never one they upgraded or merged into first: the version a
+    /// vault's records were authenticated under is then the version this function reads.
+    ///
+    /// A future writer that removes or changes a record-level key must restamp the item:
+    /// on an exact tie any key beats none and greater bytes beat smaller, so an unstamped
+    /// removal would be undone by the next peer that still holds the key.
     ///
     /// **Attachments** (v1.1) of two live items are merged by union on `id`, sorted by
     /// `(added_at, id)`, after applying the union of both sides' removal markers: a
@@ -196,6 +258,15 @@ impl UnlockedVault {
             return Err(VaultError::Malformed("vault_id mismatch".into()));
         }
         let mut report = MergeReport::default();
+        // Record-level unknown keys are merge input only if a manifest vouched for them
+        // (see "Extras"). Read here, before the header merge below can raise our version.
+        let peer_keys_bound = other.header.format_version >= format::PLAINTEXT_BINDING_VERSION;
+        let our_keys_bound = self.header.format_version >= format::PLAINTEXT_BINDING_VERSION;
+        if peer_keys_bound && !our_keys_bound {
+            // Ours are unbound and about to live in a version 3 vault: never merge input,
+            // never kept. Every id below merges as if ours had none.
+            self.record_extras.clear();
+        }
         // The format version is part of the slot unit: every slot is wrapped under an AAD
         // that binds it (01 §2), so slots and version must always be adopted together, and
         // a greater version always wins regardless of stamp (an upgrade is never undone;
@@ -241,6 +312,13 @@ impl UnlockedVault {
             // from format version 3 on the whole header is one authenticated unit, so the
             // winning header carries its own unknown keys, like `kdf_extras` always did.
             self.header.extras = other.header.extras.clone();
+            if peer_keys_bound && !our_keys_bound {
+                // We move to version 3 here, with the peer's header whole. Our manifest
+                // record's unknown keys were bound by nothing and are not merged by any
+                // rule (every vault keeps its own), so they are dropped, not bound; the
+                // peer's are not taken. Same as `upgrade_format`.
+                self.manifest_extras.clear();
+            }
             // Dropping the previous `Keys` zeroizes them. Same key in all but the rotation
             // case; see the docs above.
             self.keys = Keys::from_vault_key(other.keys.vault_key.clone(), self.header.vault_id);
@@ -250,14 +328,37 @@ impl UnlockedVault {
             match self.items.get(id) {
                 None => {
                     self.items.insert(*id, theirs.clone());
-                    if let Some(extras) = other.record_extras.get(id) {
+                    // Unbound keys must not become bound by our manifest.
+                    if (peer_keys_bound || !our_keys_bound)
+                        && let Some(extras) = other.record_extras.get(id)
+                    {
                         self.record_extras.insert(*id, extras.clone());
                     }
                     report.added += 1;
                 }
                 Some(ours) => {
+                    let none = Extras::new();
+                    let ours_keys = self.record_extras.get(id).unwrap_or(&none);
+                    // An unbound peer's keys read as ours': they cannot differ, win or
+                    // restamp, which is the item-only comparison of before 2026-11-27.
+                    let theirs_keys = if peer_keys_bound {
+                        other.record_extras.get(id).unwrap_or(&none)
+                    } else {
+                        ours_keys
+                    };
                     let mut merged = merge_items(ours, theirs);
-                    if same_record(ours, &merged) {
+                    // Record-level unknown keys follow the item winner; an exact item tie
+                    // (same payload on both sides) falls to their canonical bytes.
+                    let keys_from_ours = !peer_keys_bound
+                        || item_winner(ours, theirs).then_with(|| {
+                            record_keys_bytes(ours_keys).cmp(&record_keys_bytes(theirs_keys))
+                        }) != Ordering::Less;
+                    let merged_keys = if keys_from_ours {
+                        ours_keys
+                    } else {
+                        theirs_keys
+                    };
+                    if same_record(ours, ours_keys, &merged, merged_keys) {
                         report.unchanged += 1;
                     } else {
                         // Symmetric restamp (security review 2026-11-26 M-01): the result
@@ -268,8 +369,11 @@ impl UnlockedVault {
                         // (new bytes), or it is theirs' record but theirs' stamp equals ours
                         // (our pre-merge record, in a backup or the previous file, shares
                         // the pair with different bytes). Only theirs' record at a strictly
-                        // greater stamp is adopted verbatim.
-                        if !same_record(theirs, &merged) || theirs.modified_at == ours.modified_at {
+                        // greater stamp is adopted verbatim. "Record" includes the
+                        // record-level unknown keys on both sides of both comparisons.
+                        if !same_record(theirs, theirs_keys, &merged, merged_keys)
+                            || theirs.modified_at == ours.modified_at
+                        {
                             merged.modified_at =
                                 ours.modified_at.max(theirs.modified_at).saturating_add(1);
                         }
@@ -279,6 +383,12 @@ impl UnlockedVault {
                             report.updated += 1;
                         }
                         self.items.insert(*id, merged);
+                        if !keys_from_ours {
+                            match other.record_extras.get(id) {
+                                Some(keys) => self.record_extras.insert(*id, keys.clone()),
+                                None => self.record_extras.remove(id),
+                            };
+                        }
                     }
                 }
             }
@@ -297,28 +407,10 @@ pub fn merge_items(ours: &Item, theirs: &Item) -> Item {
     debug_assert_eq!(ours.id, theirs.id);
     let modified_at = ours.modified_at.max(theirs.modified_at);
     let mut result = match (ours.deleted_at, theirs.deleted_at) {
-        (Some(d), None) => {
-            if d >= theirs.modified_at {
-                ours.clone()
-            } else {
-                theirs.clone()
-            }
-        }
-        (None, Some(d)) => {
-            if d >= ours.modified_at {
-                theirs.clone()
-            } else {
-                ours.clone()
-            }
-        }
-        (Some(_), Some(_)) => {
-            if ours_wins_metadata(ours, theirs) {
-                ours.clone()
-            } else {
-                theirs.clone()
-            }
-        }
         (None, None) => merge_live(ours, theirs),
+        // A tombstone is involved: one whole item is taken.
+        _ if item_winner(ours, theirs) == Ordering::Less => theirs.clone(),
+        _ => ours.clone(),
     };
     result.modified_at = modified_at;
     result.created_at = merge_created_at(ours.created_at, theirs.created_at);
@@ -341,18 +433,49 @@ pub(crate) fn merge_created_at(ours: Option<Millis>, theirs: Option<Millis>) -> 
 /// order on content, so both devices pick the same side; equal bytes are the same item and
 /// either choice is the same choice).
 fn ours_wins_metadata(ours: &Item, theirs: &Item) -> bool {
-    match ours
-        .modified_at
+    metadata_order(ours, theirs) != Ordering::Less
+}
+
+/// The order behind [`ours_wins_metadata`]: `Greater` when ours supplies the metadata,
+/// `Less` when theirs does, `Equal` only for the same payload at the same
+/// `(modified_at, device_id)`.
+fn metadata_order(ours: &Item, theirs: &Item) -> Ordering {
+    ours.modified_at
         .cmp(&theirs.modified_at)
         .then_with(|| ours.device_id.cmp(&theirs.device_id))
-    {
-        Ordering::Greater => true,
-        Ordering::Less => false,
-        Ordering::Equal => {
-            format::encode_item_plain(ours).as_slice()
-                >= format::encode_item_plain(theirs).as_slice()
+        .then_with(|| {
+            format::encode_item_plain(ours)
+                .as_slice()
+                .cmp(format::encode_item_plain(theirs).as_slice())
+        })
+}
+
+/// The item winner, the side that everything without a stamp of its own follows (03 §5):
+/// `Greater` for ours, `Less` for theirs. With exactly one tombstone it is the side
+/// [`merge_items`] takes whole (the tombstone iff `deleted_at >= other.modified_at`);
+/// otherwise (both live, both tombstones) it is [`metadata_order`], whose `Equal` means the
+/// two items are the same and only data outside the item is left to decide
+/// ([`UnlockedVault::merge_from`] then compares the record-level unknown keys).
+fn item_winner(ours: &Item, theirs: &Item) -> Ordering {
+    let ours_if = |wins: bool| {
+        if wins {
+            Ordering::Greater
+        } else {
+            Ordering::Less
         }
+    };
+    match (ours.deleted_at, theirs.deleted_at) {
+        (Some(d), None) => ours_if(d >= theirs.modified_at),
+        (None, Some(d)) => ours_if(d < ours.modified_at),
+        _ => metadata_order(ours, theirs),
     }
+}
+
+/// Canonical CBOR bytes of a record's unknown plaintext keys as a map: the bytes
+/// [`format::extras_digest`] hashes, so "equal" here is "same digest" under version 3 and
+/// entry order never matters. Plaintext on disk, hence no zeroizing.
+fn record_keys_bytes(keys: &Extras) -> Vec<u8> {
+    format::canonical_bytes(Value::Map(keys.clone()))
 }
 
 /// Both sides live. `title`, `favorite`, `tags` (as one set) and `icon` are each merged by
@@ -773,16 +896,17 @@ fn attachment_eq(a: &AttachmentRef, b: &AttachmentRef) -> bool {
 }
 
 /// `true` if `a` and `b` would serialize to the same item record: [`item_eq`] plus
-/// `created_at`. This is the "is the merged result one of the two input records" test of
-/// [`UnlockedVault::merge_from`]: the manifest binds a record by `(id, modified_at)` (01 §4),
-/// so any merged record that differs from both inputs in *any* persisted byte, `created_at`
-/// included, must get a fresh timestamp (02 guarantee 6; security review 2026-11-26 M-01).
-///
-/// TODO(M-01): record-level plaintext `extras` (`ItemRecord::extras`, kept from ours, not
-/// authenticated, written by nothing today) are outside this check. If a writer ever emits
-/// them, include them here or in the manifest binding.
-pub(crate) fn same_record(a: &Item, b: &Item) -> bool {
-    item_eq(a, b) && a.created_at == b.created_at
+/// `created_at` plus the record-level unknown plaintext keys (`ItemRecord::extras`, compared
+/// as canonical CBOR, see [`record_keys_bytes`]). This is the "is the merged result one of
+/// the two input records" test of [`UnlockedVault::merge_from`]: the manifest binds a record
+/// by `(id, modified_at)` (01 §4), so any merged record that differs from both inputs in
+/// *any* persisted content, `created_at` and the record-level keys included, must get a
+/// fresh timestamp (02 guarantee 6; security review 2026-11-26 M-01, bug hunt 2026-11-27
+/// N10).
+pub(crate) fn same_record(a: &Item, a_keys: &Extras, b: &Item, b_keys: &Extras) -> bool {
+    item_eq(a, b)
+        && a.created_at == b.created_at
+        && (a_keys == b_keys || record_keys_bytes(a_keys) == record_keys_bytes(b_keys))
 }
 
 /// Full structural *content* equality including secrets and order. `Item` has no

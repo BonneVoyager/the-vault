@@ -204,7 +204,7 @@ cp "$T/up.vault/vault.bin" "$T/up-before.bin"
 BADPW="wrong horse battery staple" "$V" --vault "$T/up.vault" --password-env BADPW upgrade --allow-weak >"$T/o" 2>&1; rc=$?
 if [ $rc -ne 0 ] && [ $rc -ne 101 ] && cmp -s "$T/up-before.bin" "$T/up.vault/vault.bin" && ! grep -q "wrong horse" "$T/o"; then ok "upgrade with wrong password: clean error, file untouched"; else bad "upgrade wrong password" "rc=$rc $(cat "$T/o")"; fi
 "$V" --vault "$T/up.vault" --password-env FPW upgrade --allow-weak >"$T/o" 2>&1; rc=$?
-[ $rc -eq 0 ] && [ "$(fv "$T/up.vault/vault.bin")" = "0002" ] && ok "upgrade writes version 2" || bad "upgrade" "rc=$rc $(cat "$T/o")"
+[ $rc -eq 0 ] && [ "$(fv "$T/up.vault/vault.bin")" = "0003" ] && ok "upgrade writes the current version 3 (01 §9, updated 2026-11-27)" || bad "upgrade" "rc=$rc $(cat "$T/o")"
 "$V" --vault "$T/up.vault" --password-env FPW get AfterV1 >"$T/o" 2>&1 && ok "upgraded vault opens, items kept" || bad "after upgrade" "$(cat "$T/o")"
 cp "$T/up.vault/vault.bin" "$T/up-v2.bin"
 "$V" --vault "$T/up.vault" --password-env FPW upgrade --allow-weak >"$T/o" 2>&1; rc=$?
@@ -561,8 +561,8 @@ cmp_deps() { # name edge flags "spec list"
 cmp_deps vault-core normal "--features kdbx" "argon2 chacha20poly1305 hkdf sha2 rand zeroize secrecy ciborium serde uuid totp-rs unicode-normalization thiserror csv zip serde_json zxcvbn keepass"
 cmp_deps vault-sync normal "" "vault-core notify notify-debouncer-full rustix blake3 crossbeam-channel rand unicode-normalization zeroize thiserror tracing"
 (cd "$ROOT" && cargo tree -q --offline -p vault-sync -e dev --depth 1 --prefix none 2>/dev/null) | grep -q '^tempfile' && ok "vault-sync: tempfile is a dev dependency" || bad "vault-sync tempfile dev-only" "not found in dev edges"
-# 04 line 5 as corrected 2026-11-21 (bug hunt L4)
-cmp_deps vault-macos normal "" "vault-core thiserror uuid dirs tracing secrecy ciborium rqrr objc2 objc2-foundation objc2-app-kit objc2-local-authentication objc2-security objc2-core-foundation objc2-core-graphics objc2-service-management libc zeroize"
+# 04 line 5 as corrected 2026-11-27 (bug hunt L2)
+cmp_deps vault-macos normal "" "vault-core thiserror uuid dirs tracing secrecy ciborium rqrr objc2 objc2-foundation objc2-app-kit objc2-local-authentication objc2-security objc2-core-foundation objc2-core-graphics objc2-service-management libc zeroize block2"
 
 # User-facing help (bundled by include_str!, 05 §2.5 Help) vs the 2026-11-19 UI changes
 HELP="$ROOT/docs/help.md"
@@ -594,7 +594,7 @@ cmp -s "$T/g.bin" "$VAULT_FILE/vault 2.bin" && ok "unreadable copy left in place
 grep -q "$MPW" "$T/o" && bad "sync output contains the master password" || ok "sync output does not contain the master password"
 rm -f "$VAULT_FILE/vault 2.bin"
 # 03 §8: "unsupported format version (any value, 0 included)"
-for ver in '\x00\x00' '\x00\x03' '\xff\xff'; do
+for ver in '\x00\x00' '\x00\x04' '\xff\xff'; do  # 2026-11-27: 3 is current now, 4 is the newer version
   setver "$ver" "$VAULT_FILE/vault 3.bin"; cp "$VAULT_FILE/vault 3.bin" "$T/vc.bin"
   rc=$(sync_rc)
   if [ "$rc" = 1 ] && grep -q "not converged" "$T/o" && cmp -s "$T/vc.bin" "$VAULT_FILE/vault 3.bin"; then ok "per-file copy with version $ver: not converged, kept"; else bad "per-file copy with version $ver" "rc=$rc $(sed "s|$T|<tmp>|g" "$T/o" | head -2 | tr '\n' ' ')"; fi
@@ -722,6 +722,160 @@ lim 60 "$V" --password-env MPW add --title ThroughLink >"$T/o" 2>&1; rc=$?
 # reports the refusal as an Error event (bk09); D-1 "never a silent fallback" — the CLI must pass it on
 grep -qi "backup" "$T/o" && ok "add reports the refused snapshot through a symlinked backups/" || bad "add with a symlinked backups/ skips the policy snapshot silently (rc $rc)" "output: $(sed "s|$T|<tmp>|g" "$T/o" | tr '\n' ' ')"
 rm -f "$VAULT_FILE/backups"; mv "$T/bk-real" "$VAULT_FILE/backups"; rm -rf "$T/bk-elsewhere"
+export VAULT_FILE="$T/main.vault"
+
+# =====================================================================================
+# 2026-11-27 (bug hunt): reveal escaping, KDF floor gate, TOTP period cap, format 3 upgrade,
+# planted backups entry. Written from the specs and `vault get --help` before the source read.
+# =====================================================================================
+export VAULT_FILE="$T/esc.vault"
+v init --kdf-test-params >/dev/null 2>&1
+cat >"$T/esc.py" <<'EOF'
+import sys, re, unicodedata
+VALUES = {
+  "V1": "back\\slash\ttab\nLF\rCR",
+  "V2": "\x1b[31mred\x07bell\x7fdel",
+  "V3": "c1\u009b2Jcsi\u0085nel",
+  "V4": "bidi\u202egnp.exe\u2066x\u2069",
+  "V5": "zw\u200bsp\ufeffbom\u00adshy",
+  "V6": "literal \\u{41} and \\t and \\\\",
+  # every format (Cf) code point Python's Unicode tables know, separated by '.'
+  "V7": ".".join(chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) == "Cf"),
+}
+def esc(s):
+    out = []
+    for ch in s:
+        if ch == "\\": out.append("\\\\")
+        elif ch == "\t": out.append("\\t")
+        elif unicodedata.category(ch) in ("Cc", "Cf"): out.append("\\u{%04X}" % ord(ch))
+        else: out.append(ch)
+    return "".join(out)
+def unesc(s):
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            n = s[i+1]
+            if n == "\\": out.append("\\"); i += 2; continue
+            if n == "t": out.append("\t"); i += 2; continue
+            if n == "n": out.append("\n"); i += 2; continue
+            if n == "r": out.append("\r"); i += 2; continue
+            m = re.match(r"\\u\{([0-9A-Fa-f]+)\}", s[i:])
+            if m: out.append(chr(int(m.group(1), 16))); i += len(m.group(0)); continue
+        out.append(s[i]); i += 1
+    return "".join(out)
+cmd = sys.argv[1]
+if cmd == "env":
+    for k, v in VALUES.items():
+        sys.stdout.write("%s\0%s\0" % (k, v))
+elif cmd == "check":
+    text = open(sys.argv[2], encoding="utf-8", errors="surrogateescape").read()
+    raw = [c for c in text if c not in "\n" and unicodedata.category(c) in ("Cc", "Cf")]
+    if raw:
+        print("RAW " + " ".join("U+%04X" % ord(c) for c in sorted(set(raw))))
+    for k, v in VALUES.items():
+        line = next((l for l in text.splitlines() if re.match(r"\s*%s\b" % k, l)), None)
+        if line is None:
+            print("MISSING %s" % k); continue
+        shown = re.sub(r"^\s*%s\s*:?\s*" % k, "", line)
+        if unesc(shown) != v:
+            got = unesc(shown)
+            diff = sorted(set("U+%04X" % ord(c) for c in set(v) ^ set(got)))
+            print("NOTREVERSIBLE %s differing chars %s" % (k, " ".join(diff[:20])))
+        if shown != esc(v):
+            # spelling differs from the --help wording (\u{XXXX} for every other control char)
+            print("INFO-SPELLING %s" % k)
+elif cmd == "rawcheck":
+    text = open(sys.argv[2], encoding="utf-8", errors="surrogateescape").read()
+    raw = [c for c in text if c not in "\n" and (unicodedata.category(c) in ("Cc", "Cf"))]
+    print(" ".join("U+%04X" % ord(c) for c in sorted(set(raw))))
+EOF
+# Set each hostile value as a password-kind field through the environment (no argv exposure).
+v add --title EscItem >/dev/null 2>&1
+python3 -I "$T/esc.py" env > "$T/esc.env"
+while IFS= read -r -d '' k && IFS= read -r -d '' val; do
+  export "QAESC_$k=$val"
+  v edit EscItem --add "password:$k" >"$T/o" 2>&1 || echo "INFO edit --add password:$k: $(head -1 "$T/o")"
+  v edit EscItem --set-env "$k=QAESC_$k" >"$T/o" 2>&1 || bad "edit --set-env $k" "$(head -2 "$T/o")"
+done < "$T/esc.env"
+v get EscItem --reveal >"$T/rev" 2>&1
+res=$(python3 -I "$T/esc.py" check "$T/rev")
+spell=$(echo "$res" | grep '^INFO-SPELLING' | tr '\n' ' '); res=$(echo "$res" | grep -v '^INFO-SPELLING')
+[ -n "$spell" ] && echo "INFO reveal escape spelling differs from 'vault get --help' wording: $spell"
+[ -z "$res" ] && ok "get --reveal escapes control/format characters reversibly (vault get --help)" || bad "get --reveal escaping per 'vault get --help'" "$res"
+v get EscItem >"$T/o" 2>&1
+grep -q "QAESC\|bidi\|literal" "$T/o" && bad "get without --reveal prints secret values" "$(head -5 "$T/o")" || ok "get without --reveal prints none of the hostile secrets"
+# Titles, tags and field names with C1, bidi and zero-width characters (05 sanitize_line spirit; the
+# CLI help promises escaping only for revealed values, so these are INFO unless raw C0/C1 appear).
+C1T="$(python3 -I -c 'import sys; sys.stdout.write("Pay\u009b2Jpal\u202eexe.txt\u200b")')"
+v add --title "$C1T" --tag "$(python3 -I -c 'import sys; sys.stdout.write("tg\u009b1m")')" >/dev/null 2>&1
+for c in "list" "get $C1T" "get $C1T --ids"; do
+  # shellcheck disable=SC2086
+  if [ "$c" = "list" ]; then v list >"$T/o" 2>&1; elif [ "$c" = "get $C1T" ]; then v get "$C1T" >"$T/o" 2>&1; else v get "$C1T" --ids >"$T/o" 2>&1; fi
+  r=$(python3 -I "$T/esc.py" rawcheck "$T/o")
+  case "$r" in *U+009B*|*U+001B*) bad "'${c%% *}' prints a raw C1 CSI from a title or tag" "$r";; "") ok "'${c%% *}' prints no raw control/format characters from a hostile title";; *) echo "INFO '${c%% *}' prints raw format characters $r";; esac
+done
+# ---- KDF floor (00 phase 1: "`vault init --kdf-test-params` is hidden from `--help` and requires
+# `VAULT_DEV_KDF=1`, opening a vault whose KDF is below the recommended floor ... prints a one-line
+# warning on stderr")
+for envv in unset 0 true yes 2; do
+  rm -rf "$T/kf.vault"
+  if [ "$envv" = unset ]; then env -u VAULT_DEV_KDF "$V" --vault "$T/kf.vault" --password-env MPW init --kdf-test-params >"$T/o" 2>&1; else VAULT_DEV_KDF=$envv "$V" --vault "$T/kf.vault" --password-env MPW init --kdf-test-params >"$T/o" 2>&1; fi
+  rc=$?
+  [ $rc -ne 0 ] && [ ! -e "$T/kf.vault/vault.bin" ] && ok "init --kdf-test-params refused with VAULT_DEV_KDF=$envv" || bad "init --kdf-test-params with VAULT_DEV_KDF=$envv" "rc=$rc $(head -2 "$T/o")"
+done
+("$V" --help; "$V" init --help) 2>&1 | grep -qi "kdf-test" && bad "--kdf-test-params shows in --help" || ok "--kdf-test-params hidden from --help"
+export VAULT_FILE="$T/esc.vault"
+for c in list "get EscItem" "add --title Floor"; do
+  # shellcheck disable=SC2086
+  v $c >/dev/null 2>"$T/e"; n=$(grep -c . "$T/e")
+  [ "$n" = 1 ] && ok "below-floor vault: '$c' prints exactly one stderr line" || bad "below-floor warning for '$c'" "stderr lines: $n: $(head -3 "$T/e" | tr '\n' '|')"
+done
+rm -rf "$T/real.vault"
+"$V" --vault "$T/real.vault" --password-env MPW init >"$T/o" 2>&1 || bad "init with calibrated KDF" "$(head -2 "$T/o")"
+"$V" --vault "$T/real.vault" --password-env MPW list >/dev/null 2>"$T/e"
+[ ! -s "$T/e" ] && ok "calibrated vault: list prints nothing on stderr" || bad "calibrated vault prints a KDF warning" "$(head -2 "$T/e")"
+rm -rf "$T/real.vault"
+# ---- TOTP period cap (02 totp: "a URI outside that range is `InvalidUri`")
+for per in 301 999999 0; do
+  VAULT_ITEM_TOTP="otpauth://totp/x?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period=$per" v add --title "TP$per" --totp-field >"$T/o" 2>&1; arc=$?
+  v totp "TP$per" >"$T/o2" 2>&1; trc=$?
+  if [ $arc -ne 0 ] || [ $trc -ne 0 ]; then ok "period=$per: add rc $arc, totp rc $trc (no code shown)"; else bad "period=$per accepted and a code printed" "$(head -1 "$T/o2")"; fi
+done
+VAULT_ITEM_TOTP="otpauth://totp/x?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period=300" v add --title TP300 --totp-field >/dev/null 2>&1
+code=$(v totp TP300 2>/dev/null | tr -dc '0-9' | head -c 6)
+exp=$(python3 -I -c '
+import hmac,hashlib,struct,time,base64
+k=base64.b32decode("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
+c=int(time.time())//300
+h=hmac.new(k,struct.pack(">Q",c),hashlib.sha1).digest()
+o=h[-1]&15
+print("%06d"%((struct.unpack(">I",h[o:o+4])[0]&0x7fffffff)%1000000))')
+[ "$code" = "$exp" ] && ok "period=300 code matches independent HMAC" || bad "period=300 code" "cli=$code expected=$exp"
+# ---- format 3 (01 §9 "the app and CLI upgrade on the next password unlock" vs README "the CLI
+# does with `vault upgrade`"): record what a read-only command does to a version 2 file.
+FIXD="$ROOT/crates/vault-core/tests/fixtures"
+export FPW27="correct horse battery staple"
+rm -rf "$T/v2.vault"; mkdir -p "$T/v2.vault"; cp "$FIXD/v2-basic.vault" "$T/v2.vault/vault.bin"; chmod 600 "$T/v2.vault/vault.bin"
+before=$(xxd -s 4 -l 2 -p "$T/v2.vault/vault.bin")
+"$V" --vault "$T/v2.vault" --password-env FPW27 list >"$T/o" 2>&1; rc=$?
+after=$(xxd -s 4 -l 2 -p "$T/v2.vault/vault.bin")
+echo "INFO 'vault list' on a version 2 file: rc $rc, version $before -> $after, stderr: $(grep -i 'upgrad\|version' "$T/o" | head -1)"
+"$V" --vault "$T/v2.vault" --password-env FPW27 upgrade --allow-weak >"$T/o" 2>&1; rc=$?
+after=$(xxd -s 4 -l 2 -p "$T/v2.vault/vault.bin")
+[ $rc -eq 0 ] && [ "$after" = "0003" ] && ok "vault upgrade moves a version 2 file to 3" || bad "vault upgrade v2 -> 3" "rc=$rc version=$after $(head -2 "$T/o")"
+"$V" --vault "$T/v2.vault" --password-env FPW27 list >/dev/null 2>&1 && ok "upgraded file opens" || bad "upgraded file opens" ""
+# ---- planted plain file named backups (03 §4 L-05; 00 phase 1 "every mutating command ... prints
+# each sync error raised by its save ... `warning: …` without changing the exit code, which only a
+# failed save makes non-zero"; 03 §8 BackupFailed "the CLI prints it like Error")
+export VAULT_FILE="$T/pb.vault"
+v init --kdf-test-params >/dev/null 2>&1
+rm -rf "$VAULT_FILE/backups"; printf 'planted' >"$VAULT_FILE/backups"
+v add --title PlantedB >"$T/o" 2>"$T/e"; rc=$?
+v list >"$T/o2" 2>/dev/null; saved=0; grep -q PlantedB "$T/o2" && saved=1
+if { [ $rc -eq 0 ] && [ $saved = 1 ]; } || { [ $rc -ne 0 ] && [ $saved = 0 ]; }; then ok "planted backups file: add rc $rc consistent with saved=$saved"; else bad "planted backups file: exit code vs save" "rc=$rc saved=$saved"; fi
+grep -qi "backup" "$T/e" && ok "planted backups file: add reports it on stderr" || bad "planted backups file: add is silent" "stderr: $(head -2 "$T/e")"
+[ "$(cat "$VAULT_FILE/backups")" = planted ] && ok "planted backups file left in place by the CLI" || bad "CLI touched the planted backups file" ""
+echo "INFO planted backups file: add rc $rc saved $saved; stderr $(sed "s|$T|<tmp>|g" "$T/e" | head -2 | tr '\n' '|')"
 export VAULT_FILE="$T/main.vault"
 
 echo

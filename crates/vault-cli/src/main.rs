@@ -1,5 +1,6 @@
 //! `vault`: thin dev/debug CLI over `vault-core`. Phase 1 deliverable.
 
+mod escape_table;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -82,7 +83,9 @@ enum Cmd {
     Get {
         id_or_title: String,
         /// Print secret values. Revealed values are escaped reversibly: a backslash prints as
-        /// `\\`, a tab as `\t`, other control and format characters as `\u{XXXX}`.
+        /// `\\`, tab as `\t`, and every other control or format character as `\u{hex}`.
+        /// Single-line values also print newline as `\n` and carriage return as `\r`; notes
+        /// keep their line breaks, with continuation lines indented two spaces.
         #[arg(long)]
         reveal: bool,
         /// Show each field's id in a trailing column.
@@ -304,8 +307,8 @@ fn read_capped(path: &Path, cap: u64) -> std::io::Result<Zeroizing<Vec<u8>>> {
 }
 
 /// Escape characters that could act on a terminal when multi-line vault content (a revealed
-/// value, notes) is printed. C0 controls, DEL, C1 controls and bidi/format controls become
-/// `\u{XXXX}`; tab becomes a single space and line feed is kept.
+/// value, notes) is printed. every control, format, line-separator and paragraph-separator
+/// character becomes `\u{XXXX}`; tab becomes a single space and line feed is kept.
 fn sanitize_for_terminal(s: &str) -> String {
     sanitize(s, true, false)
 }
@@ -342,18 +345,7 @@ fn sanitize(s: &str, keep_newlines: bool, reversible: bool) -> String {
             '\n' if keep_newlines => out.push('\n'),
             '\n' => out.push_str("\\n"),
             '\r' if !keep_newlines => out.push_str("\\r"),
-            '\u{0}'..='\u{1f}'
-            | '\u{7f}'
-            | '\u{80}'..='\u{9f}'
-            | '\u{61c}'
-            | '\u{180e}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{2028}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{206a}'..='\u{206f}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{feff}'
-            | '\u{fff9}'..='\u{fffb}' => {
+            c if escape_table::needs_escape(c) => {
                 let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
             }
             _ => out.push(c),
@@ -1288,6 +1280,104 @@ mod tests {
         assert_eq!(
             sanitize_for_terminal("Plain \u{e9}\u{4e16}"),
             "Plain \u{e9}\u{4e16}"
+        );
+    }
+
+    /// Test-only inverse of the reversible escaping (`\\`, `\t`, `\n`, `\r`, `\u{hex}`).
+    fn unescape(s: &str) -> String {
+        let mut out = String::new();
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match it.next().expect("dangling backslash") {
+                '\\' => out.push('\\'),
+                't' => out.push('\t'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                'u' => {
+                    assert_eq!(it.next(), Some('{'));
+                    let hex: String = it.by_ref().take_while(|&h| h != '}').collect();
+                    out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+                }
+                other => panic!("bad escape \\{other}"),
+            }
+        }
+        out
+    }
+
+    fn assert_no_raw_escapable(out: &str) {
+        for c in out.chars() {
+            assert!(
+                !escape_table::needs_escape(c),
+                "raw {:#x} in {out:?}",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn reveal_escapes_every_cc_cf_zl_zp_and_round_trips() {
+        let mut all: Vec<char> = (0u32..=0x10ffff)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_control())
+            .collect();
+        for &(lo, hi) in escape_table::ranges() {
+            all.extend((lo..=hi).filter_map(char::from_u32));
+        }
+        for c in all {
+            let s = format!("a{c}\\b");
+            let out = sanitize_revealed_line(&s);
+            assert_no_raw_escapable(&out);
+            assert_eq!(unescape(&out), s, "{:#x}", c as u32);
+            let line = sanitize_line(&s);
+            assert_no_raw_escapable(&line);
+        }
+    }
+
+    #[test]
+    fn revealed_note_round_trips() {
+        let note = "a\nb\r\tc\\d\u{ad}e\n";
+        let shown = sanitize_revealed_multiline(note).replace('\n', "\n  ");
+        assert!(shown.contains("\n  "));
+        let back = unescape(&shown.replace("\n  ", "\n"));
+        assert_eq!(back, note);
+    }
+
+    #[test]
+    fn reveal_escapes_listed_format_characters() {
+        let mut listed = vec![0xAD, 0x6DD, 0x70F, 0x8E2, 0x110BD, 0x110CD, 0xE0001];
+        listed.extend(0x600..=0x605);
+        listed.extend(0x890..=0x891);
+        listed.extend(0x13430..=0x1343F);
+        listed.extend(0x1BCA0..=0x1BCA3);
+        listed.extend(0x1D173..=0x1D17A);
+        listed.extend(0xE0020..=0xE007F);
+        for u in listed {
+            let c = char::from_u32(u).unwrap();
+            assert_eq!(
+                sanitize_revealed_line(&c.to_string()),
+                format!("\\u{{{u:x}}}")
+            );
+            assert_eq!(sanitize_line(&c.to_string()), format!("\\u{{{u:x}}}"));
+        }
+    }
+
+    #[test]
+    fn ordinary_text_passes_through() {
+        // U+200D is Cf and was already escaped before this change, so it stays escaped.
+        for s in [
+            "Plain text 123 !~",
+            "caf\u{e9} \u{4e16}\u{754c} \u{43f}\u{440}\u{438}\u{432}\u{435}\u{442} \u{5e9}\u{5dc}\u{5d5}\u{5dd} \u{1f600}",
+        ] {
+            assert_eq!(sanitize_revealed_line(s), s.replace('\\', "\\\\"));
+            assert_eq!(sanitize_line(s), s);
+        }
+        assert_eq!(
+            sanitize_line("\u{1f468}\u{200d}\u{1f469}"),
+            "\u{1f468}\\u{200d}\u{1f469}"
         );
     }
 

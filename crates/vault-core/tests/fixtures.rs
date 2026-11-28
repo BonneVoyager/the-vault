@@ -94,6 +94,12 @@
 //! legacy `kind`, the field with its unknown kind, and the manifest record), every one of
 //! them bound by the version 3 manifest. Same password and KDF. Built by
 //! `regenerate_v3_meta_fixture`; the tamper tests on it are in `tests/v3_binding.rs`.
+//! **Frozen since 2026-11-27**: `upgrade_format` now drops every plaintext unknown key of
+//! a pre-3 file (header, kdf map, slot maps, item records, manifest record) instead of
+//! binding it, so that regenerator no longer reproduces this file and refuses to run
+//! (`v3_meta_regenerator_is_historical`). The fixture stays as the committed example of a
+//! version 3 file whose manifest vouches for unknown keys at all of those sites, which
+//! only a newer writer holding the vault key would produce now.
 
 use std::io::Cursor;
 
@@ -1157,13 +1163,25 @@ fn v3_basic_opens_and_a_save_keeps_everything_at_version_3() {
     );
 }
 
-/// Builds `v3-meta.vault` (see the module docs): `v1-forward.vault` upgraded in place.
-/// `upgrade_format` keeps every unknown key the reader preserved (header, kdf, password
-/// slot, item record, item payload, field, manifest record) and drops the opaque slot; the
-/// save then binds all of them under version 3.
+/// `v3-meta.vault` is frozen (see the module docs): it was built by upgrading
+/// `v1-forward.vault` when `upgrade_format` still carried every unknown key into the
+/// version 3 binding. Since 2026-11-27 the upgrade drops every plaintext unknown key of
+/// the old file, so the regenerator below can no longer produce the fixture and must
+/// never run again.
+fn v3_meta_regenerator_is_historical() {
+    panic!(
+        "historical: v3-meta.vault was built before upgrade_format dropped the plaintext unknown keys of a pre-3 file (2026-11-27); the fixture is frozen (01 §9)"
+    );
+}
+
+/// Built `v3-meta.vault` (see the module docs): `v1-forward.vault` upgraded in place, when
+/// `upgrade_format` kept every unknown key the reader preserved (header, kdf, password
+/// slot, item record, item payload, field, manifest record) and dropped only the opaque
+/// slot; the save then bound all of them under version 3. Historical.
 #[test]
 #[ignore]
 fn regenerate_v3_meta_fixture() {
+    v3_meta_regenerator_is_historical();
     let mut vault = LockedVault::parse(FORWARD).unwrap().unlock(&pw()).unwrap();
     vault.set_device_id(device());
     vault.upgrade_format(&pw(), V3M_AT).unwrap();
